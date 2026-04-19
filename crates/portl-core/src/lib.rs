@@ -4,6 +4,7 @@
 //! and in-process test helpers. This crate is the bedrock all other
 //! portl crates build on.
 
+pub mod bootstrap;
 pub mod caps;
 pub mod endpoint;
 pub mod error;
