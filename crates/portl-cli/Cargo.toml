@@ -18,18 +18,25 @@ path = "src/main.rs"
 [dependencies]
 portl-core  = { version = "0.0.1", path = "../portl-core" }
 portl-proto = { version = "0.0.1", path = "../portl-proto" }
+portl-agent = { version = "0.0.1", path = "../portl-agent" }
 clap        = { workspace = true }
 tokio       = { workspace = true }
 anyhow      = { workspace = true }
 thiserror   = { workspace = true }
+serde       = { workspace = true }
+postcard    = { workspace = true }
 tracing     = { workspace = true }
 tracing-subscriber = { workspace = true }
+futures-util = { workspace = true }
 iroh-base   = { workspace = true }
+iroh        = { workspace = true }
 iroh-tickets = { workspace = true }
 rpassword   = { workspace = true }
 hex         = { workspace = true }
 qrcode      = { workspace = true }
 zeroize     = { workspace = true }
+humantime   = { workspace = true }
+n0-future   = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

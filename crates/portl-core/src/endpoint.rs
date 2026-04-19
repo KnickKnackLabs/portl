@@ -16,6 +16,12 @@ use iroh_base::EndpointAddr;
 #[derive(Debug, Clone)]
 pub struct Endpoint(iroh::Endpoint);
 
+impl From<iroh::Endpoint> for Endpoint {
+    fn from(value: iroh::Endpoint) -> Self {
+        Self(value)
+    }
+}
+
 impl Endpoint {
     /// Bind a new endpoint using portl's default preset.
     ///

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use iroh::address_lookup::{DnsAddressLookup, MdnsAddressLookup, PkarrPublisher};
+use iroh::address_lookup::{DnsAddressLookup, MdnsAddressLookup, PkarrPublisher, PkarrResolver};
 use iroh::endpoint::{RelayMode, presets};
 use iroh_base::SecretKey;
 use portl_core::id::Identity;
@@ -19,7 +19,9 @@ pub async fn bind(cfg: &AgentConfig, identity: &Identity) -> Result<iroh::Endpoi
     };
 
     if cfg.discovery.pkarr {
-        builder = builder.address_lookup(PkarrPublisher::n0_dns());
+        builder = builder
+            .address_lookup(PkarrPublisher::n0_dns())
+            .address_lookup(PkarrResolver::n0_dns());
     }
     if cfg.discovery.dns {
         builder = builder.address_lookup(DnsAddressLookup::n0_dns());

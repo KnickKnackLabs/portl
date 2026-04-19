@@ -1,0 +1,267 @@
+use std::process::ExitCode;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result, anyhow, bail};
+use iroh::address_lookup::AddressLookupFailed;
+use iroh::endpoint::Connection;
+use iroh_base::{EndpointAddr, EndpointId, TransportAddr};
+use iroh_tickets::Ticket;
+use n0_future::StreamExt;
+use portl_core::endpoint::Endpoint;
+use portl_core::id::{Identity, store};
+use portl_core::net::{PeerSession, open_ticket_v1};
+use portl_core::ticket::mint::mint_root;
+use portl_core::ticket::schema::{Capabilities, MetaCaps, PortlTicket};
+use portl_proto::meta_v1::{MetaReq, MetaResp};
+use portl_proto::wire::StreamPreamble;
+use serde::{Deserialize, Serialize};
+
+pub fn run(peer: &str) -> Result<ExitCode> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async move {
+        let identity = store::load(&store::default_path()).context("load local identity")?;
+        let raw_endpoint =
+            portl_agent::endpoint::bind(&portl_agent::AgentConfig::default(), &identity)
+                .await
+                .context("bind client endpoint")?;
+        let endpoint = Endpoint::from(raw_endpoint.clone());
+
+        let resolved = resolve_peer(peer, &identity, &raw_endpoint).await?;
+        let (connection, session) = open_ticket_v1(&endpoint, &resolved.ticket, &[], &identity)
+            .await
+            .context("run ticket handshake")?;
+        let rtt = ping(&connection, &session).await?;
+        let info = info(&connection, &session).await?;
+        print_status(
+            connection.remote_id(),
+            path_label(&connection),
+            rtt,
+            &resolved.discovery,
+            &info,
+        );
+
+        connection.close(0u32.into(), b"status complete");
+        raw_endpoint.close().await;
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
+struct ResolvedPeer {
+    ticket: PortlTicket,
+    discovery: String,
+}
+
+async fn resolve_peer(
+    peer: &str,
+    identity: &Identity,
+    endpoint: &iroh::Endpoint,
+) -> Result<ResolvedPeer> {
+    if let Ok(ticket) = <PortlTicket as Ticket>::deserialize(peer) {
+        return Ok(ResolvedPeer {
+            ticket,
+            discovery: "cached".to_owned(),
+        });
+    }
+
+    let endpoint_id = parse_endpoint_id(peer)?;
+    let (addr, provenance) = resolve_endpoint_addr(endpoint, endpoint_id).await?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before unix epoch")?
+        .as_secs();
+    let ticket = mint_root(
+        identity.signing_key(),
+        addr,
+        meta_caps(),
+        now,
+        now + 300,
+        None,
+    )
+    .context("mint ephemeral status ticket")?;
+
+    Ok(ResolvedPeer {
+        ticket,
+        discovery: normalize_discovery_source(&provenance),
+    })
+}
+
+async fn resolve_endpoint_addr(
+    endpoint: &iroh::Endpoint,
+    endpoint_id: EndpointId,
+) -> Result<(EndpointAddr, String)> {
+    let mut stream = endpoint
+        .address_lookup()
+        .context("access address lookup")?
+        .resolve(endpoint_id);
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(Ok(item)) => {
+                let provenance = item.provenance().to_owned();
+                return Ok((item.into_endpoint_addr(), provenance));
+            }
+            Ok(Err(_)) => continue,
+            Err(AddressLookupFailed::NoServiceConfigured { .. }) => {
+                bail!("no discovery services configured")
+            }
+            Err(AddressLookupFailed::NoResults { errors, .. }) => {
+                let detail = errors
+                    .into_iter()
+                    .map(|err| err.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                bail!("discovery failed: {detail}")
+            }
+            Err(err) => return Err(anyhow!(err)),
+        }
+    }
+
+    bail!("discovery returned no addresses")
+}
+
+fn parse_endpoint_id(spec: &str) -> Result<EndpointId> {
+    let bytes = hex::decode(spec).context("endpoint id must be hex or a portl ticket URI")?;
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("endpoint id must be exactly 32 bytes"))?;
+    EndpointId::from_bytes(&bytes).context("invalid endpoint id")
+}
+
+fn meta_caps() -> Capabilities {
+    Capabilities {
+        presence: 0b0010_0000,
+        shell: None,
+        tcp: None,
+        udp: None,
+        fs: None,
+        vpn: None,
+        meta: Some(MetaCaps {
+            ping: true,
+            info: true,
+        }),
+    }
+}
+
+async fn ping(connection: &Connection, session: &PeerSession) -> Result<std::time::Duration> {
+    let started = Instant::now();
+    let response = meta_request(
+        connection,
+        session,
+        MetaReq::Ping {
+            t_client_us: unix_now_micros()?,
+        },
+    )
+    .await?;
+    match response {
+        MetaResp::Pong { .. } => Ok(started.elapsed()),
+        MetaResp::Error(error) => bail!("meta ping failed: {} ({:?})", error.message, error.kind),
+        other => bail!("unexpected ping response: {other:?}"),
+    }
+}
+
+async fn info(connection: &Connection, session: &PeerSession) -> Result<InfoView> {
+    let response = meta_request(connection, session, MetaReq::Info).await?;
+    match response {
+        MetaResp::Info {
+            agent_version,
+            supported_alpns: _,
+            uptime_s,
+            hostname,
+            os,
+            tags: _,
+        } => Ok(InfoView {
+            agent_version,
+            uptime_s,
+            hostname,
+            os,
+        }),
+        MetaResp::Error(error) => bail!("meta info failed: {} ({:?})", error.message, error.kind),
+        other => bail!("unexpected info response: {other:?}"),
+    }
+}
+
+async fn meta_request(
+    connection: &Connection,
+    session: &PeerSession,
+    req: MetaReq,
+) -> Result<MetaResp> {
+    let envelope = MetaEnvelope {
+        preamble: StreamPreamble {
+            peer_token: session.peer_token,
+            alpn: String::from_utf8_lossy(portl_proto::meta_v1::ALPN_META_V1).into_owned(),
+        },
+        req,
+    };
+    let bytes = postcard::to_stdvec(&envelope).context("encode meta request")?;
+    let (mut send, mut recv) = connection.open_bi().await.context("open meta stream")?;
+    send.write_all(&bytes).await.context("write meta request")?;
+    send.finish().context("finish meta request")?;
+    let response_bytes = recv
+        .read_to_end(64 * 1024)
+        .await
+        .context("read meta response")?;
+    postcard::from_bytes(&response_bytes).context("decode meta response")
+}
+
+fn path_label(connection: &Connection) -> String {
+    let path = connection
+        .paths()
+        .into_iter()
+        .find(|path| path.is_selected())
+        .or_else(|| connection.paths().into_iter().next());
+    match path.map(|path| path.remote_addr().clone()) {
+        Some(TransportAddr::Relay(url)) => format!("relay {url}"),
+        Some(_) => "direct".to_owned(),
+        None => "direct".to_owned(),
+    }
+}
+
+fn normalize_discovery_source(source: &str) -> String {
+    match source {
+        "mdns" => "local".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+fn print_status(
+    endpoint_id: EndpointId,
+    path: String,
+    rtt: std::time::Duration,
+    discovery: &str,
+    info: &InfoView,
+) {
+    println!("{:<18}{}", "endpoint:", hex::encode(endpoint_id.as_bytes()));
+    println!("{:<18}{}", "path:", path);
+    println!("{:<18}{}ms", "rtt:", rtt.as_millis());
+    println!("{:<18}{}", "discovery:", discovery);
+    println!("{:<18}{}", "agent_version:", info.agent_version);
+    println!(
+        "{:<18}{}",
+        "uptime:",
+        humantime::format_duration(std::time::Duration::from_secs(info.uptime_s))
+    );
+    println!("{:<18}{}", "hostname:", info.hostname);
+    println!("{:<18}{}", "os:", info.os);
+}
+
+fn unix_now_micros() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before unix epoch")?
+        .as_micros()
+        .try_into()
+        .context("micros overflow u64")?)
+}
+
+#[derive(Debug)]
+struct InfoView {
+    agent_version: String,
+    uptime_s: u64,
+    hostname: String,
+    os: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct MetaEnvelope {
+    preamble: StreamPreamble,
+    req: MetaReq,
+}

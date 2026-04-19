@@ -17,7 +17,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// `portl agent run` (or its `portl-agent run` symlink form).
-    AgentRun,
+    AgentRun { config: Option<PathBuf> },
     /// `portl id new [--force]`
     IdNew { force: bool },
     /// `portl id show`
@@ -42,6 +42,8 @@ pub enum Command {
         depth: Option<u8>,
         print: MintRootPrint,
     },
+    /// `portl status <peer>`
+    Status { peer: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -99,7 +101,7 @@ pub fn run(argv: Vec<OsString>) -> ExitCode {
 
 fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
     match cmd {
-        Command::AgentRun => Ok(ExitCode::SUCCESS),
+        Command::AgentRun { config } => commands::agent::run::run(config.as_deref()),
         Command::IdNew { force } => commands::id::new::run(force),
         Command::IdShow => commands::id::show::run(),
         Command::IdExport {
@@ -119,6 +121,7 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             depth,
             print,
         } => commands::mint_root::run(&endpoint, &caps, &ttl, to.as_deref(), depth, print),
+        Command::Status { peer } => commands::status::run(&peer),
     }
 }
 
@@ -169,12 +172,17 @@ enum TopLevel {
         #[arg(short = 'o', long = "print", value_enum, default_value = "string")]
         print: MintRootPrint,
     },
+    /// Query peer reachability and metadata.
+    Status { peer: String },
 }
 
 #[derive(Subcommand, Debug)]
 enum AgentAction {
     /// Start the long-running agent service.
-    Run,
+    Run {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -208,8 +216,8 @@ impl Cli {
     fn into_command(self) -> Command {
         match self.command {
             TopLevel::Agent {
-                action: AgentAction::Run,
-            } => Command::AgentRun,
+                action: AgentAction::Run { config },
+            } => Command::AgentRun { config },
             TopLevel::Id {
                 action: IdAction::New { force },
             } => Command::IdNew { force },
@@ -253,6 +261,7 @@ impl Cli {
                 depth,
                 print,
             },
+            TopLevel::Status { peer } => Command::Status { peer },
         }
     }
 }

@@ -53,6 +53,7 @@ proptest   = "1.5"
 criterion  = { version = "0.5", features = ["html_reports"] }
 assert_cmd = "2"
 tempfile   = "3"
+n0-future  = "0.3"
 
 # identity + age
 age         = { version = "0.11", default-features = false, features = ["armor"] }
@@ -63,6 +64,7 @@ qrcode      = "0.14"
 zeroize     = { version = "1", features = ["derive"] }
 rand        = "0.8"
 rand_core   = "0.6"
+humantime   = "2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
