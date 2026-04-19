@@ -8,6 +8,7 @@ pub mod caps;
 pub mod endpoint;
 pub mod error;
 pub mod id;
+pub mod net;
 pub mod ticket;
 
 #[cfg(any(test, feature = "test-util"))]
