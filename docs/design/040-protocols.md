@@ -158,13 +158,14 @@ The first stream opened for `portl/shell/v1` is the control stream.
 
 ```
 ShellReq {
+    preamble  : StreamPreamble,
     mode      : "shell" | "exec",
     argv      : Nullable<Array<Text>>, // iff mode=exec
-    env_patch : Map<Text, EnvValue>,   // see §3.5
+    env_patch : Vec<(Text, EnvValue)>, // postcard-encoded; sort by key
+                                     // for canonical form; semantically a map
     cwd       : Nullable<Text>,
     pty       : Nullable<PtyCfg>,
     user      : Nullable<Text>,        // drop to which unix user
-    preamble  : StreamPreamble,
 }
 
 PtyCfg   { term: Text, cols: u16, rows: u16 }
