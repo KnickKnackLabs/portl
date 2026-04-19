@@ -2470,6 +2470,7 @@ dependencies = [
  "anyhow",
  "iroh",
  "iroh-base",
+ "portl-core",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

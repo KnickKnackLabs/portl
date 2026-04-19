@@ -11,6 +11,15 @@ description  = "Core types and primitives for portl: tickets, sessions, endpoint
 [lints]
 workspace = true
 
+[features]
+# Enables `portl_core::test_util`, which ships in-process wiring
+# helpers (e.g. `pair()`). Off by default so release builds of
+# downstream crates don't leak test infrastructure into their
+# public API. Test and integration suites opt in via the crate's
+# own dev-dependencies and via downstream `[dev-dependencies]
+# portl-core = { features = ["test-util"] }`.
+test-util = []
+
 [dependencies]
 iroh         = { workspace = true }
 iroh-base    = { workspace = true }
@@ -20,4 +29,5 @@ thiserror    = { workspace = true }
 tracing      = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+portl-core = { version = "0.0.1", path = ".", features = ["test-util"] }
+tokio      = { workspace = true }

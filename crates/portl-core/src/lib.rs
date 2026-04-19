@@ -5,4 +5,6 @@
 //! portl crates build on.
 
 pub mod endpoint;
+
+#[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
