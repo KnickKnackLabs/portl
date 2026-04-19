@@ -35,7 +35,7 @@ pub fn run(peer: &str, cwd: Option<&str>, user: Option<&str>, argv: &[String]) -
             resize: _,
         } = exec;
 
-        let _stdin_task = tokio::spawn(async move {
+        let stdin_task = tokio::spawn(async move {
             let mut stdin_src = tokio::io::stdin();
             let _ = stdin_loop(&mut stdin, &mut stdin_src).await;
         });
@@ -59,6 +59,8 @@ pub fn run(peer: &str, cwd: Option<&str>, user: Option<&str>, argv: &[String]) -
         });
 
         let code = read_exit(&mut exit).await?;
+        stdin_task.abort();
+        let _ = stdin_task.await;
         await_output_task(stdout_task, "stdout").await?;
         await_output_task(stderr_task, "stderr").await?;
         connected.connection.close(0u32.into(), b"exec complete");

@@ -5,6 +5,7 @@ members = [
     "crates/portl-proto",
     "crates/portl-agent",
     "crates/portl-cli",
+    "adapters/docker-portl",
     "adapters/slicer-portl",
     "adapters/manual-portl",
 ]
@@ -73,6 +74,7 @@ rand_core   = "0.6"
 humantime   = "2"
 nix         = { version = "0.30", features = ["process", "signal", "user"] }
 async-trait = "0.1"
+bollard     = "0.17"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
