@@ -38,7 +38,7 @@ pub fn run(peer: &str, cwd: Option<&str>, user: Option<&str>) -> Result<ExitCode
         let ShellClient {
             control_send: _control_send,
             control_recv: _control_recv,
-            mut stdin,
+            stdin,
             stdout: mut stdout_recv,
             stderr: mut stderr_recv,
             mut exit,
@@ -46,10 +46,7 @@ pub fn run(peer: &str, cwd: Option<&str>, user: Option<&str>) -> Result<ExitCode
             resize,
         } = shell;
 
-        let _stdin_task = tokio::spawn(async move {
-            let mut stdin_src = tokio::io::stdin();
-            let _ = stdin_loop(&mut stdin, &mut stdin_src).await;
-        });
+        let stdin_task = maybe_spawn_stdin_task(stdin)?;
 
         let stdout_task = tokio::spawn(async move {
             let mut stdout = tokio::io::stdout();
@@ -96,6 +93,10 @@ pub fn run(peer: &str, cwd: Option<&str>, user: Option<&str>) -> Result<ExitCode
         let code = read_exit(&mut exit).await?;
         if let Some(task) = resize_task {
             task.abort();
+        }
+        if let Some(stdin_task) = stdin_task {
+            stdin_task.abort();
+            let _ = stdin_task.await;
         }
         await_output_task(stdout_task, "stdout").await?;
         await_output_task(stderr_task, "stderr").await?;
@@ -165,6 +166,56 @@ async fn await_output_task(
         task.abort();
     }
     Ok(())
+}
+
+fn maybe_spawn_stdin_task(mut send: SendStream) -> Result<Option<tokio::task::JoinHandle<()>>> {
+    if should_close_idle_stdin()? {
+        if let Err(err) = send.finish().context("finish remote stdin") {
+            debug!(%err, "remote stdin already closed");
+        }
+        return Ok(None);
+    }
+
+    Ok(Some(tokio::spawn(async move {
+        let mut stdin_src = tokio::io::stdin();
+        let _ = stdin_loop(&mut send, &mut stdin_src).await;
+    })))
+}
+
+fn should_close_idle_stdin() -> Result<bool> {
+    if std::io::stdin().is_terminal() {
+        return Ok(false);
+    }
+
+    #[cfg(unix)]
+    {
+        stdin_ready_within(Duration::from_millis(50)).map(|ready| !ready)
+    }
+
+    #[cfg(not(unix))]
+    {
+        Ok(false)
+    }
+}
+
+#[cfg(unix)]
+fn stdin_ready_within(timeout: Duration) -> Result<bool> {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use std::os::fd::AsFd;
+
+    let stdin = std::io::stdin();
+    let mut pollfds = [PollFd::new(stdin.as_fd(), PollFlags::POLLIN)];
+    let ready = poll(
+        &mut pollfds,
+        PollTimeout::try_from(timeout).unwrap_or(PollTimeout::MAX),
+    )
+    .context("poll local stdin")?;
+    if ready == 0 {
+        return Ok(false);
+    }
+
+    let events = pollfds[0].revents().unwrap_or(PollFlags::empty());
+    Ok(events.intersects(PollFlags::POLLIN | PollFlags::POLLHUP))
 }
 
 async fn stdin_loop(send: &mut SendStream, stdin: &mut tokio::io::Stdin) -> Result<()> {

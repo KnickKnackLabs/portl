@@ -41,6 +41,7 @@ humantime   = { workspace = true }
 n0-future   = { workspace = true }
 crossterm   = { workspace = true }
 rusqlite    = { workspace = true }
+nix         = { workspace = true }
 
 [dev-dependencies]
 portl-core = { version = "0.0.1", path = "../portl-core", features = ["test-util"] }

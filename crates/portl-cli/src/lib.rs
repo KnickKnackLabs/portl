@@ -382,6 +382,7 @@ enum IdAction {
 }
 
 impl Cli {
+    #[allow(clippy::too_many_lines)]
     fn into_command(self) -> Command {
         match self.command {
             TopLevel::Agent {

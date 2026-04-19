@@ -111,20 +111,18 @@ pub fn list(json_output: bool) -> Result<ExitCode> {
 
         if json_output {
             println!("{}", serde_json::to_string_pretty(&rendered)?);
+        } else if rendered.is_empty() {
+            println!("No docker aliases found.");
         } else {
-            if rendered.is_empty() {
-                println!("No docker aliases found.");
-            } else {
-                println!("NAME\tSTATUS\tENDPOINT\tIMAGE");
-                for row in &rendered {
-                    println!(
-                        "{}\t{}\t{}\t{}",
-                        row["name"].as_str().unwrap_or_default(),
-                        row["status"].as_str().unwrap_or_default(),
-                        row["endpoint_id"].as_str().unwrap_or_default(),
-                        row["image"].as_str().unwrap_or_default(),
-                    );
-                }
+            println!("NAME\tSTATUS\tENDPOINT\tIMAGE");
+            for row in &rendered {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    row["name"].as_str().unwrap_or_default(),
+                    row["status"].as_str().unwrap_or_default(),
+                    row["endpoint_id"].as_str().unwrap_or_default(),
+                    row["image"].as_str().unwrap_or_default(),
+                );
             }
         }
         Ok(ExitCode::SUCCESS)
@@ -167,7 +165,7 @@ pub fn rebuild(name: &str) -> Result<ExitCode> {
         Some(&alias.network),
         &render_caps(&caps),
         &format!("{}s", spec.ttl_secs),
-        spec.to.map(|bytes| hex::encode(bytes)).as_deref(),
+        spec.to.map(hex::encode).as_deref(),
         &label_args,
     )
 }
