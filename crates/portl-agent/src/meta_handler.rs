@@ -63,12 +63,8 @@ pub(crate) async fn serve_stream(
                 cap_denied("meta info not allowed")
             }
         }
-        portl_proto::meta_v1::MetaReq::PublishRevocations { .. } => {
-            portl_proto::meta_v1::MetaResp::Error(portl_proto::error::Error {
-                kind: portl_proto::error::ErrorKind::InternalError,
-                message: "not yet implemented".to_owned(),
-                retry_after_ms: None,
-            })
+        portl_proto::meta_v1::MetaReq::PublishRevocations { items } => {
+            publish_revocations(&state, &session, items)
         }
     };
 
@@ -82,6 +78,70 @@ pub(crate) async fn serve_stream(
 
 fn meta_caps(session: &Session) -> Option<&portl_core::ticket::schema::MetaCaps> {
     session.caps.meta.as_ref()
+}
+
+fn publish_revocations(
+    state: &Arc<AgentState>,
+    session: &Session,
+    items: Vec<Vec<u8>>,
+) -> portl_proto::meta_v1::MetaResp {
+    // `session` exists only because ticket/v1's pipeline (§040-protocols
+    // §1) already verified the caller's chain roots on one of our
+    // `trust_roots`. We do not need a second identity check here.
+
+    let now = match unix_now_secs() {
+        Ok(value) => value,
+        Err(err) => {
+            return portl_proto::meta_v1::MetaResp::Error(portl_proto::error::Error {
+                kind: portl_proto::error::ErrorKind::InternalError,
+                message: format!("unix time unavailable: {err}"),
+                retry_after_ms: None,
+            });
+        }
+    };
+
+    let mut accepted: u32 = 0;
+    let mut rejected: Vec<(Vec<u8>, String)> = Vec::new();
+
+    {
+        let mut revocations = state
+            .revocations
+            .write()
+            .expect("revocations lock poisoned");
+        for raw in items {
+            let Ok(id) = <[u8; 16]>::try_from(raw.as_slice()) else {
+                rejected.push((raw, "ticket_id must be 16 bytes".to_owned()));
+                continue;
+            };
+            if revocations.contains(&id) {
+                // Already known; treat as accepted (idempotent).
+                accepted += 1;
+                continue;
+            }
+            revocations.insert_record(crate::revocations::RevocationRecord::new(
+                id,
+                format!(
+                    "meta_publish_from_{}",
+                    hex::encode(session.caller_endpoint_id)
+                ),
+                now,
+                None,
+            ));
+            accepted += 1;
+        }
+        if let Err(err) = revocations.persist() {
+            tracing::warn!(?err, "persist revocations");
+        }
+    }
+
+    portl_proto::meta_v1::MetaResp::PublishedRevocations { accepted, rejected }
+}
+
+fn unix_now_secs() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before unix epoch")?
+        .as_secs())
 }
 
 fn cap_denied(message: &str) -> portl_proto::meta_v1::MetaResp {

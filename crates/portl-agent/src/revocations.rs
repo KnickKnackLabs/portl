@@ -98,6 +98,19 @@ impl RevocationSet {
         true
     }
 
+    /// Append a fully-formed `RevocationRecord` if its `ticket_id` is not
+    /// already present. Returns `true` when a new entry was recorded.
+    pub fn insert_record(&mut self, record: RevocationRecord) -> bool {
+        let Ok(id) = record.ticket_id_bytes() else {
+            return false;
+        };
+        if !self.ids.insert(id) {
+            return false;
+        }
+        self.records.push(record);
+        true
+    }
+
     pub fn persist(&self) -> Result<()> {
         if let Some(parent) = self.file.parent() {
             fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;

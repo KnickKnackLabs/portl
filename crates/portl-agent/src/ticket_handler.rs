@@ -39,7 +39,7 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
             offer: &offer,
             source_id,
             trust_roots: &state.trust_roots,
-            revocations: &state.revocations,
+            revocations: &state.revocations.read().expect("revocations lock"),
             now: unix_now_secs()?,
             rate_limit: &state.rate_limit,
         }),

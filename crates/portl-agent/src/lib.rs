@@ -36,7 +36,7 @@ pub use revocations::{RevocationRecord, RevocationSet};
 #[allow(dead_code)]
 pub(crate) struct AgentState {
     pub trust_roots: TrustRoots,
-    pub revocations: RevocationSet,
+    pub revocations: std::sync::RwLock<RevocationSet>,
     pub rate_limit: OfferRateLimiter,
     pub started_at: Instant,
     pub shell_registry: shell_registry::ShellRegistry,
@@ -55,7 +55,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
 
     let state = Arc::new(AgentState {
         trust_roots: TrustRoots(cfg.trust_roots.iter().copied().collect::<HashSet<_>>()),
-        revocations: RevocationSet::load(revocations_path(&cfg))?,
+        revocations: std::sync::RwLock::new(RevocationSet::load(revocations_path(&cfg))?),
         rate_limit: OfferRateLimiter::new(&cfg.rate_limit)?,
         started_at: Instant::now(),
         shell_registry: shell_registry::ShellRegistry::default(),
