@@ -320,7 +320,7 @@ fn spawn_exec_process(
     }
     apply_env_to_command(
         &mut command,
-        effective_env(session.caps.shell.as_ref(), req),
+        effective_env(session.caps.shell.as_ref(), req, requested_user),
     );
     #[cfg(unix)]
     if let Some(user) = requested_user
@@ -427,8 +427,10 @@ fn spawn_pty_process(
     if let Some(cwd) = req.cwd.as_deref() {
         cmd.cwd(cwd);
     }
-    apply_env_to_pty_command(&mut cmd, effective_env(shell_caps(&session.caps), req));
-    cmd.env("TERM", &pty.term);
+    apply_env_to_pty_command(
+        &mut cmd,
+        effective_env(shell_caps(&session.caps), req, requested_user),
+    );
 
     let mut child = pty_pair
         .slave
@@ -582,49 +584,81 @@ fn apply_env_to_pty_command(command: &mut CommandBuilder, envs: Vec<(String, Str
 fn effective_env(
     shell_caps: Option<&portl_core::ticket::schema::ShellCaps>,
     req: &portl_proto::shell_v1::ShellReq,
+    requested_user: Option<&RequestedUser>,
 ) -> Vec<(String, String)> {
-    let mut env = match shell_caps.map(|caps| &caps.env_policy) {
+    // v0.1 uses a minimal sanitized env; v0.2 may add PAM login-env
+    // synthesis for Merge policy.
+    let deny_base = sanitized_env_base(requested_user, req);
+
+    let env = match shell_caps.map(|caps| &caps.env_policy) {
+        Some(portl_core::ticket::schema::EnvPolicy::Deny) | None => deny_base,
+        Some(portl_core::ticket::schema::EnvPolicy::Merge { allow: Some(keys) }) => {
+            let mut env = deny_base;
+            merge_env_patch(&mut env, &req.env_patch, Some(keys));
+            env
+        }
+        Some(portl_core::ticket::schema::EnvPolicy::Merge { allow: None }) => {
+            let mut env = deny_base;
+            merge_env_patch(&mut env, &req.env_patch, None);
+            env
+        }
         Some(portl_core::ticket::schema::EnvPolicy::Replace { base }) => {
             base.iter().cloned().collect::<BTreeMap<_, _>>()
         }
-        _ => std::env::vars().collect::<BTreeMap<_, _>>(),
     };
 
-    match shell_caps.map(|caps| &caps.env_policy) {
-        Some(portl_core::ticket::schema::EnvPolicy::Deny) | None => {}
-        Some(portl_core::ticket::schema::EnvPolicy::Merge { allow }) => {
-            for (key, value) in &req.env_patch {
-                if allow
-                    .as_ref()
-                    .is_some_and(|allow| !allow.iter().any(|candidate| candidate == key))
-                {
-                    continue;
-                }
-                match value {
-                    portl_proto::shell_v1::EnvValue::Set(value) => {
-                        env.insert(key.clone(), value.clone());
-                    }
-                    portl_proto::shell_v1::EnvValue::Unset => {
-                        env.remove(key);
-                    }
-                }
-            }
+    env.into_iter().collect()
+}
+
+fn merge_env_patch(
+    env: &mut BTreeMap<String, String>,
+    env_patch: &[(String, portl_proto::shell_v1::EnvValue)],
+    allow: Option<&Vec<String>>,
+) {
+    for (key, value) in env_patch {
+        if allow
+            .as_ref()
+            .is_some_and(|allow| !allow.iter().any(|candidate| candidate == key))
+        {
+            continue;
         }
-        Some(portl_core::ticket::schema::EnvPolicy::Replace { .. }) => {
-            for (key, value) in &req.env_patch {
-                match value {
-                    portl_proto::shell_v1::EnvValue::Set(value) => {
-                        env.insert(key.clone(), value.clone());
-                    }
-                    portl_proto::shell_v1::EnvValue::Unset => {
-                        env.remove(key);
-                    }
-                }
+        match value {
+            portl_proto::shell_v1::EnvValue::Set(value) => {
+                env.insert(key.clone(), value.clone());
+            }
+            portl_proto::shell_v1::EnvValue::Unset => {
+                env.remove(key);
             }
         }
     }
+}
 
-    env.into_iter().collect()
+fn sanitized_env_base(
+    requested_user: Option<&RequestedUser>,
+    req: &portl_proto::shell_v1::ShellReq,
+) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+
+    #[cfg(unix)]
+    if let Some(user) = requested_user {
+        env.insert("HOME".to_owned(), user.home_dir.clone());
+        env.insert("USER".to_owned(), user.name.clone());
+        env.insert("LOGNAME".to_owned(), user.name.clone());
+        env.insert("SHELL".to_owned(), user.shell.clone());
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = requested_user;
+    }
+
+    env.insert("PATH".to_owned(), "/usr/local/bin:/usr/bin:/bin".to_owned());
+
+    if let Some(pty) = req.pty.as_ref() {
+        env.insert("TERM".to_owned(), pty.term.clone());
+    }
+
+    env
 }
 
 #[cfg(unix)]
@@ -632,6 +666,9 @@ fn effective_env(
 struct RequestedUser {
     uid: Uid,
     gid: Gid,
+    name: String,
+    home_dir: String,
+    shell: String,
     switch_required: bool,
 }
 
@@ -644,31 +681,40 @@ fn resolve_requested_user(
 ) -> std::result::Result<Option<RequestedUser>, portl_proto::shell_v1::ShellReason> {
     #[cfg(unix)]
     {
-        let Some(user) = user else {
-            return Ok(None);
-        };
-        let requested = User::from_name(user)
+        let current = geteuid();
+        let current_user = User::from_uid(current)
             .map_err(|err| portl_proto::shell_v1::ShellReason::BadUser(err.to_string()))?
             .ok_or_else(|| {
-                portl_proto::shell_v1::ShellReason::BadUser(format!("unknown user: {user}"))
+                portl_proto::shell_v1::ShellReason::BadUser(format!(
+                    "unknown current user: {}",
+                    current.as_raw()
+                ))
             })?;
-        let current = geteuid();
-        if current.is_root() {
-            return Ok(Some(RequestedUser {
-                uid: requested.uid,
-                gid: requested.gid,
-                switch_required: requested.uid != current,
-            }));
-        }
-        if requested.uid != current {
+        let requested = match user {
+            Some(user) => User::from_name(user)
+                .map_err(|err| portl_proto::shell_v1::ShellReason::BadUser(err.to_string()))?
+                .ok_or_else(|| {
+                    portl_proto::shell_v1::ShellReason::BadUser(format!("unknown user: {user}"))
+                })?,
+            None => current_user,
+        };
+        if !current.is_root() && requested.uid != current {
             return Err(portl_proto::shell_v1::ShellReason::BadUser(
                 "cannot drop uid as non-root".to_owned(),
             ));
         }
+        let shell = requested.shell.to_string_lossy().into_owned();
         Ok(Some(RequestedUser {
             uid: requested.uid,
             gid: requested.gid,
-            switch_required: false,
+            name: requested.name,
+            home_dir: requested.dir.to_string_lossy().into_owned(),
+            shell: if shell.is_empty() {
+                "/bin/sh".to_owned()
+            } else {
+                shell
+            },
+            switch_required: current.is_root() && requested.uid != current,
         }))
     }
 
