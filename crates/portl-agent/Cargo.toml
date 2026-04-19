@@ -19,6 +19,7 @@ serde       = { workspace = true }
 serde_json  = { workspace = true }
 postcard    = { workspace = true }
 hex         = { workspace = true }
+toml        = { workspace = true }
 tracing     = { workspace = true }
 rand        = { workspace = true }
 iroh        = { workspace = true }

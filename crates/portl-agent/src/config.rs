@@ -1,8 +1,10 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use anyhow::{Context, Result, anyhow};
 use iroh_base::RelayUrl;
 use portl_core::endpoint::Endpoint;
+use serde::Deserialize;
 
 #[derive(Debug, Clone, Default)]
 pub struct AgentConfig {
@@ -14,6 +16,61 @@ pub struct AgentConfig {
     pub rate_limit: RateLimitConfig,
     #[doc(hidden)]
     pub endpoint: Option<Endpoint>,
+}
+
+impl AgentConfig {
+    pub fn from_toml_path(path: &Path) -> Result<Self> {
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("read agent config {}", path.display()))?;
+        Self::from_toml_str(&contents)
+            .with_context(|| format!("parse agent config {}", path.display()))
+    }
+
+    pub fn from_toml_str(contents: &str) -> Result<Self> {
+        let file: AgentConfigFile = toml::from_str(contents).context("decode agent config TOML")?;
+        let trust_roots = file
+            .trust_roots
+            .unwrap_or_default()
+            .into_iter()
+            .map(|value| parse_trust_root_hex(&value))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut config = Self {
+            identity_path: file.identity_path,
+            bind_addr: file.bind_addr,
+            discovery: DiscoveryConfig::default(),
+            trust_roots,
+            revocations_path: file.revocations_path,
+            rate_limit: RateLimitConfig::default(),
+            endpoint: None,
+        };
+
+        if let Some(discovery) = file.discovery {
+            if let Some(dns) = discovery.dns {
+                config.discovery.dns = dns;
+            }
+            if let Some(pkarr) = discovery.pkarr {
+                config.discovery.pkarr = pkarr;
+            }
+            if let Some(local) = discovery.local {
+                config.discovery.local = local;
+            }
+            if let Some(relay) = discovery.relay {
+                config.discovery.relay = Some(relay);
+            }
+        }
+
+        if let Some(rate_limit) = file.rate_limit {
+            if let Some(period_secs) = rate_limit.period_secs {
+                config.rate_limit.replenish_secs = period_secs;
+            }
+            if let Some(burst) = rate_limit.burst {
+                config.rate_limit.burst = burst;
+            }
+        }
+
+        Ok(config)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,4 +122,35 @@ impl Default for RateLimitConfig {
             burst: 10,
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentConfigFile {
+    identity_path: Option<PathBuf>,
+    bind_addr: Option<SocketAddr>,
+    revocations_path: Option<PathBuf>,
+    trust_roots: Option<Vec<String>>,
+    discovery: Option<DiscoveryConfigFile>,
+    rate_limit: Option<RateLimitConfigFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscoveryConfigFile {
+    dns: Option<bool>,
+    pkarr: Option<bool>,
+    local: Option<bool>,
+    relay: Option<RelayUrl>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RateLimitConfigFile {
+    period_secs: Option<u64>,
+    burst: Option<u32>,
+}
+
+fn parse_trust_root_hex(value: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(value).with_context(|| format!("invalid trust root hex: {value}"))?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow!("trust root must decode to exactly 32 bytes: {value}"))
 }
