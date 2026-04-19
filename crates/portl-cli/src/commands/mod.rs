@@ -5,5 +5,6 @@ pub mod id;
 pub mod mint_root;
 pub mod peer;
 pub mod shell;
+pub mod slicer;
 pub mod status;
 pub mod tcp;
