@@ -11,6 +11,12 @@ pub struct Identity {
     sk: SigningKey,
 }
 
+impl Default for Identity {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Identity {
     /// Generate a fresh identity from the OS RNG.
     #[must_use]

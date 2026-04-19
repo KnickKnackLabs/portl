@@ -113,7 +113,7 @@ fn parse_port_rule(spec: &str) -> Result<PortRule> {
     })
 }
 
-fn sort_and_validate_rules(rules: &mut Vec<PortRule>) -> Result<()> {
+fn sort_and_validate_rules(rules: &mut [PortRule]) -> Result<()> {
     rules.sort_by(|left, right| {
         left.host_glob
             .cmp(&right.host_glob)
