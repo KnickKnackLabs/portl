@@ -1,0 +1,383 @@
+# 08 — CLI reference
+
+One binary, two roles, two entry points:
+
+1. `portl` — operator CLI (runs on your machine)
+2. `portl agent ...` — target-side agent (same binary, subcommand tree)
+3. `portl <adapter> ...` — dynamic subcommands registered by adapters
+
+`portl` ships as a single multicall binary. On target hosts the
+project distributes a symlink `/usr/bin/portl-agent → /usr/bin/portl`
+so that `portl-agent run` remains a valid invocation (argv[0]
+dispatch); existing systemd units referencing `/usr/bin/portl-agent`
+keep working unchanged. The canonical form in docs and new installs
+is `portl agent run`.
+
+The same binary contains both roles because the two share nearly
+all dependencies (iroh, rustls, tokio, ed25519, postcard, rusqlite,
+tracing, clap, `portl-core`, `portl-proto`) — a merged binary is
+~17–19 MB vs ~27 MB if we shipped two. More importantly, it
+eliminates client/agent version skew by construction: it is
+impossible to run a 0.1.1 client against a 0.0.9 agent from the
+same install.
+
+All CLIs use `clap` with consistent flag styles, colour output when
+TTY, JSON output via `--json` where it makes sense.
+
+## 1. `portl` (client)
+
+### 1.1 Identity
+
+```
+portl id new [--name NAME] [--force]
+    Generate a new operator identity keypair.
+    Writes ~/.config/portl/identity.key (0600) and identity.pub.
+    Refuses to overwrite without --force.
+
+portl id show
+    Print your public key, fingerprint, and any optional name.
+
+portl id export <path> [--passphrase-cmd CMD]
+    Export identity to an age-encrypted tarball at <path>.
+
+portl id import <path>
+    Import an age-encrypted tarball into the config dir.
+```
+
+### 1.2 Ticket management
+
+```
+portl ticket import <ticket-uri-or-file> [--as ALIAS]
+    Import a ticket. Auto-classifies (master | per-peer).
+    Default ALIAS is derived from ticket meta (tag "alias", or hostname).
+    Accepts a portl1… URI, a file path, or `-` for stdin.
+
+portl ticket rm [ALIAS | --all]
+    Delete ticket(s) from local store. Does NOT revoke the ticket —
+    use `portl revoke` for that.
+
+portl ticket list [--json] [--include-master]
+    List known per-peer tickets.
+      ALIAS         NODE-ID (short)  CAPS           EXPIRES   STATUS
+      claude-1      a1b2…            shell,tcp,udp  23h       reachable (direct)
+      bob-ssh       c3d4…            shell,tcp:22    6d       reachable (relay)
+    With --include-master, also lists master tickets (normally hidden
+    because they wrap credentials; see 07-security.md §4.3a).
+
+portl ticket show <alias> [--verbose] [--json]
+    Expand one ticket: full node_id, relays, caps, signature chain.
+
+portl mint-root --endpoint <ENDPOINT_ID>     # alias: --node
+                --caps <CAP_LIST>
+                --ttl DURATION
+                [--to <PUBKEY>]
+                [--depth N]
+                [-o FILE | --print]
+    Mint a ROOT ticket signed by the local operator identity Ka.
+    Requires the target's agent to list Ka.pub in its trust.roots.
+
+    --caps follows the `portl share` cap-list syntax (see §1.4).
+    --ttl has no enforced parent ceiling (this IS the root); we hard-
+          cap at 10y to prevent "forever" tickets (07-security.md §4.12
+          on GC pairs with bounded TTL).
+
+portl status [<alias>] [--watch]
+    Live connectivity status: direct/relay/lan, RTT, bytes in/out,
+    discovery source that resolved the peer (dns/pkarr/local/dht).
+    --watch refreshes every second.
+
+portl doctor
+    Diagnostic pass:
+      - iroh endpoint bind OK?
+      - which discovery services are active + healthy?
+          (DNS, Pkarr, Local/mDNS, DHT)
+      - can reach at least one configured relay?
+      - local identity key readable?
+      - system clock within skew tolerance of NTP / last observed peer?
+      - for each ticket: can we connect?
+```
+
+Shorthand aliases kept for common verbs:
+
+- `portl import` → `portl ticket import`
+- `portl list` → `portl ticket list`
+- `portl show` → `portl ticket show`
+- `portl rm` → `portl ticket rm`
+
+### 1.3 Direct peer operations (prefers per-peer ticket)
+
+```
+portl shell <alias> [--bootstrap CMD] [--cwd DIR] [--user USER]
+    Open an interactive PTY shell on the peer.
+    --bootstrap runs CMD once after the shell starts (e.g. tmux attach).
+
+portl exec <alias> [--user USER] [--cwd DIR] [--no-stdin] -- <cmd> [args...]
+    Run a command without PTY; stdio forwarded.
+
+portl cp <src> <dst>
+    Copy files. <src> or <dst> may be local or "<alias>:<path>".
+    Uses fs/v1 (deferred to v0.2). v0.1 workaround:
+        portl sh <alias> 'tar c <path>' | tar xvf -
+
+portl tcp <alias> -L [BIND:]LPORT:RHOST:RPORT [-N] [--daemon]
+portl tcp <alias> -R [BIND:]RPORT:LHOST:LPORT [-N]
+    ssh-style port forwarding. -L = local→remote, -R = remote→local.
+    -N doesn't open a shell; just forwards.
+    --daemon runs in background with a pid file in state/.
+
+portl udp <alias> -L BIND:LPORTRANGE:RHOST:RPORTRANGE
+    UDP forwarding over QUIC datagrams.
+
+portl socks <alias> --listen 127.0.0.1:1080 [--auth basic]
+    Expose a SOCKS5 proxy locally that routes through the peer.
+
+portl vpn up [<alias>...]
+portl vpn down
+portl vpn status
+    Bring up a TUN-based overlay. ULAs are deterministic from node-ids.
+```
+
+### 1.4 Sharing / delegation
+
+```
+portl share <alias> --caps <cap-list> [--ttl DURATION]
+                    [--to <pubkey>]
+                    [--depth N]
+                    [-o FILE | --print]
+    Mint a delegated ticket for the given peer.
+
+    <cap-list> examples:
+      shell
+      shell,tcp:22
+      shell,tcp:127.0.0.1:1-65535,udp:60000-61000
+      fs:/home/ubuntu:ro
+      all                   (= full caps inherited from source ticket)
+
+    --depth N        how many further re-delegations allowed (default 0)
+    --ttl 24h | 7d | 1y   (must be ≤ parent ticket's remaining ttl)
+
+    Output: a portl:// URI plus a saved file if -o.
+
+portl revoke <ticket-id> [--reason TEXT]
+    Add a revocation to your local revocations.jsonl.
+
+portl revocations list
+portl revocations publish [--to <alias>]... [--all-peers]
+    Push revocations to one or more agents.
+```
+
+### 1.5 Global flags (inherited)
+
+```
+-c, --config FILE       override ~/.config/portl/config.toml
+-v, --verbose           more logging; repeat for higher verbosity
+-q, --quiet             errors only
+    --json              structured output where supported
+    --no-color
+    --url URL           override default socket/endpoint (for tests)
+```
+
+## 2. `portl agent`
+
+The `agent` subcommand tree is the target-side role. Every command
+below is equivalent to running the argv[0] form `portl-agent <verb>`
+(via the shipped symlink).
+
+### 2.1 Run
+
+```
+portl agent run [--config /etc/portl/agent.toml]
+                [--secret PATH]
+                [--listen-relay URL]...
+                [--policy PATH]
+                [--trust-root HEXPUB]...
+                [--mode target|gateway]
+    Run until killed. Reads config if given, else expects a bootstrap
+    ticket via `enroll`.
+
+    --mode target  (default) serves shell/tcp/udp/vpn traffic directly
+                   on the target host or VM.
+    --mode gateway proxies tickets whose `bearer` field is present
+                   into an orchestrator HTTP API (the slicer daemon,
+                   a cloud API, etc.). This is the role previously
+                   drafted as a separate `portl-gw` binary. Configure
+                   the upstream via `[gateway]` in agent.toml.
+```
+
+The systemd unit file that ships alongside the agent uses the
+argv[0] form for backward-compatibility:
+
+```
+# /etc/systemd/system/portl-agent.service
+ExecStart=/usr/bin/portl agent run --config /etc/portl/agent.toml
+# (Also valid, and equivalent via the /usr/bin/portl-agent symlink:
+#   ExecStart=/usr/bin/portl-agent run --config /etc/portl/agent.toml)
+```
+
+### 2.2 Enroll (first run / rotation)
+
+```
+portl agent enroll --bootstrap-ticket <URI-OR-FILE>
+    Accept a bootstrap ticket whose payload is the agent's own secret
+    key material, and write it to the configured secret path.
+
+    Used when a target was provisioned with the secret delivered via a
+    side-channel (e.g. QR code, USB) rather than baked into disk at
+    provision time.
+```
+
+### 2.3 Introspection
+
+```
+portl agent identity show
+    Print this agent's node-id (fingerprint + hex).
+
+portl agent status [--json]
+    Active peers, bytes, RTT, path.
+
+portl agent policy show
+portl agent policy reload
+
+portl agent sessions [--tail N] [--follow]
+    Print audit records.
+```
+
+### 2.4 argv[0] compatibility
+
+For legacy installs and ops tooling that specifically names the
+agent binary:
+
+```
+/usr/bin/portl                 # the real binary
+/usr/bin/portl-agent           # symlink → portl
+```
+
+When invoked as `portl-agent`, the binary behaves as if the first
+argument were `agent`:
+
+```
+portl-agent run …              ≡  portl agent run …
+portl-agent enroll …           ≡  portl agent enroll …
+portl-agent status             ≡  portl agent status
+```
+
+This keeps existing systemd units, sudoers rules, and
+`ExecStart=/usr/bin/portl-agent …` lines working unchanged.
+Packagers SHOULD create this symlink; distributions that can't
+(e.g. single-file deployments) can fall back to `portl agent …`.
+
+## 3. `portl <adapter>` — orchestrator subcommands
+
+Adapters register themselves via executables named `portl-<name>-adapter`
+on `$PATH`. `portl` discovers them at CLI start.
+
+### 3.1 slicer adapter
+
+```
+portl slicer login <master-ticket>
+portl slicer vm add <group> [common-flags]
+                     [--cpus N] [--ram-gb N]
+                     [--tag K=V]... [--userdata-file FILE]
+                     [--ticket-out FILE]
+                     [--no-wait]
+portl slicer vm list [--json]
+portl slicer vm delete <name>
+portl slicer vm shell  <name>     # = portl shell <name>
+portl slicer vm logs   <name>
+portl slicer vm pause|resume|suspend|restore|shutdown <name>
+
+portl slicer ticket-rotate <name> [--ttl DURATION]
+portl slicer ticket-recover <name>
+```
+
+### 3.2 cloud-init adapter (future)
+
+```
+portl cloud-init aws launch --ami ...
+portl cloud-init gcp launch --image ...
+portl cloud-init generic gen-userdata > user-data.yaml
+```
+
+### 3.3 docker adapter (future)
+
+```
+portl docker run <image> [--name N] [docker-flags...]
+portl docker ls
+portl docker rm <name>
+```
+
+## 4. Exit codes (consistent across CLIs)
+
+| Code | Meaning |
+| --- | --- |
+| 0 | success |
+| 1 | generic failure |
+| 2 | usage / bad flags |
+| 3 | no matching ticket or adapter |
+| 4 | authz failure (rejected at agent) |
+| 5 | network / unreachable |
+| 6 | config error |
+| 7 | internal error (bug) |
+
+## 5. Environment variables
+
+```
+PORTL_CONFIG_DIR       overrides ~/.config/portl
+PORTL_STATE_DIR        overrides ~/.local/state/portl
+PORTL_LOG              RUST_LOG-style directive
+PORTL_IDENTITY_KEY     path override for operator key
+PORTL_RELAY            force a specific relay URL
+PORTL_NO_DISCOVERY     disable pkarr/DHT; ticket hints only
+```
+
+## 6. Shell completions
+
+```
+portl completions bash > /etc/bash_completion.d/portl
+portl completions zsh  > ~/.zfunc/_portl
+portl completions fish > ~/.config/fish/completions/portl.fish
+```
+
+## 7. Output ergonomics
+
+- Every mutating command prints a single summary line at the end.
+- Long-running streaming commands use `tracing` for logs; `stdout` is
+  reserved for the actual bytes (shell session, port forward, cp data).
+- `--json` flips tables to one-JSON-object-per-line (ndjson). No pretty
+  printing unless also `-v`.
+- Errors go to stderr with a prefix indicating category:
+  `[portl/auth]`, `[portl/net]`, `[portl/config]`, `[portl/bug]`.
+
+## 8. Example "day in the life" transcript
+
+```
+$ portl ticket import portl1eyJzd29x3q4...  --as claude-1
+imported: claude-1 (a1b2c3…) caps=[shell,tcp,udp] expires=23h59m
+
+$ portl status claude-1
+claude-1   path=direct   rtt=14ms   discovery=local   last-seen=now
+
+$ portl shell claude-1 --bootstrap "tmux attach -t claude"
+ubuntu@claude-1:~$ _
+
+(ctrl-b d, detached)
+
+$ portl tcp claude-1 -L 3000:127.0.0.1:3000 --daemon
+forwarding 127.0.0.1:3000 -> claude-1:127.0.0.1:3000  (pid 74219)
+
+$ curl http://localhost:3000/hello
+hello from slicer-1
+
+$ portl share claude-1 --caps shell,tcp:22 --ttl 24h --to $(cat pub-bob) -o bob.ticket
+minted: bob.ticket (d4e5f6…) caps=[shell,tcp:22] ttl=24h
+
+$ gh gist create bob.ticket -d "ephemeral ssh access to claude-1"
+(paste URL in the chat to bob)
+
+$ # next day, after bob is done:
+$ portl revoke d4e5f6 --reason "finished task"
+revoked: d4e5f6 in local store
+
+$ portl revocations publish --to claude-1
+published: 1 revocation to claude-1 (a1b2c3…)
+```

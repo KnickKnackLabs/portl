@@ -1,0 +1,31 @@
+# Rust
+/target/
+**/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# macOS
+.DS_Store
+*.swp
+*.swo
+
+# Editors
+.vscode/
+.idea/
+*.iml
+
+# Nix / direnv
+.direnv/
+.envrc.local
+
+# Local-only scratch directories
+/scratch/
+/.local/
+
+# Test artifacts
+*.log
+*.tmp
+
+# OS thumbnails / metadata
+Thumbs.db
+ehthumbs.db
