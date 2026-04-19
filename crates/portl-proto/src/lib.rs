@@ -6,11 +6,14 @@
 //! split later if any single protocol exceeds roughly a thousand
 //! lines.
 
+pub mod error;
+pub mod meta_v1;
+pub mod ticket_v1;
+pub mod wire;
+
+pub use portl_core::ticket::schema::Capabilities as Caps;
+
 /// Crate version at build time.
-///
-/// Stub exposed so M0's "all crates have `pub fn` stubs" exit
-/// criterion is literally satisfied. Real items land as each ALPN
-/// is implemented.
 #[must_use]
 pub const fn crate_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
