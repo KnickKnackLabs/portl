@@ -141,16 +141,36 @@ pub async fn serve(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create metrics socket parent {}", parent.display()))?;
+        // Ensure the parent is 0o700 so a lenient umask on the
+        // process doesn't leave a world-readable directory hosting
+        // the (about-to-be-0o600) socket.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let parent_perms = std::fs::Permissions::from_mode(0o700);
+            let _ = std::fs::set_permissions(parent, parent_perms);
+        }
     }
     // Clean up any stale socket left behind by a prior agent.
     let _ = std::fs::remove_file(&path);
+
+    // Tighten the umask for the duration of bind() so the socket is
+    // created with mode 0o600 atomically rather than racing with a
+    // post-bind chmod. We restore the original umask on drop.
+    #[cfg(unix)]
+    let umask_guard = UmaskGuard::tightened(0o177);
 
     let listener = UnixListener::bind(&path)
         .with_context(|| format!("bind metrics socket at {}", path.display()))?;
 
     #[cfg(unix)]
+    drop(umask_guard);
+
+    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        // Belt-and-suspenders: explicitly reapply 0o600 in case the
+        // umask-tightening had no effect on this platform.
         let perms = std::fs::Permissions::from_mode(0o600);
         std::fs::set_permissions(&path, perms)
             .with_context(|| format!("chmod 0600 {}", path.display()))?;
@@ -190,6 +210,28 @@ struct SocketGuard {
 impl Drop for SocketGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(unix)]
+struct UmaskGuard {
+    previous: nix::sys::stat::Mode,
+}
+
+#[cfg(unix)]
+impl UmaskGuard {
+    fn tightened(mask: u16) -> Self {
+        use nix::sys::stat::{Mode, umask};
+        let mode = Mode::from_bits_truncate(mask);
+        let previous = umask(mode);
+        Self { previous }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        nix::sys::stat::umask(self.previous);
     }
 }
 
