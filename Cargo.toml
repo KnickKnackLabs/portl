@@ -45,6 +45,7 @@ thiserror = "2"
 # observability
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+governor          = "0.8"
 
 # testing
 tokio-test = "0.4"

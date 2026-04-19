@@ -13,12 +13,14 @@ pub mod config;
 pub mod endpoint;
 pub mod meta_handler;
 pub mod pipeline;
+pub mod rate_limit;
 pub mod revocations;
 pub mod session;
 pub mod ticket_handler;
 
 pub use config::{AgentConfig, DiscoveryConfig, RateLimitConfig};
 pub use pipeline::{AcceptanceInput, AcceptanceOutcome, evaluate_offer};
+pub use rate_limit::OfferRateLimiter;
 pub use revocations::RevocationSet;
 
 #[derive(Debug)]
@@ -26,6 +28,7 @@ pub use revocations::RevocationSet;
 pub(crate) struct AgentState {
     pub trust_roots: TrustRoots,
     pub revocations: RevocationSet,
+    pub rate_limit: OfferRateLimiter,
     pub started_at: Instant,
 }
 
@@ -34,6 +37,7 @@ pub async fn run(cfg: AgentConfig) -> Result<()> {
     let state = Arc::new(AgentState {
         trust_roots: TrustRoots(HashSet::from_iter(cfg.trust_roots.iter().copied())),
         revocations: RevocationSet::load(revocations_path(&cfg))?,
+        rate_limit: OfferRateLimiter::new(&cfg.rate_limit)?,
         started_at: Instant::now(),
     });
 

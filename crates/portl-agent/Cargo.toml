@@ -24,6 +24,7 @@ rand        = { workspace = true }
 iroh        = { workspace = true }
 iroh-base   = { workspace = true }
 tokio       = { workspace = true }
+governor    = { workspace = true }
 
 [dev-dependencies]
 tempfile  = { workspace = true }

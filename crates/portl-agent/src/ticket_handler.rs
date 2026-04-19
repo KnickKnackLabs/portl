@@ -9,19 +9,11 @@ use tracing::{instrument, warn};
 
 use crate::AgentState;
 use crate::meta_handler;
-use crate::pipeline::{AcceptanceInput, AcceptanceOutcome, RateLimitGate, evaluate_offer};
+use crate::pipeline::{AcceptanceInput, AcceptanceOutcome, evaluate_offer};
 use crate::session::Session;
 
 const MAX_OFFER_BYTES: usize = 64 * 1024;
 const MAX_META_STREAMS: u32 = 64;
-
-struct AllowAllRateLimit;
-
-impl RateLimitGate for AllowAllRateLimit {
-    fn check(&self, _source_ip: IpAddr) -> bool {
-        true
-    }
-}
 
 #[instrument(skip_all, fields(remote = %connection.remote_id().fmt_short()))]
 pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentState>) -> Result<()> {
@@ -44,7 +36,7 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
             trust_roots: &state.trust_roots,
             revocations: &state.revocations,
             now: unix_now_secs()?,
-            rate_limit: &AllowAllRateLimit,
+            rate_limit: &state.rate_limit,
         }),
         Err(_) => AcceptanceOutcome::Rejected {
             reason: portl_proto::ticket_v1::AckReason::BadSignature,
