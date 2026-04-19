@@ -3,20 +3,14 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use iroh::endpoint::{Connection, RecvStream, SendStream};
-use serde::{Deserialize, Serialize};
+use iroh::endpoint::{Connection, SendStream};
 use tracing::instrument;
 
 use crate::AgentState;
 use crate::session::Session;
+use crate::stream_io::BufferedRecv;
 
 const MAX_META_BYTES: usize = 64 * 1024;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct MetaEnvelope {
-    preamble: portl_proto::wire::StreamPreamble,
-    req: portl_proto::meta_v1::MetaReq,
-}
 
 #[instrument(skip_all)]
 pub(crate) async fn serve_stream(
@@ -24,22 +18,22 @@ pub(crate) async fn serve_stream(
     session: Session,
     state: Arc<AgentState>,
     mut send: SendStream,
-    mut recv: RecvStream,
+    mut recv: BufferedRecv,
+    preamble: portl_proto::wire::StreamPreamble,
 ) -> Result<()> {
-    let bytes = recv
-        .read_to_end(MAX_META_BYTES)
-        .await
-        .context("read meta request")?;
-    let envelope: MetaEnvelope = postcard::from_bytes(&bytes).context("decode meta envelope")?;
-
-    if envelope.preamble.peer_token != session.peer_token
-        || envelope.preamble.alpn != String::from_utf8_lossy(portl_proto::meta_v1::ALPN_META_V1)
+    if preamble.peer_token != session.peer_token
+        || preamble.alpn != String::from_utf8_lossy(portl_proto::meta_v1::ALPN_META_V1)
     {
         connection.close(0x1001u32.into(), b"policy denied");
         bail!("policy denied");
     }
 
-    let response = match envelope.req {
+    let req = recv
+        .read_frame::<portl_proto::meta_v1::MetaReq>(MAX_META_BYTES)
+        .await?
+        .context("missing meta request")?;
+
+    let response = match req {
         portl_proto::meta_v1::MetaReq::Ping { .. } => {
             if meta_caps(&session).is_some_and(|caps| caps.ping) {
                 portl_proto::meta_v1::MetaResp::Pong {
@@ -56,6 +50,8 @@ pub(crate) async fn serve_stream(
                     supported_alpns: vec![
                         String::from_utf8_lossy(portl_proto::ticket_v1::ALPN_TICKET_V1).into(),
                         String::from_utf8_lossy(portl_proto::meta_v1::ALPN_META_V1).into(),
+                        String::from_utf8_lossy(portl_proto::shell_v1::ALPN_SHELL_V1).into(),
+                        String::from_utf8_lossy(portl_proto::tcp_v1::ALPN_TCP_V1).into(),
                     ],
                     uptime_s: state.started_at.elapsed().as_secs(),
                     hostname: hostname(),

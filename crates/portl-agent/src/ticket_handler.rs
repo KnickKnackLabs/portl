@@ -6,13 +6,19 @@ use iroh::endpoint::Connection;
 use tracing::{instrument, warn};
 
 use crate::AgentState;
+use crate::audit;
 use crate::meta_handler;
 use crate::pipeline::{AcceptanceInput, AcceptanceOutcome, evaluate_offer};
 use crate::session::Session;
+use crate::shell_handler;
+use crate::stream_io::read_postcard_prefix;
+use crate::tcp_handler;
 
 const MAX_OFFER_BYTES: usize = 64 * 1024;
 const MAX_META_STREAMS: u32 = 64;
+const MAX_PREAMBLE_BYTES: usize = 8 * 1024;
 
+#[allow(clippy::too_many_lines)]
 #[instrument(skip_all, fields(remote = %connection.remote_id().fmt_short()))]
 pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentState>) -> Result<()> {
     connection.set_max_concurrent_bi_streams(MAX_META_STREAMS.into());
@@ -57,11 +63,14 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
             let bytes = postcard::to_stdvec(&ack).context("encode accepted ack")?;
             send.write_all(&bytes).await.context("write accepted ack")?;
             send.finish().context("finish accepted ack")?;
-            Some(Session {
+            let session = Session {
                 peer_token: *peer_token,
                 caps: (**caps).clone(),
                 ticket_id: *ticket_id,
-            })
+                caller_endpoint_id: source_id,
+            };
+            audit::ticket_accepted(&session);
+            Some(session)
         }
         AcceptanceOutcome::Rejected { reason } => {
             let ack = portl_proto::ticket_v1::TicketAck {
@@ -96,10 +105,53 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
         let session = session.clone();
         let state = Arc::clone(&state);
         tokio::spawn(async move {
-            if let Err(err) =
-                meta_handler::serve_stream(connection, session, state, send, recv).await
+            match read_postcard_prefix::<portl_proto::wire::StreamPreamble>(
+                recv,
+                MAX_PREAMBLE_BYTES,
+            )
+            .await
             {
-                tracing::debug!(%err, "meta stream error");
+                Ok((preamble, recv)) => {
+                    let result = match preamble.alpn.as_str() {
+                        value
+                            if value
+                                == String::from_utf8_lossy(portl_proto::meta_v1::ALPN_META_V1) =>
+                        {
+                            meta_handler::serve_stream(
+                                connection, session, state, send, recv, preamble,
+                            )
+                            .await
+                        }
+                        value
+                            if value
+                                == String::from_utf8_lossy(
+                                    portl_proto::shell_v1::ALPN_SHELL_V1,
+                                ) =>
+                        {
+                            shell_handler::serve_stream(
+                                connection, session, state, send, recv, preamble,
+                            )
+                            .await
+                        }
+                        value
+                            if value
+                                == String::from_utf8_lossy(portl_proto::tcp_v1::ALPN_TCP_V1) =>
+                        {
+                            tcp_handler::serve_stream(
+                                connection, session, state, send, recv, preamble,
+                            )
+                            .await
+                        }
+                        _ => {
+                            connection.close(0x1003u32.into(), b"version mismatch");
+                            Ok(())
+                        }
+                    };
+                    if let Err(err) = result {
+                        tracing::debug!(%err, "authenticated stream error");
+                    }
+                }
+                Err(err) => tracing::debug!(%err, "failed to parse stream preamble"),
             }
         });
     }

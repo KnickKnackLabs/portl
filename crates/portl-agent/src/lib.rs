@@ -9,6 +9,8 @@ use portl_core::ticket::verify::TrustRoots;
 use tokio::task::JoinHandle;
 use tracing::{instrument, warn};
 
+pub mod audit;
+pub mod caps_enforce;
 pub mod config;
 pub mod endpoint;
 pub mod meta_handler;
@@ -16,6 +18,10 @@ pub mod pipeline;
 pub mod rate_limit;
 pub mod revocations;
 pub mod session;
+pub mod shell_handler;
+pub mod shell_registry;
+pub mod stream_io;
+pub mod tcp_handler;
 pub mod ticket_handler;
 
 pub use config::{AgentConfig, DiscoveryConfig, RateLimitConfig};
@@ -23,22 +29,25 @@ pub use pipeline::{AcceptanceInput, AcceptanceOutcome, evaluate_offer};
 pub use rate_limit::OfferRateLimiter;
 pub use revocations::RevocationSet;
 
-#[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct AgentState {
     pub trust_roots: TrustRoots,
     pub revocations: RevocationSet,
     pub rate_limit: OfferRateLimiter,
     pub started_at: Instant,
+    pub shell_registry: shell_registry::ShellRegistry,
 }
 
 #[instrument(skip_all)]
 pub async fn run(cfg: AgentConfig) -> Result<()> {
+    audit::init();
+
     let state = Arc::new(AgentState {
         trust_roots: TrustRoots(cfg.trust_roots.iter().copied().collect::<HashSet<_>>()),
         revocations: RevocationSet::load(revocations_path(&cfg))?,
         rate_limit: OfferRateLimiter::new(&cfg.rate_limit)?,
         started_at: Instant::now(),
+        shell_registry: shell_registry::ShellRegistry::default(),
     });
 
     let endpoint = if let Some(endpoint) = cfg.endpoint.clone() {

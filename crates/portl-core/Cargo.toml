@@ -41,6 +41,7 @@ hex           = { workspace = true }
 directories   = { workspace = true }
 age           = { workspace = true }
 n0-error      = "0.1"
+bytes         = { workspace = true }
 
 [dev-dependencies]
 portl-core = { version = "0.0.1", path = ".", features = ["test-util"] }
