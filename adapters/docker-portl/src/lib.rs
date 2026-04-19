@@ -15,7 +15,7 @@ use bollard::image::CreateImageOptions;
 use bollard::models::{ContainerInspectResponse, HostConfig};
 use bollard::secret::ContainerStateStatusEnum;
 use futures_util::stream::TryStreamExt;
-use portl_core::bootstrap::{Bootstrapper, Handle, TargetSpec, TargetStatus};
+use portl_core::bootstrap::{Bootstrapper, Handle, ProvisionSpec, TargetStatus};
 use portl_core::id::{Identity, store};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -25,6 +25,14 @@ pub const ADAPTER_NAME: &str = "docker-portl";
 pub const DEFAULT_NETWORK: &str = "bridge";
 pub const SECRET_MOUNT_PATH: &str = "/var/lib/portl/secret";
 pub const CONFIG_MOUNT_PATH: &str = "/etc/portl/agent.toml";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct DockerProvisionParams {
+    image: String,
+    network: String,
+    #[serde(default)]
+    rm_existing: bool,
+}
 
 #[derive(Clone)]
 pub struct DockerBootstrapper {
@@ -52,8 +60,9 @@ impl DockerBootstrapper {
 
 #[async_trait]
 impl Bootstrapper for DockerBootstrapper {
-    async fn provision(&self, spec: &TargetSpec) -> Result<Handle> {
-        validate_spec(spec)?;
+    async fn provision(&self, spec: &ProvisionSpec) -> Result<Handle> {
+        let params = parse_adapter_params(&spec.adapter_params)?;
+        validate_spec(spec, &params)?;
 
         let identity = Identity::new();
         let endpoint_id = hex::encode(identity.endpoint_id().as_bytes());
@@ -69,7 +78,7 @@ impl Bootstrapper for DockerBootstrapper {
             config_path: config_path.clone(),
         };
 
-        if let Err(err) = self.pull_image(&spec.image).await {
+        if let Err(err) = self.pull_image(&params.image).await {
             cleanup.best_effort();
             return Err(err);
         }
@@ -78,11 +87,11 @@ impl Bootstrapper for DockerBootstrapper {
         let binds = docker_binds(&secret_path, &config_path);
         let host_config = HostConfig {
             binds: Some(binds),
-            network_mode: Some(spec.network.clone()),
+            network_mode: Some(params.network.clone()),
             ..HostConfig::default()
         };
         let config = Config {
-            image: Some(spec.image.clone()),
+            image: Some(params.image.clone()),
             labels: Some(labels),
             host_config: Some(host_config),
             cmd: Some(vec!["--config".to_owned(), CONFIG_MOUNT_PATH.to_owned()]),
@@ -128,8 +137,8 @@ impl Bootstrapper for DockerBootstrapper {
             inner: json!(DockerHandle {
                 container_id,
                 endpoint_id,
-                image: spec.image.clone(),
-                network: spec.network.clone(),
+                image: params.image.clone(),
+                network: params.network.clone(),
                 name: spec.name.clone(),
                 config_path,
             }),
@@ -313,15 +322,24 @@ impl DockerBootstrapper {
     }
 }
 
-fn validate_spec(spec: &TargetSpec) -> Result<()> {
-    if spec.network == "none" {
+fn parse_adapter_params(adapter_params: &serde_json::Value) -> Result<DockerProvisionParams> {
+    serde_json::from_value(adapter_params.clone()).context(
+        "docker adapter_params must be an object like {\"image\":\"...\",\"network\":\"...\"}",
+    )
+}
+
+fn validate_spec(spec: &ProvisionSpec, params: &DockerProvisionParams) -> Result<()> {
+    if params.network == "none" {
         bail!("docker network mode 'none' is not supported for portl targets");
     }
     if spec.name.trim().is_empty() {
         bail!("container name must not be empty");
     }
-    if spec.image.trim().is_empty() {
+    if params.image.trim().is_empty() {
         bail!("container image must not be empty");
+    }
+    if params.network.trim().is_empty() {
+        bail!("container network must not be empty");
     }
     Ok(())
 }
@@ -331,6 +349,9 @@ fn map_target_status(inspect: ContainerInspectResponse) -> TargetStatus {
         return TargetStatus::Unknown("missing state".to_owned());
     };
     match state.status {
+        Some(ContainerStateStatusEnum::CREATED | ContainerStateStatusEnum::RESTARTING) => {
+            TargetStatus::Provisioning
+        }
         Some(ContainerStateStatusEnum::RUNNING) => TargetStatus::Running,
         Some(ContainerStateStatusEnum::EXITED) => TargetStatus::Exited {
             code: exit_code_to_i32(state.exit_code.unwrap_or_default()),
@@ -369,7 +390,7 @@ fn render_agent_config(trust_roots: &[[u8; 32]]) -> Result<String> {
     ))
 }
 
-fn docker_labels(spec: &TargetSpec, endpoint_id: &str) -> HashMap<String, String> {
+fn docker_labels(spec: &ProvisionSpec, endpoint_id: &str) -> HashMap<String, String> {
     let mut labels = HashMap::from([
         ("portl.adapter".to_owned(), ADAPTER_NAME.to_owned()),
         ("portl.endpoint_id".to_owned(), endpoint_id.to_owned()),
@@ -438,35 +459,22 @@ impl CleanupPaths {
 mod tests {
     use std::path::Path;
 
-    use portl_core::ticket::schema::Capabilities;
+    use portl_core::bootstrap::ProvisionSpec;
+    use serde_json::json;
 
     use super::{
         ADAPTER_NAME, CONFIG_MOUNT_PATH, DEFAULT_NETWORK, SECRET_MOUNT_PATH, docker_binds,
-        docker_labels, normalize_image, render_agent_config,
+        docker_labels, normalize_image, parse_adapter_params, render_agent_config,
     };
-    use portl_core::bootstrap::TargetSpec;
-
-    fn empty_caps() -> Capabilities {
-        Capabilities {
-            presence: 0,
-            shell: None,
-            tcp: None,
-            udp: None,
-            fs: None,
-            vpn: None,
-            meta: None,
-        }
-    }
 
     #[test]
     fn label_builder_includes_portl_labels_and_user_labels() {
-        let spec = TargetSpec {
+        let spec = ProvisionSpec {
             name: "demo".to_owned(),
-            image: "portl-agent".to_owned(),
-            network: DEFAULT_NETWORK.to_owned(),
-            caps: empty_caps(),
-            ttl_secs: 60,
-            to: None,
+            adapter_params: json!({
+                "image": "portl-agent",
+                "network": DEFAULT_NETWORK,
+            }),
             labels: vec![("com.example.demo".to_owned(), "true".to_owned())],
         };
 
@@ -475,6 +483,28 @@ mod tests {
         assert_eq!(labels.get("portl.adapter"), Some(&ADAPTER_NAME.to_owned()));
         assert_eq!(labels.get("portl.endpoint_id"), Some(&"abc123".to_owned()));
         assert_eq!(labels.get("com.example.demo"), Some(&"true".to_owned()));
+    }
+
+    #[test]
+    fn docker_adapter_params_parse_expected_object() {
+        let params = parse_adapter_params(&json!({
+            "image": "portl-agent:latest",
+            "network": "bridge",
+        }))
+        .expect("parse params");
+
+        assert_eq!(params.image, "portl-agent:latest");
+        assert_eq!(params.network, "bridge");
+        assert!(!params.rm_existing);
+    }
+
+    #[test]
+    fn docker_adapter_params_reject_invalid_shape() {
+        let err = parse_adapter_params(&json!("portl-agent:latest")).expect_err("reject string");
+        assert!(
+            err.to_string()
+                .contains("docker adapter_params must be an object")
+        );
     }
 
     #[test]

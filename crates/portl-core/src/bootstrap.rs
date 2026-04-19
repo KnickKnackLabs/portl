@@ -14,12 +14,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::ticket::schema::Capabilities;
+use crate::ticket::verify::MAX_DELEGATION_DEPTH;
 
 /// Provisioning lifecycle surface shared by all adapters.
 #[async_trait]
 pub trait Bootstrapper: Send + Sync {
     /// Provision a new target from the requested specification.
-    async fn provision(&self, spec: &TargetSpec) -> Result<Handle>;
+    async fn provision(&self, spec: &ProvisionSpec) -> Result<Handle>;
 
     /// Register or verify the target's endpoint id with local adapter state.
     async fn register(&self, handle: &Handle, endpoint_id: EndpointId) -> Result<()>;
@@ -31,16 +32,26 @@ pub trait Bootstrapper: Send + Sync {
     async fn teardown(&self, handle: &Handle) -> Result<()>;
 }
 
-/// Adapter-agnostic description of a desired target.
+/// Adapter-agnostic provisioning request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TargetSpec {
+pub struct ProvisionSpec {
     pub name: String,
-    pub image: String,
-    pub network: String,
+    pub adapter_params: Value,
+    pub labels: Vec<(String, String)>,
+}
+
+/// Adapter-agnostic ticket minting request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketSpec {
     pub caps: Capabilities,
     pub ttl_secs: u64,
     pub to: Option<[u8; 32]>,
-    pub labels: Vec<(String, String)>,
+    #[serde(default = "default_ticket_depth")]
+    pub depth: u8,
+}
+
+fn default_ticket_depth() -> u8 {
+    MAX_DELEGATION_DEPTH
 }
 
 /// Opaque adapter-specific handle.
@@ -53,6 +64,7 @@ pub struct Handle {
 /// Runtime status for a provisioned target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TargetStatus {
+    Provisioning,
     Running,
     Exited { code: i32 },
     NotFound,
@@ -63,7 +75,20 @@ pub enum TargetStatus {
 mod tests {
     use serde_json::json;
 
-    use super::{Handle, TargetStatus};
+    use super::{Handle, ProvisionSpec, TargetStatus, TicketSpec, default_ticket_depth};
+    use crate::ticket::schema::Capabilities;
+
+    fn empty_caps() -> Capabilities {
+        Capabilities {
+            presence: 0,
+            shell: None,
+            tcp: None,
+            udp: None,
+            fs: None,
+            vpn: None,
+            meta: None,
+        }
+    }
 
     #[test]
     fn handle_round_trips_through_json() {
@@ -79,6 +104,37 @@ mod tests {
         let decoded: Handle = serde_json::from_str(&encoded).expect("deserialize handle");
 
         assert_eq!(decoded, handle);
+    }
+
+    #[test]
+    fn provision_spec_round_trips_through_json() {
+        let spec = ProvisionSpec {
+            name: "demo".to_owned(),
+            adapter_params: json!({
+                "image": "portl-agent:latest",
+                "network": "bridge",
+            }),
+            labels: vec![("com.example.demo".to_owned(), "true".to_owned())],
+        };
+
+        let encoded = serde_json::to_string(&spec).expect("serialize provision spec");
+        let decoded: ProvisionSpec =
+            serde_json::from_str(&encoded).expect("deserialize provision spec");
+
+        assert_eq!(decoded, spec);
+    }
+
+    #[test]
+    fn ticket_spec_defaults_depth_on_json_decode() {
+        let encoded = json!({
+            "caps": empty_caps(),
+            "ttl_secs": 60,
+            "to": null,
+        });
+
+        let decoded: TicketSpec = serde_json::from_value(encoded).expect("deserialize ticket");
+
+        assert_eq!(decoded.depth, default_ticket_depth());
     }
 
     #[test]

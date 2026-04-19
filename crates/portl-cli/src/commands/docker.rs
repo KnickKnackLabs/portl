@@ -3,7 +3,7 @@ use std::process::{Command as ProcessCommand, ExitCode, Stdio};
 use anyhow::{Context, Result, anyhow, bail};
 use docker_portl::{ADAPTER_NAME, DockerBootstrapper, DockerHandle};
 use iroh_tickets::Ticket;
-use portl_core::bootstrap::{Bootstrapper, Handle, TargetSpec};
+use portl_core::bootstrap::{Bootstrapper, Handle, ProvisionSpec, TicketSpec};
 use portl_core::id::store;
 use portl_core::ticket::mint::mint_root;
 
@@ -32,16 +32,21 @@ pub fn add(
         let labels = parse_labels(labels)?;
         let bootstrapper =
             DockerBootstrapper::connect_with_local_defaults(vec![operator.verifying_key()])?;
-        let spec = TargetSpec {
+        let provision_spec = ProvisionSpec {
             name: name.to_owned(),
-            image: image.unwrap_or(DEFAULT_IMAGE).to_owned(),
-            network: network.unwrap_or(DEFAULT_NETWORK).to_owned(),
+            adapter_params: serde_json::json!({
+                "image": image.unwrap_or(DEFAULT_IMAGE),
+                "network": network.unwrap_or(DEFAULT_NETWORK),
+            }),
+            labels: labels.clone(),
+        };
+        let ticket_spec = TicketSpec {
             caps: caps.clone(),
             ttl_secs,
             to: to_bytes,
-            labels: labels.clone(),
+            depth: portl_core::ticket::verify::MAX_DELEGATION_DEPTH,
         };
-        let handle = bootstrapper.provision(&spec).await?;
+        let handle = bootstrapper.provision(&provision_spec).await?;
         let docker_handle = DockerHandle::from_handle(&handle)?;
         let endpoint_bytes = parse_endpoint_bytes(&docker_handle.endpoint_id)?;
         let endpoint_id =
@@ -52,10 +57,11 @@ pub fn add(
         let ticket = mint_root(
             operator.signing_key(),
             iroh_base::EndpointAddr::new(endpoint_id),
-            caps.clone(),
+            ticket_spec.caps.clone(),
             now,
-            now.checked_add(ttl_secs).context("ticket ttl overflow")?,
-            to_bytes,
+            now.checked_add(ticket_spec.ttl_secs)
+                .context("ticket ttl overflow")?,
+            ticket_spec.to,
         )?;
 
         AliasStore::default().save(
@@ -64,14 +70,14 @@ pub fn add(
                 adapter: ADAPTER_NAME.to_owned(),
                 container_id: docker_handle.container_id,
                 endpoint_id: docker_handle.endpoint_id,
-                image: spec.image.clone(),
-                network: spec.network.clone(),
+                image: image.unwrap_or(DEFAULT_IMAGE).to_owned(),
+                network: network.unwrap_or(DEFAULT_NETWORK).to_owned(),
                 created_at: now_unix_secs()?,
             },
             &StoredSpec {
                 caps,
-                ttl_secs,
-                to: to_bytes,
+                ttl_secs: ticket_spec.ttl_secs,
+                to: ticket_spec.to,
                 labels,
             },
         )?;
