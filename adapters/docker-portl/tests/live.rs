@@ -92,3 +92,56 @@ async fn agent_graceful_shutdown_on_sigterm() -> Result<()> {
     bootstrapper.teardown(&handle).await?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires a live docker daemon and test image"]
+async fn list_reports_actual_network() -> Result<()> {
+    let bootstrapper = DockerBootstrapper::connect_with_local_defaults(vec![[1; 32]])?;
+
+    let bridge = bootstrapper
+        .provision(&ProvisionSpec {
+            name: format!("portl-bridge-{}", std::process::id()),
+            adapter_params: json!({
+                "image": "portl-agent:local",
+                "network": "bridge",
+            }),
+            labels: vec![],
+        })
+        .await?;
+    let bridge_handle = DockerHandle::from_handle(&bridge)?;
+
+    let listed = bootstrapper.list_portl_containers().await?;
+    let bridge_listed = listed
+        .iter()
+        .find(|handle| handle.container_id == bridge_handle.container_id)
+        .context("bridge container missing from list")?;
+    assert_eq!(bridge_listed.network, "bridge");
+
+    bootstrapper.teardown(&bridge).await?;
+
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("PORTL_TEST_HOST_NETWORK").is_some() {
+        let host = bootstrapper
+            .provision(&ProvisionSpec {
+                name: format!("portl-host-{}", std::process::id()),
+                adapter_params: json!({
+                    "image": "portl-agent:local",
+                    "network": "host",
+                }),
+                labels: vec![],
+            })
+            .await?;
+        let host_handle = DockerHandle::from_handle(&host)?;
+
+        let listed = bootstrapper.list_portl_containers().await?;
+        let host_listed = listed
+            .iter()
+            .find(|handle| handle.container_id == host_handle.container_id)
+            .context("host container missing from list")?;
+        assert_eq!(host_listed.network, "host");
+
+        bootstrapper.teardown(&host).await?;
+    }
+
+    Ok(())
+}

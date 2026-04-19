@@ -82,6 +82,7 @@ pub enum Command {
         ttl: String,
         to: Option<String>,
         labels: Vec<String>,
+        rm_existing: bool,
     },
     DockerList {
         json: bool,
@@ -98,6 +99,7 @@ pub enum Command {
         name: String,
         follow: bool,
         tail: Option<String>,
+        deprecated_container_alias: bool,
     },
 }
 
@@ -195,6 +197,7 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             ttl,
             to,
             labels,
+            rm_existing,
         } => commands::docker::add(
             &name,
             image.as_deref(),
@@ -203,6 +206,7 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             &ttl,
             to.as_deref(),
             &labels,
+            rm_existing,
         ),
         Command::DockerList { json } => commands::docker::list(json),
         Command::DockerRm {
@@ -211,9 +215,12 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             keep_tickets,
         } => commands::docker::rm(&name, force, keep_tickets),
         Command::DockerRebuild { name } => commands::docker::rebuild(&name),
-        Command::DockerLogs { name, follow, tail } => {
-            commands::docker::logs(&name, follow, tail.as_deref())
-        }
+        Command::DockerLogs {
+            name,
+            follow,
+            tail,
+            deprecated_container_alias,
+        } => commands::docker::logs(&name, follow, tail.as_deref(), deprecated_container_alias),
     }
 }
 
@@ -312,6 +319,13 @@ enum DockerAction {
         #[command(subcommand)]
         action: DockerContainerAction,
     },
+    Logs {
+        name: String,
+        #[arg(long)]
+        follow: bool,
+        #[arg(long)]
+        tail: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -330,6 +344,8 @@ enum DockerContainerAction {
         to: Option<String>,
         #[arg(long = "label")]
         labels: Vec<String>,
+        #[arg(long = "rm-existing")]
+        rm_existing: bool,
     },
     List {
         #[arg(long)]
@@ -457,6 +473,7 @@ impl Cli {
                                 ttl,
                                 to,
                                 labels,
+                                rm_existing,
                             },
                     },
             } => Command::DockerAdd {
@@ -467,6 +484,7 @@ impl Cli {
                 ttl,
                 to,
                 labels,
+                rm_existing,
             },
             TopLevel::Docker {
                 action:
@@ -496,11 +514,24 @@ impl Cli {
                     },
             } => Command::DockerRebuild { name },
             TopLevel::Docker {
+                action: DockerAction::Logs { name, follow, tail },
+            } => Command::DockerLogs {
+                name,
+                follow,
+                tail,
+                deprecated_container_alias: false,
+            },
+            TopLevel::Docker {
                 action:
                     DockerAction::Container {
                         action: DockerContainerAction::Logs { name, follow, tail },
                     },
-            } => Command::DockerLogs { name, follow, tail },
+            } => Command::DockerLogs {
+                name,
+                follow,
+                tail,
+                deprecated_container_alias: true,
+            },
         }
     }
 }

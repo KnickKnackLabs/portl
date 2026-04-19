@@ -91,8 +91,29 @@ impl Bootstrapper for DockerBootstrapper {
             name: spec.name.clone(),
             platform: None,
         });
-        let response = match self.docker.create_container(options, config).await {
+        let response = match self
+            .docker
+            .create_container(options.clone(), config.clone())
+            .await
+        {
             Ok(response) => response,
+            Err(err) if is_conflict_docker(&err) && params.rm_existing => {
+                self.teardown_container(&spec.name)
+                    .await
+                    .with_context(|| format!("remove existing container {}", spec.name))?;
+                self.docker
+                    .create_container(options, config)
+                    .await
+                    .context("create docker container after removing existing one")?
+            }
+            Err(err) if is_conflict_docker(&err) => {
+                cleanup.best_effort();
+                bail!(
+                    "container '{}' already exists; remove it first with `portl docker container rm {}` or pass --rm-existing",
+                    spec.name,
+                    spec.name
+                );
+            }
             Err(err) => {
                 cleanup.best_effort();
                 return Err(err).context("create docker container");
@@ -224,10 +245,10 @@ impl DockerBootstrapper {
                 .unwrap_or(false);
             if running {
                 // The agent process starts immediately after docker marks the
-                // container running, but the iroh endpoint needs a moment to
-                // bind and publish. A fixed 1 s delay keeps the adapter simple
-                // and is exercised by the M4 smoke test.
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                // container running, but the iroh endpoint may need a moment to
+                // bind and publish. Keep the readiness grace period short so
+                // CLI follow-up operations can probe the endpoint promptly.
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
@@ -298,11 +319,17 @@ impl DockerBootstrapper {
                 .into_iter()
                 .find_map(|name| name.strip_prefix('/').map(str::to_owned))
                 .unwrap_or_else(|| id.clone());
+            let network = container
+                .network_settings
+                .as_ref()
+                .and_then(|settings| settings.networks.as_ref())
+                .and_then(|networks| networks.keys().next().cloned())
+                .unwrap_or_else(|| DEFAULT_NETWORK.to_owned());
             handles.push(DockerHandle {
                 container_id: id,
                 endpoint_id: endpoint_id.clone(),
                 image,
-                network: DEFAULT_NETWORK.to_owned(),
+                network,
                 name,
                 config_path: PathBuf::new(),
             });
@@ -456,6 +483,16 @@ fn is_not_found_docker(err: &DockerError) -> bool {
     }
 }
 
+fn is_conflict_docker(err: &DockerError) -> bool {
+    matches!(
+        err,
+        DockerError::DockerResponseServerError {
+            status_code: 409,
+            ..
+        }
+    )
+}
+
 struct CleanupPaths {
     secret_path: PathBuf,
     config_path: PathBuf,
@@ -524,6 +561,18 @@ mod tests {
             err.to_string()
                 .contains("docker adapter_params must be an object")
         );
+    }
+
+    #[test]
+    fn docker_adapter_params_parse_rm_existing_flag() {
+        let params = parse_adapter_params(&json!({
+            "image": "portl-agent:latest",
+            "network": "bridge",
+            "rm_existing": true,
+        }))
+        .expect("parse params");
+
+        assert!(params.rm_existing);
     }
 
     #[test]

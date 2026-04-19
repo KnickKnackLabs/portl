@@ -122,6 +122,61 @@ fn shell_exec_and_tcp_subcommands_parse() {
 }
 
 #[test]
+fn docker_logs_paths_parse_and_mark_deprecated_alias() {
+    let top_level = parse(argv(&[
+        "portl", "docker", "logs", "demo", "--follow", "--tail", "10",
+    ]))
+    .expect("top-level docker logs should parse");
+    assert_eq!(
+        top_level,
+        Command::DockerLogs {
+            name: "demo".to_owned(),
+            follow: true,
+            tail: Some("10".to_owned()),
+            deprecated_container_alias: false,
+        }
+    );
+
+    let deprecated = parse(argv(&["portl", "docker", "container", "logs", "demo"]))
+        .expect("container docker logs alias should parse");
+    assert_eq!(
+        deprecated,
+        Command::DockerLogs {
+            name: "demo".to_owned(),
+            follow: false,
+            tail: None,
+            deprecated_container_alias: true,
+        }
+    );
+}
+
+#[test]
+fn docker_add_rm_existing_flag_parses() {
+    let cmd = parse(argv(&[
+        "portl",
+        "docker",
+        "container",
+        "add",
+        "demo",
+        "--rm-existing",
+    ]))
+    .expect("docker add should parse");
+    assert_eq!(
+        cmd,
+        Command::DockerAdd {
+            name: "demo".to_owned(),
+            image: None,
+            network: None,
+            agent_caps: "shell".to_owned(),
+            ttl: "30d".to_owned(),
+            to: None,
+            labels: vec![],
+            rm_existing: true,
+        }
+    );
+}
+
+#[test]
 fn unknown_subcommand_errors() {
     let result = parse(argv(&["portl", "definitely-not-a-real-subcommand"]));
     assert!(
