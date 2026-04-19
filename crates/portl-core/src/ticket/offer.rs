@@ -78,9 +78,12 @@ pub fn validate_ticket_proof(
     proof: Option<&[u8; 64]>,
 ) -> Result<()> {
     match (ticket.body.to, proof) {
-        (Some(pk), Some(proof)) => verify_pop(&pk, &ticket_id(&ticket.sig), client_nonce, proof),
+        (Some(holder), Some(sig)) => {
+            verify_pop(&holder, &ticket_id(&ticket.sig), client_nonce, sig)
+        }
+        (None, None) => Ok(()),
+        (None, Some(_)) => Err(PortlError::Ticket("proof not expected for bearer ticket")),
         (Some(_), None) => Err(PortlError::Ticket("proof required for to-bound ticket")),
-        (None, _) => Ok(()),
     }
 }
 

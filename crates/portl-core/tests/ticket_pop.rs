@@ -120,7 +120,7 @@ fn missing_proof_when_to_is_set_fails() {
 }
 
 #[test]
-fn bearer_ticket_ignores_proof() {
+fn pop_bearer_ticket_requires_no_proof() {
     let issuer = SigningKey::from_bytes(&[50u8; 32]);
     let holder = SigningKey::from_bytes(&[51u8; 32]);
     let ticket = mint_root(
@@ -133,8 +133,26 @@ fn bearer_ticket_ignores_proof() {
     )
     .unwrap();
     let nonce = [12u8; 16];
-    let proof = compute_pop_sig(&holder, &ticket_id(&ticket.sig), &nonce);
+    let _proof = compute_pop_sig(&holder, &ticket_id(&ticket.sig), &nonce);
 
     validate_ticket_proof(&ticket, &nonce, None).unwrap();
-    validate_ticket_proof(&ticket, &nonce, Some(&proof)).unwrap();
+}
+
+#[test]
+fn pop_rejects_unexpected_proof_on_bearer() {
+    let issuer = SigningKey::from_bytes(&[52u8; 32]);
+    let holder = SigningKey::from_bytes(&[53u8; 32]);
+    let ticket = mint_root(
+        &issuer,
+        endpoint_addr_from_key(&issuer),
+        shell_caps(),
+        1_000,
+        4_600,
+        None,
+    )
+    .unwrap();
+    let nonce = [13u8; 16];
+    let proof = compute_pop_sig(&holder, &ticket_id(&ticket.sig), &nonce);
+
+    assert!(validate_ticket_proof(&ticket, &nonce, Some(&proof)).is_err());
 }
