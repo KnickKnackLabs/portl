@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr};
 
 use portl_agent::RevocationSet;
 use portl_agent::pipeline::{AcceptanceInput, AcceptanceOutcome, RateLimitGate, evaluate_offer};
@@ -14,12 +13,12 @@ use portl_proto::ticket_v1::{AckReason, TicketOffer};
 use tempfile::tempdir;
 
 const NOW: u64 = 1_735_689_600;
-const SOURCE_IP: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+const SOURCE_ID: [u8; 32] = [7; 32];
 
 struct AllowAll;
 
 impl RateLimitGate for AllowAll {
-    fn check(&self, _source_ip: IpAddr) -> bool {
+    fn check(&self, _source_id: [u8; 32]) -> bool {
         true
     }
 }
@@ -27,7 +26,7 @@ impl RateLimitGate for AllowAll {
 struct DenyAll;
 
 impl RateLimitGate for DenyAll {
-    fn check(&self, _source_ip: IpAddr) -> bool {
+    fn check(&self, _source_id: [u8; 32]) -> bool {
         false
     }
 }
@@ -295,7 +294,7 @@ impl Fixture {
     ) -> AcceptanceOutcome {
         evaluate_offer(&AcceptanceInput {
             offer,
-            source_ip: SOURCE_IP,
+            source_id: SOURCE_ID,
             trust_roots: &self.trust_roots,
             revocations,
             now: NOW,

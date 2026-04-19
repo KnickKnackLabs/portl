@@ -1,4 +1,3 @@
-use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
@@ -13,7 +12,7 @@ use crate::pipeline::RateLimitGate;
 
 #[derive(Debug)]
 pub struct OfferRateLimiter {
-    inner: RateLimiter<IpAddr, DashMapStateStore<IpAddr>, DefaultClock>,
+    inner: RateLimiter<[u8; 32], DashMapStateStore<[u8; 32]>, DefaultClock>,
 }
 
 impl OfferRateLimiter {
@@ -29,13 +28,13 @@ impl OfferRateLimiter {
     }
 
     #[must_use]
-    pub fn check(&self, source_ip: IpAddr) -> bool {
-        self.inner.check_key(&source_ip).is_ok()
+    pub fn check(&self, source_id: [u8; 32]) -> bool {
+        self.inner.check_key(&source_id).is_ok()
     }
 }
 
 impl RateLimitGate for OfferRateLimiter {
-    fn check(&self, source_ip: IpAddr) -> bool {
-        self.check(source_ip)
+    fn check(&self, source_id: [u8; 32]) -> bool {
+        self.check(source_id)
     }
 }

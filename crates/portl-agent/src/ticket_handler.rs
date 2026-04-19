@@ -1,10 +1,8 @@
-use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use iroh::endpoint::Connection;
-use iroh_base::TransportAddr;
 use tracing::{instrument, warn};
 
 use crate::AgentState;
@@ -27,12 +25,12 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
         .read_to_end(MAX_OFFER_BYTES)
         .await
         .context("read offer stream")?;
-    let source_ip = source_ip(&connection);
+    let source_id = remote_node_id(&connection);
 
     let outcome = match postcard::from_bytes::<portl_proto::ticket_v1::TicketOffer>(&offer_bytes) {
         Ok(offer) => evaluate_offer(&AcceptanceInput {
             offer: &offer,
-            source_ip,
+            source_id,
             trust_roots: &state.trust_roots,
             revocations: &state.revocations,
             now: unix_now_secs()?,
@@ -114,15 +112,6 @@ fn unix_now_secs() -> Result<u64> {
         .as_secs())
 }
 
-fn source_ip(connection: &Connection) -> IpAddr {
-    connection
-        .paths()
-        .into_iter()
-        .find(iroh::endpoint::PathInfo::is_selected)
-        .or_else(|| connection.paths().into_iter().next())
-        .and_then(|path| match path.remote_addr() {
-            TransportAddr::Ip(addr) => Some(addr.ip()),
-            _ => None,
-        })
-        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+fn remote_node_id(connection: &Connection) -> [u8; 32] {
+    *connection.remote_id().as_bytes()
 }

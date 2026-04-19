@@ -1,5 +1,3 @@
-use std::net::IpAddr;
-
 use portl_core::caps::is_narrowing;
 use portl_core::ticket::canonical::{canonical_check_ticket, resolved_issuer};
 use portl_core::ticket::hash::{parent_ticket_id, ticket_id};
@@ -14,12 +12,12 @@ use crate::revocations::RevocationSet;
 const CLOCK_SKEW_SECS: u64 = 60;
 
 pub trait RateLimitGate: Send + Sync {
-    fn check(&self, source_ip: IpAddr) -> bool;
+    fn check(&self, source_id: [u8; 32]) -> bool;
 }
 
 pub struct AcceptanceInput<'a> {
     pub offer: &'a TicketOffer,
-    pub source_ip: IpAddr,
+    pub source_id: [u8; 32],
     pub trust_roots: &'a TrustRoots,
     pub revocations: &'a RevocationSet,
     pub now: u64,
@@ -39,7 +37,7 @@ pub enum AcceptanceOutcome {
 }
 
 pub fn evaluate_offer(input: &AcceptanceInput<'_>) -> AcceptanceOutcome {
-    if !input.rate_limit.check(input.source_ip) {
+    if !input.rate_limit.check(input.source_id) {
         return reject(AckReason::RateLimited);
     }
 
