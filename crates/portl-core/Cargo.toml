@@ -1,0 +1,23 @@
+[package]
+name         = "portl-core"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+rust-version.workspace = true
+description  = "Core types and primitives for portl: tickets, sessions, endpoint wrapper."
+
+[lints]
+workspace = true
+
+[dependencies]
+iroh         = { workspace = true }
+iroh-base    = { workspace = true }
+tokio        = { workspace = true }
+anyhow       = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

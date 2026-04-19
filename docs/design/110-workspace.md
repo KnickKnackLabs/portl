@@ -9,7 +9,9 @@ and stable APIs freeze.
 portl/
 ├── Cargo.toml                     [workspace]
 ├── Cargo.lock
-├── rust-toolchain.toml            stable pinned (≥ 1.85 for edition 2024)
+├── rust-toolchain.toml            stable pinned (≥ 1.89; bumped from the
+│                                   1.85 baseline to match iroh 0.98's
+│                                   transitive dependency requirements)
 ├── rustfmt.toml
 ├── clippy.toml
 ├── deny.toml                      cargo-deny config
@@ -193,7 +195,7 @@ edition      = "2024"
 license      = "MIT"
 repository   = "https://github.com/KnickKnackLabs/portl"
 authors      = ["KnickKnackLabs and portl contributors"]
-rust-version = "1.85"    # 2024 edition baseline
+rust-version = "1.89"    # iroh 0.98 transitive deps (time, vergen, ...)
 
 [workspace.dependencies]
 # transport

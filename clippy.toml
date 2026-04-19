@@ -1,0 +1,2 @@
+# Extra lint configuration can go here.
+# Currently no overrides; lints are declared in workspace Cargo.toml.

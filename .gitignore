@@ -4,6 +4,9 @@
 **/*.rs.bk
 Cargo.lock.bak
 
+# Pi agent local state (todos, session scratch)
+.pi/
+
 # macOS
 .DS_Store
 *.swp

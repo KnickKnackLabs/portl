@@ -1,0 +1,19 @@
+[package]
+name         = "portl-proto"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+rust-version.workspace = true
+description  = "Wire protocols and ALPNs for portl: ticket/v1, meta/v1, shell/v1, tcp/v1, udp/v1."
+
+[lints]
+workspace = true
+
+[dependencies]
+portl-core = { version = "0.0.1", path = "../portl-core" }
+iroh       = { workspace = true }
+tokio      = { workspace = true }
+bytes      = { workspace = true }
+tracing    = { workspace = true }

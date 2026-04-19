@@ -1,0 +1,20 @@
+[package]
+name         = "manual-portl"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+rust-version.workspace = true
+description  = "Manual/reference adapter for portl — prints operator instructions, no orchestration."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "portl-manual-adapter"
+path = "src/main.rs"
+
+[dependencies]
+portl-core = { version = "0.0.1", path = "../../crates/portl-core" }
+anyhow     = { workspace = true }
