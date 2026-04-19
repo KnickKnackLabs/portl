@@ -186,7 +186,7 @@ Alice (operator)         Bob (operator)            VM agent
    │                        │    err: "revoked"         │
 ```
 
-## 5. UDP + mosh (post M5)
+## 5. UDP + mosh (M6)
 
 ```
 Client (Mac)                                          Target VM (Linux)
@@ -217,7 +217,7 @@ Client (Mac)                                          Target VM (Linux)
  mosh continues as if talking to a local UDP endpoint
 ```
 
-## 6. VPN mode (M7, stretch)
+## 6. VPN mode (M9, stretch)
 
 ```
  step 1: `portl vpn up claude-1 sbox-2`

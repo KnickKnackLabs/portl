@@ -312,7 +312,7 @@ documents the branch we didn't take). These decisions are settled:
 - **Connection migration**: explicit non-goal for v0.1. Sessions drop
   on transport change; reconnect via same ticket. `tmux attach` is
   the documented mitigation for long-running work.
-- **`fs/v1`**: **deferred to post-v0.1** (M7). Workaround for v0.1 is
+- **`fs/v1`**: **deferred to post-v0.1** (M8). Workaround for v0.1 is
   `portl sh peer 'tar c DIR' | tar x`.
 - **M0 workspace scope**: trimmed to 4 active crates (`portl-core`,
   `portl-proto`, `portl-cli`, `slicer-portl`, `manual-portl`;

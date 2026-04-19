@@ -31,8 +31,10 @@ capability tickets**. Ships as:
    mode (`vpn/v1`) is a feature-gated stretch.
 5. **Embeddability.** `portl-core` must be callable from other Rust
    programs. Binaries are thin wrappers.
-6. **Bootstrap-agnostic.** Slicer is the motivating adapter but not a
-   dependency of the core. Other adapters must be straightforward to write.
+6. **Bootstrap-agnostic.** Docker is the M4 reference adapter, slicer
+   ships at M5 — both exercise the `Bootstrapper` trait from
+   different angles, and neither is a dependency of the core. Other
+   adapters must be straightforward to write.
 7. **Revocable.** Tickets have a ticket-id; agents honour a revocation list.
    Delegated tickets can be revoked from either end of the chain.
 8. **Observable.** Direct-vs-relay path, peer liveness, per-session audit
@@ -120,15 +122,18 @@ The project is useful when:
 1. Two laptops running `portl agent run` can shell and port-forward to
    each other across the public internet using only a ticket exchanged
    via any out-of-band channel.
-2. `portl slicer vm add sbox` provisions a VM such that the operator's
-   laptop can `portl shell <vm>` directly, without the slicer daemon being
-   in the hot path.
-3. `portl share <peer> --caps shell,tcp:22 --ttl 24h --to <friend>`
-   produces a ticket that gives the friend exactly that access and nothing
-   else.
-4. Revoking a ticket takes effect on the agent within one session.
+2. `portl docker container add demo-1` provisions a container on any
+   dev laptop or CI runner and the operator can `portl shell demo-1`
+   from their own machine with no port-forwarding. (M4)
+3. `portl slicer vm add sbox` provisions a VM such that the operator's
+   laptop can `portl shell <vm>` directly, without the slicer daemon
+   being in the hot path. (M5)
+4. `portl share <peer> --caps shell,tcp:22 --ttl 24h --to <friend>`
+   produces a ticket that gives the friend exactly that access and
+   nothing else.
+5. Revoking a ticket takes effect on the agent within one session.
 
 Stretch for v0.2:
 
-5. `mosh` via `portl udp -L`.
-6. `vpn` mode with `ping <peer>.portl.local`.
+6. `mosh` via `portl udp -L`.
+7. `vpn` mode with `ping <peer>.portl.local`.

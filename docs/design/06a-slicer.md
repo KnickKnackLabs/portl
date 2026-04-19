@@ -1,4 +1,13 @@
-# 06 — Slicer adapter
+# 06a — Slicer adapter
+
+> **Scheduled for M5.** The slicer adapter ships one milestone after
+> the Docker adapter (M4). Docker is the canonical reference
+> `Bootstrapper` implementation for v0.1; slicer-portl exercises
+> additional surfaces (systemd installs, gateway-mode for wrapping
+> the slicer HTTP API, master tickets). The two adapters validate
+> different parts of the design and both ship in v0.1.
+>
+> See `06-docker.md` for the M4 adapter.
 
 ## 1. Shape
 

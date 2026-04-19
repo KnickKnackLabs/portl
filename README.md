@@ -25,17 +25,39 @@ what ships when.
 
 ## What portl is for
 
-- **Primary**: reaching [slicer](https://slicer.sh) VMs on a developer's
-  laptop from that same laptop, without TCP port forwarding.
 - **General**: any workflow where you want to hand someone a signed
   bearer URL that grants narrow, time-bounded access to a specific
   capability (shell, TCP/UDP forward, file transfer, or small VPN) on a
   target, with no central account system required.
+- **Reference adapter (M4)**: Docker. Provisions a container, injects
+  an agent identity, mints a ticket. Runs on any developer laptop or
+  CI runner.
+- **Primary personal use case (M5)**: [slicer](https://slicer.sh) VMs
+  on a developer's Mac, reached without port-forwarding or tailnet.
 
 The threat model (see
 [`docs/design/07-security.md`](docs/design/07-security.md)) is
 *"possession of the ticket is the authorisation"*. Revocation exists;
 accounts do not.
+
+## Quickstart (M4, approximate)
+
+```bash
+# On the target host (a laptop, a server, or a container):
+portl agent run --config /etc/portl/agent.toml
+
+# On your laptop, provision a docker container target:
+portl docker container add demo-1
+# → prints a portl<…> ticket URI
+
+# Use it:
+portl shell demo-1
+portl tcp demo-1 -L 127.0.0.1:3000:127.0.0.1:3000 -N
+```
+
+See [`docs/design/06-docker.md`](docs/design/06-docker.md) for full
+adapter details, [`docs/design/06a-slicer.md`](docs/design/06a-slicer.md)
+for slicer adapter (M5).
 
 ## What portl is NOT
 
@@ -45,7 +67,8 @@ accounts do not.
 - Not a SaaS. No mandatory control plane. You can run the reference
   setup entirely without talking to any server controlled by a third
   party.
-- Not tied to slicer. Slicer is the first adapter; the design treats
+- Not tied to any one orchestrator. Docker is the M4 reference adapter
+  and slicer is the M5 adapter; both ship in v0.1. The design treats
   adapters as the extensibility point (see
   [`docs/design/05-bootstrap.md`](docs/design/05-bootstrap.md)).
 

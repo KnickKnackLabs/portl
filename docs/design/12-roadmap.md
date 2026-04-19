@@ -5,25 +5,26 @@
 ```
   M0 ─ scaffold (workspace, iroh Endpoint wrapper, CI)
          │
-  M1 ─ identity + tickets v1 (node_id + relays[])
+  M1 ─ identity + tickets v1 (EndpointAddr + caps)
          │
   M2 ─ handshake (ticket/v1 + meta/v1) over iroh
          │
   M3 ─ shell + tcp
          │
-  M4 ─ slicer adapter (primary portl use case usable)
+  M4 ─ docker adapter (reference Bootstrapper + CI e2e)
          │
-         ▼  v0.1-pre (internal dogfooding)
+         ▼  v0.1-pre (external-friendly dogfooding)
 
-  M5 ─ udp (mosh-quality roaming)
-  M6 ─ polish (revocation GC, doctor, metrics, docs)
+  M5 ─ slicer adapter (gateway mode + master tickets)
+  M6 ─ udp (mosh-quality roaming)
+  M7 ─ polish (revocation GC, doctor, metrics, docs)
          │
          ▼  v0.1.0 release
 
   ─── post-v0.1 ───
-  M7 ─ fs/v1
-  M8 ─ vpn mode (stretch)
-  M9 ─ publish to crates.io ─────────► v0.2.0
+  M8 ─ fs/v1
+  M9 ─ vpn mode (stretch)
+ M10 ─ publish to crates.io ─────────► v0.2.0
 
   Future (demand-driven, not on critical path):
      Alternate data planes (WebRTC, Loom/AWDL) — `OverlayTransport`
@@ -113,32 +114,84 @@ Tests:
   backpressure correct).
 - `portl exec` with non-zero exit correctly reported.
 
-### M4 — slicer adapter
+### M4 — docker adapter (reference Bootstrapper + CI e2e)
 
 Exit:
 
+- `adapters/docker-portl/` crate implements the `Bootstrapper` trait
+  against `dockerd` via `bollard`.
+- `portl docker container add <name>` provisions, registers, mints a
+  root ticket, and prints the URI. See `06-docker.md`.
+- `portl docker container {list,rm,rebuild,logs}` all work.
+- Reference `Dockerfile` at `adapters/docker-portl/images/` builds
+  a <80 MiB image containing the multicall binary.
+- GH Actions `ci-e2e.yml` workflow brings up two ephemeral
+  containers on an `ubuntu-latest` runner and exercises
+  ticket/v1 + shell/v1 + tcp/v1 + delegation + revocation.
+- Agent runs correctly as PID 1 (SIGTERM graceful shutdown, SIGCHLD
+  reaping).
+- Zero license / proprietary gates: anyone with `docker` can run
+  the README quickstart.
+
+Tests:
+
+- `docker compose` with 3 agents; full mesh shell + tcp forward.
+- Signal handling: container SIGTERM → agent closes QUIC cleanly
+  within 10 s.
+- Rootless dockerd: adapter works without privileged socket.
+- macOS Docker Desktop `bridge` mode: hole-punch out succeeds,
+  relay fallback works for inbound.
+- Ephemeral container cycle: add → shell → rm → add (same name)
+  produces a new endpoint_id; old tickets correctly rejected.
+
+### v0.1-pre — external-friendly dogfooding
+
+Tag, but no release. At this point the quickstart is:
+
+```
+brew install portl          # or apt / direct download
+portl id new
+portl docker container add demo-1
+portl shell demo-1
+```
+
+Dogfood against docker for a week. Also dogfood on slicer via the
+`manual-portl` adapter (print-the-instructions flow) to surface
+anything docker happens to hide.
+
+Collect:
+
+- Pain points in CLI UX
+- Reconnection edge cases
+- Missing error messages
+- Diagnostic gaps
+- Surface gaps that M5's slicer-portl will need to fill
+
+### M5 — slicer adapter
+
+Exit:
+
+- `adapters/slicer-portl/` crate implements `Bootstrapper` against
+  the slicer HTTP API.
 - Base OCI image fork with `portl` installed and
   `portl-agent.service` enabled.
 - `portl slicer login <master>` works.
 - `portl slicer vm add sbox` creates + registers + prints ticket.
 - `portl shell <vm>` uses the per-VM ticket, bypasses slicer daemon.
 - `portl slicer vm delete <vm>` revokes + deprovisions.
+- `portl agent run --mode gateway` implemented; master-ticket
+  bearer injection against the slicer HTTP API works.
+- Published `ghcr.io/knickknacklabs/portl-agent:<version>` image
+  (shared with docker-portl).
 
 Tests:
 
 - Full round trip: add → shell → cp → delete, no orphaned secrets.
 - Master ticket rotation: old master refused after rotation.
+- Gateway mode: master-ticket-held slicer API calls proxy
+  correctly; non-bearer traffic is rejected at the gateway.
 
-### v0.1-pre — internal dogfooding
-
-Tag, but no release. Use against real VMs for a week. Collect:
-
-- Pain points in CLI UX
-- Reconnection edge cases
-- Missing error messages
-- Diagnostic gaps
-
-### M5 — udp
+### M6 — udp
 
 Exit:
 
@@ -152,7 +205,7 @@ Tests:
 - DNS over UDP works under latency loss.
 - Mosh continues across a forced QUIC teardown + reconnect.
 
-### M6 — polish
+### M7 — polish
 
 Exit:
 
@@ -161,14 +214,14 @@ Exit:
 - `portl doctor` diagnoses: clock skew, discovery config, listener
   bind, relay reachability, ticket expiry.
 - Agent exposes Prometheus metrics on the local unix socket.
-- README quickstart reproducible by a stranger.
+- README quickstart reproducible by a stranger (uses docker-portl).
 - `portl-relay` packaged (if we need it beyond iroh-relay upstream);
   documented how to self-host.
 - v0.1.0 tagged; GH release artifacts.
 
 ---
 
-### M7 — `fs/v1`
+### M8 — `fs/v1`
 
 Exit:
 
@@ -176,7 +229,7 @@ Exit:
 - Symlink, sparse-file, and cross-OS-permission corner cases tested.
 - Throughput within 50% of native scp over equivalent path.
 
-### M8 — VPN mode (stretch)
+### M9 — VPN mode (stretch)
 
 Exit:
 
@@ -185,13 +238,14 @@ Exit:
 - `portl vpn up <peer>` + local DNS stub for `*.portl.local`.
 - `mosh <peer>.portl.local` works end-to-end without `portl udp -L`.
 
-### M9 — publish
+### M10 — publish
 
 Exit:
 
 - Crates published in dep-order to crates.io.
-- Slicer adapter split to its own repo
-  (`KnickKnackLabs/slicer-portl`) if adapter velocity has diverged.
+- Adapter crates split to their own repos
+  (`KnickKnackLabs/slicer-portl`, `KnickKnackLabs/docker-portl`)
+  if adapter velocity has diverged.
 - Blog post / README published.
 - v0.2.0 tagged.
 
@@ -207,21 +261,23 @@ Exit:
   3     M2 handshake + discovery        30%
   4     M3 shell                        40%
   5     M3 tcp                          50%
-  6-7   M4 slicer adapter               65%
-  8     v0.1-pre dogfooding             —
-  9-10  M5 udp (mosh roaming)           80%
- 11     M6 polish + metrics             95%
- 12     v0.1.0 release                 100%
+  6     M4 docker adapter (+ CI e2e)    65%
+  7     v0.1-pre dogfooding             —
+  8-9   M5 slicer adapter               78%
+ 10-11  M6 udp (mosh roaming)           88%
+ 12     M7 polish + metrics             98%
+ 13     v0.1.0 release                 100%
  ─── post-v0.1 ───
- 13-14  M7 fs/v1
- 15-17  M8 vpn mode (stretch)
- 18+    M9 publish → v0.2.0
+ 14-15  M8 fs/v1
+ 16-18  M9 vpn mode (stretch)
+ 19+    M10 publish → v0.2.0
 ```
 
-Adjust for life. Plan is that M4 is usable even if M5+ slips. Budget
-for at least one iroh API migration between M2 and M6 (iroh is
-pre-1.0 and has had breaking changes in nearly every minor release
-during 2024–25).
+Adjust for life. Plan is that M4 (docker adapter) is usable even if
+M5+ slips — external contributors and CI already get a working
+system without any slicer dependency. Budget for at least one iroh
+API migration between M2 and M7 (iroh is pre-1.0 and has had
+breaking changes in nearly every minor release during 2024–25).
 
 ## 4. Explicit non-milestones
 
@@ -247,12 +303,15 @@ For each milestone, a concrete demo/recording is filed:
   typical NAT; second clip showing two LAN peers finding each other
   with no external network.
 - M3: `portl shell + portl tcp` in action.
-- M4: full `portl slicer vm add → shell → delete` cycle.
-- M5: mosh across the internet to a slicer VM, surviving a Wi-Fi
-  switch.
-- M6: ticket revoked mid-session, follow-up attempt rejected within
+- M4: quickstart recording — stranger clones repo, runs `docker
+  compose up`, pastes a ticket, gets a shell into a container.
+  CI e2e workflow running green on every PR.
+- M5: full `portl slicer vm add → shell → delete` cycle.
+- M6: mosh across the internet to a container or slicer VM,
+  surviving a Wi-Fi switch.
+- M7: ticket revoked mid-session, follow-up attempt rejected within
   1 s.
-- M8: `mosh <peer>.portl.local` works with `portl vpn up` and nothing
+- M9: `mosh <peer>.portl.local` works with `portl vpn up` and nothing
   else.
 
 These are the benchmarks for whether a milestone "shipped."

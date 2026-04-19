@@ -32,7 +32,8 @@ portl/
 │       ├── 03-tickets.md
 │       ├── 04-protocols.md
 │       ├── 05-bootstrap.md
-│       ├── 06-slicer.md
+│       ├── 06-docker.md
+│       ├── 06a-slicer.md
 │       ├── 07-security.md
 │       ├── 08-cli.md
 │       ├── 09-config.md
@@ -125,7 +126,18 @@ portl/
 │           └── config.rs
 │
 ├── adapters/
-│   ├── slicer-portl/
+│   ├── docker-portl/                      M4 reference adapter
+│   │   ├── Cargo.toml
+│   │   ├── images/
+│   │   │   └── Dockerfile.reference       <80 MiB agent image
+│   │   └── src/
+│   │       ├── main.rs                    binary: portl-docker-adapter
+│   │       ├── bootstrapper.rs             bollard-backed Bootstrapper impl
+│   │       ├── agent_toml.rs               render config from defaults+flags
+│   │       ├── networking.rs               bridge|host|user-defined dispatch
+│   │       └── subcommands.rs              `portl docker container …` tree
+│   │
+│   ├── slicer-portl/                      M5 adapter (gateway-capable)
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── main.rs                    binary: portl-slicer-adapter
@@ -154,7 +166,8 @@ portl/
     │   ├── revocation.rs
     │   ├── shell_e2e.rs
     │   ├── tcp_e2e.rs
-    │   └── udp_e2e.rs
+    │   ├── udp_e2e.rs
+    │   └── docker_e2e.rs              M4; spins up 2 containers
     └── fuzz/
         ├── ticket_decoder/
         └── frame_parsers/
@@ -169,6 +182,7 @@ members = [
     "crates/portl-core",
     "crates/portl-proto",
     "crates/portl-cli",
+    "adapters/docker-portl",
     "adapters/slicer-portl",
     "adapters/manual-portl",
     # extras/portl-relay is added when (if) iroh-relay can't be used directly
@@ -219,6 +233,11 @@ directories      = "5"
 portable-pty     = "0.8"    # shell
 socket2          = "0.5"    # udp
 tun              = { version = "0.7", optional = true }
+
+# adapters
+bollard          = "0.17"   # docker API (docker-portl)
+reqwest          = { version = "0.12", default-features = false,
+                     features = ["rustls-tls", "json"] }  # slicer-portl
 ```
 
 ## 3. Justfile (task runner)
@@ -304,8 +323,11 @@ portl-<version>-x86_64-apple-darwin.tar.gz
 portl-<version>-aarch64-unknown-linux-musl.tar.gz
 portl-<version>-x86_64-unknown-linux-musl.tar.gz
 
+portl-docker-adapter-<version>-*.tar.gz
 portl-slicer-adapter-<version>-*.tar.gz
 portl-relay-<version>-*.tar.gz
+
+ghcr.io/knickknacklabs/portl-agent:<version>   # reference image (M5+)
 
 SHA256SUMS (signed by the release key)
 ```
@@ -327,14 +349,15 @@ as a separate `share/launchd/com.portl.agent.plist` artifact).
 
 ## 7. Publishing to crates.io
 
-Not until v0.1.0 (after M6). Order:
+Not until v0.1.0 (after M7). Order:
 
 ```
 1.  portl-core
 2.  portl-proto
 3.  portl-cli               # the multicall binary
-4.  slicer-portl
-5.  portl-relay (optional)
+4.  docker-portl
+5.  slicer-portl
+6.  portl-relay (optional)
 ```
 
 Separate repos split only if / when adapters want their own velocity.
@@ -350,7 +373,8 @@ portl               multicall binary                  (both sides)
                       • argv[0] = `portl-agent` → dispatches as
                         `portl agent …` (symlink installed by
                         packagers)
-portl-slicer-adapter  dynamic subcommand plugin        (operator laptop)
+portl-docker-adapter  dynamic subcommand plugin (M4)   (operator laptop)
+portl-slicer-adapter  dynamic subcommand plugin (M5)   (operator laptop)
 portl-relay         relay server (optional)             (public-IP VPS)
 ```
 
@@ -382,6 +406,7 @@ portl-dns           *.portl.local DNS stub (bundled into portl-cli
 | `vpn/v1` (opt-in feature) | `portl-proto::vpn` | `tun` crate, OS-specific |
 | Agent serve loop | `portl-cli::commands::agent::service` | runs ticket/v1 + dispatches ALPNs |
 | Gateway mode | `portl-cli::commands::agent::gateway` | bearer injection for master tix |
+| Docker API client      | `docker-portl` | bollard; M4 reference adapter |
 | Slicer HTTP API client | `slicer-portl` | reqwest + bearer injection |
 | Client state on disk | `portl-cli::config` | tickets + sqlite |
 | Relay (optional) | `portl-relay` | iroh-relay thin wrapper |

@@ -60,13 +60,14 @@ prose still use `node_id`. Treat them as synonymous.
 | 03 | `03-tickets.md` | Ticket URI format, postcard schema, delegation, revocation. |
 | 04 | `04-protocols.md` | Every ALPN with framing and sequence diagrams. |
 | 05 | `05-bootstrap.md` | `Bootstrapper` trait, adapter pattern, lifecycle. |
-| 06 | `06-slicer.md` | The slicer adapter end-to-end. |
+| 06 | `06-docker.md` | The Docker adapter (M4 reference implementation). |
+| 06a | `06a-slicer.md` | The slicer adapter end-to-end (M5). |
 | 07 | `07-security.md` | Threat model, trust, key custody, failure modes. |
 | 08 | `08-cli.md` | Exhaustive CLI reference: `portl` (operator), `portl agent` (target-side), adapters. |
 | 09 | `09-config.md` | Config file formats, on-disk layout, directories, keys. |
 | 10 | `10-walkthroughs.md` | End-to-end example flows with diagrams. |
 | 11 | `11-workspace.md` | Cargo workspace layout, crate boundaries, dependencies. |
-| 12 | `12-roadmap.md` | Milestones M0–M9 with exit criteria. |
+| 12 | `12-roadmap.md` | Milestones M0–M10 with exit criteria (M4 docker, M5 slicer). |
 | 13 | `13-open-questions.md` | Decisions the author wants confirmed before scaffolding. |
 
 Design artifacts for deferred/post-v0.1 work (in `future/`):
@@ -90,8 +91,9 @@ Design artifacts for deferred/post-v0.1 work (in `future/`):
 - **Protocols are ALPNs.** `shell/v1`, `tcp/v1`, `udp/v1` ship at v0.1;
   `fs/v1` is v0.2; `vpn/v1` is a feature-gated stretch. Each a small,
   separately-reviewable module.
-- **Bootstrap is pluggable.** Slicer is one `Bootstrapper` among many
-  (cloud-init, docker, nixos, manual).
+- **Bootstrap is pluggable.** Docker is the M4 reference
+  `Bootstrapper`; slicer lands at M5. Others (cloud-init, nixos,
+  k8s, manual) follow the same pattern.
 - **One binary.** `portl` is a single multicall binary that serves
   both operator and target roles: `portl shell foo` on your laptop,
   `portl agent run` on the target. Packagers ship a
