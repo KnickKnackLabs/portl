@@ -315,6 +315,7 @@ payload.
 ```
 UdpCtlReq {
     preamble,
+    session_id : Bytes(8),   // zero on first attach; echoed on reattach
     // list of local binds the client holds open and wants forwarded
     binds: Array<UdpBind>
 }

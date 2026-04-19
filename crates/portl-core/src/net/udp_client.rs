@@ -10,8 +10,8 @@ use tokio::sync::Mutex;
 
 use crate::wire::StreamPreamble;
 use crate::wire::udp::{
-    ALPN_UDP_V1, MAX_UDP_DATAGRAM_BYTES, UdpBind, UdpCtlReq, UdpCtlResp, UdpDatagram,
-    encode_datagram, udp_error_payload,
+    ALPN_UDP_V1, MAX_UDP_DATAGRAM_BYTES, UdpBind, UdpCtlReq, UdpCtlReqTail, UdpCtlResp,
+    UdpDatagram, encode_datagram, udp_error_payload,
 };
 
 use super::PeerSession;
@@ -102,14 +102,16 @@ pub async fn open_udp(
     requested_session_id: Option<[u8; 8]>,
     binds: Vec<UdpBind>,
 ) -> Result<UdpControl> {
-    let req = UdpCtlReq {
-        preamble: StreamPreamble {
+    let req = UdpCtlReq::new(
+        StreamPreamble {
             peer_token: session.peer_token,
             alpn: String::from_utf8_lossy(ALPN_UDP_V1).into_owned(),
         },
-        session_id: requested_session_id.unwrap_or_default(),
-        binds,
-    };
+        UdpCtlReqTail {
+            session_id: requested_session_id.unwrap_or_default(),
+            binds,
+        },
+    );
     let (mut send, mut recv) = connection.open_bi().await.context("open udp stream")?;
     send.write_all(&postcard::to_stdvec(&req).context("encode udp control request")?)
         .await

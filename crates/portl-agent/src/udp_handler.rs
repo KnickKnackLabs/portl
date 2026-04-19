@@ -17,12 +17,6 @@ pub(crate) struct UdpConnectionContext {
     datagram_pump_started: AtomicBool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct UdpCtlReqBody {
-    session_id: [u8; 8],
-    binds: Vec<portl_proto::udp_v1::UdpBind>,
-}
-
 impl UdpConnectionContext {
     pub(crate) fn new(registry: UdpSessionRegistry) -> Self {
         Self {
@@ -85,14 +79,10 @@ pub(crate) async fn serve_stream(
     connection_ctx: Arc<UdpConnectionContext>,
 ) -> Result<()> {
     let body = recv
-        .read_frame::<UdpCtlReqBody>(MAX_UDP_CTL_REQ_BYTES)
+        .read_frame::<portl_proto::udp_v1::UdpCtlReqTail>(MAX_UDP_CTL_REQ_BYTES)
         .await?
         .context("missing udp control request")?;
-    let req = portl_proto::udp_v1::UdpCtlReq {
-        preamble,
-        session_id: body.session_id,
-        binds: body.binds,
-    };
+    let req = portl_proto::udp_v1::UdpCtlReq::new(preamble, body);
 
     if req.preamble.peer_token != session.peer_token
         || req.preamble.alpn != String::from_utf8_lossy(portl_proto::udp_v1::ALPN_UDP_V1)

@@ -14,6 +14,31 @@ pub struct UdpCtlReq {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UdpCtlReqTail {
+    pub session_id: [u8; 8],
+    pub binds: Vec<UdpBind>,
+}
+
+impl UdpCtlReq {
+    #[must_use]
+    pub fn new(preamble: StreamPreamble, tail: UdpCtlReqTail) -> Self {
+        Self {
+            preamble,
+            session_id: tail.session_id,
+            binds: tail.binds,
+        }
+    }
+
+    #[must_use]
+    pub fn tail(&self) -> UdpCtlReqTail {
+        UdpCtlReqTail {
+            session_id: self.session_id,
+            binds: self.binds.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UdpBind {
     pub local_port_range: (u16, u16),
     pub target_host: String,
@@ -54,27 +79,46 @@ pub fn datagram_fits(datagram: &UdpDatagram) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ALPN_UDP_V1, UdpBind, UdpCtlReq, UdpCtlResp, UdpDatagram, datagram_fits, udp_error_payload,
+        ALPN_UDP_V1, UdpBind, UdpCtlReq, UdpCtlReqTail, UdpCtlResp, UdpDatagram, datagram_fits,
+        udp_error_payload,
     };
     use crate::wire::StreamPreamble;
 
     #[test]
     fn udp_ctl_req_roundtrips_via_postcard() {
-        let value = UdpCtlReq {
-            preamble: StreamPreamble {
+        let value = UdpCtlReq::new(
+            StreamPreamble {
                 peer_token: [9; 16],
                 alpn: String::from_utf8_lossy(ALPN_UDP_V1).into_owned(),
             },
-            session_id: [7; 8],
-            binds: vec![UdpBind {
-                local_port_range: (6000, 6000),
-                target_host: "127.0.0.1".to_owned(),
-                target_port_range: (6001, 6001),
-            }],
-        };
+            UdpCtlReqTail {
+                session_id: [7; 8],
+                binds: vec![UdpBind {
+                    local_port_range: (6000, 6000),
+                    target_host: "127.0.0.1".to_owned(),
+                    target_port_range: (6001, 6001),
+                }],
+            },
+        );
 
         let encoded = postcard::to_stdvec(&value).expect("encode udp ctl req");
         let decoded: UdpCtlReq = postcard::from_bytes(&encoded).expect("decode udp ctl req");
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn udp_ctl_req_tail_roundtrips_via_postcard() {
+        let value = UdpCtlReqTail {
+            session_id: [4; 8],
+            binds: vec![UdpBind {
+                local_port_range: (7000, 7000),
+                target_host: "localhost".to_owned(),
+                target_port_range: (7001, 7001),
+            }],
+        };
+
+        let encoded = postcard::to_stdvec(&value).expect("encode udp ctl tail");
+        let decoded: UdpCtlReqTail = postcard::from_bytes(&encoded).expect("decode udp ctl tail");
         assert_eq!(decoded, value);
     }
 
