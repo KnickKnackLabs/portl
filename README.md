@@ -96,8 +96,9 @@ The running agent exposes OpenMetrics on a local unix socket at
 curl --unix-socket $PORTL_HOME/metrics.sock http://metrics/
 ```
 
-Counters cover ticket accept/reject rates (with reason labels),
-stream opens per ALPN, and active resource counts.
+Counters cover ticket accept/reject rates (with reason labels)
+and stream opens per ALPN. Byte-counter series are scheduled for
+v0.2.
 
 `portl doctor` runs a local diagnostic sweep: wall-clock sanity,
 identity file + permissions, UDP ephemeral bind, and ticket-expiry

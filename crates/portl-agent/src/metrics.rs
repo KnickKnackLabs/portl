@@ -28,11 +28,6 @@ pub struct AckReasonLabel {
     pub reason: String,
 }
 
-#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
-pub struct AlpnLabel {
-    pub alpn: String,
-}
-
 pub struct Metrics {
     registry: Registry,
     pub tickets_accepted: Counter,
@@ -40,7 +35,6 @@ pub struct Metrics {
     pub shell_sessions_opened: Counter,
     pub tcp_streams_opened: Counter,
     pub udp_sessions_opened: Counter,
-    pub bytes_forwarded_total: Family<AlpnLabel, Counter>,
     pub active_connections: Gauge,
     pub active_udp_sessions: Gauge,
 }
@@ -84,13 +78,6 @@ impl Default for Metrics {
             udp_sessions_opened.clone(),
         );
 
-        let bytes_forwarded_total = Family::<AlpnLabel, Counter>::default();
-        registry.register(
-            "bytes_forwarded",
-            "Total bytes forwarded per ALPN",
-            bytes_forwarded_total.clone(),
-        );
-
         let active_connections = Gauge::default();
         registry.register(
             "active_connections",
@@ -112,7 +99,6 @@ impl Default for Metrics {
             shell_sessions_opened,
             tcp_streams_opened,
             udp_sessions_opened,
-            bytes_forwarded_total,
             active_connections,
             active_udp_sessions,
         }

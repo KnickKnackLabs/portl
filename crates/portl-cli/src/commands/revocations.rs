@@ -5,10 +5,18 @@
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use portl_core::id::store;
 use portl_proto::meta_v1::{MetaReq, MetaResp};
+use tokio::time::timeout;
+
+/// Matches the agent-side `MAX_PUBLISH_ITEMS` guardrail in
+/// `crates/portl-agent/src/meta_handler.rs`.
+const MAX_PUBLISH_BATCH: usize = 1000;
+/// Wall-clock budget per per-peer publish request.
+const PUBLISH_TIMEOUT: Duration = Duration::from_secs(10);
 
 use portl_core::ticket::schema::{Capabilities, MetaCaps};
 
@@ -96,18 +104,51 @@ async fn push_to_peer(
     endpoint: &iroh::Endpoint,
     items: &[Vec<u8>],
 ) -> Result<(u32, Vec<(Vec<u8>, String)>)> {
-    let connected =
-        connect_peer_with_endpoint(peer, publish_meta_caps(), identity, endpoint).await?;
+    let connected = timeout(
+        PUBLISH_TIMEOUT,
+        connect_peer_with_endpoint(peer, publish_meta_caps(), identity, endpoint),
+    )
+    .await
+    .with_context(|| format!("ticket handshake to {peer} timed out"))??;
+    let connection = connected.connection.clone();
+    let peer_token = connected.session.peer_token;
+    let _guard = ConnectionClose {
+        connection: connection.clone(),
+        reason: b"publish done",
+    };
 
-    let (mut send, mut recv) = connected
-        .connection
-        .open_bi()
+    // Agents cap each PublishRevocations batch at 1000 records. Chunk
+    // so operators with thousands of stored revocations can still
+    // ship the whole set without exceeding the 64 KiB meta frame.
+    let mut accepted_total: u32 = 0;
+    let mut rejected_total: Vec<(Vec<u8>, String)> = Vec::new();
+    for chunk in items.chunks(MAX_PUBLISH_BATCH) {
+        match timeout(
+            PUBLISH_TIMEOUT,
+            publish_chunk(&connection, peer_token, chunk),
+        )
         .await
-        .context("open meta/v1 stream")?;
+        {
+            Ok(Ok((accepted, rejected))) => {
+                accepted_total = accepted_total.saturating_add(accepted);
+                rejected_total.extend(rejected);
+            }
+            Ok(Err(err)) => return Err(err),
+            Err(_) => return Err(anyhow!("publish request to {peer} timed out")),
+        }
+    }
+    Ok((accepted_total, rejected_total))
+}
 
-    // Stream preamble: the peer_token authenticates this sub-stream.
+async fn publish_chunk(
+    connection: &iroh::endpoint::Connection,
+    peer_token: [u8; 16],
+    items: &[Vec<u8>],
+) -> Result<(u32, Vec<(Vec<u8>, String)>)> {
+    let (mut send, mut recv) = connection.open_bi().await.context("open meta/v1 stream")?;
+
     let preamble = portl_core::wire::StreamPreamble {
-        peer_token: connected.session.peer_token,
+        peer_token,
         alpn: String::from_utf8_lossy(portl_proto::meta_v1::ALPN_META_V1).into_owned(),
     };
     let pre_bytes = postcard::to_stdvec(&preamble).context("encode preamble")?;
@@ -127,11 +168,21 @@ async fn push_to_peer(
         .await
         .context("read publish response")?;
     let resp: MetaResp = postcard::from_bytes(&raw).context("decode publish response")?;
-    connected.connection.close(0u32.into(), b"publish done");
     match resp {
         MetaResp::PublishedRevocations { accepted, rejected } => Ok((accepted, rejected)),
         MetaResp::Error(err) => Err(anyhow!("peer returned error: {}", err.message)),
         other => Err(anyhow!("unexpected response: {other:?}")),
+    }
+}
+
+struct ConnectionClose {
+    connection: iroh::endpoint::Connection,
+    reason: &'static [u8],
+}
+
+impl Drop for ConnectionClose {
+    fn drop(&mut self) {
+        self.connection.close(0u32.into(), self.reason);
     }
 }
 
