@@ -39,6 +39,7 @@ humantime   = { workspace = true }
 n0-future   = { workspace = true }
 
 [dev-dependencies]
+portl-core = { version = "0.0.1", path = "../portl-core", features = ["test-util"] }
 assert_cmd = { workspace = true }
 tempfile   = { workspace = true }
 iroh-tickets = { workspace = true }

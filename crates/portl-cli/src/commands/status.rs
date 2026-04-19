@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -17,9 +18,14 @@ use portl_proto::wire::StreamPreamble;
 use serde::{Deserialize, Serialize};
 
 pub fn run(peer: &str) -> Result<ExitCode> {
+    run_with_identity_path(peer, None)
+}
+
+pub fn run_with_identity_path(peer: &str, identity_path: Option<&Path>) -> Result<ExitCode> {
     let runtime = tokio::runtime::Runtime::new()?;
+    let identity_path = resolve_identity_path(identity_path);
     runtime.block_on(async move {
-        let identity = store::load(&store::default_path()).context("load local identity")?;
+        let identity = store::load(&identity_path).context("load local identity")?;
         let raw_endpoint =
             portl_agent::endpoint::bind(&portl_agent::AgentConfig::default(), &identity)
                 .await
@@ -32,9 +38,10 @@ pub fn run(peer: &str) -> Result<ExitCode> {
             .context("run ticket handshake")?;
         let rtt = ping(&connection, &session).await?;
         let info = info(&connection, &session).await?;
+        let path = path_label(&connection);
         print_status(
             connection.remote_id(),
-            path_label(&connection),
+            &path,
             rtt,
             &resolved.discovery,
             &info,
@@ -99,7 +106,7 @@ async fn resolve_endpoint_addr(
                 let provenance = item.provenance().to_owned();
                 return Ok((item.into_endpoint_addr(), provenance));
             }
-            Ok(Err(_)) => continue,
+            Ok(Err(_)) => {}
             Err(AddressLookupFailed::NoServiceConfigured { .. }) => {
                 bail!("no discovery services configured")
             }
@@ -206,12 +213,11 @@ fn path_label(connection: &Connection) -> String {
     let path = connection
         .paths()
         .into_iter()
-        .find(|path| path.is_selected())
+        .find(iroh::endpoint::PathInfo::is_selected)
         .or_else(|| connection.paths().into_iter().next());
     match path.map(|path| path.remote_addr().clone()) {
         Some(TransportAddr::Relay(url)) => format!("relay {url}"),
-        Some(_) => "direct".to_owned(),
-        None => "direct".to_owned(),
+        Some(_) | None => "direct".to_owned(),
     }
 }
 
@@ -224,7 +230,7 @@ fn normalize_discovery_source(source: &str) -> String {
 
 fn print_status(
     endpoint_id: EndpointId,
-    path: String,
+    path: &str,
     rtt: std::time::Duration,
     discovery: &str,
     info: &InfoView,
@@ -243,13 +249,20 @@ fn print_status(
     println!("{:<18}{}", "os:", info.os);
 }
 
+fn resolve_identity_path(explicit: Option<&Path>) -> PathBuf {
+    explicit
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("PORTL_IDENTITY_KEY").map(PathBuf::from))
+        .unwrap_or_else(store::default_path)
+}
+
 fn unix_now_micros() -> Result<u64> {
-    Ok(SystemTime::now()
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before unix epoch")?
         .as_micros()
         .try_into()
-        .context("micros overflow u64")?)
+        .context("micros overflow u64")
 }
 
 #[derive(Debug)]

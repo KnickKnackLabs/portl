@@ -39,6 +39,8 @@ pub async fn open_ticket_v1(
     chain: &[PortlTicket],
     identity: &Identity,
 ) -> Result<(Connection, PeerSession)> {
+    endpoint.inner().online().await;
+
     let connection = endpoint
         .inner()
         .connect(ticket.addr.clone(), portl_alpn::ALPN_TICKET_V1)

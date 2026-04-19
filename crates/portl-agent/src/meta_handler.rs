@@ -41,18 +41,16 @@ pub(crate) async fn serve_stream(
 
     let response = match envelope.req {
         portl_proto::meta_v1::MetaReq::Ping { .. } => {
-            if !meta_caps(session).is_some_and(|caps| caps.ping) {
-                cap_denied("meta ping not allowed")
-            } else {
+            if meta_caps(session).is_some_and(|caps| caps.ping) {
                 portl_proto::meta_v1::MetaResp::Pong {
                     t_server_us: unix_now_micros()?,
                 }
+            } else {
+                cap_denied("meta ping not allowed")
             }
         }
         portl_proto::meta_v1::MetaReq::Info => {
-            if !meta_caps(session).is_some_and(|caps| caps.info) {
-                cap_denied("meta info not allowed")
-            } else {
+            if meta_caps(session).is_some_and(|caps| caps.info) {
                 portl_proto::meta_v1::MetaResp::Info {
                     agent_version: env!("CARGO_PKG_VERSION").to_owned(),
                     supported_alpns: vec![
@@ -64,6 +62,8 @@ pub(crate) async fn serve_stream(
                     os: std::env::consts::OS.to_owned(),
                     tags: Vec::new(),
                 }
+            } else {
+                cap_denied("meta info not allowed")
             }
         }
         portl_proto::meta_v1::MetaReq::PublishRevocations { .. } => {
@@ -96,12 +96,12 @@ fn cap_denied(message: &str) -> portl_proto::meta_v1::MetaResp {
 }
 
 fn unix_now_micros() -> Result<u64> {
-    Ok(SystemTime::now()
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before unix epoch")?
         .as_micros()
         .try_into()
-        .context("micros overflow u64")?)
+        .context("micros overflow u64")
 }
 
 fn hostname() -> String {

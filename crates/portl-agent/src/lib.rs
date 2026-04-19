@@ -35,18 +35,20 @@ pub(crate) struct AgentState {
 #[instrument(skip_all)]
 pub async fn run(cfg: AgentConfig) -> Result<()> {
     let state = Arc::new(AgentState {
-        trust_roots: TrustRoots(HashSet::from_iter(cfg.trust_roots.iter().copied())),
+        trust_roots: TrustRoots(cfg.trust_roots.iter().copied().collect::<HashSet<_>>()),
         revocations: RevocationSet::load(revocations_path(&cfg))?,
         rate_limit: OfferRateLimiter::new(&cfg.rate_limit)?,
         started_at: Instant::now(),
     });
 
-    let endpoint = match cfg.endpoint.clone() {
-        Some(endpoint) => endpoint.inner().clone(),
-        None => {
-            let identity = load_identity(&cfg)?;
-            endpoint::bind(&cfg, &identity).await?
-        }
+    let endpoint = if let Some(endpoint) = cfg.endpoint.clone() {
+        endpoint
+            .inner()
+            .set_alpns(vec![portl_proto::ticket_v1::ALPN_TICKET_V1.to_vec()]);
+        endpoint.inner().clone()
+    } else {
+        let identity = load_identity(&cfg)?;
+        endpoint::bind(&cfg, &identity).await?
     };
 
     while let Some(incoming) = endpoint.accept().await {

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use iroh_base::RelayUrl;
 use portl_core::endpoint::Endpoint;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AgentConfig {
     pub identity_path: Option<PathBuf>,
     pub bind_addr: Option<SocketAddr>,
@@ -14,20 +14,6 @@ pub struct AgentConfig {
     pub rate_limit: RateLimitConfig,
     #[doc(hidden)]
     pub endpoint: Option<Endpoint>,
-}
-
-impl Default for AgentConfig {
-    fn default() -> Self {
-        Self {
-            identity_path: None,
-            bind_addr: None,
-            discovery: DiscoveryConfig::default(),
-            trust_roots: Vec::new(),
-            revocations_path: None,
-            rate_limit: RateLimitConfig::default(),
-            endpoint: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

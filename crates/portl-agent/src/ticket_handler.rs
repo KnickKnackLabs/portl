@@ -30,7 +30,7 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
     let source_ip = source_ip(&connection);
 
     let outcome = match postcard::from_bytes::<portl_proto::ticket_v1::TicketOffer>(&offer_bytes) {
-        Ok(offer) => evaluate_offer(AcceptanceInput {
+        Ok(offer) => evaluate_offer(&AcceptanceInput {
             offer: &offer,
             source_ip,
             trust_roots: &state.trust_roots,
@@ -53,7 +53,7 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
                 ok: true,
                 reason: None,
                 peer_token: Some(*peer_token),
-                effective_caps: Some(caps.clone()),
+                effective_caps: Some((**caps).clone()),
                 server_time: unix_now_secs()?,
             };
             let bytes = postcard::to_stdvec(&ack).context("encode accepted ack")?;
@@ -61,7 +61,7 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
             send.finish().context("finish accepted ack")?;
             Some(Session {
                 peer_token: *peer_token,
-                caps: caps.clone(),
+                caps: (**caps).clone(),
                 ticket_id: *ticket_id,
             })
         }
@@ -81,6 +81,7 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
     };
 
     let Some(session) = maybe_session else {
+        connection.closed().await;
         return Ok(());
     };
 
@@ -110,7 +111,7 @@ fn source_ip(connection: &Connection) -> IpAddr {
     connection
         .paths()
         .into_iter()
-        .find(|path| path.is_selected())
+        .find(iroh::endpoint::PathInfo::is_selected)
         .or_else(|| connection.paths().into_iter().next())
         .and_then(|path| match path.remote_addr() {
             TransportAddr::Ip(addr) => Some(addr.ip()),

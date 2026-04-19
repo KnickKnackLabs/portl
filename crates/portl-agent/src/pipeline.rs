@@ -30,7 +30,7 @@ pub struct AcceptanceInput<'a> {
 pub enum AcceptanceOutcome {
     Accepted {
         peer_token: [u8; 16],
-        caps: Capabilities,
+        caps: Box<Capabilities>,
         ticket_id: [u8; 16],
     },
     Rejected {
@@ -38,25 +38,23 @@ pub enum AcceptanceOutcome {
     },
 }
 
-pub fn evaluate_offer(input: AcceptanceInput<'_>) -> AcceptanceOutcome {
+pub fn evaluate_offer(input: &AcceptanceInput<'_>) -> AcceptanceOutcome {
     if !input.rate_limit.check(input.source_ip) {
         return reject(AckReason::RateLimited);
     }
 
-    let terminal = match portl_core::ticket::decode(&input.offer.ticket) {
-        Ok(ticket) => ticket,
-        Err(_) => return reject(AckReason::BadSignature),
+    let Ok(terminal) = portl_core::ticket::decode(&input.offer.ticket) else {
+        return reject(AckReason::BadSignature);
     };
 
-    let chain = match input
+    let Ok(chain) = input
         .offer
         .chain
         .iter()
         .map(|bytes| portl_core::ticket::decode(bytes))
         .collect::<portl_core::error::Result<Vec<_>>>()
-    {
-        Ok(chain) => chain,
-        Err(_) => return reject(AckReason::BadSignature),
+    else {
+        return reject(AckReason::BadSignature);
     };
 
     let caps = match verify_chain_without_time(&terminal, &chain, input.trust_roots) {
@@ -82,7 +80,7 @@ pub fn evaluate_offer(input: AcceptanceInput<'_>) -> AcceptanceOutcome {
 
     AcceptanceOutcome::Accepted {
         peer_token: rand::random(),
-        caps,
+        caps: Box::new(caps),
         ticket_id: ticket_id(&terminal.sig),
     }
 }
@@ -180,9 +178,7 @@ fn check_validity_windows(
 }
 
 fn check_proof(terminal: &PortlTicket, offer: &TicketOffer) -> Option<AckReason> {
-    let Some(holder) = terminal.body.to else {
-        return None;
-    };
+    let holder = terminal.body.to?;
     let Some(proof) = offer.proof.as_ref() else {
         return Some(AckReason::ProofMissing);
     };

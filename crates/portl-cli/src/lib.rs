@@ -9,6 +9,8 @@
 
 mod commands;
 
+pub use commands::status::run_with_identity_path as run_status_with_identity_path;
+
 use std::{ffi::OsString, path::Path, path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand, ValueEnum};

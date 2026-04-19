@@ -14,7 +14,7 @@ use portl_proto::ticket_v1::{AckReason, TicketOffer};
 use tempfile::tempdir;
 
 const NOW: u64 = 1_735_689_600;
-const SOURCE_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+const SOURCE_IP: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 struct AllowAll;
 
@@ -45,7 +45,7 @@ fn accepts_valid_root_ticket() {
             ticket_id: id,
             ..
         } => {
-            assert_eq!(caps, meta_caps(true, true));
+            assert_eq!(*caps, meta_caps(true, true));
             assert_eq!(id, ticket_id(&ticket.sig));
         }
         AcceptanceOutcome::Rejected { reason } => panic!("unexpected rejection: {reason:?}"),
@@ -60,7 +60,7 @@ fn rejects_bad_signature() {
 
     let outcome = fixture.evaluate(&offer(&ticket, &[], None), &AllowAll);
 
-    assert_rejected(outcome, AckReason::BadSignature);
+    assert_rejected(outcome, &AckReason::BadSignature);
 }
 
 #[test]
@@ -79,7 +79,7 @@ fn rejects_bad_chain() {
 
     let outcome = fixture.evaluate(&offer(&child, &[], None), &AllowAll);
 
-    assert_rejected(outcome, AckReason::BadChain);
+    assert_rejected(outcome, &AckReason::BadChain);
 }
 
 #[test]
@@ -110,7 +110,7 @@ fn rejects_caps_exceed_parent() {
 
     let outcome = fixture.evaluate(&offer(&child, &[root], None), &AllowAll);
 
-    assert_rejected(outcome, AckReason::CapsExceedParent);
+    assert_rejected(outcome, &AckReason::CapsExceedParent);
 }
 
 #[test]
@@ -120,7 +120,7 @@ fn rejects_not_yet_valid_ticket() {
 
     let outcome = fixture.evaluate(&offer(&ticket, &[], None), &AllowAll);
 
-    assert_rejected(outcome, AckReason::NotYetValid);
+    assert_rejected(outcome, &AckReason::NotYetValid);
 }
 
 #[test]
@@ -130,7 +130,7 @@ fn rejects_expired_ticket() {
 
     let outcome = fixture.evaluate(&offer(&ticket, &[], None), &AllowAll);
 
-    assert_rejected(outcome, AckReason::Expired);
+    assert_rejected(outcome, &AckReason::Expired);
 }
 
 #[test]
@@ -142,7 +142,7 @@ fn rejects_revoked_ticket() {
     let outcome =
         fixture.evaluate_with_revocations(&offer(&ticket, &[], None), &AllowAll, &revocations);
 
-    assert_rejected(outcome, AckReason::Revoked);
+    assert_rejected(outcome, &AckReason::Revoked);
 }
 
 #[test]
@@ -158,7 +158,7 @@ fn rejects_missing_proof_for_bound_ticket() {
 
     let outcome = fixture.evaluate(&offer(&ticket, &[], None), &AllowAll);
 
-    assert_rejected(outcome, AckReason::ProofMissing);
+    assert_rejected(outcome, &AckReason::ProofMissing);
 }
 
 #[test]
@@ -179,7 +179,7 @@ fn rejects_invalid_proof() {
         &AllowAll,
     );
 
-    assert_rejected(outcome, AckReason::ProofInvalid);
+    assert_rejected(outcome, &AckReason::ProofInvalid);
 }
 
 #[test]
@@ -189,13 +189,13 @@ fn rejects_rate_limited_source() {
 
     let outcome = fixture.evaluate(&offer(&ticket, &[], None), &DenyAll);
 
-    assert_rejected(outcome, AckReason::RateLimited);
+    assert_rejected(outcome, &AckReason::RateLimited);
 }
 
-fn assert_rejected(outcome: AcceptanceOutcome, expected: AckReason) {
+fn assert_rejected(outcome: AcceptanceOutcome, expected: &AckReason) {
     match outcome {
         AcceptanceOutcome::Accepted { .. } => panic!("expected rejection"),
-        AcceptanceOutcome::Rejected { reason } => assert_eq!(reason, expected),
+        AcceptanceOutcome::Rejected { reason } => assert_eq!(&reason, expected),
     }
 }
 
@@ -293,7 +293,7 @@ impl Fixture {
         rate_limit: &dyn RateLimitGate,
         revocations: &RevocationSet,
     ) -> AcceptanceOutcome {
-        evaluate_offer(AcceptanceInput {
+        evaluate_offer(&AcceptanceInput {
             offer,
             source_ip: SOURCE_IP,
             trust_roots: &self.trust_roots,
