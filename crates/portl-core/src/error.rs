@@ -39,6 +39,10 @@ pub enum PortlError {
     #[error("clock: {0}")]
     Clock(&'static str),
 
+    /// age encryption / decryption error while exporting/importing identity.
+    #[error("age: {0}")]
+    Age(String),
+
     /// Filesystem or I/O error while touching on-disk identity.
     #[error("i/o: {0}")]
     Io(#[from] std::io::Error),
