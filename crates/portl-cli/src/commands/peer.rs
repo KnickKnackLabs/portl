@@ -13,6 +13,8 @@ use portl_core::net::{PeerSession, open_ticket_v1};
 use portl_core::ticket::mint::mint_root;
 use portl_core::ticket::schema::{Capabilities, PortlTicket};
 
+use crate::alias_store::AliasStore;
+
 pub(crate) struct ConnectedPeer {
     pub(crate) endpoint: iroh::Endpoint,
     pub(crate) connection: Connection,
@@ -54,7 +56,11 @@ async fn resolve_peer_ticket(
         return Ok(ticket);
     }
 
-    let endpoint_id = parse_endpoint_id(peer)?;
+    let endpoint_id = if let Some(alias) = AliasStore::default().get(peer)? {
+        parse_endpoint_id(&alias.endpoint_id)?
+    } else {
+        parse_endpoint_id(peer)?
+    };
     let addr = resolve_endpoint_addr(endpoint, endpoint_id).await?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

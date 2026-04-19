@@ -54,7 +54,7 @@ pub fn run(
     Ok(ExitCode::SUCCESS)
 }
 
-fn parse_caps(spec: &str) -> Result<Capabilities> {
+pub(crate) fn parse_caps(spec: &str) -> Result<Capabilities> {
     if spec == "all" {
         return Ok(all_caps());
     }
@@ -188,7 +188,7 @@ fn sort_and_validate_rules(rules: &mut [PortRule]) -> Result<()> {
     Ok(())
 }
 
-fn parse_ttl(spec: &str) -> Result<u64> {
+pub(crate) fn parse_ttl(spec: &str) -> Result<u64> {
     let (value, unit) = spec.split_at(spec.len().checked_sub(1).context("ttl is empty")?);
     let value = value
         .parse::<u64>()
@@ -210,7 +210,7 @@ fn parse_endpoint_addr(spec: &str) -> Result<EndpointAddr> {
     Ok(EndpointAddr::new(endpoint_id))
 }
 
-fn parse_endpoint_bytes(spec: &str) -> Result<[u8; 32]> {
+pub(crate) fn parse_endpoint_bytes(spec: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(spec).context("endpoint id must be hex")?;
     let bytes: [u8; 32] = bytes
         .try_into()

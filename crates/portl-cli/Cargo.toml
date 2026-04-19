@@ -18,12 +18,14 @@ path = "src/main.rs"
 [dependencies]
 portl-core  = { version = "0.0.1", path = "../portl-core" }
 portl-proto = { version = "0.0.1", path = "../portl-proto" }
-portl-agent = { version = "0.0.1", path = "../portl-agent" }
-clap        = { workspace = true }
+portl-agent  = { version = "0.0.1", path = "../portl-agent" }
+docker-portl = { version = "0.0.1", path = "../../adapters/docker-portl" }
+clap         = { workspace = true }
 tokio       = { workspace = true }
 anyhow      = { workspace = true }
 thiserror   = { workspace = true }
 serde       = { workspace = true }
+serde_json  = { workspace = true }
 postcard    = { workspace = true }
 tracing     = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -38,6 +40,7 @@ zeroize     = { workspace = true }
 humantime   = { workspace = true }
 n0-future   = { workspace = true }
 crossterm   = { workspace = true }
+rusqlite    = { workspace = true }
 
 [dev-dependencies]
 portl-core = { version = "0.0.1", path = "../portl-core", features = ["test-util"] }

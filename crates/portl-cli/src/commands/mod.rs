@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod docker;
 pub mod exec;
 pub mod id;
 pub mod mint_root;

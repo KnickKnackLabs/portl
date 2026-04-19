@@ -7,6 +7,7 @@
 //! on a structured [`Command`] value without caring about
 //! stdout, exit codes, or process setup.
 
+mod alias_store;
 mod commands;
 
 pub use commands::agent::run::load_config as load_agent_config;
@@ -21,9 +22,13 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// `portl agent run` (or its `portl-agent run` symlink form).
-    AgentRun { config: Option<PathBuf> },
+    AgentRun {
+        config: Option<PathBuf>,
+    },
     /// `portl id new [--force]`
-    IdNew { force: bool },
+    IdNew {
+        force: bool,
+    },
     /// `portl id show`
     IdShow,
     /// `portl id export --out <path> [--passphrase-cmd <cmd>]`
@@ -47,7 +52,9 @@ pub enum Command {
         print: MintRootPrint,
     },
     /// `portl status <peer>`
-    Status { peer: String },
+    Status {
+        peer: String,
+    },
     /// `portl shell <peer>`
     Shell {
         peer: String,
@@ -62,7 +69,36 @@ pub enum Command {
         argv: Vec<String>,
     },
     /// `portl tcp <peer> -L ...`
-    Tcp { peer: String, local: Vec<String> },
+    Tcp {
+        peer: String,
+        local: Vec<String>,
+    },
+    /// `portl docker container add ...`
+    DockerAdd {
+        name: String,
+        image: Option<String>,
+        network: Option<String>,
+        agent_caps: String,
+        ttl: String,
+        to: Option<String>,
+        labels: Vec<String>,
+    },
+    DockerList {
+        json: bool,
+    },
+    DockerRm {
+        name: String,
+        force: bool,
+        keep_tickets: bool,
+    },
+    DockerRebuild {
+        name: String,
+    },
+    DockerLogs {
+        name: String,
+        follow: bool,
+        tail: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -151,6 +187,33 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             argv,
         } => commands::exec::run(&peer, cwd.as_deref(), user.as_deref(), &argv),
         Command::Tcp { peer, local } => commands::tcp::run(&peer, &local),
+        Command::DockerAdd {
+            name,
+            image,
+            network,
+            agent_caps,
+            ttl,
+            to,
+            labels,
+        } => commands::docker::add(
+            &name,
+            image.as_deref(),
+            network.as_deref(),
+            &agent_caps,
+            &ttl,
+            to.as_deref(),
+            &labels,
+        ),
+        Command::DockerList { json } => commands::docker::list(json),
+        Command::DockerRm {
+            name,
+            force,
+            keep_tickets,
+        } => commands::docker::rm(&name, force, keep_tickets),
+        Command::DockerRebuild { name } => commands::docker::rebuild(&name),
+        Command::DockerLogs { name, follow, tail } => {
+            commands::docker::logs(&name, follow, tail.as_deref())
+        }
     }
 }
 
@@ -227,6 +290,11 @@ enum TopLevel {
         #[arg(short = 'L', required = true)]
         local: Vec<String>,
     },
+    /// Docker target management.
+    Docker {
+        #[command(subcommand)]
+        action: DockerAction,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -235,6 +303,54 @@ enum AgentAction {
     Run {
         #[arg(long)]
         config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DockerAction {
+    Container {
+        #[command(subcommand)]
+        action: DockerContainerAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DockerContainerAction {
+    Add {
+        name: String,
+        #[arg(long)]
+        image: Option<String>,
+        #[arg(long)]
+        network: Option<String>,
+        #[arg(long = "agent-caps", default_value = "shell")]
+        agent_caps: String,
+        #[arg(long, default_value = "30d")]
+        ttl: String,
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long = "label")]
+        labels: Vec<String>,
+    },
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    Rm {
+        name: String,
+        #[arg(long)]
+        force: bool,
+        #[arg(long = "keep-tickets")]
+        keep_tickets: bool,
+    },
+    Rebuild {
+        name: String,
+    },
+    Logs {
+        name: String,
+        #[arg(long)]
+        follow: bool,
+        #[arg(long)]
+        tail: Option<String>,
     },
 }
 
@@ -328,6 +444,62 @@ impl Cli {
                 argv,
             },
             TopLevel::Tcp { peer, local } => Command::Tcp { peer, local },
+            TopLevel::Docker {
+                action:
+                    DockerAction::Container {
+                        action:
+                            DockerContainerAction::Add {
+                                name,
+                                image,
+                                network,
+                                agent_caps,
+                                ttl,
+                                to,
+                                labels,
+                            },
+                    },
+            } => Command::DockerAdd {
+                name,
+                image,
+                network,
+                agent_caps,
+                ttl,
+                to,
+                labels,
+            },
+            TopLevel::Docker {
+                action:
+                    DockerAction::Container {
+                        action: DockerContainerAction::List { json },
+                    },
+            } => Command::DockerList { json },
+            TopLevel::Docker {
+                action:
+                    DockerAction::Container {
+                        action:
+                            DockerContainerAction::Rm {
+                                name,
+                                force,
+                                keep_tickets,
+                            },
+                    },
+            } => Command::DockerRm {
+                name,
+                force,
+                keep_tickets,
+            },
+            TopLevel::Docker {
+                action:
+                    DockerAction::Container {
+                        action: DockerContainerAction::Rebuild { name },
+                    },
+            } => Command::DockerRebuild { name },
+            TopLevel::Docker {
+                action:
+                    DockerAction::Container {
+                        action: DockerContainerAction::Logs { name, follow, tail },
+                    },
+            } => Command::DockerLogs { name, follow, tail },
         }
     }
 }

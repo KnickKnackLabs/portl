@@ -75,6 +75,7 @@ humantime   = "2"
 nix         = { version = "0.30", features = ["process", "signal", "user"] }
 async-trait = "0.1"
 bollard     = "0.17"
+rusqlite    = { version = "0.32", features = ["bundled"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
