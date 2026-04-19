@@ -12,6 +12,13 @@ pub struct UserdataContext<'a> {
 }
 
 pub fn render(context: &UserdataContext<'_>) -> Result<String> {
+    validate_safe("secret_name", context.secret_name)?;
+    validate_safe("portl_release_url", context.portl_release_url)?;
+    validate_safe("operator_pubkey", context.operator_pubkey)?;
+    if let Some(relay) = context.relay_list.first() {
+        validate_safe("relay", relay)?;
+    }
+
     let mut rendered = TEMPLATE.to_owned();
     for (needle, replacement) in [
         ("{{SECRET_NAME}}", context.secret_name.to_owned()),
@@ -33,6 +40,15 @@ pub fn render(context: &UserdataContext<'_>) -> Result<String> {
         .context("validate rendered agent config TOML")?;
 
     Ok(rendered)
+}
+
+fn validate_safe(name: &str, value: &str) -> Result<()> {
+    for c in value.chars() {
+        if !c.is_ascii_alphanumeric() && !matches!(c, '_' | '-' | '.' | '/' | ':' | '=') {
+            bail!("unsafe character {c:?} in {name} value {value:?}");
+        }
+    }
+    Ok(())
 }
 
 fn relay_line(relay_list: &[String]) -> String {
@@ -73,6 +89,18 @@ mod tests {
         assert!(rendered.contains("relay = \"https://relay.example.invalid\""));
         assert!(rendered.contains("0123456789abcdef0123456789abcdef"));
         assert!(!rendered.contains("{{"));
+    }
+
+    #[test]
+    fn render_rejects_unsafe_shell_substitutions() {
+        let err = render(&UserdataContext {
+            secret_name: "portl-demo$(whoami)",
+            portl_release_url: "example.invalid/releases",
+            relay_list: &[],
+            operator_pubkey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        })
+        .expect_err("unsafe shell substitution must be rejected");
+        assert!(err.to_string().contains("unsafe character"));
     }
 
     #[test]
