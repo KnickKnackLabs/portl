@@ -1,12 +1,12 @@
 use anyhow::{Context, Result, bail};
 use iroh::endpoint::Connection;
-use serde::{Deserialize, Serialize};
 
 use crate::endpoint::Endpoint;
 use crate::id::Identity;
 use crate::ticket::hash::ticket_id;
 use crate::ticket::offer::compute_pop_sig;
 use crate::ticket::schema::{Capabilities, PortlTicket};
+use crate::wire::{AckReason, TicketAck, TicketOffer};
 
 const MAX_ACK_BYTES: usize = 64 * 1024;
 
@@ -96,67 +96,6 @@ pub async fn open_ticket_v1(
     ))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct TicketOffer {
-    ticket: Vec<u8>,
-    chain: Vec<Vec<u8>>,
-    #[serde(with = "option_signature_bytes")]
-    proof: Option<[u8; 64]>,
-    client_nonce: [u8; 16],
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct TicketAck {
-    ok: bool,
-    reason: Option<AckReason>,
-    peer_token: Option<[u8; 16]>,
-    effective_caps: Option<Capabilities>,
-    server_time: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AckReason {
-    BadSignature,
-    BadChain,
-    CapsExceedParent,
-    NotYetValid,
-    Expired,
-    Revoked,
-    ProofMissing,
-    ProofInvalid,
-    RateLimited,
-    InternalError { detail: Option<String> },
-}
-
 mod portl_alpn {
     pub const ALPN_TICKET_V1: &[u8] = b"portl/ticket/v1";
-}
-
-mod option_signature_bytes {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    #[allow(clippy::ref_option)]
-    pub fn serialize<S>(value: &Option<[u8; 64]>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match value {
-            Some(bytes) => serializer.serialize_some(&bytes.as_slice()),
-            None => serializer.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<[u8; 64]>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let maybe = Option::<Vec<u8>>::deserialize(deserializer)?;
-        maybe
-            .map(|bytes| {
-                bytes
-                    .try_into()
-                    .map_err(|_| serde::de::Error::custom("expected 64 proof bytes"))
-            })
-            .transpose()
-    }
 }

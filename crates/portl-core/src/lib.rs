@@ -10,6 +10,7 @@ pub mod error;
 pub mod id;
 pub mod net;
 pub mod ticket;
+pub mod wire;
 
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
