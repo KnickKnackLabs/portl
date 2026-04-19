@@ -89,6 +89,11 @@ pub enum Command {
         ticket: Option<String>,
         list: bool,
     },
+    /// `portl revocations publish --peer <alias_or_ticket>` or `--all-peers`
+    RevocationsPublish {
+        peer: Option<String>,
+        all_peers: bool,
+    },
     /// `portl docker container add ...`
     DockerAdd {
         name: String,
@@ -250,6 +255,9 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             ticket,
             list,
         } => commands::revoke::run(alias.as_deref(), ticket.as_deref(), list),
+        Command::RevocationsPublish { peer, all_peers } => {
+            commands::revocations::publish(peer.as_deref(), all_peers)
+        }
         Command::DockerAdd {
             name,
             image,
@@ -404,6 +412,11 @@ enum TopLevel {
         #[arg(long, conflicts_with_all = ["alias", "ticket"])]
         list: bool,
     },
+    /// Distribute local revocations to peer agents via `meta/v1 PublishRevocations`.
+    Revocations {
+        #[command(subcommand)]
+        action: RevocationsAction,
+    },
     /// Docker target management.
     Docker {
         #[command(subcommand)]
@@ -426,6 +439,17 @@ enum AgentAction {
         mode: Option<AgentModeArg>,
         #[arg(long)]
         upstream_url: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RevocationsAction {
+    /// Push local revocations to one peer or every alias in the alias store.
+    Publish {
+        #[arg(long, conflicts_with = "all_peers")]
+        peer: Option<String>,
+        #[arg(long, conflicts_with = "peer")]
+        all_peers: bool,
     },
 }
 
@@ -647,6 +671,9 @@ impl Cli {
                 ticket,
                 list,
             },
+            TopLevel::Revocations {
+                action: RevocationsAction::Publish { peer, all_peers },
+            } => Command::RevocationsPublish { peer, all_peers },
             TopLevel::Docker {
                 action:
                     DockerAction::Container {

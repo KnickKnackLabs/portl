@@ -79,7 +79,7 @@ fn render_list(path: &Path) -> Result<String> {
     fs::read_to_string(path).with_context(|| format!("read revocations from {}", path.display()))
 }
 
-fn local_revocations_path() -> PathBuf {
+pub(crate) fn local_revocations_path() -> PathBuf {
     store::default_path().parent().map_or_else(
         || PathBuf::from("revocations.jsonl"),
         |parent| parent.join("revocations.jsonl"),
