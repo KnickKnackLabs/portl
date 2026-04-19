@@ -15,6 +15,33 @@ hello from m4
 $ ./target/debug/portl docker container rm demo
 ```
 
+## 2026-04-19 post-fix re-run
+
+The requested exact release-mode smoke path now needs `--force` on removal, but the
+`exec demo -- echo hi` step was not green in this macOS environment.
+
+Observed results:
+
+```text
+$ ./target/release/portl docker container add demo
+# initially failed to pull ghcr.io/knickknacklabs/portl-agent:latest with HTTP 403
+
+$ docker build -t ghcr.io/knickknacklabs/portl-agent:latest ...
+# built a local replacement image under the default tag
+
+$ ./target/release/portl docker container add demo
+# succeeded and printed a ticket
+
+$ ./target/release/portl exec demo -- echo hi
+discovery failed: Service 'pkarr' failed; Service 'dns' failed
+
+$ ./target/release/portl docker container rm demo --force
+# cleanup succeeds when the alias exists; manual docker cleanup was needed after the failed exec path
+```
+
+This leaves the post-fix smoke **blocked by endpoint discovery in this environment**, not by
+container provisioning or forced removal.
+
 Image build steps used for the smoke:
 
 ```text
