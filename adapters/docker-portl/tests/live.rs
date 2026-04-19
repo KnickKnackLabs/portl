@@ -1,38 +1,94 @@
-use anyhow::Result;
-use docker_portl::DockerBootstrapper;
-use portl_core::bootstrap::{Bootstrapper, TargetSpec, TargetStatus};
-use portl_core::ticket::schema::Capabilities;
+use std::process::Command;
+use std::time::{Duration, Instant};
 
-fn empty_caps() -> Capabilities {
-    Capabilities {
-        presence: 0,
-        shell: None,
-        tcp: None,
-        udp: None,
-        fs: None,
-        vpn: None,
-        meta: None,
-    }
-}
+use anyhow::{Context, Result, anyhow};
+use docker_portl::{DockerBootstrapper, DockerHandle};
+use portl_core::bootstrap::{Bootstrapper, ProvisionSpec, TargetStatus};
+use serde_json::json;
 
 #[tokio::test]
 #[ignore = "requires a live docker daemon and test image"]
 async fn provision_cycle_smoke_test() -> Result<()> {
     let bootstrapper = DockerBootstrapper::connect_with_local_defaults(vec![[1; 32]])?;
     let handle = bootstrapper
-        .provision(&TargetSpec {
+        .provision(&ProvisionSpec {
             name: format!("portl-live-{}", std::process::id()),
-            image: "portl-agent:local".to_owned(),
-            network: "bridge".to_owned(),
-            caps: empty_caps(),
-            ttl_secs: 60,
-            to: None,
+            adapter_params: json!({
+                "image": "portl-agent:local",
+                "network": "bridge",
+            }),
             labels: vec![],
         })
         .await?;
 
     let status = bootstrapper.resolve(&handle).await?;
     assert!(matches!(status, TargetStatus::Running));
+    bootstrapper.teardown(&handle).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a live docker daemon and test image"]
+async fn agent_graceful_shutdown_on_sigterm() -> Result<()> {
+    let bootstrapper = DockerBootstrapper::connect_with_local_defaults(vec![[1; 32]])?;
+    let handle = bootstrapper
+        .provision(&ProvisionSpec {
+            name: format!("portl-sigterm-{}", std::process::id()),
+            adapter_params: json!({
+                "image": "portl-agent:local",
+                "network": "bridge",
+            }),
+            labels: vec![],
+        })
+        .await?;
+    let docker_handle = DockerHandle::from_handle(&handle)?;
+
+    let started = Instant::now();
+    let stop_output = Command::new("docker")
+        .args(["stop", "--time=15", &docker_handle.container_id])
+        .output()
+        .context("run docker stop")?;
+    if !stop_output.status.success() {
+        return Err(anyhow!(
+            "docker stop failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&stop_output.stdout),
+            String::from_utf8_lossy(&stop_output.stderr)
+        ));
+    }
+
+    let inspect_output = Command::new("docker")
+        .args([
+            "inspect",
+            &docker_handle.container_id,
+            "--format",
+            "{{.State.Status}} {{.State.ExitCode}}",
+        ])
+        .output()
+        .context("inspect stopped container")?;
+    if !inspect_output.status.success() {
+        return Err(anyhow!(
+            "docker inspect failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&inspect_output.stdout),
+            String::from_utf8_lossy(&inspect_output.stderr)
+        ));
+    }
+
+    let state = String::from_utf8(inspect_output.stdout).context("decode docker inspect")?;
+    let mut parts = state.split_whitespace();
+    let status = parts.next().unwrap_or_default();
+    let exit_code = parts
+        .next()
+        .unwrap_or_default()
+        .parse::<i32>()
+        .context("parse docker exit code")?;
+
+    assert!(started.elapsed() <= Duration::from_secs(12));
+    assert_eq!(status, "exited");
+    assert!(
+        matches!(exit_code, 0 | 143),
+        "unexpected exit code {exit_code}"
+    );
+
     bootstrapper.teardown(&handle).await?;
     Ok(())
 }

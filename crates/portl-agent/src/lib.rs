@@ -66,7 +66,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
         endpoint::bind(&cfg, &identity).await?
     };
 
-    let signal_tasks = install_pid1_signal_tasks(&shutdown)?;
+    let signal_tasks = install_signal_tasks(&shutdown)?;
 
     loop {
         tokio::select! {
@@ -121,11 +121,7 @@ async fn graceful_close_endpoint(endpoint: &iroh::Endpoint) {
     }
 }
 
-fn install_pid1_signal_tasks(shutdown: &CancellationToken) -> Result<SignalTasks> {
-    if std::process::id() != 1 {
-        return Ok(SignalTasks::default());
-    }
-
+fn install_signal_tasks(shutdown: &CancellationToken) -> Result<SignalTasks> {
     #[cfg(unix)]
     {
         use nix::errno::Errno;
@@ -133,45 +129,47 @@ fn install_pid1_signal_tasks(shutdown: &CancellationToken) -> Result<SignalTasks
         use nix::unistd::Pid;
         use tokio::signal::unix::{SignalKind, signal};
 
+        let mut handles = Vec::new();
+
         let mut sigterm = signal(SignalKind::terminate())?;
         let mut sigint = signal(SignalKind::interrupt())?;
         let shutdown_for_signals = shutdown.clone();
-        let signal_task = tokio::spawn(async move {
+        handles.push(tokio::spawn(async move {
             tokio::select! {
                 _ = sigterm.recv() => shutdown_for_signals.cancel(),
                 _ = sigint.recv() => shutdown_for_signals.cancel(),
                 () = shutdown_for_signals.cancelled() => {}
             }
-        });
+        }));
 
-        let mut sigchld = signal(SignalKind::child())?;
-        let shutdown_for_reaper = shutdown.clone();
-        let reaper_task = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    () = shutdown_for_reaper.cancelled() => break,
-                    signal = sigchld.recv() => {
-                        if signal.is_none() {
-                            break;
-                        }
-                        loop {
-                            match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
-                                Ok(WaitStatus::StillAlive) | Err(Errno::ECHILD) => break,
-                                Ok(_) => {}
-                                Err(err) => {
-                                    warn!(?err, "failed to reap child process");
-                                    break;
+        if std::process::id() == 1 {
+            let mut sigchld = signal(SignalKind::child())?;
+            let shutdown_for_reaper = shutdown.clone();
+            handles.push(tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        () = shutdown_for_reaper.cancelled() => break,
+                        signal = sigchld.recv() => {
+                            if signal.is_none() {
+                                break;
+                            }
+                            loop {
+                                match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
+                                    Ok(WaitStatus::StillAlive) | Err(Errno::ECHILD) => break,
+                                    Ok(_) => {}
+                                    Err(err) => {
+                                        warn!(?err, "failed to reap child process");
+                                        break;
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
-        });
+            }));
+        }
 
-        Ok(SignalTasks {
-            handles: vec![signal_task, reaper_task],
-        })
+        Ok(SignalTasks { handles })
     }
 
     #[cfg(not(unix))]
