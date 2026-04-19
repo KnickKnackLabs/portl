@@ -73,9 +73,18 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
                 bearer: bearer.clone(),
             };
             audit::ticket_accepted(&session);
+            state.metrics.tickets_accepted.inc();
+            state.metrics.active_connections.inc();
             Some(session)
         }
         AcceptanceOutcome::Rejected { reason } => {
+            state
+                .metrics
+                .tickets_rejected_total
+                .get_or_create(&crate::metrics::AckReasonLabel {
+                    reason: format!("{reason:?}"),
+                })
+                .inc();
             let ack = portl_proto::ticket_v1::TicketAck {
                 ok: false,
                 reason: Some(reason.clone()),
@@ -96,6 +105,9 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
     };
 
     let udp_context = Arc::new(UdpConnectionContext::new(state.udp_registry.clone()));
+    let _conn_gauge_guard = ConnectionGaugeGuard {
+        metrics: Arc::clone(&state.metrics),
+    };
 
     loop {
         let (send, recv) = match connection.accept_bi().await {
@@ -134,6 +146,7 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
                                     portl_proto::shell_v1::ALPN_SHELL_V1,
                                 ) =>
                         {
+                            state.metrics.shell_sessions_opened.inc();
                             shell_handler::serve_stream(
                                 connection, session, state, send, recv, preamble,
                             )
@@ -143,6 +156,7 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
                             if value
                                 == String::from_utf8_lossy(portl_proto::tcp_v1::ALPN_TCP_V1) =>
                         {
+                            state.metrics.tcp_streams_opened.inc();
                             match &state.mode {
                                 crate::AgentMode::Listener => {
                                     tcp_handler::serve_stream(
@@ -162,6 +176,7 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
                             if value
                                 == String::from_utf8_lossy(portl_proto::udp_v1::ALPN_UDP_V1) =>
                         {
+                            state.metrics.udp_sessions_opened.inc();
                             udp_handler::serve_stream(
                                 connection,
                                 session,
@@ -193,6 +208,18 @@ fn unix_now_secs() -> Result<u64> {
         .duration_since(UNIX_EPOCH)
         .context("system clock is before unix epoch")?
         .as_secs())
+}
+
+/// Decrement `active_connections` when the authenticated stream loop
+/// exits, regardless of whether it exited cleanly or via an error.
+struct ConnectionGaugeGuard {
+    metrics: Arc<crate::metrics::Metrics>,
+}
+
+impl Drop for ConnectionGaugeGuard {
+    fn drop(&mut self) {
+        self.metrics.active_connections.dec();
+    }
 }
 
 fn remote_node_id(connection: &Connection) -> [u8; 32] {
