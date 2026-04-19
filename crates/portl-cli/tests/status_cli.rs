@@ -6,7 +6,7 @@ use iroh_tickets::Ticket;
 use portl_agent::{AgentConfig, DiscoveryConfig, run_task};
 use portl_core::id::{Identity, store};
 use portl_core::test_util::pair;
-use portl_core::ticket::mint::mint_root;
+use portl_core::ticket::mint::{mint_delegated, mint_root};
 use portl_core::ticket::schema::{Capabilities, MetaCaps};
 use tempfile::tempdir;
 
@@ -80,6 +80,54 @@ async fn status_command_reports_bare_endpoint_peer() -> Result<()> {
     tokio::time::timeout(Duration::from_secs(5), agent)
         .await
         .expect("agent join timeout")??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn status_refuses_delegated_tickets() -> Result<()> {
+    let home = tempdir()?;
+    let identity_path = home.path().join("identity.bin");
+    let operator = Identity::new();
+    store::save(&operator, &identity_path)?;
+
+    let (_, server) = pair().await?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let root = mint_root(
+        operator.signing_key(),
+        server.addr(),
+        meta_caps(),
+        now,
+        now + 300,
+        None,
+    )?;
+    let delegated = mint_delegated(
+        operator.signing_key(),
+        &root,
+        meta_caps(),
+        now,
+        now + 300,
+        None,
+    )?;
+    let delegated_uri = delegated.serialize();
+    let identity_path_for_status = identity_path.clone();
+
+    let err = tokio::task::spawn_blocking(move || {
+        portl_cli::run_status_with_identity_path(
+            &delegated_uri,
+            Some(identity_path_for_status.as_path()),
+        )
+    })
+    .await?
+    .expect_err("delegated status should fail before dialing");
+
+    assert!(
+        format!("{err:#}").contains(
+            "delegated tickets not yet supported by status; use the root ticket or pass --chain"
+        ),
+        "unexpected error: {err:#}"
+    );
+
+    server.inner().close().await;
     Ok(())
 }
 

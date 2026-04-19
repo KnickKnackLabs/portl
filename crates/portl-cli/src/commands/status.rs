@@ -84,6 +84,11 @@ async fn resolve_peer(
     endpoint: &iroh::Endpoint,
 ) -> Result<ResolvedPeer> {
     if let Ok(ticket) = <PortlTicket as Ticket>::deserialize(peer) {
+        if ticket.body.parent.is_some() {
+            bail!(
+                "delegated tickets not yet supported by status; use the root ticket or pass --chain"
+            );
+        }
         return Ok(ResolvedPeer {
             ticket,
             discovery: "cached".to_owned(),

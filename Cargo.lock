@@ -3259,6 +3259,7 @@ dependencies = [
  "hex",
  "iroh",
  "iroh-base",
+ "n0-future",
  "portl-core",
  "portl-proto",
  "postcard",
