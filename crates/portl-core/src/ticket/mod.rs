@@ -16,6 +16,7 @@ pub mod canonical;
 pub mod codec;
 pub mod hash;
 pub mod mint;
+pub mod offer;
 pub mod schema;
 pub mod sign;
 pub mod verify;
