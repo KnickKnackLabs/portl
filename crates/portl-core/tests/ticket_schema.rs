@@ -16,9 +16,10 @@ fn dummy_endpoint_id() -> EndpointId {
 
 #[test]
 fn can_construct_minimal_self_signed_root_ticket() {
+    let addr = EndpointAddr::new(dummy_endpoint_id());
     let ticket = PortlTicket {
         v: 1,
-        addr: EndpointAddr::new(dummy_endpoint_id()),
+        addr: addr.clone(),
         body: PortlBody {
             caps: Capabilities {
                 presence: 0b0000_0001,
@@ -35,6 +36,7 @@ fn can_construct_minimal_self_signed_root_ticket() {
                 vpn: None,
                 meta: None,
             },
+            target: *addr.id.as_bytes(),
             alpns_extra: vec![],
             not_before: 0,
             not_after: 3600,

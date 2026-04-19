@@ -22,6 +22,7 @@ fn addr_from_seed(seed: u8) -> EndpointAddr {
 }
 
 fn canonical_body() -> PortlBody {
+    let addr = addr_from_seed(7);
     PortlBody {
         caps: Capabilities {
             presence: 0b0000_0001,
@@ -38,6 +39,7 @@ fn canonical_body() -> PortlBody {
             vpn: None,
             meta: None,
         },
+        target: *addr.id.as_bytes(),
         alpns_extra: vec![],
         not_before: 1_000,
         not_after: 2_000,
@@ -103,6 +105,20 @@ fn resolved_issuer_returns_explicit_key_when_different_from_addr() {
 }
 
 // ---------- rule 2: presence bitmap ----------
+
+#[test]
+fn rejects_target_mismatch_with_addr_endpoint_id() {
+    let mut body = canonical_body();
+    body.target = [8u8; 32];
+    let ticket = PortlTicket {
+        v: 1,
+        addr: addr_from_seed(7),
+        body,
+        sig: [0u8; 64],
+    };
+    let err = canonical_check_ticket(&ticket).unwrap_err();
+    assert!(matches!(err, PortlError::Canonical(_)));
+}
 
 #[test]
 fn rejects_presence_bit_set_but_body_none() {

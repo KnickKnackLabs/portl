@@ -103,6 +103,7 @@ fn forge_child(
     let caps = parent.body.caps.clone();
     let body = PortlBody {
         caps,
+        target: parent.body.target,
         alpns_extra: vec![],
         not_before,
         not_after,
@@ -146,6 +147,7 @@ prop_compose! {
         ) -> PortlBody {
             PortlBody {
                 caps,
+                target: [7u8; 32],
                 alpns_extra: vec![],
                 not_before,
                 not_after: not_before + delta,

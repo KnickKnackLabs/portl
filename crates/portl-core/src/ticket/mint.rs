@@ -23,6 +23,7 @@ pub fn mint_root(
 ) -> Result<PortlTicket> {
     let body = PortlBody {
         caps,
+        target: *addr.id.as_bytes(),
         alpns_extra: vec![],
         not_before,
         not_after,
@@ -71,6 +72,7 @@ pub fn mint_delegated(
 
     let body = PortlBody {
         caps: child_caps,
+        target: parent_ticket.body.target,
         alpns_extra: vec![],
         not_before,
         not_after,

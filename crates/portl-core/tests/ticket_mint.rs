@@ -56,8 +56,9 @@ fn shell_and_tcp_caps() -> Capabilities {
 fn mint_root_self_signed_elides_issuer() {
     let sk = SigningKey::from_bytes(&[21u8; 32]);
     let addr = endpoint_addr_from_key(&sk);
-    let ticket = mint_root(&sk, addr, shell_caps(), 1_000, 4_600, None).expect("mint root");
+    let ticket = mint_root(&sk, addr.clone(), shell_caps(), 1_000, 4_600, None).expect("mint root");
     assert_eq!(ticket.body.issuer, None);
+    assert_eq!(ticket.body.target, *addr.id.as_bytes());
     verify_body(&resolved_issuer(&ticket), &ticket.body, &ticket.sig).expect("verify");
 }
 
@@ -66,8 +67,10 @@ fn mint_root_operator_issued_sets_explicit_issuer() {
     let signer = SigningKey::from_bytes(&[22u8; 32]);
     let target = SigningKey::from_bytes(&[23u8; 32]);
     let addr = endpoint_addr_from_key(&target);
-    let ticket = mint_root(&signer, addr, shell_caps(), 1_000, 4_600, None).expect("mint root");
+    let ticket =
+        mint_root(&signer, addr.clone(), shell_caps(), 1_000, 4_600, None).expect("mint root");
     assert_eq!(ticket.body.issuer, Some(signer.verifying_key().to_bytes()));
+    assert_eq!(ticket.body.target, *addr.id.as_bytes());
     verify_body(&resolved_issuer(&ticket), &ticket.body, &ticket.sig).expect("verify");
 }
 
@@ -114,6 +117,7 @@ fn mint_delegated_preserves_addr() {
         mint_delegated(&signer, &parent, shell_caps(), 1_100, 4_500, None).expect("mint delegated");
 
     assert_eq!(child.addr, parent.addr);
+    assert_eq!(child.body.target, parent.body.target);
     verify_body(&resolved_issuer(&child), &child.body, &child.sig).expect("verify");
 }
 

@@ -34,6 +34,9 @@ pub struct PortlTicket {
 pub struct PortlBody {
     /// Capabilities granted by this ticket.
     pub caps: Capabilities,
+    /// Signed target endpoint id. MUST equal `addr.endpoint_id`.
+    #[serde(with = "BigArray")]
+    pub target: [u8; 32],
     /// Reserved; MUST be empty in v0.1.
     pub alpns_extra: Vec<String>,
     /// Unix seconds; inclusive.

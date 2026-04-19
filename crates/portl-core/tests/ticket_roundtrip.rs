@@ -30,6 +30,7 @@ fn fixture_signed_root() -> PortlTicket {
             vpn: None,
             meta: None,
         },
+        target: *addr.id.as_bytes(),
         alpns_extra: vec![],
         not_before: 1_000,
         not_after: 1_000 + 3600,

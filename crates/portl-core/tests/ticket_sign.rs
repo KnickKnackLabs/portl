@@ -22,6 +22,7 @@ fn body_fixture() -> PortlBody {
             vpn: None,
             meta: None,
         },
+        target: [99u8; 32],
         alpns_extra: vec![],
         not_before: 1_000,
         not_after: 4_600,

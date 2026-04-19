@@ -8,6 +8,7 @@
 //!
 //! Rules enforced (numbered as in the design doc):
 //!   1. Issuer elision is **mandatory**, not optional.
+//!      1b. `body.target` equals `addr.endpoint_id`.
 //!   2. The presence bitmap on `Capabilities` equals the set of
 //!      `Some` fields — no mismatch in either direction.
 //!   3. All `Vec` fields are lexicographically sorted with unique
@@ -94,9 +95,15 @@ pub fn canonical_check(body: &PortlBody) -> Result<()> {
 ///
 /// Enforces rule 1 in its full form: `body.issuer ==
 /// Some(addr.endpoint_id)` is rejected, so self-signed roots MUST
-/// use issuer elision (`None`).
+/// use issuer elision (`None`). Also enforces rule 1b:
+/// `body.target == addr.endpoint_id`.
 pub fn canonical_check_ticket(ticket: &PortlTicket) -> Result<()> {
     canonical_check(&ticket.body)?;
+    if ticket.body.target != *ticket.addr.id.as_bytes() {
+        return Err(PortlError::Canonical(
+            "body.target does not match addr.endpoint_id",
+        ));
+    }
     if let Some(issuer) = ticket.body.issuer
         && &issuer == ticket.addr.id.as_bytes()
     {

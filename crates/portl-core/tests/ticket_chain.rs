@@ -4,6 +4,7 @@ use std::collections::HashSet;
 
 use ed25519_dalek::SigningKey;
 use iroh_base::{EndpointAddr, EndpointId};
+use portl_core::error::PortlError;
 use portl_core::ticket::hash::parent_ticket_id;
 use portl_core::ticket::mint::{mint_delegated, mint_root};
 use portl_core::ticket::schema::{
@@ -70,6 +71,7 @@ fn forge_child(
 ) -> PortlTicket {
     let body = PortlBody {
         caps,
+        target: parent.body.target,
         alpns_extra: vec![],
         not_before,
         not_after,
@@ -258,6 +260,29 @@ fn verify_chain_honors_clock_skew_boundaries() {
     assert!(verify_chain(&root, &[], &trust_root_for(&signer), 940).is_ok());
     assert!(verify_chain(&root, &[], &trust_root_for(&signer), 4_599).is_ok());
     assert!(verify_chain(&root, &[], &trust_root_for(&signer), 4_600).is_err());
+}
+
+#[test]
+fn verify_rejects_forged_target_on_operator_issued_ticket() {
+    let operator = SigningKey::from_bytes(&[41u8; 32]);
+    let target = SigningKey::from_bytes(&[42u8; 32]);
+    let mut ticket = mint_root(
+        &operator,
+        endpoint_addr_from_key(&target),
+        shell_caps(),
+        1_000,
+        4_600,
+        None,
+    )
+    .unwrap();
+    let forged = SigningKey::from_bytes(&[43u8; 32]);
+    ticket.addr = endpoint_addr_from_key(&forged);
+
+    let err = verify_chain(&ticket, &[], &trust_root_for(&operator), 1_200).unwrap_err();
+    assert!(matches!(
+        err,
+        PortlError::Canonical("body.target does not match addr.endpoint_id")
+    ));
 }
 
 #[test]
