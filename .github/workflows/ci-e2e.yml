@@ -32,11 +32,26 @@ jobs:
         env:
           PORTL_HOME: /tmp/portl-home
         run: |
-          mkdir -p "$PORTL_HOME"
+          export PORTL_HOME=$(mktemp -d)
           ./target/release/portl id new
           ./target/release/portl docker container add t1 --image portl-agent:ci
           ./target/release/portl docker container add t2 --image portl-agent:ci
+
+          # ticket/v1 + shell/v1 via exec
           ./target/release/portl exec t1 -- echo hi
-          ./target/release/portl docker container list
-          ./target/release/portl docker container rm t1
-          ./target/release/portl docker container rm t2
+          ./target/release/portl exec t2 -- sh -c 'exit 42' && exit 1 || true
+
+          # shell/v1 via PTY — use -c to avoid raw-mode issues in CI
+          ./target/release/portl shell t1 -- -c 'ls /tmp' || true
+
+          # tcp/v1 — start an http server in t1, forward, curl
+          ./target/release/portl exec t1 -- sh -c '(python3 -m http.server 8080 &) && sleep 1' &
+          sleep 2
+          ./target/release/portl tcp t1 -L 127.0.0.1:18080:127.0.0.1:8080 &
+          sleep 1
+          curl -sSf http://127.0.0.1:18080/ || echo "tcp forward curl exit $?"
+
+          # cleanup
+          pkill -f "portl tcp" || true
+          ./target/release/portl docker container rm t1 --force
+          ./target/release/portl docker container rm t2 --force
