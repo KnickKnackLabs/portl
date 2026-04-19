@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::process::Stdio;
+use std::process::{Command as StdCommand, Stdio};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -10,7 +10,7 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::{Gid, Pid, Uid, User, geteuid};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
+use tokio::process::Command as TokioCommand;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, warn};
 
@@ -307,7 +307,7 @@ fn spawn_exec_process(
         .ok_or_else(|| {
             portl_proto::shell_v1::ShellReason::SpawnFailed("missing argv".to_owned())
         })?;
-    let mut command = Command::new(&argv[0]);
+    let mut command = StdCommand::new(&argv[0]);
     command.args(&argv[1..]);
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
@@ -320,16 +320,11 @@ fn spawn_exec_process(
         effective_env(session.caps.shell.as_ref(), req, requested_user),
     );
     #[cfg(unix)]
-    if let Some(user) = requested_user
-        && user.switch_required
-    {
-        let gid = user.gid;
-        let uid = user.uid;
-        command.uid(uid.as_raw());
-        command.gid(gid.as_raw());
+    if let Some(user) = requested_user {
+        install_exec_user_switch(&mut command, user);
     }
 
-    let mut child = command
+    let mut child = TokioCommand::from(command)
         .spawn()
         .map_err(|err| portl_proto::shell_v1::ShellReason::SpawnFailed(err.to_string()))?;
     let pid = child.id().ok_or_else(|| {
@@ -581,7 +576,7 @@ fn pty_stdout_thread(mut reader: Box<dyn std::io::Read + Send>, tx: &mpsc::Sende
     }
 }
 
-fn apply_env_to_command(command: &mut Command, envs: Vec<(String, String)>) {
+fn apply_env_to_command(command: &mut StdCommand, envs: Vec<(String, String)>) {
     command.env_clear();
     command.envs(envs);
 }
@@ -776,6 +771,73 @@ fn signal_target_from_pid(
     })
 }
 
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    ))
+))]
+#[allow(deprecated)]
+fn install_exec_user_switch(command: &mut StdCommand, user: &RequestedUser) -> bool {
+    if !user.switch_required {
+        return false;
+    }
+
+    let target_gid = user.gid.as_raw();
+    let target_uid = user.uid.as_raw();
+    command.before_exec(move || {
+        // Drop supplementary groups BEFORE setgid/setuid. Order matters:
+        // setgroups requires uid 0.
+        nix::unistd::setgroups(&[]).map_err(nix_to_io_error)?;
+        // Set the primary gid before uid.
+        nix::unistd::setgid(Gid::from_raw(target_gid)).map_err(nix_to_io_error)?;
+        nix::unistd::setuid(Uid::from_raw(target_uid)).map_err(nix_to_io_error)?;
+        Ok(())
+    });
+
+    true
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    ))
+))]
+fn nix_to_io_error(err: nix::errno::Errno) -> std::io::Error {
+    std::io::Error::from_raw_os_error(err as i32)
+}
+
+#[cfg(all(
+    unix,
+    any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    )
+))]
+fn install_exec_user_switch(command: &mut StdCommand, user: &RequestedUser) -> bool {
+    if !user.switch_required {
+        return false;
+    }
+
+    use std::os::unix::process::CommandExt;
+
+    command.uid(user.uid.as_raw());
+    command.gid(user.gid.as_raw());
+    true
+}
+
 fn fresh_session_id() -> [u8; 16] {
     loop {
         let mut id = rand::random::<[u8; 16]>();
@@ -788,8 +850,14 @@ fn fresh_session_id() -> [u8; 16] {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::{RequestedUser, install_exec_user_switch};
     use super::{ShellProcess, ShellSessionGuard};
     use crate::shell_registry::ShellRegistry;
+    #[cfg(unix)]
+    use nix::unistd::{Gid, Uid};
+    #[cfg(unix)]
+    use std::process::Command as StdCommand;
     use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 
     #[test]
@@ -824,5 +892,26 @@ mod tests {
         }
 
         assert!(registry.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_user_switch_hook_only_installs_when_switch_is_required() {
+        let base_user = RequestedUser {
+            uid: Uid::from_raw(1000),
+            gid: Gid::from_raw(1000),
+            name: "demo".to_owned(),
+            home_dir: "/home/demo".to_owned(),
+            shell: "/bin/sh".to_owned(),
+            switch_required: false,
+        };
+
+        let mut unchanged = StdCommand::new("/bin/echo");
+        assert!(!install_exec_user_switch(&mut unchanged, &base_user));
+
+        let mut switched = StdCommand::new("/bin/echo");
+        let mut target_user = base_user;
+        target_user.switch_required = true;
+        assert!(install_exec_user_switch(&mut switched, &target_user));
     }
 }
