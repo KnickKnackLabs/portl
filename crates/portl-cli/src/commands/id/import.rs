@@ -7,10 +7,10 @@ use portl_core::id::store;
 
 use super::read_passphrase;
 
-pub fn run(from: &std::path::Path, force: bool) -> Result<ExitCode> {
+pub fn run(from: &std::path::Path, force: bool, passphrase_cmd: Option<&str>) -> Result<ExitCode> {
     let bytes = fs::read(from)?;
-    let passphrase = read_passphrase("passphrase: ")?;
-    let identity = store::import(&bytes, &passphrase)?;
+    let passphrase = read_passphrase("passphrase: ", passphrase_cmd)?;
+    let identity = store::import(&bytes, passphrase.as_str())?;
     let path = store::default_path();
     if path.exists() && !force {
         return Err(PortlError::Io(std::io::Error::new(

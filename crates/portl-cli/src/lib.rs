@@ -22,10 +22,17 @@ pub enum Command {
     IdNew { force: bool },
     /// `portl id show`
     IdShow,
-    /// `portl id export --out <path>`
-    IdExport { out: PathBuf },
-    /// `portl id import --from <path> [--force]`
-    IdImport { from: PathBuf, force: bool },
+    /// `portl id export --out <path> [--passphrase-cmd <cmd>]`
+    IdExport {
+        out: PathBuf,
+        passphrase_cmd: Option<String>,
+    },
+    /// `portl id import --from <path> [--force] [--passphrase-cmd <cmd>]`
+    IdImport {
+        from: PathBuf,
+        force: bool,
+        passphrase_cmd: Option<String>,
+    },
     /// `portl mint-root --endpoint ... --caps ... --ttl ...`
     MintRoot {
         endpoint: String,
@@ -95,8 +102,15 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
         Command::AgentRun => Ok(ExitCode::SUCCESS),
         Command::IdNew { force } => commands::id::new::run(force),
         Command::IdShow => commands::id::show::run(),
-        Command::IdExport { out } => commands::id::export::run(&out),
-        Command::IdImport { from, force } => commands::id::import::run(&from, force),
+        Command::IdExport {
+            out,
+            passphrase_cmd,
+        } => commands::id::export::run(&out, passphrase_cmd.as_deref()),
+        Command::IdImport {
+            from,
+            force,
+            passphrase_cmd,
+        } => commands::id::import::run(&from, force, passphrase_cmd.as_deref()),
         Command::MintRoot {
             endpoint,
             caps,
@@ -176,6 +190,8 @@ enum IdAction {
     Export {
         #[arg(long)]
         out: PathBuf,
+        #[arg(long = "passphrase-cmd")]
+        passphrase_cmd: Option<String>,
     },
     /// Import an encrypted identity export.
     Import {
@@ -183,6 +199,8 @@ enum IdAction {
         from: PathBuf,
         #[arg(long)]
         force: bool,
+        #[arg(long = "passphrase-cmd")]
+        passphrase_cmd: Option<String>,
     },
 }
 
@@ -199,11 +217,27 @@ impl Cli {
                 action: IdAction::Show,
             } => Command::IdShow,
             TopLevel::Id {
-                action: IdAction::Export { out },
-            } => Command::IdExport { out },
+                action:
+                    IdAction::Export {
+                        out,
+                        passphrase_cmd,
+                    },
+            } => Command::IdExport {
+                out,
+                passphrase_cmd,
+            },
             TopLevel::Id {
-                action: IdAction::Import { from, force },
-            } => Command::IdImport { from, force },
+                action:
+                    IdAction::Import {
+                        from,
+                        force,
+                        passphrase_cmd,
+                    },
+            } => Command::IdImport {
+                from,
+                force,
+                passphrase_cmd,
+            },
             TopLevel::MintRoot {
                 endpoint,
                 caps,

@@ -147,6 +147,68 @@ fn id_show_errors_when_no_identity() {
 }
 
 #[test]
+fn id_import_uses_passphrase_cmd() {
+    let home_a = tempdir().unwrap();
+    let home_b = tempdir().unwrap();
+    let export_path = home_a.path().join("identity.age");
+
+    init_identity(&home_a);
+
+    let original_show = Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home_a.path())
+        .args(["id", "show"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home_a.path())
+        .args([
+            "id",
+            "export",
+            "--out",
+            export_path.to_str().unwrap(),
+            "--passphrase-cmd",
+            "echo hunter2",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home_b.path())
+        .args([
+            "id",
+            "import",
+            "--from",
+            export_path.to_str().unwrap(),
+            "--passphrase-cmd",
+            "echo hunter2",
+        ])
+        .assert()
+        .success();
+
+    let imported_show = Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home_b.path())
+        .args(["id", "show"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(
+        String::from_utf8(original_show).unwrap(),
+        String::from_utf8(imported_show).unwrap()
+    );
+}
+
+#[test]
 fn id_import_refuses_overwrite_without_force() {
     let home_a = tempdir().unwrap();
     let home_b = tempdir().unwrap();

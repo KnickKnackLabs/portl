@@ -6,10 +6,10 @@ use portl_core::id::store;
 
 use super::read_passphrase;
 
-pub fn run(out: &std::path::Path) -> Result<ExitCode> {
+pub fn run(out: &std::path::Path, passphrase_cmd: Option<&str>) -> Result<ExitCode> {
     let identity = store::load(&store::default_path())?;
-    let passphrase = read_passphrase("passphrase: ")?;
-    let bytes = store::export(&identity, &passphrase)?;
+    let passphrase = read_passphrase("passphrase: ", passphrase_cmd)?;
+    let bytes = store::export(&identity, passphrase.as_str())?;
 
     if let Some(parent) = out.parent() {
         fs::create_dir_all(parent)?;

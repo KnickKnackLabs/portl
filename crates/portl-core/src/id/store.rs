@@ -10,6 +10,7 @@ use age::secrecy::SecretString;
 use age::{Decryptor, Encryptor};
 use directories::ProjectDirs;
 use ed25519_dalek::SigningKey;
+use zeroize::Zeroizing;
 
 use crate::error::{PortlError, Result};
 use crate::id::keypair::Identity;
@@ -45,7 +46,8 @@ pub fn save(id: &Identity, path: &Path) -> Result<()> {
 
     let tmp_path = sibling_tmp_path(path);
     let mut file = open_private_file(&tmp_path)?;
-    file.write_all(&id.signing_key().to_bytes())?;
+    let secret = Zeroizing::new(id.signing_key().to_bytes().to_vec());
+    file.write_all(secret.as_slice())?;
     file.sync_all()?;
     drop(file);
 
@@ -62,13 +64,13 @@ pub fn save(id: &Identity, path: &Path) -> Result<()> {
 
 /// Load an identity saved via [`save`].
 pub fn load(path: &Path) -> Result<Identity> {
-    let bytes = fs::read(path)?;
-    let secret: [u8; 32] = bytes.try_into().map_err(|_| {
+    let bytes = Zeroizing::new(fs::read(path)?);
+    let secret = Zeroizing::new(bytes.as_slice().try_into().map_err(|_| {
         PortlError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "identity file must contain exactly 32 bytes",
         ))
-    })?;
+    })?);
     Ok(Identity::from_signing_key(SigningKey::from_bytes(&secret)))
 }
 
@@ -79,7 +81,8 @@ pub fn export(id: &Identity, passphrase: &str) -> Result<Vec<u8>> {
     let armor =
         ArmoredWriter::wrap_output(&mut ciphertext, Format::AsciiArmor).map_err(age_error)?;
     let mut writer = encryptor.wrap_output(armor).map_err(age_error)?;
-    writer.write_all(&id.signing_key().to_bytes())?;
+    let secret = Zeroizing::new(id.signing_key().to_bytes().to_vec());
+    writer.write_all(secret.as_slice())?;
     let armor = writer.finish().map_err(age_error)?;
     armor.finish().map_err(age_error)?;
     Ok(ciphertext)
@@ -89,7 +92,7 @@ pub fn export(id: &Identity, passphrase: &str) -> Result<Vec<u8>> {
 pub fn import(bytes: &[u8], passphrase: &str) -> Result<Identity> {
     let decryptor =
         Decryptor::new_buffered(ArmoredReader::new(Cursor::new(bytes))).map_err(age_error)?;
-    let mut plaintext = Vec::new();
+    let mut plaintext = Zeroizing::new(Vec::new());
 
     if !decryptor.is_scrypt() {
         return Err(PortlError::Age(
@@ -103,12 +106,12 @@ pub fn import(bytes: &[u8], passphrase: &str) -> Result<Identity> {
         .map_err(age_error)?;
     reader.read_to_end(&mut plaintext).map_err(age_error)?;
 
-    let secret: [u8; 32] = plaintext.try_into().map_err(|_| {
+    let secret = Zeroizing::new(plaintext.as_slice().try_into().map_err(|_| {
         PortlError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "decrypted identity must contain exactly 32 bytes",
         ))
-    })?;
+    })?);
     Ok(Identity::from_signing_key(SigningKey::from_bytes(&secret)))
 }
 
