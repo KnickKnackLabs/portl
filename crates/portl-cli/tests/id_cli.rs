@@ -147,6 +147,33 @@ fn id_show_errors_when_no_identity() {
 }
 
 #[test]
+fn id_import_refuses_overwrite_without_force() {
+    let home_a = tempdir().unwrap();
+    let home_b = tempdir().unwrap();
+    let export_path = home_a.path().join("identity.age");
+    let passphrase = "battery horse staple";
+
+    init_identity(&home_a);
+    init_identity(&home_b);
+
+    Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home_a.path())
+        .env("PORTL_PASSPHRASE", passphrase)
+        .args(["id", "export", "--out", export_path.to_str().unwrap()])
+        .assert()
+        .success();
+
+    Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home_b.path())
+        .env("PORTL_PASSPHRASE", passphrase)
+        .args(["id", "import", "--from", export_path.to_str().unwrap()])
+        .assert()
+        .failure();
+}
+
+#[test]
 fn id_export_then_import_roundtrip() {
     let home_a = tempdir().unwrap();
     let home_b = tempdir().unwrap();

@@ -24,8 +24,8 @@ pub enum Command {
     IdShow,
     /// `portl id export --out <path>`
     IdExport { out: PathBuf },
-    /// `portl id import --from <path>`
-    IdImport { from: PathBuf },
+    /// `portl id import --from <path> [--force]`
+    IdImport { from: PathBuf, force: bool },
     /// `portl mint-root --endpoint ... --caps ... --ttl ...`
     MintRoot {
         endpoint: String,
@@ -96,7 +96,7 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
         Command::IdNew { force } => commands::id::new::run(force),
         Command::IdShow => commands::id::show::run(),
         Command::IdExport { out } => commands::id::export::run(&out),
-        Command::IdImport { from } => commands::id::import::run(&from),
+        Command::IdImport { from, force } => commands::id::import::run(&from, force),
         Command::MintRoot {
             endpoint,
             caps,
@@ -181,6 +181,8 @@ enum IdAction {
     Import {
         #[arg(long)]
         from: PathBuf,
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -200,8 +202,8 @@ impl Cli {
                 action: IdAction::Export { out },
             } => Command::IdExport { out },
             TopLevel::Id {
-                action: IdAction::Import { from },
-            } => Command::IdImport { from },
+                action: IdAction::Import { from, force },
+            } => Command::IdImport { from, force },
             TopLevel::MintRoot {
                 endpoint,
                 caps,
