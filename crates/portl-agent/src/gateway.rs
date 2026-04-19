@@ -191,7 +191,11 @@ fn rewrite_request_headers(headers: &[u8], bearer: &[u8]) -> Result<Vec<u8>> {
     rewritten.extend_from_slice(format!("Authorization: Bearer {header_value}\r\n").as_bytes());
     rewritten.extend_from_slice(b"Connection: close\r\n");
     for line in header_block.split(|byte| *byte == b'\n') {
-        if line.is_empty() || line == b"\r" || is_header_named(line, b"connection") {
+        if line.is_empty()
+            || line == b"\r"
+            || is_header_named(line, b"authorization")
+            || is_header_named(line, b"connection")
+        {
             continue;
         }
         rewritten.extend_from_slice(line);
@@ -276,6 +280,18 @@ mod tests {
         let rewritten = String::from_utf8(rewritten).expect("utf-8 header block");
         assert!(rewritten.contains("\r\nConnection: close\r\n"));
         assert!(!rewritten.contains("keep-alive"));
+    }
+
+    #[test]
+    fn rewrite_request_headers_strips_incoming_authorization() {
+        let rewritten = rewrite_request_headers(
+            b"GET / HTTP/1.1\r\nHost: example.test\r\nAuthorization: Bearer attacker\r\n\r\n",
+            b"slicer-token",
+        )
+        .expect("inject header");
+        let rewritten = String::from_utf8(rewritten).expect("utf-8 header block");
+        assert!(rewritten.contains("Authorization: Bearer slicer-token"));
+        assert!(!rewritten.contains("attacker"));
     }
 
     #[test]
