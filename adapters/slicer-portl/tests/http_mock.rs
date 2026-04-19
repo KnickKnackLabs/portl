@@ -51,7 +51,7 @@ async fn provision_resolve_teardown_roundtrip() -> Result<()> {
                 "ram_gb": 4,
                 "tags": [["agent", "claude"]],
                 "relay_list": ["https://relay.example.invalid"],
-                "operator_pubkey": "deadbeef",
+                "operator_pubkey": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 "portl_release_url": "example.invalid/releases"
             }),
             labels: vec![("managed_by".to_owned(), "test".to_owned())],

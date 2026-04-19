@@ -18,9 +18,8 @@ ln -sf /usr/local/bin/portl /usr/local/bin/portl-agent
 
 cat > /etc/portl/agent.toml <<'TOML'
 identity_path = "/var/lib/portl/secret"
+trust_roots = ["{{OPERATOR_PUBKEY}}"]
 
 [discovery]
-relay = {{RELAY_LIST}}
-
-trust_roots = ["{{OPERATOR_PUBKEY}}"]
+{{RELAY_LINE}}
 TOML

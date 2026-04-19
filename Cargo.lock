@@ -4940,6 +4940,7 @@ dependencies = [
  "base64 0.22.1",
  "hex",
  "iroh-base",
+ "portl-agent",
  "portl-core",
  "reqwest 0.12.28",
  "serde",
