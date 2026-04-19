@@ -17,8 +17,7 @@ struct StreamPreamble {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ShellReq {
-    preamble: StreamPreamble,
+struct ShellReqBody {
     mode: ShellMode,
     argv: Option<Vec<String>>,
     env_patch: Vec<(String, EnvValue)>,
@@ -75,11 +74,15 @@ pub enum ShellStreamKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ShellSubPreamble {
-    peer_token: [u8; 16],
-    alpn: String,
+struct ShellSubTail {
     session_id: [u8; 16],
     kind: ShellStreamKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum ShellFirstFrame {
+    Control(ShellReqBody),
+    Sub(ShellSubTail),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,8 +164,7 @@ pub async fn open_shell(
     cwd: Option<String>,
     pty: PtyCfg,
 ) -> Result<ShellClient> {
-    let req = ShellReq {
-        preamble: preamble(session, ALPN_SHELL_V1.as_bytes()),
+    let req = ShellReqBody {
         mode: ShellMode::Shell,
         argv: None,
         env_patch: Vec::new(),
@@ -180,8 +182,7 @@ pub async fn open_exec(
     cwd: Option<String>,
     argv: Vec<String>,
 ) -> Result<ShellClient> {
-    let req = ShellReq {
-        preamble: preamble(session, ALPN_SHELL_V1.as_bytes()),
+    let req = ShellReqBody {
         mode: ShellMode::Exec,
         argv: Some(argv),
         env_patch: Vec::new(),
@@ -195,7 +196,7 @@ pub async fn open_exec(
 async fn open_shell_session(
     connection: &Connection,
     session: &PeerSession,
-    req: ShellReq,
+    req: ShellReqBody,
     interactive: bool,
 ) -> Result<ShellClient> {
     let (mut control_send, control_recv) = connection
@@ -203,7 +204,16 @@ async fn open_shell_session(
         .await
         .context("open shell control stream")?;
     control_send
-        .write_all(&postcard::to_stdvec(&req).context("encode shell request")?)
+        .write_all(
+            &postcard::to_stdvec(&preamble(session, ALPN_SHELL_V1.as_bytes()))
+                .context("encode shell request preamble")?,
+        )
+        .await
+        .context("write shell request preamble")?;
+    control_send
+        .write_all(
+            &postcard::to_stdvec(&ShellFirstFrame::Control(req)).context("encode shell request")?,
+        )
         .await
         .context("write shell request")?;
     let mut control_recv = BufferedRecv::new(control_recv, Vec::new());
@@ -262,15 +272,18 @@ async fn open_send_stream(
         .open_bi()
         .await
         .context("open shell sub-stream")?;
-    let preamble = ShellSubPreamble {
-        peer_token: session.peer_token,
-        alpn: String::from_utf8_lossy(ALPN_SHELL_V1.as_bytes()).into_owned(),
-        session_id,
-        kind,
-    };
-    send.write_all(&postcard::to_stdvec(&preamble).context("encode shell sub-stream preamble")?)
-        .await
-        .context("write shell sub-stream preamble")?;
+    send.write_all(
+        &postcard::to_stdvec(&preamble(session, ALPN_SHELL_V1.as_bytes()))
+            .context("encode shell sub-stream preamble")?,
+    )
+    .await
+    .context("write shell sub-stream preamble")?;
+    send.write_all(
+        &postcard::to_stdvec(&ShellFirstFrame::Sub(ShellSubTail { session_id, kind }))
+            .context("encode shell sub-stream first frame")?,
+    )
+    .await
+    .context("write shell sub-stream first frame")?;
     Ok((send, recv))
 }
 

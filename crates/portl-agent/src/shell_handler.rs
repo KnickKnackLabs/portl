@@ -22,7 +22,6 @@ use nix::unistd::{Gid, Pid, Uid, User, geteuid};
 ))]
 use nix::unistd::{setgid, setgroups, setuid};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::{mpsc, watch};
@@ -40,22 +39,6 @@ const MAX_SIGNAL_BYTES: usize = 1024;
 const MAX_RESIZE_BYTES: usize = 1024;
 const IO_CHUNK: usize = 16 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ShellReqBody {
-    mode: portl_proto::shell_v1::ShellMode,
-    argv: Option<Vec<String>>,
-    env_patch: Vec<(String, portl_proto::shell_v1::EnvValue)>,
-    cwd: Option<String>,
-    pty: Option<portl_proto::shell_v1::PtyCfg>,
-    user: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ShellSubTail {
-    session_id: [u8; 16],
-    kind: portl_proto::shell_v1::ShellStreamKind,
-}
-
 pub(crate) async fn serve_stream(
     connection: Connection,
     session: Session,
@@ -64,43 +47,28 @@ pub(crate) async fn serve_stream(
     mut recv: BufferedRecv,
     preamble: portl_proto::wire::StreamPreamble,
 ) -> Result<()> {
-    if recv.prefix().is_empty() {
-        let mut hint = [0_u8; 1];
-        let read = recv
-            .read(&mut hint)
-            .await
-            .context("read shell stream hint")?;
-        if read == 0 {
-            bail!("empty shell stream")
-        }
-        recv.push_front(&hint[..read]);
-    }
-
-    if recv.prefix()[0] < 2 {
-        let req_body = recv
-            .read_frame::<ShellReqBody>(MAX_CONTROL_BYTES)
-            .await?
-            .context("missing shell control request")?;
-        let req = portl_proto::shell_v1::ShellReq {
-            preamble: preamble.clone(),
-            mode: req_body.mode,
-            argv: req_body.argv,
-            env_patch: req_body.env_patch,
-            cwd: req_body.cwd,
-            pty: req_body.pty,
-            user: req_body.user,
-        };
-        serve_control_stream(connection, session, state, send, recv, req).await
-    } else {
-        let tail = postcard_tail(&mut recv, MAX_CONTROL_BYTES).await?;
-        serve_substream(connection, session, state, send, recv, preamble, tail).await
-    }
-}
-
-async fn postcard_tail(recv: &mut BufferedRecv, max_bytes: usize) -> Result<ShellSubTail> {
-    recv.read_frame::<ShellSubTail>(max_bytes)
+    let first = recv
+        .read_frame::<portl_proto::shell_v1::ShellFirstFrame>(MAX_CONTROL_BYTES)
         .await?
-        .context("missing shell sub-stream preamble")
+        .context("missing shell first frame")?;
+
+    match first {
+        portl_proto::shell_v1::ShellFirstFrame::Control(req_body) => {
+            let req = portl_proto::shell_v1::ShellReq {
+                preamble: preamble.clone(),
+                mode: req_body.mode,
+                argv: req_body.argv,
+                env_patch: req_body.env_patch,
+                cwd: req_body.cwd,
+                pty: req_body.pty,
+                user: req_body.user,
+            };
+            serve_control_stream(connection, session, state, send, recv, req).await
+        }
+        portl_proto::shell_v1::ShellFirstFrame::Sub(tail) => {
+            serve_substream(connection, session, state, send, recv, preamble, tail).await
+        }
+    }
 }
 
 async fn serve_control_stream(
@@ -194,7 +162,7 @@ async fn serve_substream(
     send: SendStream,
     recv: BufferedRecv,
     preamble: portl_proto::wire::StreamPreamble,
-    tail: ShellSubTail,
+    tail: portl_proto::shell_v1::ShellSubTail,
 ) -> Result<()> {
     if preamble.peer_token != session.peer_token
         || preamble.alpn != String::from_utf8_lossy(portl_proto::shell_v1::ALPN_SHELL_V1)

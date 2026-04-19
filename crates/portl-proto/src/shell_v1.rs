@@ -15,6 +15,16 @@ pub struct ShellReq {
     pub user: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellReqBody {
+    pub mode: ShellMode,
+    pub argv: Option<Vec<String>>,
+    pub env_patch: Vec<(String, EnvValue)>,
+    pub cwd: Option<String>,
+    pub pty: Option<PtyCfg>,
+    pub user: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShellMode {
     Shell,
@@ -70,6 +80,18 @@ pub struct ShellSubPreamble {
     pub kind: ShellStreamKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellSubTail {
+    pub session_id: [u8; 16],
+    pub kind: ShellStreamKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShellFirstFrame {
+    Control(ShellReqBody),
+    Sub(ShellSubTail),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResizeFrame {
     pub cols: u16,
@@ -89,8 +111,9 @@ pub struct ExitFrame {
 #[cfg(test)]
 mod tests {
     use super::{
-        ALPN_SHELL_V1, EnvValue, ExitFrame, PtyCfg, ResizeFrame, ShellAck, ShellMode, ShellReason,
-        ShellReq, ShellStreamKind, ShellSubPreamble, SignalFrame,
+        ALPN_SHELL_V1, EnvValue, ExitFrame, PtyCfg, ResizeFrame, ShellAck, ShellFirstFrame,
+        ShellMode, ShellReason, ShellReq, ShellReqBody, ShellStreamKind, ShellSubPreamble,
+        ShellSubTail, SignalFrame,
     };
     use crate::wire::StreamPreamble;
 
@@ -151,6 +174,36 @@ mod tests {
         let decoded: ShellSubPreamble =
             postcard::from_bytes(&encoded).expect("decode sub preamble");
         assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn shell_first_frame_roundtrips_via_postcard() {
+        let control = ShellFirstFrame::Control(ShellReqBody {
+            mode: ShellMode::Shell,
+            argv: None,
+            env_patch: vec![("TERM".to_owned(), EnvValue::Set("xterm".to_owned()))],
+            cwd: Some("/tmp".to_owned()),
+            pty: Some(PtyCfg {
+                term: "xterm-256color".to_owned(),
+                cols: 100,
+                rows: 40,
+            }),
+            user: Some("alice".to_owned()),
+        });
+        let sub = ShellFirstFrame::Sub(ShellSubTail {
+            session_id: [3; 16],
+            kind: ShellStreamKind::Stdout,
+        });
+
+        assert_eq!(
+            postcard::from_bytes::<ShellFirstFrame>(&postcard::to_stdvec(&control).unwrap())
+                .unwrap(),
+            control
+        );
+        assert_eq!(
+            postcard::from_bytes::<ShellFirstFrame>(&postcard::to_stdvec(&sub).unwrap()).unwrap(),
+            sub
+        );
     }
 
     #[test]
