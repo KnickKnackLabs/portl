@@ -1,9 +1,11 @@
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use portl_core::net::{open_udp, run_local_udp_forward};
+use portl_core::net::{LocalUdpForwardHandle, open_udp};
 use portl_core::ticket::schema::{Capabilities, PortRule};
 use portl_proto::udp_v1::UdpBind;
+use tokio::sync::watch;
 
 use crate::commands::peer::connect_peer;
 
@@ -14,49 +16,109 @@ pub fn run(peer: &str, specs: &[String]) -> Result<ExitCode> {
             bail!("at least one -L spec is required")
         }
 
+        let parsed_specs = specs
+            .iter()
+            .map(|spec| parse_local_spec(spec))
+            .collect::<Result<Vec<_>>>()?;
+        let (shutdown_tx, _) = watch::channel(false);
         let mut tasks = Vec::new();
-        let mut connections = Vec::new();
-        let mut endpoints = Vec::new();
-        for spec in specs {
-            let parsed = parse_local_spec(spec)?;
-            let connected = connect_peer(peer, udp_caps()).await?;
-            let control = open_udp(
-                &connected.connection,
-                &connected.session,
-                None,
-                vec![UdpBind {
-                    local_port_range: (parsed.local_port, parsed.local_port),
-                    target_host: parsed.remote_host.clone(),
-                    target_port_range: (parsed.remote_port, parsed.remote_port),
-                }],
-            )
-            .await?;
-            let connection = connected.connection.clone();
-            connections.push(connected.connection);
-            endpoints.push(connected.endpoint);
+
+        for parsed in parsed_specs {
+            let peer = peer.to_owned();
+            let mut shutdown_rx = shutdown_tx.subscribe();
+            let forward = LocalUdpForwardHandle::bind(&parsed.local_addr()).await?;
             tasks.push(tokio::spawn(async move {
-                run_local_udp_forward(
-                    connection,
-                    control,
-                    &parsed.local_addr(),
-                    parsed.remote_port,
-                )
-                .await
+                let mut backoff = Duration::from_millis(100);
+                loop {
+                    if *shutdown_rx.borrow() {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+
+                    let connected = match connect_peer(&peer, udp_caps()).await {
+                        Ok(connected) => connected,
+                        Err(err) => {
+                            tracing::debug!(%err, spec = %parsed.local_addr(), "udp reconnect failed during ticket handshake");
+                            wait_backoff(&mut shutdown_rx, backoff).await;
+                            backoff = next_backoff(backoff);
+                            continue;
+                        }
+                    };
+
+                    let requested_session_id = forward.session_id().await;
+                    let control = match open_udp(
+                        &connected.connection,
+                        &connected.session,
+                        requested_session_id,
+                        vec![UdpBind {
+                            local_port_range: (parsed.local_port, parsed.local_port),
+                            target_host: parsed.remote_host.clone(),
+                            target_port_range: (parsed.remote_port, parsed.remote_port),
+                        }],
+                    )
+                    .await
+                    {
+                        Ok(control) => control,
+                        Err(err) => {
+                            tracing::debug!(%err, spec = %parsed.local_addr(), "udp reconnect failed while opening control stream");
+                            connected.connection.close(0u32.into(), b"udp reconnect retry");
+                            connected.endpoint.close().await;
+                            wait_backoff(&mut shutdown_rx, backoff).await;
+                            backoff = next_backoff(backoff);
+                            continue;
+                        }
+                    };
+
+                    backoff = Duration::from_millis(100);
+                    let result = tokio::select! {
+                        result = forward.run_with_control(
+                            connected.connection.clone(),
+                            control,
+                            parsed.remote_port,
+                        ) => result,
+                        changed = shutdown_rx.changed() => {
+                            let _ = changed;
+                            connected.connection.close(0u32.into(), b"udp shutdown");
+                            connected.endpoint.close().await;
+                            return Ok(());
+                        }
+                    };
+
+                    connected.connection.close(0u32.into(), b"udp reconnect retry");
+                    connected.endpoint.close().await;
+
+                    if *shutdown_rx.borrow() {
+                        return Ok(());
+                    }
+
+                    if let Err(err) = result {
+                        tracing::debug!(%err, spec = %parsed.local_addr(), "udp forward loop stopped; reconnecting");
+                    }
+                    wait_backoff(&mut shutdown_rx, backoff).await;
+                    backoff = next_backoff(backoff);
+                }
             }));
         }
 
         tokio::signal::ctrl_c().await.context("wait for ctrl-c")?;
-        for connection in &connections {
-            connection.close(0u32.into(), b"udp complete");
-        }
-        for endpoint in endpoints {
-            endpoint.close().await;
-        }
+        let _ = shutdown_tx.send(true);
         for task in tasks {
-            task.abort();
+            let _ = task.await;
         }
         Ok(ExitCode::SUCCESS)
     })
+}
+
+async fn wait_backoff(shutdown_rx: &mut watch::Receiver<bool>, backoff: Duration) {
+    tokio::select! {
+        _ = tokio::time::sleep(backoff) => {}
+        changed = shutdown_rx.changed() => {
+            let _ = changed;
+        }
+    }
+}
+
+fn next_backoff(current: Duration) -> Duration {
+    (current * 2).min(Duration::from_secs(5))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,7 +172,8 @@ fn udp_caps() -> Capabilities {
 
 #[cfg(test)]
 mod tests {
-    use super::{LocalForwardSpec, parse_local_spec};
+    use super::{LocalForwardSpec, next_backoff, parse_local_spec};
+    use std::time::Duration;
 
     #[test]
     fn parses_short_forward_spec() {
@@ -136,5 +199,15 @@ mod tests {
                 remote_port: 53,
             }
         );
+    }
+
+    #[test]
+    fn udp_reconnect_backoff_caps_at_five_seconds() {
+        assert_eq!(
+            next_backoff(Duration::from_millis(100)),
+            Duration::from_millis(200)
+        );
+        assert_eq!(next_backoff(Duration::from_secs(4)), Duration::from_secs(5));
+        assert_eq!(next_backoff(Duration::from_secs(5)), Duration::from_secs(5));
     }
 }

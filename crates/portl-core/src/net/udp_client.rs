@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -26,6 +27,72 @@ pub struct UdpControl {
 impl UdpControl {
     pub fn close(mut self) -> Result<()> {
         self.send.finish().context("finish udp control stream")
+    }
+}
+
+#[derive(Debug)]
+pub struct LocalUdpForwardHandle {
+    local_socket: Arc<UdpSocket>,
+    src_tags: Arc<Mutex<HashMap<SocketAddr, u32>>>,
+    reverse_index: Arc<Mutex<HashMap<u32, SocketAddr>>>,
+    next_src_tag: Arc<Mutex<u32>>,
+    session_id: Arc<Mutex<Option<[u8; 8]>>>,
+}
+
+impl LocalUdpForwardHandle {
+    pub async fn bind(local_addr: &str) -> Result<Self> {
+        Ok(Self {
+            local_socket: Arc::new(
+                UdpSocket::bind(local_addr)
+                    .await
+                    .with_context(|| format!("bind local udp socket on {local_addr}"))?,
+            ),
+            src_tags: Arc::new(Mutex::new(HashMap::new())),
+            reverse_index: Arc::new(Mutex::new(HashMap::new())),
+            next_src_tag: Arc::new(Mutex::new(1)),
+            session_id: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    pub async fn session_id(&self) -> Option<[u8; 8]> {
+        *self.session_id.lock().await
+    }
+
+    pub async fn run_with_control(
+        &self,
+        connection: Connection,
+        control: UdpControl,
+        target_port: u16,
+    ) -> Result<()> {
+        let session_id = control.session_id;
+        *self.session_id.lock().await = Some(session_id);
+
+        let upstream = upstream_loop(
+            connection.clone(),
+            Arc::clone(&self.local_socket),
+            Arc::clone(&self.src_tags),
+            Arc::clone(&self.reverse_index),
+            Arc::clone(&self.next_src_tag),
+            session_id,
+            target_port,
+        );
+        let reverse = reverse_loop(
+            connection,
+            Arc::clone(&self.local_socket),
+            Arc::clone(&self.reverse_index),
+            session_id,
+        );
+
+        tokio::select! {
+            result = upstream => {
+                drop(control);
+                result
+            }
+            result = reverse => {
+                drop(control);
+                result
+            }
+        }
     }
 }
 
@@ -73,47 +140,21 @@ pub async fn run_local_forward(
     local_addr: &str,
     target_port: u16,
 ) -> Result<()> {
-    let control = control;
-    let local_socket = Arc::new(
-        UdpSocket::bind(local_addr)
-            .await
-            .with_context(|| format!("bind local udp socket on {local_addr}"))?,
-    );
-    let src_tags = Arc::new(Mutex::new(HashMap::<std::net::SocketAddr, u32>::new()));
-    let reverse_index = Arc::new(Mutex::new(HashMap::<u32, std::net::SocketAddr>::new()));
-    let session_id = control.session_id;
-
-    let reverse_task = tokio::spawn(reverse_loop(
-        connection.clone(),
-        Arc::clone(&local_socket),
-        Arc::clone(&reverse_index),
-        session_id,
-    ));
-
-    let upstream_result = upstream_loop(
-        connection,
-        local_socket,
-        src_tags,
-        reverse_index,
-        session_id,
-        target_port,
-    )
-    .await;
-    reverse_task.abort();
-    let _ = reverse_task.await;
-    drop(control);
-    upstream_result
+    let handle = LocalUdpForwardHandle::bind(local_addr).await?;
+    handle
+        .run_with_control(connection, control, target_port)
+        .await
 }
 
 async fn upstream_loop(
     connection: Connection,
     local_socket: Arc<UdpSocket>,
-    src_tags: Arc<Mutex<HashMap<std::net::SocketAddr, u32>>>,
-    reverse_index: Arc<Mutex<HashMap<u32, std::net::SocketAddr>>>,
+    src_tags: Arc<Mutex<HashMap<SocketAddr, u32>>>,
+    reverse_index: Arc<Mutex<HashMap<u32, SocketAddr>>>,
+    next_src_tag: Arc<Mutex<u32>>,
     session_id: [u8; 8],
     target_port: u16,
 ) -> Result<()> {
-    let mut next_src_tag = 1_u32;
     let mut buf = vec![0_u8; 64 * 1024];
 
     loop {
@@ -127,8 +168,7 @@ async fn upstream_loop(
             if let Some(src_tag) = src_tags.get(&from).copied() {
                 src_tag
             } else {
-                let allocated = next_src_tag;
-                next_src_tag = next_src_tag.saturating_add(1);
+                let allocated = allocate_src_tag(&next_src_tag, &reverse_index).await;
                 src_tags.insert(from, allocated);
                 reverse_index.lock().await.insert(allocated, from);
                 allocated
@@ -169,7 +209,7 @@ async fn upstream_loop(
 async fn reverse_loop(
     connection: Connection,
     local_socket: Arc<UdpSocket>,
-    reverse_index: Arc<Mutex<HashMap<u32, std::net::SocketAddr>>>,
+    reverse_index: Arc<Mutex<HashMap<u32, SocketAddr>>>,
     session_id: [u8; 8],
 ) -> Result<()> {
     loop {
@@ -188,5 +228,23 @@ async fn reverse_loop(
             .send_to(&datagram.payload, to)
             .await
             .context("send udp payload to local app")?;
+    }
+}
+
+async fn allocate_src_tag(
+    next_src_tag: &Arc<Mutex<u32>>,
+    reverse_index: &Arc<Mutex<HashMap<u32, SocketAddr>>>,
+) -> u32 {
+    loop {
+        let candidate = {
+            let mut next_src_tag_guard = next_src_tag.lock().await;
+            let candidate = (*next_src_tag_guard).max(1);
+            let next = candidate.wrapping_add(1);
+            *next_src_tag_guard = if next == 0 { 1 } else { next };
+            candidate
+        };
+        if !reverse_index.lock().await.contains_key(&candidate) {
+            return candidate;
+        }
     }
 }

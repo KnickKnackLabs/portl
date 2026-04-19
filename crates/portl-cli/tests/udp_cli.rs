@@ -1,4 +1,5 @@
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -6,6 +7,7 @@ use assert_cmd::cargo::CommandCargoExt;
 use iroh_tickets::Ticket;
 use portl_agent::{AgentConfig, DiscoveryConfig, run_task};
 use portl_core::id::{Identity, store};
+use portl_core::net::{LocalUdpForwardHandle, open_ticket_v1, open_udp};
 use portl_core::test_util::pair;
 use portl_core::ticket::mint::mint_root;
 use portl_core::ticket::schema::{Capabilities, PortRule, PortlTicket};
@@ -62,6 +64,144 @@ async fn udp_command_connects_and_forwards_datagrams() -> Result<()> {
     let _status = child.wait().context("wait for killed udp command")?;
 
     shutdown(client, server, agent).await
+}
+
+#[tokio::test]
+async fn udp_forward_handle_reconnects_and_preserves_session() -> Result<()> {
+    let remote = UdpSocket::bind(("127.0.0.1", 0)).await?;
+    let remote_port = remote.local_addr()?.port();
+    let remote_task = tokio::spawn(async move {
+        let mut buf = [0_u8; 2048];
+        loop {
+            let (read, from) = remote.recv_from(&mut buf).await?;
+            remote.send_to(&buf[..read], from).await?;
+        }
+        #[allow(unreachable_code)]
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator).await?;
+    let ticket = root_ticket(&operator, server.addr(), udp_caps(remote_port)).serialize();
+    let identity = Identity::new();
+    let local_port = reserve_udp_port()?;
+    let forward = Arc::new(LocalUdpForwardHandle::bind(&format!("127.0.0.1:{local_port}")).await?);
+    let app = UdpSocket::bind(("127.0.0.1", 0)).await?;
+
+    let first = connect_and_open(
+        &client,
+        &identity,
+        &ticket,
+        local_port,
+        remote_port,
+        forward.session_id().await,
+    )
+    .await?;
+    let first_connection = first.connection.clone();
+    let first_task = tokio::spawn({
+        let forward = Arc::clone(&forward);
+        async move {
+            forward
+                .run_with_control(first.connection, first.control, remote_port)
+                .await
+        }
+    });
+    wait_for_udp_forward_socket(&app, local_port).await?;
+    app.send_to(b"first", ("127.0.0.1", local_port)).await?;
+    let mut buf = [0_u8; 32];
+    let (read, _) = app.recv_from(&mut buf).await?;
+    assert_eq!(&buf[..read], b"first");
+    let session_id = forward
+        .session_id()
+        .await
+        .expect("session id after first attach");
+
+    first_connection.close(0u32.into(), b"force reconnect");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), first_task)
+            .await??
+            .is_err()
+    );
+
+    let second = connect_and_open(
+        &client,
+        &identity,
+        &ticket,
+        local_port,
+        remote_port,
+        Some(session_id),
+    )
+    .await?;
+    assert_eq!(second.control.session_id, session_id);
+    let second_task = tokio::spawn({
+        let forward = Arc::clone(&forward);
+        async move {
+            forward
+                .run_with_control(second.connection, second.control, remote_port)
+                .await
+        }
+    });
+    wait_for_udp_forward_socket(&app, local_port).await?;
+    app.send_to(b"second", ("127.0.0.1", local_port)).await?;
+    let (read, _) = app.recv_from(&mut buf).await?;
+    assert_eq!(&buf[..read], b"second");
+
+    second_task.abort();
+    remote_task.abort();
+    shutdown(client, server, agent).await
+}
+
+async fn connect_and_open(
+    client: &portl_core::endpoint::Endpoint,
+    identity: &Identity,
+    ticket: &str,
+    local_port: u16,
+    remote_port: u16,
+    session_id: Option<[u8; 8]>,
+) -> Result<OpenedUdp> {
+    let ticket =
+        <portl_core::ticket::schema::PortlTicket as iroh_tickets::Ticket>::deserialize(ticket)
+            .context("deserialize udp ticket")?;
+    let (connection, session) = open_ticket_v1(client, &ticket, &[], identity).await?;
+    let control = open_udp(
+        &connection,
+        &session,
+        session_id,
+        vec![portl_proto::udp_v1::UdpBind {
+            local_port_range: (local_port, local_port),
+            target_host: "127.0.0.1".to_owned(),
+            target_port_range: (remote_port, remote_port),
+        }],
+    )
+    .await?;
+    Ok(OpenedUdp {
+        connection,
+        control,
+    })
+}
+
+struct OpenedUdp {
+    connection: iroh::endpoint::Connection,
+    control: portl_core::net::UdpControl,
+}
+
+async fn wait_for_udp_forward_socket(app: &UdpSocket, local_port: u16) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut buf = [0_u8; 64];
+    loop {
+        app.send_to(b"probe", ("127.0.0.1", local_port)).await?;
+        if let Ok(Ok((read, _))) =
+            tokio::time::timeout(Duration::from_millis(200), app.recv_from(&mut buf)).await
+            && &buf[..read] == b"probe"
+        {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("timed out waiting for udp forward on {local_port}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 async fn start_agent(
