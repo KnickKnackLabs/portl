@@ -2,36 +2,63 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use iroh_base::EndpointAddr;
+use iroh_base::{EndpointAddr, EndpointId};
 use iroh_tickets::Ticket;
 use portl_core::id::store;
 use portl_core::ticket::mint::mint_root;
 use portl_core::ticket::schema::{Capabilities, EnvPolicy, MetaCaps, PortRule, ShellCaps};
+use qrcode::QrCode;
+use qrcode::render::unicode;
 
-pub fn run(caps: &str, ttl: &str) -> Result<ExitCode> {
+use crate::MintRootPrint;
+
+const TICKET_EXPLORER_URL: &str = "https://ticket.iroh.computer/#";
+const ONE_YEAR_SECONDS: u64 = 365 * 24 * 60 * 60;
+
+pub fn run(
+    endpoint: &str,
+    caps: &str,
+    ttl: &str,
+    to: Option<&str>,
+    depth: Option<u8>,
+    print: MintRootPrint,
+) -> Result<ExitCode> {
     let identity = store::load(&store::default_path())?;
+    let addr = parse_endpoint_addr(endpoint)?;
     let caps = parse_caps(caps)?;
     let ttl_secs = parse_ttl(ttl)?;
+    let to = to.map(parse_endpoint_bytes).transpose()?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before the Unix epoch")?
         .as_secs();
     let not_after = now.checked_add(ttl_secs).context("ttl overflows u64")?;
 
-    let ticket = mint_root(
-        identity.signing_key(),
-        EndpointAddr::new(identity.endpoint_id()),
-        caps,
-        now,
-        not_after,
-        None,
-    )?;
+    if let Some(depth) = depth {
+        eprintln!("warning: ignoring --depth={depth} for root tickets in M1");
+    }
 
-    println!("{}", ticket.serialize());
+    let ticket = mint_root(identity.signing_key(), addr, caps, now, not_after, to)?;
+    let ticket_uri = ticket.serialize();
+
+    match print {
+        MintRootPrint::String => println!("{ticket_uri}"),
+        MintRootPrint::Qr => {
+            let qr = QrCode::new(ticket_uri.as_bytes()).context("encode QR")?;
+            let rendered = qr.render::<unicode::Dense1x2>().build();
+            println!("{rendered}");
+        }
+        MintRootPrint::Url => println!("{TICKET_EXPLORER_URL}{ticket_uri}"),
+    }
+
     Ok(ExitCode::SUCCESS)
 }
 
 fn parse_caps(spec: &str) -> Result<Capabilities> {
+    if spec == "all" {
+        return Ok(all_caps());
+    }
+
     let mut shell = None;
     let mut tcp = Vec::new();
     let mut udp = Vec::new();
@@ -40,13 +67,7 @@ fn parse_caps(spec: &str) -> Result<Capabilities> {
     for entry in spec.split(',').filter(|entry| !entry.is_empty()) {
         match entry {
             "shell" => {
-                shell = Some(ShellCaps {
-                    pty_allowed: true,
-                    exec_allowed: true,
-                    user_allowlist: None,
-                    command_allowlist: None,
-                    env_policy: EnvPolicy::Deny,
-                });
+                shell = Some(default_shell_caps());
             }
             "meta:ping" => {
                 meta.get_or_insert(MetaCaps {
@@ -91,6 +112,39 @@ fn parse_caps(spec: &str) -> Result<Capabilities> {
         vpn: None,
         meta,
     })
+}
+
+fn all_caps() -> Capabilities {
+    Capabilities {
+        presence: 0b0010_0111,
+        shell: Some(default_shell_caps()),
+        tcp: Some(vec![PortRule {
+            host_glob: "*".to_owned(),
+            port_min: 1,
+            port_max: u16::MAX,
+        }]),
+        udp: Some(vec![PortRule {
+            host_glob: "*".to_owned(),
+            port_min: 1,
+            port_max: u16::MAX,
+        }]),
+        fs: None,
+        vpn: None,
+        meta: Some(MetaCaps {
+            ping: true,
+            info: true,
+        }),
+    }
+}
+
+fn default_shell_caps() -> ShellCaps {
+    ShellCaps {
+        pty_allowed: true,
+        exec_allowed: true,
+        user_allowlist: None,
+        command_allowlist: None,
+        env_policy: EnvPolicy::Deny,
+    }
 }
 
 fn parse_port_rule(spec: &str) -> Result<PortRule> {
@@ -144,7 +198,22 @@ fn parse_ttl(spec: &str) -> Result<u64> {
         "m" => 60,
         "h" => 60 * 60,
         "d" => 24 * 60 * 60,
-        _ => bail!("ttl unit must be one of s, m, h, d"),
+        "y" => ONE_YEAR_SECONDS,
+        _ => bail!("ttl unit must be one of s, m, h, d, y"),
     };
     value.checked_mul(multiplier).context("ttl overflows u64")
+}
+
+fn parse_endpoint_addr(spec: &str) -> Result<EndpointAddr> {
+    let bytes = parse_endpoint_bytes(spec)?;
+    let endpoint_id = EndpointId::from_bytes(&bytes).context("invalid endpoint id")?;
+    Ok(EndpointAddr::new(endpoint_id))
+}
+
+fn parse_endpoint_bytes(spec: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(spec).context("endpoint id must be hex")?;
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("endpoint id must be exactly 32 bytes"))?;
+    Ok(bytes)
 }

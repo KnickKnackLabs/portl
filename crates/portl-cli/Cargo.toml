@@ -27,8 +27,11 @@ tracing-subscriber = { workspace = true }
 iroh-base   = { workspace = true }
 iroh-tickets = { workspace = true }
 rpassword   = { workspace = true }
+hex         = { workspace = true }
+qrcode      = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
 tempfile   = { workspace = true }
 iroh-tickets = { workspace = true }
+ed25519-dalek = { workspace = true }

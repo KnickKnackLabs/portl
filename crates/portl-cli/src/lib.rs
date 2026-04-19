@@ -11,7 +11,7 @@ mod commands;
 
 use std::{ffi::OsString, path::Path, path::PathBuf, process::ExitCode};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// Structured representation of a parsed invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,8 +26,22 @@ pub enum Command {
     IdExport { out: PathBuf },
     /// `portl id import --from <path>`
     IdImport { from: PathBuf },
-    /// `portl mint-root --caps ... --ttl ...`
-    MintRoot { caps: String, ttl: String },
+    /// `portl mint-root --endpoint ... --caps ... --ttl ...`
+    MintRoot {
+        endpoint: String,
+        caps: String,
+        ttl: String,
+        to: Option<String>,
+        depth: Option<u8>,
+        print: MintRootPrint,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum MintRootPrint {
+    String,
+    Qr,
+    Url,
 }
 
 /// Errors returned by [`parse`].
@@ -83,7 +97,14 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
         Command::IdShow => commands::id::show::run(),
         Command::IdExport { out } => commands::id::export::run(&out),
         Command::IdImport { from } => commands::id::import::run(&from),
-        Command::MintRoot { caps, ttl } => commands::mint_root::run(&caps, &ttl),
+        Command::MintRoot {
+            endpoint,
+            caps,
+            ttl,
+            to,
+            depth,
+            print,
+        } => commands::mint_root::run(&endpoint, &caps, &ttl, to.as_deref(), depth, print),
     }
 }
 
@@ -121,10 +142,18 @@ enum TopLevel {
     },
     /// Mint a root ticket with the local operator identity.
     MintRoot {
+        #[arg(long, alias = "node")]
+        endpoint: String,
         #[arg(long)]
         caps: String,
         #[arg(long)]
         ttl: String,
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long)]
+        depth: Option<u8>,
+        #[arg(short = 'o', long = "print", value_enum, default_value = "string")]
+        print: MintRootPrint,
     },
 }
 
@@ -173,7 +202,21 @@ impl Cli {
             TopLevel::Id {
                 action: IdAction::Import { from },
             } => Command::IdImport { from },
-            TopLevel::MintRoot { caps, ttl } => Command::MintRoot { caps, ttl },
+            TopLevel::MintRoot {
+                endpoint,
+                caps,
+                ttl,
+                to,
+                depth,
+                print,
+            } => Command::MintRoot {
+                endpoint,
+                caps,
+                ttl,
+                to,
+                depth,
+                print,
+            },
         }
     }
 }

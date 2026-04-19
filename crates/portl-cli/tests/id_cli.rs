@@ -1,10 +1,13 @@
 use std::process::Command;
 
 use assert_cmd::prelude::*;
+use ed25519_dalek::SigningKey;
 use iroh_tickets::Ticket;
 use portl_core::id::store::{default_path_with_home, load};
-use portl_core::ticket::schema::{Capabilities, EnvPolicy, PortRule, PortlTicket, ShellCaps};
-use tempfile::tempdir;
+use portl_core::ticket::schema::{
+    Capabilities, EnvPolicy, MetaCaps, PortRule, PortlTicket, ShellCaps,
+};
+use tempfile::{TempDir, tempdir};
 
 fn shell_caps() -> Capabilities {
     Capabilities {
@@ -22,6 +25,27 @@ fn shell_caps() -> Capabilities {
         vpn: None,
         meta: None,
     }
+}
+
+fn init_identity(home: &TempDir) -> [u8; 32] {
+    Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home.path())
+        .args(["id", "new"])
+        .assert()
+        .success();
+
+    load(&default_path_with_home(Some(home.path())))
+        .unwrap()
+        .verifying_key()
+}
+
+fn endpoint_hex_from_seed(seed: u8) -> String {
+    hex::encode(
+        SigningKey::from_bytes(&[seed; 32])
+            .verifying_key()
+            .to_bytes(),
+    )
 }
 
 #[test]
@@ -179,20 +203,36 @@ fn id_export_then_import_roundtrip() {
 }
 
 #[test]
-fn mint_root_emits_portl_prefix_ticket() {
+fn mint_root_requires_endpoint_arg() {
     let home = tempdir().unwrap();
+    init_identity(&home);
 
     Command::cargo_bin("portl")
         .unwrap()
         .env("PORTL_HOME", home.path())
-        .args(["id", "new"])
+        .args(["mint-root", "--caps", "shell", "--ttl", "24h"])
         .assert()
-        .success();
+        .failure();
+}
+
+#[test]
+fn mint_root_emits_portl_prefix_ticket() {
+    let home = tempdir().unwrap();
+    let operator = init_identity(&home);
+    let endpoint = hex::encode(operator);
 
     let stdout = Command::cargo_bin("portl")
         .unwrap()
         .env("PORTL_HOME", home.path())
-        .args(["mint-root", "--caps", "shell", "--ttl", "24h"])
+        .args([
+            "mint-root",
+            "--endpoint",
+            endpoint.as_str(),
+            "--caps",
+            "shell",
+            "--ttl",
+            "24h",
+        ])
         .assert()
         .success()
         .get_output()
@@ -207,23 +247,27 @@ fn mint_root_emits_portl_prefix_ticket() {
 
     let parsed = PortlTicket::deserialize(ticket.trim()).unwrap();
     assert_eq!(parsed.body.caps, shell_caps());
+    assert_eq!(parsed.body.issuer, None);
 }
 
 #[test]
 fn mint_root_with_tcp_rule() {
     let home = tempdir().unwrap();
-
-    Command::cargo_bin("portl")
-        .unwrap()
-        .env("PORTL_HOME", home.path())
-        .args(["id", "new"])
-        .assert()
-        .success();
+    let operator = init_identity(&home);
+    let endpoint = hex::encode(operator);
 
     let stdout = Command::cargo_bin("portl")
         .unwrap()
         .env("PORTL_HOME", home.path())
-        .args(["mint-root", "--caps", "tcp:127.0.0.1:22-22", "--ttl", "1h"])
+        .args([
+            "mint-root",
+            "--endpoint",
+            endpoint.as_str(),
+            "--caps",
+            "tcp:127.0.0.1:22-22",
+            "--ttl",
+            "1h",
+        ])
         .assert()
         .success()
         .get_output()
@@ -241,4 +285,163 @@ fn mint_root_with_tcp_rule() {
             port_max: 22,
         }])
     );
+}
+
+#[test]
+fn mint_root_accepts_all_caps_keyword() {
+    let home = tempdir().unwrap();
+    let operator = init_identity(&home);
+    let endpoint = hex::encode(operator);
+
+    let stdout = Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home.path())
+        .args([
+            "mint-root",
+            "--endpoint",
+            endpoint.as_str(),
+            "--caps",
+            "all",
+            "--ttl",
+            "1h",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let ticket = String::from_utf8(stdout).unwrap();
+    let parsed = PortlTicket::deserialize(ticket.trim()).unwrap();
+
+    assert_eq!(parsed.body.caps.presence, 0b0010_0111);
+    assert_eq!(
+        parsed.body.caps.shell,
+        Some(ShellCaps {
+            user_allowlist: None,
+            pty_allowed: true,
+            exec_allowed: true,
+            command_allowlist: None,
+            env_policy: EnvPolicy::Deny,
+        })
+    );
+    assert_eq!(
+        parsed.body.caps.tcp,
+        Some(vec![PortRule {
+            host_glob: "*".into(),
+            port_min: 1,
+            port_max: u16::MAX,
+        }])
+    );
+    assert_eq!(
+        parsed.body.caps.udp,
+        Some(vec![PortRule {
+            host_glob: "*".into(),
+            port_min: 1,
+            port_max: u16::MAX,
+        }])
+    );
+    assert_eq!(
+        parsed.body.caps.meta,
+        Some(MetaCaps {
+            ping: true,
+            info: true,
+        })
+    );
+}
+
+#[test]
+fn mint_root_accepts_y_ttl_up_to_365d() {
+    let home = tempdir().unwrap();
+    let operator = init_identity(&home);
+    let endpoint = hex::encode(operator);
+
+    let stdout = Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home.path())
+        .args([
+            "mint-root",
+            "--endpoint",
+            endpoint.as_str(),
+            "--caps",
+            "shell",
+            "--ttl",
+            "1y",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let ticket = String::from_utf8(stdout).unwrap();
+    let parsed = PortlTicket::deserialize(ticket.trim()).unwrap();
+
+    assert_eq!(
+        parsed.body.not_after - parsed.body.not_before,
+        365 * 24 * 60 * 60
+    );
+}
+
+#[test]
+fn mint_root_sets_to_field_from_flag() {
+    let home = tempdir().unwrap();
+    let operator = init_identity(&home);
+    let endpoint = hex::encode(operator);
+    let holder = endpoint_hex_from_seed(91);
+    let holder_bytes: [u8; 32] = hex::decode(&holder).unwrap().try_into().unwrap();
+
+    let stdout = Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home.path())
+        .args([
+            "mint-root",
+            "--endpoint",
+            endpoint.as_str(),
+            "--caps",
+            "shell",
+            "--ttl",
+            "24h",
+            "--to",
+            holder.as_str(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let ticket = String::from_utf8(stdout).unwrap();
+    let parsed = PortlTicket::deserialize(ticket.trim()).unwrap();
+
+    assert_eq!(parsed.body.to, Some(holder_bytes));
+}
+
+#[test]
+fn mint_root_targets_endpoint_when_different_from_operator() {
+    let home = tempdir().unwrap();
+    let operator = init_identity(&home);
+    let endpoint = endpoint_hex_from_seed(92);
+    let endpoint_bytes: [u8; 32] = hex::decode(&endpoint).unwrap().try_into().unwrap();
+
+    let stdout = Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home.path())
+        .args([
+            "mint-root",
+            "--endpoint",
+            endpoint.as_str(),
+            "--caps",
+            "shell",
+            "--ttl",
+            "24h",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let ticket = String::from_utf8(stdout).unwrap();
+    let parsed = PortlTicket::deserialize(ticket.trim()).unwrap();
+
+    assert_eq!(parsed.body.issuer, Some(operator));
+    assert_eq!(*parsed.addr.id.as_bytes(), endpoint_bytes);
+    assert_eq!(parsed.body.target, endpoint_bytes);
 }
