@@ -41,18 +41,20 @@ pub fn evaluate_offer(input: &AcceptanceInput<'_>) -> AcceptanceOutcome {
         return reject(AckReason::RateLimited);
     }
 
-    let Ok(terminal) = portl_core::ticket::decode(&input.offer.ticket) else {
-        return reject(AckReason::BadSignature);
+    let terminal = match decode_offer_ticket(&input.offer.ticket) {
+        Ok(ticket) => ticket,
+        Err(reason) => return reject(reason),
     };
 
-    let Ok(chain) = input
+    let chain = match input
         .offer
         .chain
         .iter()
-        .map(|bytes| portl_core::ticket::decode(bytes))
-        .collect::<portl_core::error::Result<Vec<_>>>()
-    else {
-        return reject(AckReason::BadSignature);
+        .map(|bytes| decode_offer_ticket(bytes))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(chain) => chain,
+        Err(reason) => return reject(reason),
     };
 
     let caps = match verify_chain_without_time(&terminal, &chain, input.trust_roots) {
@@ -81,6 +83,25 @@ pub fn evaluate_offer(input: &AcceptanceInput<'_>) -> AcceptanceOutcome {
         caps: Box::new(caps),
         ticket_id: ticket_id(&terminal.sig),
     }
+}
+
+fn decode_offer_ticket(bytes: &[u8]) -> Result<PortlTicket, AckReason> {
+    let ticket: PortlTicket =
+        postcard::from_bytes(bytes).map_err(|_| AckReason::InternalError {
+            detail: Some("malformed offer".to_owned()),
+        })?;
+    canonical_check_ticket(&ticket).map_err(|_| AckReason::InternalError {
+        detail: Some("non-canonical ticket".to_owned()),
+    })?;
+    let reencoded = postcard::to_stdvec(&ticket).map_err(|_| AckReason::InternalError {
+        detail: Some("malformed offer".to_owned()),
+    })?;
+    if reencoded.as_slice() != bytes {
+        return Err(AckReason::InternalError {
+            detail: Some("non-canonical ticket".to_owned()),
+        });
+    }
+    Ok(ticket)
 }
 
 fn verify_chain_without_time(

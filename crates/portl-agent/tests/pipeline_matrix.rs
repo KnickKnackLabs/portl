@@ -63,6 +63,46 @@ fn rejects_bad_signature() {
 }
 
 #[test]
+fn rejects_malformed_postcard() {
+    let fixture = Fixture::new();
+    let outcome = fixture.evaluate(
+        &raw_offer(vec![1, 2, 3], Vec::new(), None, [3; 16]),
+        &AllowAll,
+    );
+
+    assert_rejected(
+        outcome,
+        &AckReason::InternalError {
+            detail: Some("malformed offer".to_owned()),
+        },
+    );
+}
+
+#[test]
+fn rejects_non_canonical_ticket() {
+    let fixture = Fixture::new();
+    let mut ticket = fixture.root_ticket(meta_caps(true, true), NOW, NOW + 300, None);
+    ticket.body.caps.presence = 0;
+
+    let outcome = fixture.evaluate(
+        &raw_offer(
+            postcard::to_stdvec(&ticket).expect("encode non-canonical ticket"),
+            Vec::new(),
+            None,
+            [3; 16],
+        ),
+        &AllowAll,
+    );
+
+    assert_rejected(
+        outcome,
+        &AckReason::InternalError {
+            detail: Some("non-canonical ticket".to_owned()),
+        },
+    );
+}
+
+#[test]
 fn rejects_bad_chain() {
     let fixture = Fixture::new();
     let root = fixture.root_ticket(meta_caps(true, true), NOW, NOW + 300, None);
@@ -220,12 +260,26 @@ fn offer_with_nonce(
     proof: Option<[u8; 64]>,
     client_nonce: [u8; 16],
 ) -> TicketOffer {
-    TicketOffer {
-        ticket: portl_core::ticket::encode(ticket).expect("encode ticket"),
-        chain: chain
+    raw_offer(
+        portl_core::ticket::encode(ticket).expect("encode ticket"),
+        chain
             .iter()
             .map(|ticket| portl_core::ticket::encode(ticket).expect("encode chain ticket"))
             .collect(),
+        proof,
+        client_nonce,
+    )
+}
+
+fn raw_offer(
+    ticket: Vec<u8>,
+    chain: Vec<Vec<u8>>,
+    proof: Option<[u8; 64]>,
+    client_nonce: [u8; 16],
+) -> TicketOffer {
+    TicketOffer {
+        ticket,
+        chain,
         proof,
         client_nonce,
     }
