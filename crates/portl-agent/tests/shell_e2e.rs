@@ -20,6 +20,7 @@ use portl_core::net::{TicketHandshakeError, open_exec, open_shell, open_ticket_v
 use portl_core::test_util::pair;
 use portl_core::ticket::mint::mint_root;
 use portl_core::ticket::schema::{Capabilities, EnvPolicy, PortlTicket, ShellCaps};
+use tokio::io::AsyncReadExt;
 
 #[tokio::test]
 async fn shell_exec_echo_returns_output_and_exit_code() -> Result<()> {
@@ -106,9 +107,9 @@ async fn shell_with_pty_resize_mid_session_applies_winsz() -> Result<()> {
     let mut buf = [0_u8; 1024];
     loop {
         let read = shell.stdout.read(&mut buf).await?;
-        let Some(read) = read else {
+        if read == 0 {
             anyhow::bail!("shell exited before emitting marker")
-        };
+        }
         stdout.extend_from_slice(&buf[..read]);
         if String::from_utf8_lossy(&stdout).contains("__PORTL__") {
             break;

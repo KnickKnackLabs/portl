@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use iroh::endpoint::RecvStream;
+use portl_core::io::BufferedRecv;
 use portl_core::net::{ShellClient, open_exec};
 use portl_core::ticket::schema::{Capabilities, EnvPolicy, ShellCaps};
 use tokio::io::{AsyncWriteExt, copy};
@@ -92,19 +92,10 @@ fn exit_code_from_i32(code: i32) -> ExitCode {
     ExitCode::from(code)
 }
 
-async fn read_exit(recv: &mut RecvStream) -> Result<i32> {
-    let mut buf = Vec::new();
-    let mut tmp = [0_u8; 128];
-    loop {
-        match postcard::take_from_bytes::<portl_proto::shell_v1::ExitFrame>(&buf) {
-            Ok((frame, _)) => return Ok(frame.code),
-            Err(postcard::Error::DeserializeUnexpectedEnd) => {
-                match recv.read(&mut tmp).await.context("read exit frame")? {
-                    Some(read) => buf.extend_from_slice(&tmp[..read]),
-                    None => anyhow::bail!("truncated exit frame"),
-                }
-            }
-            Err(err) => return Err(err).context("decode exit frame"),
-        }
-    }
+async fn read_exit(recv: &mut BufferedRecv) -> Result<i32> {
+    let frame = recv
+        .read_frame::<portl_proto::shell_v1::ExitFrame>(128)
+        .await?
+        .context("missing exit frame")?;
+    Ok(frame.code)
 }

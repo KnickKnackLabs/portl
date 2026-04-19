@@ -96,6 +96,49 @@ async fn tcp_forward_large_transfer_10mb_no_corruption() -> Result<()> {
 }
 
 #[tokio::test]
+async fn tcp_preserves_server_data_sent_immediately_after_ack() -> Result<()> {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let port = listener.local_addr()?.port();
+    let server_task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await?;
+        socket.write_all(b"HELLO\n").await?;
+
+        let mut buf = [0_u8; 1024];
+        loop {
+            let read = socket.read(&mut buf).await?;
+            if read == 0 {
+                break;
+            }
+            socket.write_all(&buf[..read]).await?;
+        }
+        socket.shutdown().await?;
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator).await?;
+    let ticket = root_ticket(&operator, server.addr(), tcp_caps(port, port));
+
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let (mut send, mut recv) = open_tcp(&connection, &session, "127.0.0.1", port).await?;
+
+    let mut banner = [0_u8; 6];
+    recv.read_exact(&mut banner).await?;
+    assert_eq!(&banner, b"HELLO\n");
+
+    send.write_all(b"echo").await?;
+    send.finish()?;
+
+    let mut echoed = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut recv, &mut echoed).await?;
+    assert_eq!(echoed, b"echo");
+
+    server_task.await??;
+    shutdown(connection, client, server, agent).await
+}
+
+#[tokio::test]
 async fn tcp_forward_propagates_eof_both_directions() -> Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let port = listener.local_addr()?.port();

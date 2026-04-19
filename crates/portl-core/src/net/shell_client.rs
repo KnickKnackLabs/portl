@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
+
+use crate::io::BufferedRecv;
 
 use super::PeerSession;
 
@@ -99,11 +101,11 @@ struct ExitFrame {
 pub struct ShellClient {
     pub control_send: SendStream,
     #[allow(dead_code)]
-    pub control_recv: RecvStream,
+    pub control_recv: BufferedRecv,
     pub stdin: SendStream,
-    pub stdout: RecvStream,
-    pub stderr: RecvStream,
-    pub exit: RecvStream,
+    pub stdout: BufferedRecv,
+    pub stderr: BufferedRecv,
+    pub exit: BufferedRecv,
     pub signal: Option<SendStream>,
     pub resize: Option<SendStream>,
 }
@@ -139,7 +141,11 @@ impl ShellClient {
     }
 
     pub async fn wait_exit(&mut self) -> Result<i32> {
-        let frame: ExitFrame = read_postcard_frame(&mut self.exit, MAX_EXIT_BYTES).await?;
+        let frame: ExitFrame = self
+            .exit
+            .read_frame(MAX_EXIT_BYTES)
+            .await?
+            .context("missing exit frame")?;
         Ok(frame.code)
     }
 
@@ -192,7 +198,7 @@ async fn open_shell_session(
     req: ShellReq,
     interactive: bool,
 ) -> Result<ShellClient> {
-    let (mut control_send, mut control_recv) = connection
+    let (mut control_send, control_recv) = connection
         .open_bi()
         .await
         .context("open shell control stream")?;
@@ -200,7 +206,11 @@ async fn open_shell_session(
         .write_all(&postcard::to_stdvec(&req).context("encode shell request")?)
         .await
         .context("write shell request")?;
-    let ack: ShellAck = read_postcard_frame(&mut control_recv, MAX_ACK_BYTES).await?;
+    let mut control_recv = BufferedRecv::new(control_recv, Vec::new());
+    let ack: ShellAck = control_recv
+        .read_frame(MAX_ACK_BYTES)
+        .await?
+        .context("missing shell ack")?;
     if !ack.ok {
         bail!("shell request rejected: {:?}", ack.reason);
     }
@@ -269,34 +279,11 @@ async fn open_recv_stream(
     session: &PeerSession,
     session_id: [u8; 16],
     kind: ShellStreamKind,
-) -> Result<RecvStream> {
+) -> Result<BufferedRecv> {
     let (mut send, recv) = open_send_stream(connection, session, session_id, kind).await?;
     send.finish()
         .context("finish shell receive sub-stream preamble")?;
-    Ok(recv)
-}
-
-async fn read_postcard_frame<T>(recv: &mut RecvStream, max_bytes: usize) -> Result<T>
-where
-    T: DeserializeOwned,
-{
-    let mut buf = Vec::new();
-    let mut tmp = [0_u8; 1024];
-    loop {
-        match postcard::take_from_bytes::<T>(&buf) {
-            Ok((value, _)) => return Ok(value),
-            Err(postcard::Error::DeserializeUnexpectedEnd) => {
-                if buf.len() >= max_bytes {
-                    bail!("postcard frame exceeds {max_bytes} bytes");
-                }
-                match recv.read(&mut tmp).await.context("read postcard frame")? {
-                    Some(read) => buf.extend_from_slice(&tmp[..read]),
-                    None => bail!("truncated postcard frame"),
-                }
-            }
-            Err(err) => return Err(err).context("decode postcard frame"),
-        }
-    }
+    Ok(BufferedRecv::new(recv, Vec::new()))
 }
 
 fn preamble(session: &PeerSession, alpn: &[u8]) -> StreamPreamble {

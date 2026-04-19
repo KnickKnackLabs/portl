@@ -1,6 +1,7 @@
+use crate::io::BufferedRecv;
 use anyhow::{Context, Result, bail};
-use iroh::endpoint::{Connection, RecvStream, SendStream};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use iroh::endpoint::{Connection, SendStream};
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncWriteExt, copy};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -33,7 +34,7 @@ pub async fn open_tcp(
     session: &PeerSession,
     host: &str,
     port: u16,
-) -> Result<(SendStream, RecvStream)> {
+) -> Result<(SendStream, BufferedRecv)> {
     let req = TcpReq {
         preamble: StreamPreamble {
             peer_token: session.peer_token,
@@ -42,11 +43,15 @@ pub async fn open_tcp(
         host: host.to_owned(),
         port,
     };
-    let (mut send, mut recv) = connection.open_bi().await.context("open tcp stream")?;
+    let (mut send, recv) = connection.open_bi().await.context("open tcp stream")?;
     send.write_all(&postcard::to_stdvec(&req).context("encode tcp request")?)
         .await
         .context("write tcp request")?;
-    let ack: TcpAck = read_postcard_frame(&mut recv, MAX_TCP_ACK_BYTES).await?;
+    let mut recv = BufferedRecv::new(recv, Vec::new());
+    let ack: TcpAck = recv
+        .read_frame(MAX_TCP_ACK_BYTES)
+        .await?
+        .context("missing tcp ack")?;
     if !ack.ok {
         bail!(
             "tcp request rejected: {}",
@@ -115,27 +120,4 @@ async fn forward_one(
 
     tokio::try_join!(upstream, downstream)?;
     Ok(())
-}
-
-async fn read_postcard_frame<T>(recv: &mut RecvStream, max_bytes: usize) -> Result<T>
-where
-    T: DeserializeOwned,
-{
-    let mut buf = Vec::new();
-    let mut tmp = [0_u8; 1024];
-    loop {
-        match postcard::take_from_bytes::<T>(&buf) {
-            Ok((value, _)) => return Ok(value),
-            Err(postcard::Error::DeserializeUnexpectedEnd) => {
-                if buf.len() >= max_bytes {
-                    bail!("postcard frame exceeds {max_bytes} bytes");
-                }
-                match recv.read(&mut tmp).await.context("read postcard frame")? {
-                    Some(read) => buf.extend_from_slice(&tmp[..read]),
-                    None => bail!("truncated postcard frame"),
-                }
-            }
-            Err(err) => return Err(err).context("decode postcard frame"),
-        }
-    }
 }
