@@ -12,4 +12,7 @@
 //!
 //! See `docs/design/030-tickets.md` for the authoritative spec.
 
+pub mod canonical;
 pub mod schema;
+
+pub use canonical::{canonical_check, resolved_issuer};
