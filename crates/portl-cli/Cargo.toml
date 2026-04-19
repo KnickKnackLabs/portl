@@ -20,6 +20,7 @@ portl-core  = { version = "0.0.1", path = "../portl-core" }
 portl-proto = { version = "0.0.1", path = "../portl-proto" }
 portl-agent  = { version = "0.0.1", path = "../portl-agent" }
 docker-portl = { version = "0.0.1", path = "../../adapters/docker-portl" }
+slicer-portl = { version = "0.0.1", path = "../../adapters/slicer-portl" }
 clap         = { workspace = true }
 tokio       = { workspace = true }
 anyhow      = { workspace = true }
@@ -42,6 +43,7 @@ n0-future   = { workspace = true }
 crossterm   = { workspace = true }
 rusqlite    = { workspace = true }
 nix         = { workspace = true }
+reqwest     = { workspace = true }
 
 [dev-dependencies]
 portl-core = { version = "0.0.1", path = "../portl-core", features = ["test-util"] }

@@ -25,7 +25,14 @@ fn argv(parts: &[&str]) -> Vec<OsString> {
 fn portl_agent_run_parses_as_agent_run() {
     let cmd = parse(argv(&["portl", "agent", "run"])).expect("parse should succeed");
     assert!(
-        matches!(cmd, Command::AgentRun { config: None }),
+        matches!(
+            cmd,
+            Command::AgentRun {
+                config: None,
+                mode: None,
+                upstream_url: None
+            }
+        ),
         "expected Command::AgentRun, got {cmd:?}"
     );
 }
@@ -36,7 +43,14 @@ fn portl_agent_symlink_prepends_agent() {
     // equivalent to `agent run`.
     let cmd = parse(argv(&["portl-agent", "run"])).expect("parse should succeed");
     assert!(
-        matches!(cmd, Command::AgentRun { config: None }),
+        matches!(
+            cmd,
+            Command::AgentRun {
+                config: None,
+                mode: None,
+                upstream_url: None
+            }
+        ),
         "expected Command::AgentRun when invoked as portl-agent, got {cmd:?}"
     );
 }
@@ -48,7 +62,14 @@ fn portl_agent_symlink_respects_full_path() {
     let cmd = parse(argv(&["/usr/local/bin/portl-agent", "run"]))
         .expect("parse with absolute path argv[0]");
     assert!(
-        matches!(cmd, Command::AgentRun { config: None }),
+        matches!(
+            cmd,
+            Command::AgentRun {
+                config: None,
+                mode: None,
+                upstream_url: None
+            }
+        ),
         "basename dispatch must see past absolute path"
     );
 }

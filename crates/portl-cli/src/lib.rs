@@ -10,7 +10,6 @@
 mod alias_store;
 mod commands;
 
-pub use commands::agent::run::load_config as load_agent_config;
 pub use commands::status::run_with_identity_path as run_status_with_identity_path;
 pub use commands::status::run_with_identity_path_and_endpoint as run_status_with_identity_path_and_endpoint;
 
@@ -18,12 +17,18 @@ use std::{ffi::OsString, path::Path, path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+pub fn load_agent_config(config: Option<&Path>) -> anyhow::Result<portl_agent::AgentConfig> {
+    commands::agent::run::load_config(config, None, None)
+}
+
 /// Structured representation of a parsed invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// `portl agent run` (or its `portl-agent run` symlink form).
     AgentRun {
         config: Option<PathBuf>,
+        mode: Option<AgentModeArg>,
+        upstream_url: Option<String>,
     },
     /// `portl id new [--force]`
     IdNew {
@@ -101,6 +106,34 @@ pub enum Command {
         tail: Option<String>,
         deprecated_container_alias: bool,
     },
+    SlicerLogin {
+        master_ticket: String,
+        base_url: Option<String>,
+    },
+    SlicerVmAdd {
+        group: String,
+        base_url: Option<String>,
+        cpus: Option<u8>,
+        ram_gb: Option<u16>,
+        tags: Vec<String>,
+        ticket_out: Option<PathBuf>,
+    },
+    SlicerVmList {
+        base_url: Option<String>,
+        json: bool,
+    },
+    SlicerVmDelete {
+        name: String,
+        base_url: Option<String>,
+    },
+    SlicerVmLogs {
+        name: String,
+        base_url: Option<String>,
+        tail: usize,
+    },
+    SlicerVmShell {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -108,6 +141,12 @@ pub enum MintRootPrint {
     String,
     Qr,
     Url,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AgentModeArg {
+    Listener,
+    Gateway,
 }
 
 /// Errors returned by [`parse`].
@@ -158,7 +197,11 @@ pub fn run(argv: Vec<OsString>) -> ExitCode {
 
 fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
     match cmd {
-        Command::AgentRun { config } => commands::agent::run::run(config.as_deref()),
+        Command::AgentRun {
+            config,
+            mode,
+            upstream_url,
+        } => commands::agent::run::run(config.as_deref(), mode, upstream_url.as_deref()),
         Command::IdNew { force } => commands::id::new::run(force),
         Command::IdShow => commands::id::show::run(),
         Command::IdExport {
@@ -221,6 +264,37 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             tail,
             deprecated_container_alias,
         } => commands::docker::logs(&name, follow, tail.as_deref(), deprecated_container_alias),
+        Command::SlicerLogin {
+            master_ticket,
+            base_url,
+        } => commands::slicer::login(&master_ticket, base_url.as_deref()),
+        Command::SlicerVmAdd {
+            group,
+            base_url,
+            cpus,
+            ram_gb,
+            tags,
+            ticket_out,
+        } => commands::slicer::vm_add(
+            &group,
+            base_url.as_deref(),
+            cpus,
+            ram_gb,
+            &tags,
+            ticket_out.as_deref(),
+        ),
+        Command::SlicerVmList { base_url, json } => {
+            commands::slicer::vm_list(base_url.as_deref(), json)
+        }
+        Command::SlicerVmDelete { name, base_url } => {
+            commands::slicer::vm_delete(&name, base_url.as_deref())
+        }
+        Command::SlicerVmLogs {
+            name,
+            base_url,
+            tail,
+        } => commands::slicer::vm_logs(&name, base_url.as_deref(), tail),
+        Command::SlicerVmShell { name } => commands::slicer::vm_shell(&name),
     }
 }
 
@@ -302,6 +376,11 @@ enum TopLevel {
         #[command(subcommand)]
         action: DockerAction,
     },
+    /// Slicer target management.
+    Slicer {
+        #[command(subcommand)]
+        action: SlicerAction,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -310,6 +389,10 @@ enum AgentAction {
     Run {
         #[arg(long)]
         config: Option<PathBuf>,
+        #[arg(long, value_enum)]
+        mode: Option<AgentModeArg>,
+        #[arg(long)]
+        upstream_url: Option<String>,
     },
 }
 
@@ -371,6 +454,57 @@ enum DockerContainerAction {
 }
 
 #[derive(Subcommand, Debug)]
+enum SlicerAction {
+    Login {
+        master_ticket: String,
+        #[arg(long)]
+        base_url: Option<String>,
+    },
+    Vm {
+        #[command(subcommand)]
+        action: SlicerVmAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SlicerVmAction {
+    Add {
+        group: String,
+        #[arg(long)]
+        base_url: Option<String>,
+        #[arg(long)]
+        cpus: Option<u8>,
+        #[arg(long = "ram-gb")]
+        ram_gb: Option<u16>,
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        #[arg(long = "ticket-out")]
+        ticket_out: Option<PathBuf>,
+    },
+    List {
+        #[arg(long)]
+        base_url: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    Delete {
+        name: String,
+        #[arg(long)]
+        base_url: Option<String>,
+    },
+    Logs {
+        name: String,
+        #[arg(long)]
+        base_url: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        tail: usize,
+    },
+    Shell {
+        name: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum IdAction {
     /// Generate a new local identity.
     New {
@@ -402,8 +536,17 @@ impl Cli {
     fn into_command(self) -> Command {
         match self.command {
             TopLevel::Agent {
-                action: AgentAction::Run { config },
-            } => Command::AgentRun { config },
+                action:
+                    AgentAction::Run {
+                        config,
+                        mode,
+                        upstream_url,
+                    },
+            } => Command::AgentRun {
+                config,
+                mode,
+                upstream_url,
+            },
             TopLevel::Id {
                 action: IdAction::New { force },
             } => Command::IdNew { force },
@@ -532,6 +675,70 @@ impl Cli {
                 tail,
                 deprecated_container_alias: true,
             },
+            TopLevel::Slicer {
+                action:
+                    SlicerAction::Login {
+                        master_ticket,
+                        base_url,
+                    },
+            } => Command::SlicerLogin {
+                master_ticket,
+                base_url,
+            },
+            TopLevel::Slicer {
+                action:
+                    SlicerAction::Vm {
+                        action:
+                            SlicerVmAction::Add {
+                                group,
+                                base_url,
+                                cpus,
+                                ram_gb,
+                                tags,
+                                ticket_out,
+                            },
+                    },
+            } => Command::SlicerVmAdd {
+                group,
+                base_url,
+                cpus,
+                ram_gb,
+                tags,
+                ticket_out,
+            },
+            TopLevel::Slicer {
+                action:
+                    SlicerAction::Vm {
+                        action: SlicerVmAction::List { base_url, json },
+                    },
+            } => Command::SlicerVmList { base_url, json },
+            TopLevel::Slicer {
+                action:
+                    SlicerAction::Vm {
+                        action: SlicerVmAction::Delete { name, base_url },
+                    },
+            } => Command::SlicerVmDelete { name, base_url },
+            TopLevel::Slicer {
+                action:
+                    SlicerAction::Vm {
+                        action:
+                            SlicerVmAction::Logs {
+                                name,
+                                base_url,
+                                tail,
+                            },
+                    },
+            } => Command::SlicerVmLogs {
+                name,
+                base_url,
+                tail,
+            },
+            TopLevel::Slicer {
+                action:
+                    SlicerAction::Vm {
+                        action: SlicerVmAction::Shell { name },
+                    },
+            } => Command::SlicerVmShell { name },
         }
     }
 }
