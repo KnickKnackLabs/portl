@@ -1,7 +1,17 @@
-//! Shared wire types for the portl ticket handshake.
+//! Shared wire types for portl protocols.
+
+pub mod shell;
+pub mod tcp;
 
 use crate::ticket::schema::Capabilities;
 use serde::{Deserialize, Serialize};
+
+/// Preamble carried on every post-handshake stream open.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamPreamble {
+    pub peer_token: [u8; 16],
+    pub alpn: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketOffer {

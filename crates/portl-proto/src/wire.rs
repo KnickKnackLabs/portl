@@ -1,11 +1,4 @@
-use serde::{Deserialize, Serialize};
-
-/// Preamble carried on every post-handshake stream open.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StreamPreamble {
-    pub peer_token: [u8; 16],
-    pub alpn: String,
-}
+pub use portl_core::wire::StreamPreamble;
 
 #[cfg(test)]
 mod tests {

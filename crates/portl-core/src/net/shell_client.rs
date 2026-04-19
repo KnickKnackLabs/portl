@@ -1,105 +1,19 @@
 use anyhow::{Context, Result, bail};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use serde::{Deserialize, Serialize};
 
 use crate::io::BufferedRecv;
+use crate::wire::StreamPreamble;
+use crate::wire::shell::{
+    ALPN_SHELL_V1, ExitFrame, ResizeFrame, ShellAck, ShellFirstFrame, ShellMode, ShellReqBody,
+    ShellStreamKind, ShellSubTail, SignalFrame,
+};
 
 use super::PeerSession;
 
-const ALPN_SHELL_V1: &str = "portl/shell/v1";
+pub use crate::wire::shell::PtyCfg;
+
 const MAX_ACK_BYTES: usize = 64 * 1024;
 const MAX_EXIT_BYTES: usize = 1024;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct StreamPreamble {
-    peer_token: [u8; 16],
-    alpn: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ShellReqBody {
-    mode: ShellMode,
-    argv: Option<Vec<String>>,
-    env_patch: Vec<(String, EnvValue)>,
-    cwd: Option<String>,
-    pty: Option<PtyCfg>,
-    user: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-enum ShellMode {
-    Shell,
-    Exec,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PtyCfg {
-    pub term: String,
-    pub cols: u16,
-    pub rows: u16,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-enum EnvValue {
-    Set(String),
-    Unset,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ShellAck {
-    ok: bool,
-    reason: Option<ShellReason>,
-    pid: Option<u32>,
-    session_id: Option<[u8; 16]>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-enum ShellReason {
-    CapDenied,
-    BadUser(String),
-    SpawnFailed(String),
-    InvalidPty,
-    NotFound,
-    InternalError(String),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ShellStreamKind {
-    Stdin,
-    Stdout,
-    Stderr,
-    Signal,
-    Resize,
-    Exit,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ShellSubTail {
-    session_id: [u8; 16],
-    kind: ShellStreamKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-enum ShellFirstFrame {
-    Control(ShellReqBody),
-    Sub(ShellSubTail),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-struct ResizeFrame {
-    cols: u16,
-    rows: u16,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-struct SignalFrame {
-    sig: u8,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-struct ExitFrame {
-    code: i32,
-}
 
 pub struct ShellClient {
     pub control_send: SendStream,
@@ -205,7 +119,7 @@ async fn open_shell_session(
         .context("open shell control stream")?;
     control_send
         .write_all(
-            &postcard::to_stdvec(&preamble(session, ALPN_SHELL_V1.as_bytes()))
+            &postcard::to_stdvec(&preamble(session, ALPN_SHELL_V1))
                 .context("encode shell request preamble")?,
         )
         .await
@@ -273,7 +187,7 @@ async fn open_send_stream(
         .await
         .context("open shell sub-stream")?;
     send.write_all(
-        &postcard::to_stdvec(&preamble(session, ALPN_SHELL_V1.as_bytes()))
+        &postcard::to_stdvec(&preamble(session, ALPN_SHELL_V1))
             .context("encode shell sub-stream preamble")?,
     )
     .await

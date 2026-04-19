@@ -1,33 +1,15 @@
-use crate::io::BufferedRecv;
 use anyhow::{Context, Result, bail};
 use iroh::endpoint::{Connection, SendStream};
-use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncWriteExt, copy};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::io::BufferedRecv;
+use crate::wire::StreamPreamble;
+use crate::wire::tcp::{ALPN_TCP_V1, TcpAck, TcpReq};
+
 use super::PeerSession;
 
-const ALPN_TCP_V1: &str = "portl/tcp/v1";
 const MAX_TCP_ACK_BYTES: usize = 64 * 1024;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct StreamPreamble {
-    peer_token: [u8; 16],
-    alpn: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct TcpReq {
-    preamble: StreamPreamble,
-    host: String,
-    port: u16,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct TcpAck {
-    ok: bool,
-    error: Option<String>,
-}
 
 pub async fn open_tcp(
     connection: &Connection,
@@ -38,7 +20,7 @@ pub async fn open_tcp(
     let req = TcpReq {
         preamble: StreamPreamble {
             peer_token: session.peer_token,
-            alpn: ALPN_TCP_V1.to_owned(),
+            alpn: String::from_utf8_lossy(ALPN_TCP_V1).into_owned(),
         },
         host: host.to_owned(),
         port,
