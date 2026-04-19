@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -15,6 +17,8 @@ impl SlicerClient {
             base_url: reqwest::Url::parse(base_url)
                 .with_context(|| format!("parse slicer base url {base_url}"))?,
             http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .connect_timeout(Duration::from_secs(5))
                 .build()
                 .context("build reqwest client")?,
             auth_token,
@@ -33,9 +37,6 @@ impl SlicerClient {
             .await
             .context("call slicer POST /secret")?;
         if response.status().is_success() {
-            return Ok(());
-        }
-        if response.status() == StatusCode::NOT_FOUND {
             return Ok(());
         }
         bail!("slicer secret upload failed: {}", response.status())
