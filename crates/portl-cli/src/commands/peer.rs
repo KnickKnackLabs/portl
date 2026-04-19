@@ -31,16 +31,29 @@ pub(crate) fn resolve_identity_path(explicit: Option<&Path>) -> PathBuf {
 pub(crate) async fn connect_peer(peer: &str, caps: Capabilities) -> Result<ConnectedPeer> {
     let identity_path = resolve_identity_path(None);
     let identity = store::load(&identity_path).context("load local identity")?;
-    let endpoint = portl_agent::endpoint::bind(&portl_agent::AgentConfig::default(), &identity)
+    let endpoint = bind_client_endpoint(&identity).await?;
+    connect_peer_with_endpoint(peer, caps, &identity, &endpoint).await
+}
+
+pub(crate) async fn bind_client_endpoint(identity: &Identity) -> Result<iroh::Endpoint> {
+    portl_agent::endpoint::bind(&portl_agent::AgentConfig::default(), identity)
         .await
-        .context("bind client endpoint")?;
+        .context("bind client endpoint")
+}
+
+pub(crate) async fn connect_peer_with_endpoint(
+    peer: &str,
+    caps: Capabilities,
+    identity: &Identity,
+    endpoint: &iroh::Endpoint,
+) -> Result<ConnectedPeer> {
     let endpoint_wrapper = Endpoint::from(endpoint.clone());
-    let ticket = resolve_peer_ticket(peer, &identity, &endpoint, caps).await?;
-    let (connection, session) = open_ticket_v1(&endpoint_wrapper, &ticket, &[], &identity)
+    let ticket = resolve_peer_ticket(peer, identity, endpoint, caps).await?;
+    let (connection, session) = open_ticket_v1(&endpoint_wrapper, &ticket, &[], identity)
         .await
         .context("run ticket handshake")?;
     Ok(ConnectedPeer {
-        endpoint,
+        endpoint: endpoint.clone(),
         connection,
         session,
     })

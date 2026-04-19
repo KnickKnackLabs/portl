@@ -111,6 +111,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
         }
     }
 
+    state.udp_registry.shutdown().await;
     if shutdown.is_cancelled() {
         graceful_close_endpoint(&endpoint).await;
     }

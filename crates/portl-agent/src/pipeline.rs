@@ -6,10 +6,12 @@ use portl_core::ticket::schema::{Capabilities, PortlTicket};
 use portl_core::ticket::sign::verify_body;
 use portl_core::ticket::verify::{MAX_DELEGATION_DEPTH, TrustRoots};
 use portl_proto::ticket_v1::{AckReason, TicketOffer};
+use sha2::{Digest, Sha256};
 
 use crate::revocations::RevocationSet;
 
 const CLOCK_SKEW_SECS: u64 = 60;
+const PEER_TOKEN_DOMAIN: &[u8] = b"portl/peer-token/v1";
 
 pub trait RateLimitGate: Send + Sync {
     fn check(&self, source_id: [u8; 32]) -> bool;
@@ -79,10 +81,11 @@ pub fn evaluate_offer(input: &AcceptanceInput<'_>) -> AcceptanceOutcome {
         return reject(reason);
     }
 
+    let terminal_ticket_id = ticket_id(&terminal.sig);
     AcceptanceOutcome::Accepted {
-        peer_token: rand::random(),
+        peer_token: derive_peer_token(input.source_id, terminal_ticket_id),
         caps: Box::new(caps),
-        ticket_id: ticket_id(&terminal.sig),
+        ticket_id: terminal_ticket_id,
         bearer: terminal.body.bearer.clone(),
     }
 }
@@ -211,6 +214,15 @@ fn check_proof(terminal: &PortlTicket, offer: &TicketOffer) -> Option<AckReason>
     )
     .err()
     .map(|_| AckReason::ProofInvalid)
+}
+
+fn derive_peer_token(source_id: [u8; 32], ticket_id: [u8; 16]) -> [u8; 16] {
+    let mut hasher = Sha256::new();
+    hasher.update(source_id);
+    hasher.update(ticket_id);
+    hasher.update(PEER_TOKEN_DOMAIN);
+    let digest: [u8; 32] = hasher.finalize().into();
+    digest[..16].try_into().expect("peer token length")
 }
 
 fn reject(reason: AckReason) -> AcceptanceOutcome {

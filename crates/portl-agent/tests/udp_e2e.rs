@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::net::UdpSocket as StdUdpSocket;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use portl_agent::{AgentConfig, DiscoveryConfig, run_task};
+use portl_core::endpoint::Endpoint;
 use portl_core::id::Identity;
 use portl_core::net::{open_ticket_v1, open_udp, run_local_udp_forward};
 use portl_core::test_util::pair;
@@ -262,6 +264,327 @@ async fn udp_oversize_payload_rejected() -> Result<()> {
 
     forward.abort();
     close_connection(&connection);
+    echo.task.abort();
+    shutdown(client, server, agent).await
+}
+
+#[tokio::test]
+async fn udp_forced_quic_teardown_and_reconnect_preserves_session() -> Result<()> {
+    let echo = start_udp_echo_server().await?;
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator, None).await?;
+    let ticket = root_ticket(&operator, server.addr(), udp_caps(echo.port, echo.port));
+
+    let (connection1, session1) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let control1 = open_udp(
+        &connection1,
+        &session1,
+        None,
+        vec![udp_bind(echo.port, echo.port)],
+    )
+    .await?;
+    let session_id = control1.session_id;
+
+    send_udp_datagram(&connection1, session_id, echo.port, 1, b"first").await?;
+    assert_eq!(recv_udp_datagram(&connection1).await?.payload, b"first");
+
+    close_connection(&connection1);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let (connection2, session2) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let control2 = open_udp(
+        &connection2,
+        &session2,
+        Some(session_id),
+        vec![udp_bind(echo.port, echo.port)],
+    )
+    .await?;
+    assert_eq!(control2.session_id, session_id);
+
+    send_udp_datagram(&connection2, session_id, echo.port, 1, b"second").await?;
+    assert_eq!(recv_udp_datagram(&connection2).await?.payload, b"second");
+
+    close_connection(&connection2);
+    echo.task.abort();
+    shutdown(client, server, agent).await
+}
+
+#[tokio::test]
+async fn udp_reply_side_oversize_rejected() -> Result<()> {
+    let remote = UdpSocket::bind(("127.0.0.1", 0)).await?;
+    let remote_port = remote.local_addr()?.port();
+    let forward_port = reserve_udp_port()?;
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator, None).await?;
+    let ticket = root_ticket(&operator, server.addr(), udp_caps(remote_port, remote_port));
+
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let control = open_udp(
+        &connection,
+        &session,
+        None,
+        vec![udp_bind(forward_port, remote_port)],
+    )
+    .await?;
+    let forward_addr = format!("127.0.0.1:{forward_port}");
+    let forward_connection = connection.clone();
+    let forward = tokio::spawn(async move {
+        run_local_udp_forward(forward_connection, control, &forward_addr, remote_port).await
+    });
+
+    let app = UdpSocket::bind(("127.0.0.1", 0)).await?;
+    app.send_to(b"small", ("127.0.0.1", forward_port)).await?;
+    let mut remote_buf = [0_u8; 64];
+    let (_, from) = remote.recv_from(&mut remote_buf).await?;
+    remote.send_to(&vec![9_u8; 2_000], from).await?;
+
+    let mut buf = vec![0_u8; 256];
+    let (read, _) = tokio::time::timeout(Duration::from_secs(5), app.recv_from(&mut buf)).await??;
+    let message = String::from_utf8(buf[..read].to_vec())?;
+    assert!(message.contains("payload too large"));
+
+    forward.abort();
+    close_connection(&connection);
+    shutdown(client, server, agent).await
+}
+
+#[tokio::test]
+async fn udp_reattach_from_different_peer_rejected() -> Result<()> {
+    let echo = start_udp_echo_server().await?;
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator, None).await?;
+    let ticket = root_ticket(&operator, server.addr(), udp_caps(echo.port, echo.port));
+
+    let (connection1, session1) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let control1 = open_udp(
+        &connection1,
+        &session1,
+        None,
+        vec![udp_bind(echo.port, echo.port)],
+    )
+    .await?;
+    let session_id = control1.session_id;
+    control1.close()?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let other_client = Endpoint::bind().await?;
+    let other_identity = Identity::new();
+    let (connection2, session2) =
+        open_ticket_v1(&other_client, &ticket, &[], &other_identity).await?;
+    let err = open_udp(
+        &connection2,
+        &session2,
+        Some(session_id),
+        vec![udp_bind(echo.port, echo.port)],
+    )
+    .await
+    .expect_err("reattach from a different peer must be rejected");
+    assert!(err.to_string().contains("owner mismatch"));
+
+    close_connection(&connection1);
+    close_connection(&connection2);
+    other_client.inner().close().await;
+    echo.task.abort();
+    shutdown(client, server, agent).await
+}
+
+#[tokio::test]
+async fn udp_session_cap_enforced() -> Result<()> {
+    let echo = start_udp_echo_server().await?;
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator, None).await?;
+    let ticket = root_ticket(&operator, server.addr(), udp_caps(echo.port, echo.port));
+
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let mut controls = Vec::new();
+    for offset in 0..16_u16 {
+        controls.push(
+            open_udp(
+                &connection,
+                &session,
+                None,
+                vec![udp_bind(40_000 + offset, echo.port)],
+            )
+            .await?,
+        );
+    }
+
+    let err = open_udp(
+        &connection,
+        &session,
+        None,
+        vec![udp_bind(41_000, echo.port)],
+    )
+    .await
+    .expect_err("17th udp session should exceed the per-connection quota");
+    assert!(err.to_string().contains("session quota exceeded"));
+
+    drop(controls);
+    close_connection(&connection);
+    echo.task.abort();
+    shutdown(client, server, agent).await
+}
+
+#[tokio::test]
+async fn udp_src_tag_lru_eviction() -> Result<()> {
+    let remote = UdpSocket::bind(("127.0.0.1", 0)).await?;
+    let remote_port = remote.local_addr()?.port();
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator, None).await?;
+    let ticket = root_ticket(&operator, server.addr(), udp_caps(remote_port, remote_port));
+
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let control = open_udp(
+        &connection,
+        &session,
+        None,
+        vec![udp_bind(remote_port, remote_port)],
+    )
+    .await?;
+    let session_id = control.session_id;
+
+    let mut buf = [0_u8; 64];
+    let mut first_addr = None;
+    let mut newest_addr = None;
+    for src_tag in 1..=1_025_u32 {
+        send_udp_datagram(&connection, session_id, remote_port, src_tag, b"tag").await?;
+        let (_, from) = remote.recv_from(&mut buf).await?;
+        if src_tag == 1 {
+            first_addr = Some(from);
+        }
+        if src_tag == 1_025 {
+            newest_addr = Some(from);
+        }
+    }
+
+    remote
+        .send_to(b"evicted", first_addr.expect("first addr"))
+        .await?;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), recv_udp_datagram(&connection))
+            .await
+            .is_err()
+    );
+
+    remote
+        .send_to(b"kept", newest_addr.expect("newest addr"))
+        .await?;
+    let kept = recv_udp_datagram(&connection).await?;
+    assert_eq!(kept.src_tag, 1_025);
+    assert_eq!(kept.payload, b"kept");
+
+    close_connection(&connection);
+    shutdown(client, server, agent).await
+}
+
+#[tokio::test]
+async fn udp_distinct_src_tags_get_isolated_reply_paths() -> Result<()> {
+    let remote = UdpSocket::bind(("127.0.0.1", 0)).await?;
+    let remote_port = remote.local_addr()?.port();
+    let forward_port = reserve_udp_port()?;
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator, None).await?;
+    let ticket = root_ticket(&operator, server.addr(), udp_caps(remote_port, remote_port));
+
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let control = open_udp(
+        &connection,
+        &session,
+        None,
+        vec![udp_bind(forward_port, remote_port)],
+    )
+    .await?;
+    let forward_addr = format!("127.0.0.1:{forward_port}");
+    let forward_connection = connection.clone();
+    let forward = tokio::spawn(async move {
+        run_local_udp_forward(forward_connection, control, &forward_addr, remote_port).await
+    });
+
+    let app1 = UdpSocket::bind(("127.0.0.1", 0)).await?;
+    let app2 = UdpSocket::bind(("127.0.0.1", 0)).await?;
+    app1.send_to(b"one", ("127.0.0.1", forward_port)).await?;
+    app2.send_to(b"two", ("127.0.0.1", forward_port)).await?;
+
+    let mut recv_buf = [0_u8; 32];
+    let mut src_addrs = HashMap::new();
+    for _ in 0..2 {
+        let (read, from) = remote.recv_from(&mut recv_buf).await?;
+        src_addrs.insert(recv_buf[..read].to_vec(), from);
+    }
+
+    let one_addr = *src_addrs.get(b"one".as_slice()).expect("one addr");
+    let two_addr = *src_addrs.get(b"two".as_slice()).expect("two addr");
+    assert_ne!(one_addr, two_addr);
+
+    remote.send_to(b"reply-one", one_addr).await?;
+    remote.send_to(b"reply-two", two_addr).await?;
+
+    let mut app1_buf = [0_u8; 32];
+    let mut app2_buf = [0_u8; 32];
+    let (read1, _) = app1.recv_from(&mut app1_buf).await?;
+    let (read2, _) = app2.recv_from(&mut app2_buf).await?;
+    assert_eq!(&app1_buf[..read1], b"reply-one");
+    assert_eq!(&app2_buf[..read2], b"reply-two");
+
+    forward.abort();
+    close_connection(&connection);
+    shutdown(client, server, agent).await
+}
+
+#[tokio::test]
+async fn udp_multiple_control_streams_require_last_close_for_linger() -> Result<()> {
+    let echo = start_udp_echo_server().await?;
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator, None).await?;
+    let ticket = root_ticket(&operator, server.addr(), udp_caps(echo.port, echo.port));
+
+    let (connection1, session1) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let control1 = open_udp(
+        &connection1,
+        &session1,
+        None,
+        vec![udp_bind(echo.port, echo.port)],
+    )
+    .await?;
+    let session_id = control1.session_id;
+    let control2 = open_udp(
+        &connection1,
+        &session1,
+        Some(session_id),
+        vec![udp_bind(echo.port, echo.port)],
+    )
+    .await?;
+    assert_eq!(control2.session_id, session_id);
+
+    control1.close()?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    send_udp_datagram(&connection1, session_id, echo.port, 1, b"still-live").await?;
+    assert_eq!(
+        recv_udp_datagram(&connection1).await?.payload,
+        b"still-live"
+    );
+
+    control2.close()?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (connection2, session2) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let control3 = open_udp(
+        &connection2,
+        &session2,
+        Some(session_id),
+        vec![udp_bind(echo.port, echo.port)],
+    )
+    .await?;
+    assert_eq!(control3.session_id, session_id);
+
+    close_connection(&connection1);
+    close_connection(&connection2);
     echo.task.abort();
     shutdown(client, server, agent).await
 }

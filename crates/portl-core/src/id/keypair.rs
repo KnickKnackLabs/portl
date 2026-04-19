@@ -6,7 +6,7 @@ use rand_core::OsRng;
 use zeroize::ZeroizeOnDrop;
 
 /// Operator identity.
-#[derive(ZeroizeOnDrop)]
+#[derive(Clone, ZeroizeOnDrop)]
 pub struct Identity {
     sk: SigningKey,
 }

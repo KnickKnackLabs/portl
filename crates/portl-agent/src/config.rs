@@ -6,6 +6,8 @@ use iroh_base::RelayUrl;
 use portl_core::endpoint::Endpoint;
 use serde::{Deserialize, Serialize};
 
+use crate::udp_registry::DEFAULT_UDP_SESSION_LINGER_SECS;
+
 #[derive(Debug, Clone, Default)]
 pub struct AgentConfig {
     pub identity_path: Option<PathBuf>,
@@ -47,7 +49,7 @@ impl AgentConfig {
             rate_limit: RateLimitConfig::default(),
             mode: AgentMode::Listener,
             endpoint: None,
-            udp_session_linger_secs: None,
+            udp_session_linger_secs: Some(DEFAULT_UDP_SESSION_LINGER_SECS),
         };
 
         if let Some(discovery) = file.discovery {
@@ -72,6 +74,13 @@ impl AgentConfig {
             if let Some(burst) = rate_limit.burst {
                 config.rate_limit.burst = burst;
             }
+        }
+
+        if let Some(udp) = file.udp {
+            config.udp_session_linger_secs = Some(
+                udp.session_linger_secs
+                    .unwrap_or(DEFAULT_UDP_SESSION_LINGER_SECS),
+            );
         }
 
         if let Some(mode) = file.mode.as_deref() {
@@ -157,6 +166,7 @@ struct AgentConfigFile {
     trust_roots: Option<Vec<String>>,
     discovery: Option<DiscoveryConfigFile>,
     rate_limit: Option<RateLimitConfigFile>,
+    udp: Option<UdpConfigFile>,
     mode: Option<String>,
     upstream_url: Option<String>,
     upstream_host: Option<String>,
@@ -175,6 +185,11 @@ struct DiscoveryConfigFile {
 struct RateLimitConfigFile {
     period_secs: Option<u64>,
     burst: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UdpConfigFile {
+    session_linger_secs: Option<u64>,
 }
 
 fn parse_mode(
@@ -211,4 +226,26 @@ fn parse_trust_root_hex(value: &str) -> Result<[u8; 32]> {
     bytes
         .try_into()
         .map_err(|_| anyhow!("trust root must decode to exactly 32 bytes: {value}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AgentConfig;
+    use crate::udp_registry::DEFAULT_UDP_SESSION_LINGER_SECS;
+
+    #[test]
+    fn udp_session_linger_defaults_from_toml() {
+        let config = AgentConfig::from_toml_str("").expect("parse empty config");
+        assert_eq!(
+            config.udp_session_linger_secs,
+            Some(DEFAULT_UDP_SESSION_LINGER_SECS)
+        );
+    }
+
+    #[test]
+    fn udp_session_linger_reads_udp_section() {
+        let config = AgentConfig::from_toml_str("[udp]\nsession_linger_secs = 7\n")
+            .expect("parse udp config");
+        assert_eq!(config.udp_session_linger_secs, Some(7));
+    }
 }

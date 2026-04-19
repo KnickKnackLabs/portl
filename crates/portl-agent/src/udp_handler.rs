@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
-use iroh::endpoint::{Connection, SendStream};
+use iroh::endpoint::{Connection, ConnectionError, SendStream};
 
 use crate::caps_enforce::udp_permits;
 use crate::session::Session;
@@ -39,31 +39,38 @@ impl UdpConnectionContext {
 
     async fn datagram_pump(self: Arc<Self>, connection: Connection) -> Result<()> {
         loop {
-            let bytes = connection
-                .read_datagram()
-                .await
-                .context("read udp datagram")?;
-            let datagram: portl_proto::udp_v1::UdpDatagram =
-                match postcard::from_bytes(&bytes).context("decode udp datagram") {
-                    Ok(datagram) => datagram,
-                    Err(err) => {
-                        tracing::debug!(%err, "dropping invalid udp datagram");
-                        continue;
-                    }
-                };
-            let Some(session) = self.registry.get_live(datagram.session_id).await? else {
-                continue;
+            let bytes = match connection.read_datagram().await {
+                Ok(bytes) => bytes,
+                Err(err) if is_connection_close(&err) => return Ok(()),
+                Err(err) => {
+                    tracing::debug!(%err, "udp datagram pump read failed");
+                    continue;
+                }
             };
-            if bytes.len() > portl_proto::udp_v1::MAX_UDP_DATAGRAM_BYTES {
-                session
-                    .send_error(datagram.target_port, datagram.src_tag, "payload too large")
-                    .await?;
-                continue;
+
+            let result = async {
+                let datagram: portl_proto::udp_v1::UdpDatagram =
+                    postcard::from_bytes(&bytes).context("decode udp datagram")?;
+                let Some(session) = self.registry.get_live(datagram.session_id).await? else {
+                    return Ok::<_, anyhow::Error>(());
+                };
+                if bytes.len() > portl_proto::udp_v1::MAX_UDP_DATAGRAM_BYTES {
+                    session
+                        .send_error(datagram.target_port, datagram.src_tag, "payload too large")
+                        .await?;
+                    return Ok(());
+                }
+                if let Err(err) = session.route_to_target(&datagram).await {
+                    session
+                        .send_error(datagram.target_port, datagram.src_tag, &err.to_string())
+                        .await?;
+                }
+                Ok(())
             }
-            if let Err(err) = session.route_to_target(&datagram).await {
-                session
-                    .send_error(datagram.target_port, datagram.src_tag, &err.to_string())
-                    .await?;
+            .await;
+
+            if let Err(err) = result {
+                tracing::debug!(%err, "udp datagram handling failed");
             }
         }
     }
@@ -105,10 +112,24 @@ pub(crate) async fn serve_stream(
         }
     }
 
-    let udp_session = connection_ctx
+    let ticket_id_hex = hex::encode(session.ticket_id);
+    let udp_session = match connection_ctx
         .registry
-        .attach_or_create(req.session_id, req.binds.clone(), connection.clone())
-        .await?;
+        .attach_or_create(
+            req.session_id,
+            req.binds.clone(),
+            connection.clone(),
+            session.peer_token,
+            &ticket_id_hex,
+        )
+        .await
+    {
+        Ok(udp_session) => udp_session,
+        Err(err) => {
+            reject(&mut send, req.session_id, &err.to_string()).await?;
+            return Ok(());
+        }
+    };
     send.write_all(&postcard::to_stdvec(&portl_proto::udp_v1::UdpCtlResp {
         ok: true,
         error: None,
@@ -127,6 +148,15 @@ pub(crate) async fn serve_stream(
         .mark_linger_if_current(udp_session.session_id(), connection_id)
         .await?;
     Ok(())
+}
+
+fn is_connection_close(error: &ConnectionError) -> bool {
+    matches!(
+        error,
+        ConnectionError::ApplicationClosed(_)
+            | ConnectionError::ConnectionClosed(_)
+            | ConnectionError::LocallyClosed
+    )
 }
 
 async fn reject(send: &mut SendStream, session_id: [u8; 8], error: &str) -> Result<()> {

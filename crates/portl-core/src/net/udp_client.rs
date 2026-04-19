@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -17,6 +18,7 @@ use crate::wire::udp::{
 use super::PeerSession;
 
 const MAX_UDP_CTL_RESP_BYTES: usize = 64 * 1024;
+pub const CLIENT_MAX_SRC_TAGS: usize = 4096;
 
 #[derive(Debug)]
 pub struct UdpControl {
@@ -33,10 +35,21 @@ impl UdpControl {
 #[derive(Debug)]
 pub struct LocalUdpForwardHandle {
     local_socket: Arc<UdpSocket>,
-    src_tags: Arc<Mutex<HashMap<SocketAddr, u32>>>,
-    reverse_index: Arc<Mutex<HashMap<u32, SocketAddr>>>,
-    next_src_tag: Arc<Mutex<u32>>,
+    src_tags: Arc<Mutex<SrcTagTable>>,
     session_id: Arc<Mutex<Option<[u8; 8]>>>,
+}
+
+#[derive(Debug)]
+struct SrcTagTable {
+    by_addr: HashMap<SocketAddr, SrcTagEntry>,
+    by_tag: HashMap<u32, SocketAddr>,
+    next_src_tag: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SrcTagEntry {
+    src_tag: u32,
+    last_used: Instant,
 }
 
 impl LocalUdpForwardHandle {
@@ -47,9 +60,7 @@ impl LocalUdpForwardHandle {
                     .await
                     .with_context(|| format!("bind local udp socket on {local_addr}"))?,
             ),
-            src_tags: Arc::new(Mutex::new(HashMap::new())),
-            reverse_index: Arc::new(Mutex::new(HashMap::new())),
-            next_src_tag: Arc::new(Mutex::new(1)),
+            src_tags: Arc::new(Mutex::new(SrcTagTable::default())),
             session_id: Arc::new(Mutex::new(None)),
         })
     }
@@ -71,15 +82,13 @@ impl LocalUdpForwardHandle {
             connection.clone(),
             Arc::clone(&self.local_socket),
             Arc::clone(&self.src_tags),
-            Arc::clone(&self.reverse_index),
-            Arc::clone(&self.next_src_tag),
             session_id,
             target_port,
         );
         let reverse = reverse_loop(
             connection,
             Arc::clone(&self.local_socket),
-            Arc::clone(&self.reverse_index),
+            Arc::clone(&self.src_tags),
             session_id,
         );
 
@@ -151,9 +160,7 @@ pub async fn run_local_forward(
 async fn upstream_loop(
     connection: Connection,
     local_socket: Arc<UdpSocket>,
-    src_tags: Arc<Mutex<HashMap<SocketAddr, u32>>>,
-    reverse_index: Arc<Mutex<HashMap<u32, SocketAddr>>>,
-    next_src_tag: Arc<Mutex<u32>>,
+    src_tags: Arc<Mutex<SrcTagTable>>,
     session_id: [u8; 8],
     target_port: u16,
 ) -> Result<()> {
@@ -164,18 +171,7 @@ async fn upstream_loop(
             .recv_from(&mut buf)
             .await
             .context("receive local udp datagram")?;
-
-        let src_tag = {
-            let mut src_tags = src_tags.lock().await;
-            if let Some(src_tag) = src_tags.get(&from).copied() {
-                src_tag
-            } else {
-                let allocated = allocate_src_tag(&next_src_tag, &reverse_index).await;
-                src_tags.insert(from, allocated);
-                reverse_index.lock().await.insert(allocated, from);
-                allocated
-            }
-        };
+        let src_tag = src_tags.lock().await.touch_or_insert(from);
 
         let datagram = UdpDatagram {
             session_id,
@@ -211,7 +207,7 @@ async fn upstream_loop(
 async fn reverse_loop(
     connection: Connection,
     local_socket: Arc<UdpSocket>,
-    reverse_index: Arc<Mutex<HashMap<u32, SocketAddr>>>,
+    src_tags: Arc<Mutex<SrcTagTable>>,
     session_id: [u8; 8],
 ) -> Result<()> {
     loop {
@@ -223,7 +219,7 @@ async fn reverse_loop(
             Ok(datagram) if datagram.session_id == session_id => datagram,
             Ok(_) | Err(_) => continue,
         };
-        let Some(to) = reverse_index.lock().await.get(&datagram.src_tag).copied() else {
+        let Some(to) = src_tags.lock().await.touch_by_tag(datagram.src_tag) else {
             continue;
         };
         local_socket
@@ -233,20 +229,103 @@ async fn reverse_loop(
     }
 }
 
-async fn allocate_src_tag(
-    next_src_tag: &Arc<Mutex<u32>>,
-    reverse_index: &Arc<Mutex<HashMap<u32, SocketAddr>>>,
-) -> u32 {
-    loop {
-        let candidate = {
-            let mut next_src_tag_guard = next_src_tag.lock().await;
-            let candidate = (*next_src_tag_guard).max(1);
-            let next = candidate.wrapping_add(1);
-            *next_src_tag_guard = if next == 0 { 1 } else { next };
-            candidate
-        };
-        if !reverse_index.lock().await.contains_key(&candidate) {
-            return candidate;
+impl Default for SrcTagTable {
+    fn default() -> Self {
+        Self {
+            by_addr: HashMap::new(),
+            by_tag: HashMap::new(),
+            next_src_tag: 1,
         }
+    }
+}
+
+impl SrcTagTable {
+    fn touch_or_insert(&mut self, addr: SocketAddr) -> u32 {
+        if let Some(entry) = self.by_addr.get_mut(&addr) {
+            entry.last_used = Instant::now();
+            return entry.src_tag;
+        }
+
+        if self.by_addr.len() >= CLIENT_MAX_SRC_TAGS
+            && let Some(oldest_addr) = self
+                .by_addr
+                .iter()
+                .min_by_key(|entry| entry.1.last_used)
+                .map(|entry| *entry.0)
+            && let Some(evicted) = self.by_addr.remove(&oldest_addr)
+        {
+            self.by_tag.remove(&evicted.src_tag);
+        }
+
+        let src_tag = self.allocate_src_tag();
+        self.by_addr.insert(
+            addr,
+            SrcTagEntry {
+                src_tag,
+                last_used: Instant::now(),
+            },
+        );
+        self.by_tag.insert(src_tag, addr);
+        src_tag
+    }
+
+    fn touch_by_tag(&mut self, src_tag: u32) -> Option<SocketAddr> {
+        let addr = self.by_tag.get(&src_tag).copied()?;
+        if let Some(entry) = self.by_addr.get_mut(&addr) {
+            entry.last_used = Instant::now();
+        }
+        Some(addr)
+    }
+
+    fn allocate_src_tag(&mut self) -> u32 {
+        loop {
+            let candidate = self.next_src_tag.max(1);
+            let next = candidate.wrapping_add(1);
+            self.next_src_tag = if next == 0 { 1 } else { next };
+            if !self.by_tag.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::{CLIENT_MAX_SRC_TAGS, SrcTagTable};
+
+    #[test]
+    fn client_src_tag_lru_evicts_oldest_entry() {
+        let mut table = SrcTagTable::default();
+        let first = std::net::SocketAddr::from(([127, 0, 0, 1], 1000));
+        let second = std::net::SocketAddr::from(([127, 0, 0, 1], 1001));
+
+        let first_tag = table.touch_or_insert(first);
+        std::thread::sleep(Duration::from_millis(1));
+        let second_tag = table.touch_or_insert(second);
+        table
+            .by_addr
+            .get_mut(&first)
+            .expect("first entry")
+            .last_used = Instant::now()
+            .checked_sub(Duration::from_secs(5))
+            .expect("backdate");
+        table
+            .by_addr
+            .get_mut(&second)
+            .expect("second entry")
+            .last_used = Instant::now();
+
+        table.by_addr.reserve(CLIENT_MAX_SRC_TAGS);
+        for offset in 2..=CLIENT_MAX_SRC_TAGS {
+            let port =
+                u16::try_from(1000 + offset).expect("synthetic port fits in u16 for test range");
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            table.touch_or_insert(addr);
+        }
+
+        assert!(table.touch_by_tag(first_tag).is_none());
+        assert_eq!(table.touch_by_tag(second_tag), Some(second));
     }
 }

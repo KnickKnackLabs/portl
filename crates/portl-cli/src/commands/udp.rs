@@ -2,12 +2,15 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use portl_core::id::store;
 use portl_core::net::{LocalUdpForwardHandle, open_udp};
 use portl_core::ticket::schema::{Capabilities, PortRule};
 use portl_proto::udp_v1::UdpBind;
 use tokio::sync::watch;
 
-use crate::commands::peer::connect_peer;
+use crate::commands::peer::{
+    bind_client_endpoint, connect_peer_with_endpoint, resolve_identity_path,
+};
 
 pub fn run(peer: &str, specs: &[String]) -> Result<ExitCode> {
     let runtime = tokio::runtime::Runtime::new()?;
@@ -20,11 +23,15 @@ pub fn run(peer: &str, specs: &[String]) -> Result<ExitCode> {
             .iter()
             .map(|spec| parse_local_spec(spec))
             .collect::<Result<Vec<_>>>()?;
+        let identity_path = resolve_identity_path(None);
+        let identity = store::load(&identity_path).context("load local identity")?;
         let (shutdown_tx, _) = watch::channel(false);
         let mut tasks = Vec::new();
 
         for parsed in parsed_specs {
             let peer = peer.to_owned();
+            let identity = identity.clone();
+            let endpoint = bind_client_endpoint(&identity).await?;
             let mut shutdown_rx = shutdown_tx.subscribe();
             let forward = LocalUdpForwardHandle::bind(&parsed.local_addr()).await?;
             tasks.push(tokio::spawn(async move {
@@ -34,7 +41,13 @@ pub fn run(peer: &str, specs: &[String]) -> Result<ExitCode> {
                         return Ok::<_, anyhow::Error>(());
                     }
 
-                    let connected = match connect_peer(&peer, udp_caps()).await {
+                    let connected = match connect_peer_with_endpoint(
+                        &peer,
+                        udp_caps(),
+                        &identity,
+                        &endpoint,
+                    )
+                    .await {
                         Ok(connected) => connected,
                         Err(err) => {
                             tracing::debug!(%err, spec = %parsed.local_addr(), "udp reconnect failed during ticket handshake");
@@ -61,7 +74,6 @@ pub fn run(peer: &str, specs: &[String]) -> Result<ExitCode> {
                         Err(err) => {
                             tracing::debug!(%err, spec = %parsed.local_addr(), "udp reconnect failed while opening control stream");
                             connected.connection.close(0u32.into(), b"udp reconnect retry");
-                            connected.endpoint.close().await;
                             wait_backoff(&mut shutdown_rx, backoff).await;
                             backoff = next_backoff(backoff);
                             continue;
@@ -78,13 +90,11 @@ pub fn run(peer: &str, specs: &[String]) -> Result<ExitCode> {
                         changed = shutdown_rx.changed() => {
                             let _ = changed;
                             connected.connection.close(0u32.into(), b"udp shutdown");
-                            connected.endpoint.close().await;
                             return Ok(());
                         }
                     };
 
                     connected.connection.close(0u32.into(), b"udp reconnect retry");
-                    connected.endpoint.close().await;
 
                     if *shutdown_rx.borrow() {
                         return Ok(());
@@ -110,7 +120,7 @@ pub fn run(peer: &str, specs: &[String]) -> Result<ExitCode> {
 
 async fn wait_backoff(shutdown_rx: &mut watch::Receiver<bool>, backoff: Duration) {
     tokio::select! {
-        _ = tokio::time::sleep(backoff) => {}
+        () = tokio::time::sleep(backoff) => {}
         changed = shutdown_rx.changed() => {
             let _ = changed;
         }
