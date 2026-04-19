@@ -21,29 +21,28 @@ portl/
 │       └── docs.yml               mdbook → gh-pages
 ├── README.md
 ├── CHANGELOG.md
-├── LICENSE-APACHE
 ├── LICENSE-MIT
 │
 ├── docs/
 │   └── design/                     this doc set (markdown)
 │       ├── README.md               landing / index
-│       ├── 01-goals.md
-│       ├── 02-architecture.md
-│       ├── 03-tickets.md
-│       ├── 04-protocols.md
-│       ├── 05-bootstrap.md
-│       ├── 06-docker.md
-│       ├── 06a-slicer.md
-│       ├── 07-security.md
-│       ├── 08-cli.md
-│       ├── 09-config.md
-│       ├── 10-walkthroughs.md
-│       ├── 11-workspace.md
-│       ├── 12-roadmap.md
-│       ├── 13-open-questions.md
+│       ├── 010-goals.md
+│       ├── 020-architecture.md
+│       ├── 030-tickets.md
+│       ├── 040-protocols.md
+│       ├── 050-bootstrap.md
+│       ├── 060-docker.md
+│       ├── 065-slicer.md
+│       ├── 070-security.md
+│       ├── 080-cli.md
+│       ├── 090-config.md
+│       ├── 100-walkthroughs.md
+│       ├── 110-workspace.md
+│       ├── 120-roadmap.md
+│       ├── 130-open-questions.md
 │       └── future/                 deferred design artifacts
-│           ├── 14-transport-abstraction.md
-│           └── 15-loom-analysis.md
+│           ├── 140-transport-abstraction.md
+│           └── 150-loom-analysis.md
 │
 ├── crates/
 │   ├── portl-core/                     # sessions, tickets, caps, traits,
@@ -191,7 +190,7 @@ members = [
 [workspace.package]
 version      = "0.0.1"
 edition      = "2024"
-license      = "Apache-2.0 OR MIT"
+license      = "MIT"
 repository   = "https://github.com/KnickKnackLabs/portl"
 authors      = ["KnickKnackLabs and portl contributors"]
 rust-version = "1.85"    # 2024 edition baseline
@@ -339,7 +338,6 @@ bin/portl                        # the multicall binary
 bin/portl-agent                  # symlink → portl (argv[0] dispatch)
 share/systemd/portl-agent.service
 share/man/*                      # generated from clap
-LICENSE-APACHE
 LICENSE-MIT
 README.md
 ```

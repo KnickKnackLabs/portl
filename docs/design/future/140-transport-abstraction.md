@@ -457,7 +457,7 @@ upstream maturity. Direct NAT traversal not yet implemented upstream
 (DERP-only as of this writing).
 ```
 
-### loom / AWDL (deferred, see 15-loom-analysis.md)
+### loom / AWDL (deferred, see 150-loom-analysis.md)
 
 ```
 PeerAddress  = LoomPeerRef (UUID + Bonjour name)
@@ -563,7 +563,7 @@ TransportHint = one of:
   WebRtcHint    { signaling_url: Text }   // future
 ```
 
-See `03-tickets.md §2` for the full v2 schema.
+See `030-tickets.md §2` for the full v2 schema.
 
 ## 16. What we commit to in v1 — crate-by-crate status
 
@@ -591,7 +591,7 @@ future PR promotes the placeholder into a real crate.
 | Placeholder | Why not now |
 | --- | --- |
 | `portl-overlay-tailscale` | upstream `tailscale-rs` is still labelled unstable/insecure, DERP-only, no direct connections; revisit when 1.0 lands |
-| `portl-overlay-loom` | requires Swift FFI, codesigning, entitlements, and is Apple-only; primary Mac→Linux-VM portl use case can't benefit from AWDL anyway (see 15-loom-analysis.md) |
+| `portl-overlay-loom` | requires Swift FFI, codesigning, entitlements, and is Apple-only; primary Mac→Linux-VM portl use case can't benefit from AWDL anyway (see 150-loom-analysis.md) |
 | `portl-overlay-ssh` | valuable for retrofit scenarios but not on the v0.1 critical path; contributors welcome |
 | `portl-overlay-webrtc` | for browser clients; no signal yet that anyone wants this |
 
@@ -623,4 +623,4 @@ a real implementation in one PR.
 - How eagerly to cancel "losing" parallel dials — cancel on winner, keep
   for 5s as warm standby, or always drop.
 
-These live in `13-open-questions.md`.
+These live in `130-open-questions.md`.

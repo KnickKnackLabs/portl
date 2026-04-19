@@ -17,7 +17,7 @@ one to ship because Docker is:
 - An environment that stress-tests the "no systemd, no cloud-init"
   code path in the agent.
 
-See `06a-slicer.md` for the slicer adapter (M5), which exercises
+See `065-slicer.md` for the slicer adapter (M5), which exercises
 gateway-mode, master tickets, and systemd installs. Most other
 adapters (cloud-init, nixos, k8s) follow the same pattern as
 docker-portl with a different provisioning verb.
@@ -281,7 +281,7 @@ orchestrator HTTP API that benefits from being wrapped in a portl
 master ticket. Operators manage containers directly from their
 laptop; no gateway needed.
 
-Gateway-mode is slicer's story (see `06a-slicer.md §4`). If a
+Gateway-mode is slicer's story (see `065-slicer.md §4`). If a
 future docker-adapter variant wants to expose remote docker hosts
 (e.g. `DOCKER_HOST=tcp://server:2376`), portl's regular `tcp/v1`
 port-forward is the right primitive — the master-ticket pattern
@@ -397,7 +397,7 @@ CMD ["--config", "/etc/portl/agent.toml"]
 
 LABEL org.opencontainers.image.title="portl-agent"
 LABEL org.opencontainers.image.source="https://github.com/KnickKnackLabs/portl"
-LABEL org.opencontainers.image.licenses="Apache-2.0 OR MIT"
+LABEL org.opencontainers.image.licenses="MIT"
 ```
 
 Image size target: <80 MiB uncompressed on `linux/amd64` (debian-

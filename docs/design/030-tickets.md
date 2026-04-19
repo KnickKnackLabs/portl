@@ -315,7 +315,7 @@ compute_ticket_id(t) = sha256(HASH_TICKET_ID || t.sig)[..16]
 resolved_issuer(t)   = t.body.issuer.unwrap_or(t.addr.endpoint_id)
 ```
 
-`SKEW_TOLERANCE` is ±60 s on `not_before` (see `07-security.md §4`);
+`SKEW_TOLERANCE` is ±60 s on `not_before` (see `070-security.md §4`);
 `not_after` is enforced strictly.
 
 ### Key invariants (enforced at verify time)
@@ -480,7 +480,7 @@ A "master ticket" isn't a separate type — it's a ticket whose:
 - `bearer` field is non-empty (containing the slicer API token, or
   equivalent),
 - target is a **gateway-mode agent** (a `portl-agent` running with
-  `--mode gateway`; see `08-cli.md §2.1`) that proxies the HTTP API.
+  `--mode gateway`; see `080-cli.md §2.1`) that proxies the HTTP API.
 
 ```
 Master ticket for a slicer host gateway
@@ -492,13 +492,13 @@ Master ticket for a slicer host gateway
   bearer   : <base64 slicer API token; the gateway-mode agent injects
              "Authorization: Bearer <...>" into each tunnelled HTTP
              request>
-  ttl      : ≤ 30 days (see 07-security.md §4.3a for bearer handling)
+  ttl      : ≤ 30 days (see 070-security.md §4.3a for bearer handling)
 ```
 
 The bearer field only exists in master tickets. Regular per-peer tickets
 omit it. Master tickets carry elevated risk (leaking the URL ≡ leaking
 the API token it wraps) and should always be `to`-bound to a specific
-operator; see `07-security.md §4.3a`.
+operator; see `070-security.md §4.3a`.
 
 ## 8. Sharing UX
 
@@ -538,7 +538,7 @@ absent, the ticket is bearer-style and anyone holding the bytes can
 present it.
 
 The canonical `TicketOffer` / `TicketAck` wire format (see also
-`04-protocols.md §1`):
+`040-protocols.md §1`):
 
 ```
 TicketOffer {
@@ -772,7 +772,7 @@ so future contributors can challenge them on the right axis.
 
 | Win | Mechanism | Per-ticket save | Why safe |
 | --- | --- | --- | --- |
-| Single data plane | `addr: EndpointAddr` (iroh's type) instead of custom `node_id + relays[]` | ~40 B | Matches `future/14-transport-abstraction.md` non-commitment |
+| Single data plane | `addr: EndpointAddr` (iroh's type) instead of custom `node_id + relays[]` | ~40 B | Matches `future/140-transport-abstraction.md` non-commitment |
 | Postcard over CBOR | field-order encoding, no map keys | ~20% overall | Both are well-reviewed; postcard matches iroh |
 | Kind-prefixed base32 (no bech32m) | follows iroh's `<KIND><base32>` | ~10 chars | Signature rejection catches typos |
 | Elide `issuer` when == `addr.endpoint_id` | §2.2 canonicalization rule | 32 B for self-signed roots | `resolved_issuer()` is deterministic; MUST reject the non-canonical form |
@@ -837,7 +837,7 @@ implementers and reviewers must hold in mind.
   adversary-controlled relays. iroh's QUIC end-to-end encryption
   prevents session MITM; the residual risk is targeted DoS or
   traffic analysis. Accepted for v0.1; matches iroh convention.
-  See `07-security.md §4.5`.
+  See `070-security.md §4.5`.
 - **Ad-hoc sharing of delegated tickets requires bundle, not URI
   alone**: a recipient of a delegated terminal URI cannot complete
   `TicketOffer.chain` without receiving the parent bytes out of
@@ -852,7 +852,7 @@ implementers and reviewers must hold in mind.
 - **Master-ticket leak ≡ credential leak**: a ticket with non-empty
   `bearer` carries a real API credential and MUST be treated
   accordingly. Short TTLs (≤ 30 d enforced at mint), mandatory
-  `to`-binding, audit-log bearer redaction. See `07-security.md
+  `to`-binding, audit-log bearer redaction. See `070-security.md
   §4.3a`.
 
 ### 12.5 When to revisit
@@ -862,7 +862,7 @@ true:
 
 - A second genuine data plane ships (WebRTC, Loom/AWDL,
   BLE/LoRa). That would motivate a `transports[]` array and a v2
-  schema. See `future/14-transport-abstraction.md`.
+  schema. See `future/140-transport-abstraction.md`.
 - Birthday-collision cost on SHA-256 drops below ~2^60. Domain
   separation is the mitigation today; a genuine break would force
   a full 32-B hash migration.

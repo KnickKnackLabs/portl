@@ -195,8 +195,8 @@ verifies.
 ```
 
 Every reject emits an audit record with a typed `AckReason` (see
-`04-protocols.md §1`). Rate-limit metrics are enumerated in
-`07-security.md §4.10`; per-source-per-reason counters prevent the
+`040-protocols.md §1`). Rate-limit metrics are enumerated in
+`070-security.md §4.10`; per-source-per-reason counters prevent the
 agent from becoming a free oracle about `trust.roots`.
 
 ## 5. Stream multiplex / per-protocol dispatch
@@ -440,7 +440,7 @@ served by "iroh + more discovery." Specifically:
 None are v0.1. When the first one is demanded, we design the
 `OverlayTransport` trait informed by what the second data plane
 actually looks like, instead of guessing. A draft of that future
-abstraction lives at `future/14-transport-abstraction.md` — retained
+abstraction lives at `future/140-transport-abstraction.md` — retained
 as a design artifact, not a commitment.
 
 ### 11.2 What this means for tickets (03) and walkthroughs (10)

@@ -15,9 +15,9 @@ and (opt-in) Mainline DHT services.
 only. Implementation is about to start.
 
 - Full design doc set → [`docs/design/`](docs/design/)
-- Short version → [`docs/design/01-goals.md`](docs/design/01-goals.md)
-- Architecture → [`docs/design/02-architecture.md`](docs/design/02-architecture.md)
-- Roadmap → [`docs/design/12-roadmap.md`](docs/design/12-roadmap.md)
+- Short version → [`docs/design/010-goals.md`](docs/design/010-goals.md)
+- Architecture → [`docs/design/020-architecture.md`](docs/design/020-architecture.md)
+- Roadmap → [`docs/design/120-roadmap.md`](docs/design/120-roadmap.md)
 
 The design is complete enough to start on M0 (workspace scaffold +
 `portl-core` skeleton + in-process test helpers). See the roadmap for
@@ -36,7 +36,7 @@ what ships when.
   on a developer's Mac, reached without port-forwarding or tailnet.
 
 The threat model (see
-[`docs/design/07-security.md`](docs/design/07-security.md)) is
+[`docs/design/070-security.md`](docs/design/070-security.md)) is
 *"possession of the ticket is the authorisation"*. Revocation exists;
 accounts do not.
 
@@ -55,8 +55,8 @@ portl shell demo-1
 portl tcp demo-1 -L 127.0.0.1:3000:127.0.0.1:3000 -N
 ```
 
-See [`docs/design/06-docker.md`](docs/design/06-docker.md) for full
-adapter details, [`docs/design/06a-slicer.md`](docs/design/06a-slicer.md)
+See [`docs/design/060-docker.md`](docs/design/060-docker.md) for full
+adapter details, [`docs/design/065-slicer.md`](docs/design/065-slicer.md)
 for slicer adapter (M5).
 
 ## What portl is NOT
@@ -70,20 +70,15 @@ for slicer adapter (M5).
 - Not tied to any one orchestrator. Docker is the M4 reference adapter
   and slicer is the M5 adapter; both ship in v0.1. The design treats
   adapters as the extensibility point (see
-  [`docs/design/05-bootstrap.md`](docs/design/05-bootstrap.md)).
+  [`docs/design/050-bootstrap.md`](docs/design/050-bootstrap.md)).
 
 ## License
 
-Dual-licensed under either of
-
-- [Apache License, Version 2.0](LICENSE-APACHE)
-- [MIT license](LICENSE-MIT)
-
-at your option.
+Licensed under the [MIT license](LICENSE-MIT). See `LICENSE-MIT` for
+the full text.
 
 ### Contribution
 
 Unless you explicitly state otherwise, any contribution intentionally
-submitted for inclusion in the work by you, as defined in the Apache-2.0
-license, shall be dual licensed as above, without any additional terms
-or conditions.
+submitted for inclusion in the work by you shall be licensed under
+the MIT license, without any additional terms or conditions.

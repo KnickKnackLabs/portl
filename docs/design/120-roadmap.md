@@ -28,7 +28,7 @@
 
   Future (demand-driven, not on critical path):
      Alternate data planes (WebRTC, Loom/AWDL) — `OverlayTransport`
-         design landed then; see `future/14-transport-abstraction.md`
+         design landed then; see `future/140-transport-abstraction.md`
      Tailscale passthrough — if `tailscale-rs` stabilises
      SSH-as-transport
      Post-quantum hybrid signatures
@@ -64,7 +64,7 @@ Exit:
 - Chain carrying tested: a 3-hop delegation encodes via separate
   `Bytes` blobs in `TicketOffer.chain`, not embedded in the URI.
 - Proof-of-possession: `to`-bound ticket requires `proof` with domain-
-  separated signature (see `03-tickets.md §9`).
+  separated signature (see `030-tickets.md §9`).
 - Property tests: monotone narrowing, TTL bounds, delegation depth,
   clock-skew tolerance.
 - No network code yet — verification runs against in-memory fixtures.
@@ -93,7 +93,7 @@ Tests:
 - Ticket acceptance matrix: valid, expired, revoked, bad-sig,
   wrong-root, bad-proof, wrong-`to`.
 - Pre-auth rate-limit gate rejects a CPU-flood attacker before
-  ed25519 verify (see `07-security.md §4.10`).
+  ed25519 verify (see `070-security.md §4.10`).
 - Direct + relay paths exercised in CI via container networking.
 - LAN-only path exercised in CI via a docker bridge network with
   no outbound route.
@@ -121,7 +121,7 @@ Exit:
 - `adapters/docker-portl/` crate implements the `Bootstrapper` trait
   against `dockerd` via `bollard`.
 - `portl docker container add <name>` provisions, registers, mints a
-  root ticket, and prints the URI. See `06-docker.md`.
+  root ticket, and prints the URI. See `060-docker.md`.
 - `portl docker container {list,rm,rebuild,logs}` all work.
 - Reference `Dockerfile` at `adapters/docker-portl/images/` builds
   a <80 MiB image containing the multicall binary.
@@ -210,7 +210,7 @@ Tests:
 Exit:
 
 - `portl revoke` + `portl revocations publish` works end-to-end.
-- Revocation GC enforced (per `07-security.md §4.12`).
+- Revocation GC enforced (per `070-security.md §4.12`).
 - `portl doctor` diagnoses: clock skew, discovery config, listener
   bind, relay reachability, ticket expiry.
 - Agent exposes Prometheus metrics on the local unix socket.
@@ -290,7 +290,7 @@ Features that will not have dedicated milestones in this plan:
 - Post-quantum migration
 - Multi-hop routing / real mesh topology
 - Pluggable alternate data planes (OverlayTransport trait); see
-  `future/14-transport-abstraction.md`
+  `future/140-transport-abstraction.md`
 - Bonjour backend (iroh's Local discovery covers our LAN case)
 
 These might happen later, but not along the critical path.

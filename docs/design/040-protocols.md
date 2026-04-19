@@ -2,14 +2,14 @@
 
 Each protocol is a separate crate (`portl-proto-*`) implementing a common
 trait. All frames are **postcard**-encoded (matching the ticket wire
-format; see `03-tickets.md §2.1`). All streams are QUIC bidirectional
+format; see `030-tickets.md §2.1`). All streams are QUIC bidirectional
 streams. Datagrams are QUIC datagrams (RFC 9221).
 
 ## 1. Common handshake: `ticket/v1`
 
 Every connection begins with exactly one `ticket/v1` stream. No other
 streams are served until `TicketAck.ok == true`. The wire format is
-specified canonically here; `03-tickets.md §9` cross-references this
+specified canonically here; `030-tickets.md §9` cross-references this
 section for proof-of-possession semantics.
 
 ```
@@ -32,7 +32,7 @@ section for proof-of-possession semantics.
    │    }                                                         │
    │                                                             │
    │                                  Agent pipeline (see         │
-   │                                  02-architecture.md §4):     │
+   │                                  020-architecture.md §4):     │
    │                                   1. per-source-IP rate gate │
    │                                   2. postcard parse          │
    │                                   3. canonicalization check  │
@@ -219,7 +219,7 @@ is combined with the target user's login environment:
 | `Replace { base: [...] }` | Login env discarded; child process sees `base` merged with `env_patch` under the same merge rules |
 
 `env_policy` is part of `ShellCaps` in the ticket schema
-(`03-tickets.md §2`), so the shape is proof-carrying: a narrowed
+(`030-tickets.md §2`), so the shape is proof-carrying: a narrowed
 delegation can tighten `env_policy` (e.g. Merge → Merge-with-allowlist,
 or Merge → Deny) but cannot widen it.
 
@@ -362,7 +362,7 @@ Session state persistence:
 ```
 
 The 60 s default is a config knob (`[udp] session_linger_secs` in
-`09-config.md`). Mosh-quality roaming is the target use case.
+`090-config.md`). Mosh-quality roaming is the target use case.
 
 ### 5.2 Datagram frame (QUIC datagram, not stream)
 
@@ -554,7 +554,7 @@ plus datagrams). This table is reference material for future
 post-v0.1 work where an alternate data plane (WebRTC, Loom) might
 not support every ALPN. If/when that happens, the full
 `ProtocolRequirements` design is at
-`future/14-transport-abstraction.md`.
+`future/140-transport-abstraction.md`.
 
 | ALPN | Streams | Datagrams | Interactive | Notes |
 | --- | --- | --- | --- | --- |

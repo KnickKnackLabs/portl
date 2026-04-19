@@ -111,7 +111,7 @@ forward).
 ### 4.3a Master-ticket / bearer leak (elevated-risk variant)
 
 **Impact.** A ticket carrying a non-empty `bearer` field (master
-tickets, see `03-tickets.md §7`) is equivalent to leaking the wrapped
+tickets, see `030-tickets.md §7`) is equivalent to leaking the wrapped
 credential itself (slicer API token, cloud IAM bearer, etc.). The
 gateway injects this credential into every proxied request, so an
 attacker who decodes the CBOR can skip portl entirely and hit the
@@ -199,7 +199,7 @@ a fake shell prompt; the operator could be tricked into typing secrets.
 ### 4.10 DoS — rate-limit taxonomy
 
 Pre-authentication CPU exhaustion (e.g. Ed25519-verify floods) is
-real; the pipeline in `02-architecture.md §4` enforces these layers
+real; the pipeline in `020-architecture.md §4` enforces these layers
 in order, cheapest first:
 
 1. **Per-source-IP connection cap** (applied before QUIC handshake
@@ -218,7 +218,7 @@ in order, cheapest first:
    node_id, at most 1000 records per batch.
 
 All limits are configurable under `[limits]` in the agent config.
-Exceeded limits increment metrics counters (`09-config.md §7`) so
+Exceeded limits increment metrics counters (`090-config.md §7`) so
 operators can see abuse in real time.
 
 Relay-level DoS is out of scope for the agent; operators that self-host

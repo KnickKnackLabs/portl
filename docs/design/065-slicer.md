@@ -7,7 +7,7 @@
 > the slicer HTTP API, master tickets). The two adapters validate
 > different parts of the design and both ship in v0.1.
 >
-> See `06-docker.md` for the M4 adapter.
+> See `060-docker.md` for the M4 adapter.
 
 ## 1. Shape
 
@@ -178,7 +178,7 @@ POSTing to slicer's `/vm/add`.
 A `portl-agent` running with `--mode gateway` lives on the slicer host
 and gives the daemon's HTTP API an iroh-addressable face. ("Gateway
 mode" is a flag on the normal agent binary; there is no separate
-`portl-gw` binary in v0.1 — see `08-cli.md §2.1`.)
+`portl-gw` binary in v0.1 — see `080-cli.md §2.1`.)
 
 ```
  host (where slicer-mac or slicer is running)
@@ -285,7 +285,7 @@ portl slicer ticket-rotate <name>         # replace ticket with a fresh one
 ```
 
 Subcommand routing (`portl-cli` ↔ `portl-slicer-adapter`) is explained in
-`05-bootstrap.md §5`.
+`050-bootstrap.md §5`.
 
 ## 8. Interaction with existing slicer helpers
 

@@ -101,12 +101,12 @@ and protocol suite on top of iroh without adding a control plane.
   Local/mDNS, DHT) covers LAN + internet peer-finding. When a genuine
   alternate data plane (WebRTC, Loom/AWDL) becomes necessary, the
   abstraction gets designed then, informed by what that plane actually
-  needs. Draft kept at `future/14-transport-abstraction.md`.
+  needs. Draft kept at `future/140-transport-abstraction.md`.
 - **One identity primitive (ed25519).** No post-quantum story in v0.1.
   Upgrade path: bump ticket version, rotate keys, republish.
 - **One ticket schema version (v1).** iroh `EndpointAddr` for dialing,
   postcard for serialization, kind-prefixed base32 wire format
-  (matches iroh-tickets; see `03-tickets.md §11`). Bumps to v2 on
+  (matches iroh-tickets; see `030-tickets.md §11`). Bumps to v2 on
   the first breaking change.
 - **Postcard, not Protobuf/JSON/CBOR.** Smaller tickets, deterministic
   encoding, matches iroh's own ticket format.

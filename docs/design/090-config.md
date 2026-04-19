@@ -103,7 +103,7 @@ clock_skew_tolerance_secs       = 60      # ±window on not_before
 relays = ["https://relay.myhomelab.xyz"]
 
 [discovery]
-# See 02-architecture.md §11. These map directly to iroh's Discovery
+# See 020-architecture.md §11. These map directly to iroh's Discovery
 # services; portl-core::discovery translates the flags into iroh
 # DiscoveryBuilder options.
 dns   = true    # iroh DNS discovery (default origin dns.iroh.link)
@@ -115,7 +115,7 @@ dht   = false   # opt-in Mainline DHT
 # dns_origin = "dns.example.com"
 
 [limits]
-# See 07-security.md §4.10 for the full rate-limit taxonomy.
+# See 070-security.md §4.10 for the full rate-limit taxonomy.
 per_src_ip_concurrent        = 16
 per_src_ip_burst_per_minute  = 64
 per_node_id_concurrent       = 8
@@ -274,8 +274,8 @@ portl_revocation_set_size            gauge
 portl_discovery_resolutions_total    counter, labels: {service, outcome}
 ```
 
-`{outcome}` is the `AckReason` enum from `04-protocols.md §1`. See
-`07-security.md §4.10` for `{kind}` enumeration.
+`{outcome}` is the `AckReason` enum from `040-protocols.md §1`. See
+`070-security.md §4.10` for `{kind}` enumeration.
 
 ## 5. Directories by OS
 
@@ -288,7 +288,7 @@ Linux           macOS                               Windows
 v1 targets Linux + macOS. Windows client is best-effort; Windows agent
 is post-v1.
 
-## 6. Environment variables (already listed in 08-cli §5)
+## 6. Environment variables (already listed in 080-cli §5)
 
 ## 7. Secret lifecycle
 

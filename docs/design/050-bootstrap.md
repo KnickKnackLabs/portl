@@ -114,7 +114,7 @@ operator CLI:   portl slicer vm add sbox --tag agent=claude
 
 ### 4.1 `slicer-portl` (primary)
 
-See `06-docker.md` (M4 reference) and `06a-slicer.md` (M5) for
+See `060-docker.md` (M4 reference) and `065-slicer.md` (M5) for
 concrete adapter implementations.
 
 ```

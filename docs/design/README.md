@@ -46,34 +46,62 @@ translation of what's written here.
 These two terms refer to the same thing: the ed25519 public key that
 uniquely identifies a peer on the overlay. `endpoint_id` is iroh's
 current name (≥ 0.33); `node_id` is iroh's previous name and the term
-historically used in portl prose. The ticket schema (`03-tickets.md §2`)
+historically used in portl prose. The ticket schema (`030-tickets.md §2`)
 uses `endpoint_id` to match iroh's type names; most diagrams and English
 prose still use `node_id`. Treat them as synonymous.
 
 ## Index
 
-| # | File | What's in it |
+| #   | File | What's in it |
 | --- | --- | --- |
-| — | `README.md` | This file. High-level map. |
-| 01 | `01-goals.md` | Goals, non-goals, positioning, prior art. |
-| 02 | `02-architecture.md` | Components, data flow, state machines. Many diagrams. |
-| 03 | `03-tickets.md` | Ticket URI format, postcard schema, delegation, revocation. |
-| 04 | `04-protocols.md` | Every ALPN with framing and sequence diagrams. |
-| 05 | `05-bootstrap.md` | `Bootstrapper` trait, adapter pattern, lifecycle. |
-| 06 | `06-docker.md` | The Docker adapter (M4 reference implementation). |
-| 06a | `06a-slicer.md` | The slicer adapter end-to-end (M5). |
-| 07 | `07-security.md` | Threat model, trust, key custody, failure modes. |
-| 08 | `08-cli.md` | Exhaustive CLI reference: `portl` (operator), `portl agent` (target-side), adapters. |
-| 09 | `09-config.md` | Config file formats, on-disk layout, directories, keys. |
-| 10 | `10-walkthroughs.md` | End-to-end example flows with diagrams. |
-| 11 | `11-workspace.md` | Cargo workspace layout, crate boundaries, dependencies. |
-| 12 | `12-roadmap.md` | Milestones M0–M10 with exit criteria (M4 docker, M5 slicer). |
-| 13 | `13-open-questions.md` | Decisions the author wants confirmed before scaffolding. |
+| —   | `README.md` | This file. High-level map. |
+| 010 | `010-goals.md` | Goals, non-goals, positioning, prior art. |
+| 020 | `020-architecture.md` | Components, data flow, state machines. Many diagrams. |
+| 030 | `030-tickets.md` | Ticket URI format, postcard schema, delegation, revocation. |
+| 040 | `040-protocols.md` | Every ALPN with framing and sequence diagrams. |
+| 050 | `050-bootstrap.md` | `Bootstrapper` trait, adapter pattern, lifecycle. |
+| 060 | `060-docker.md` | The Docker adapter (M4 reference implementation). |
+| 065 | `065-slicer.md` | The slicer adapter end-to-end (M5). |
+| 070 | `070-security.md` | Threat model, trust, key custody, failure modes. |
+| 080 | `080-cli.md` | Exhaustive CLI reference: `portl` (operator), `portl agent` (target-side), adapters. |
+| 090 | `090-config.md` | Config file formats, on-disk layout, directories, keys. |
+| 100 | `100-walkthroughs.md` | End-to-end example flows with diagrams. |
+| 110 | `110-workspace.md` | Cargo workspace layout, crate boundaries, dependencies. |
+| 120 | `120-roadmap.md` | Milestones M0–M10 with exit criteria (M4 docker, M5 slicer). |
+| 130 | `130-open-questions.md` | Decisions the author wants confirmed before scaffolding. |
 
 Design artifacts for deferred/post-v0.1 work (in `future/`):
 
-- [`future/14-transport-abstraction.md`](future/14-transport-abstraction.md) — `OverlayTransport` trait design. Deferred: iroh's `Discovery` plugins (DNS, Pkarr, Local/mDNS, DHT) cover our v0.1 needs; a full transport trait gets designed when a second genuine data plane (WebRTC, Loom/AWDL) is demanded.
-- [`future/15-loom-analysis.md`](future/15-loom-analysis.md) — Loom / AWDL deep dive. Deferred alongside the transport trait; preserved for future reference.
+- [`future/140-transport-abstraction.md`](future/140-transport-abstraction.md) — `OverlayTransport` trait design. Deferred: iroh's `Discovery` plugins (DNS, Pkarr, Local/mDNS, DHT) cover our v0.1 needs; a full transport trait gets designed when a second genuine data plane (WebRTC, Loom/AWDL) is demanded.
+- [`future/150-loom-analysis.md`](future/150-loom-analysis.md) — Loom / AWDL deep dive. Deferred alongside the transport trait; preserved for future reference.
+
+## Numbering convention
+
+Filenames use a **3-digit prefix** (`NNN-slug.md`) with **canon docs
+on multiples of 10** (`010`, `020`, `030`, …). This leaves 9 free
+slots between every pair of canon docs.
+
+- **Inserting a new doc between two existing ones**: pick any
+  non-multiple-of-10 in the gap (`065` went between `060-docker.md`
+  and `070-security.md` this way when the slicer adapter slid to
+  M5). Prefer the midpoint first (e.g. `015` between `010` and
+  `020`), then `011`/`019`, etc.
+- **Inserting at either end**: go below `010` (`005`, `001`) or
+  past `130` (`140`, `150`). The `future/` subdirectory uses the
+  same number line, reserving `≥ 140` for deferred design
+  artifacts.
+- **Reordering canon**: rare. When needed, renumber only within
+  the affected region, not the whole tree. Cross-references can
+  be updated with a single `sed` pass plus a grep check that no
+  old prefixes survive.
+- **Superseding**: mark the old doc's frontmatter with
+  `Status: superseded by NNN-slug.md`, and either leave it in
+  place or move to `archive/`. Do not reuse its number.
+
+The number itself has no semantic meaning beyond ordering —
+don't overload it with thematic ranges ("20s are protocols, 30s
+are adapters"). That temptation trades one renumbering crisis
+(insertion) for a harder one (re-theming).
 
 ## One-minute pitch
 
@@ -103,13 +131,13 @@ Design artifacts for deferred/post-v0.1 work (in `future/`):
 
 ## Reading order
 
-If you only read three documents, read **01-goals**, **02-architecture**,
-and **10-walkthroughs**. The rest fills in the shapes.
+If you only read three documents, read **010-goals**, **020-architecture**,
+and **100-walkthroughs**. The rest fills in the shapes.
 
 If you care about the long-range transport story (WebRTC, Loom/AWDL,
 running over Tailscale, SSH-as-transport), the artifact reading is
-**future/14-transport-abstraction** and **future/15-loom-analysis** —
+**future/140-transport-abstraction** and **future/150-loom-analysis** —
 both deferred from v0.1. For v0.1's one-data-plane-with-pluggable-
-discovery story, **02-architecture** and **09-config** are the truth.
+discovery story, **020-architecture** and **090-config** are the truth.
 
-If you're reviewing: the live decision points are in **13-open-questions**.
+If you're reviewing: the live decision points are in **130-open-questions**.

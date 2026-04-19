@@ -12,7 +12,7 @@ of getting it wrong.
 
 Decision: **(a) Separate QUIC sub-streams** per kind (stdin, stdout,
 stderr, resize, signal, exit), all carrying the same `session_id` in
-their `StreamPreamble`. See `04-protocols.md §3.2`.
+their `StreamPreamble`. See `040-protocols.md §3.2`.
 
 Why: QUIC's built-in per-stream flow control is exactly what we want
 for tty data. Choice (b) was simpler in frame-count terms but collapsed
@@ -59,7 +59,7 @@ etc.). DHT adds a layer of gossip where "this node exists" is a real
 privacy signal even if the attacker can't connect, so we leave it
 opt-in.
 
-See `09-config.md` for config keys.
+See `090-config.md` for config keys.
 
 ---
 
@@ -104,18 +104,15 @@ across adapters (each adapter can have whatever subcommands it wants).
 
 ---
 
-## Q7. License
+## Q7. License — RESOLVED
 
-Options:
+**Decision: MIT only.**
 
-- **Apache-2.0 OR MIT** (Rust ecosystem default; minimal friction).
-- **Apache-2.0 only** (patent clause is nice; some shops dislike MIT).
-- **MIT only** (maximally permissive).
-- **MPL-2.0** (file-level copyleft; ensures upstreaming of changes).
-- **Dual + CLA** (for future commercial offering).
-
-Lean: **Apache-2.0 OR MIT**, no CLA. Lowest friction for adoption;
-protects contributors.
+Rationale: maximally permissive, single-file license text, minimal
+friction for both consumers and contributors. No CLA. Chosen over
+`Apache-2.0 OR MIT` because a single license keeps `LICENSE` files,
+`Cargo.toml` metadata, and contributor language simpler at this
+scale.
 
 ---
 
@@ -257,13 +254,9 @@ sink=journald. Both at once via dual-sink if needed.
 
 ## Questions to answer **before scaffolding**
 
-Just these three:
-
-1. **Q7 license** — Apache-2.0 OR MIT ok? (affects LICENSE files in
-   scaffold)
-2. **Q6 subcommand namespacing** — scoped like `portl slicer ...` ok?
+1. **Q6 subcommand namespacing** — scoped like `portl slicer ...` ok?
    (affects CLI module layout)
-3. **Q14 `portl list` naming** — confirm top-level `portl list` lists
+2. **Q14 `portl list` naming** — confirm top-level `portl list` lists
    tickets? (affects commands/ skeleton)
 
 Everything else can be decided as we build, or left to RFC after v0.1.
@@ -273,7 +266,7 @@ Everything else can be decided as we build, or left to RFC after v0.1.
 ## Resolved decisions (post-roundtable review)
 
 The design went through a formal roundtable review
-([`future/14-transport-abstraction.md`](future/14-transport-abstraction.md)
+([`future/140-transport-abstraction.md`](future/140-transport-abstraction.md)
 documents the branch we didn't take). These decisions are settled:
 
 - **Transport abstraction in v0.1**: **no**. Iroh is the single data
@@ -281,34 +274,34 @@ documents the branch we didn't take). These decisions are settled:
   imports out of protocol crates. When a genuine alternate data plane
   (WebRTC, Loom/AWDL) is demanded, the `OverlayTransport` trait gets
   designed then, informed by what that second plane actually needs.
-  See `02-architecture.md §11`.
+  See `020-architecture.md §11`.
 - **Ticket schema version**: **v1** with `node_id` + `relays[]`
-  (iroh's `NodeAddr` shape). See `03-tickets.md §2`. Bumps to v2 when
+  (iroh's `NodeAddr` shape). See `030-tickets.md §2`. Bumps to v2 when
   the first wire-format change lands.
 - **Bonjour-style LAN discovery**: iroh's built-in **Local discovery**
   (mDNS-based) is turned on by default. No separate `portl-overlay-
   bonjour` crate needed; the work is a config flag on the iroh
-  endpoint. See `09-config.md` `[discovery]` section.
+  endpoint. See `090-config.md` `[discovery]` section.
 - **Proof-of-possession**: `to`-bound tickets require a signature with
   domain separation; bearer-style tickets carry no extra handshake
   turn. Iroh QUIC TLS already binds node identity, so no mutual
-  challenge-response in `ticket/v1`. See `03-tickets.md §9`.
+  challenge-response in `ticket/v1`. See `030-tickets.md §9`.
 - **Delegation chain encoding**: parent ticket bytes travel on the
   wire inside `TicketOffer.chain`, not embedded in the URI. URIs stay
   bounded at ~400–500 chars regardless of delegation depth. See
-  `03-tickets.md §3` and `04-protocols.md §1`.
+  `030-tickets.md §3` and `040-protocols.md §1`.
 - **URI encoding**: kind-prefixed base32-lowercase, matching
   iroh-tickets (`portl<base32>`, no separator, no checksum). Gives
   us parseability in `ticket.iroh.computer` and reuses
   `iroh_base::EndpointAddr` for dialing info. Postcard-encoded body.
-  See `03-tickets.md §11`.
+  See `030-tickets.md §11`.
 - **Ticket schema compression**: three mechanical wins taken after
   roundtable review — elide `issuer` for self-signed roots; replace
   `parent_sig` with `parent_ticket_id: [u8; 16]` (domain-separated
   SHA-256); elide `parent_issuer`. Plus drop redundant `alpns` field
   (derive from `Capabilities`) and use a presence bitmap for
   `Capabilities`. Net effect: ~30% smaller tickets for the common
-  cases. See `03-tickets.md §12`.
+  cases. See `030-tickets.md §12`.
 - **Connection migration**: explicit non-goal for v0.1. Sessions drop
   on transport change; reconnect via same ticket. `tmux attach` is
   the documented mitigation for long-running work.
@@ -330,13 +323,13 @@ documents the branch we didn't take). These decisions are settled:
   `portl-agent` symlink preserves existing systemd units and
   operator muscle memory.
 - **Clock skew**: ±60 s tolerance on `not_before`; strict on
-  `not_after`. See `07-security.md §4.11`.
+  `not_after`. See `070-security.md §4.11`.
 - **Revocation GC**: `REVOCATION_LINGER = 7 days past original ticket
-  not_after`. See `07-security.md §4.12`.
+  not_after`. See `070-security.md §4.12`.
 - **Loom backend**: deferred indefinitely (community-driven). AWDL
   cannot reach the primary Mac→Linux-VM use case; iroh Local
   discovery + iroh QUIC cover what Loom would cover for that topology.
-  Analysis preserved at `future/15-loom-analysis.md`.
+  Analysis preserved at `future/150-loom-analysis.md`.
 
 ## New questions introduced by the revision
 
