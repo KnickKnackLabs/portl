@@ -56,11 +56,26 @@ async fn resolve_peer_ticket(
         return Ok(ticket);
     }
 
-    let endpoint_id = if let Some(alias) = AliasStore::default().get(peer)? {
-        parse_endpoint_id(&alias.endpoint_id)?
-    } else {
-        parse_endpoint_id(peer)?
-    };
+    if let Some(alias) = AliasStore::default().get(peer)? {
+        if let Some(spec) = AliasStore::default().get_spec(peer)?
+            && let Some(ticket_path) = spec.ticket_file_path
+        {
+            let raw = std::fs::read_to_string(&ticket_path)
+                .with_context(|| format!("read stored ticket {}", ticket_path.display()))?;
+            return <PortlTicket as Ticket>::deserialize(raw.trim())
+                .map_err(|err| anyhow!("parse stored ticket {}: {err}", ticket_path.display()));
+        }
+        let endpoint_id = parse_endpoint_id(&alias.endpoint_id)?;
+        let addr = resolve_endpoint_addr(endpoint, endpoint_id).await?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before unix epoch")?
+            .as_secs();
+        return mint_root(identity.signing_key(), addr, caps, now, now + 300, None)
+            .context("mint ephemeral peer ticket");
+    }
+
+    let endpoint_id = parse_endpoint_id(peer)?;
     let addr = resolve_endpoint_addr(endpoint, endpoint_id).await?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

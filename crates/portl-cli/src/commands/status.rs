@@ -17,6 +17,8 @@ use portl_proto::meta_v1::{MetaReq, MetaResp};
 use portl_proto::wire::StreamPreamble;
 use serde::{Deserialize, Serialize};
 
+use crate::alias_store::AliasStore;
+
 pub fn run(peer: &str) -> Result<ExitCode> {
     run_with_identity_path(peer, None)
 }
@@ -92,6 +94,41 @@ async fn resolve_peer(
         return Ok(ResolvedPeer {
             ticket,
             discovery: "cached".to_owned(),
+        });
+    }
+
+    if let Some(alias) = AliasStore::default().get(peer)? {
+        if let Some(spec) = AliasStore::default().get_spec(peer)?
+            && let Some(ticket_path) = spec.ticket_file_path
+        {
+            let raw = std::fs::read_to_string(&ticket_path)
+                .with_context(|| format!("read stored ticket {}", ticket_path.display()))?;
+            let ticket = <PortlTicket as Ticket>::deserialize(raw.trim())
+                .map_err(|err| anyhow!("parse stored ticket {}: {err}", ticket_path.display()))?;
+            return Ok(ResolvedPeer {
+                ticket,
+                discovery: "stored-ticket".to_owned(),
+            });
+        }
+        let endpoint_id = parse_endpoint_id(&alias.endpoint_id)?;
+        let (addr, provenance) = resolve_endpoint_addr(endpoint, endpoint_id).await?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before unix epoch")?
+            .as_secs();
+        let ticket = mint_root(
+            identity.signing_key(),
+            addr,
+            meta_caps(),
+            now,
+            now + 300,
+            None,
+        )
+        .context("mint ephemeral status ticket")?;
+
+        return Ok(ResolvedPeer {
+            ticket,
+            discovery: normalize_discovery_source(&provenance),
         });
     }
 
