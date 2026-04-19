@@ -330,6 +330,29 @@ fn verify_rejects_child_whose_resolved_issuer_mismatches_parent_key() {
 }
 
 #[test]
+fn verify_rejects_child_introducing_bearer() {
+    let signer = SigningKey::from_bytes(&[47u8; 32]);
+    let root = mint_root(
+        &signer,
+        endpoint_addr_from_key(&signer),
+        shell_caps(),
+        1_000,
+        4_600,
+        None,
+    )
+    .unwrap();
+    let mut child = mint_delegated(&signer, &root, shell_caps(), 1_100, 4_500, None).unwrap();
+    child.body.bearer = Some(b"slicer-token".to_vec());
+    child.sig = sign_body(&signer, &child.body).unwrap();
+
+    let err = verify_chain(&child, &[root], &trust_root_for(&signer), 1_200).unwrap_err();
+    assert!(matches!(
+        err,
+        PortlError::Chain("child introduces bearer not present in parent")
+    ));
+}
+
+#[test]
 fn verify_chain_verifies_before_hashing_parent_signature() {
     let signer = SigningKey::from_bytes(&[40u8; 32]);
     let root = mint_root(

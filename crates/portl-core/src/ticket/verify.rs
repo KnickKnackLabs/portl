@@ -83,6 +83,15 @@ pub fn verify_chain(
             return Err(PortlError::Chain("child validity window escapes parent"));
         }
 
+        if parent.body.bearer.is_some() && child.body.bearer != parent.body.bearer {
+            return Err(PortlError::Chain("child bearer differs from parent"));
+        }
+        if parent.body.bearer.is_none() && child.body.bearer.is_some() {
+            return Err(PortlError::Chain(
+                "child introduces bearer not present in parent",
+            ));
+        }
+
         let expected_depth = match parent.body.parent {
             Some(ref delegation) => delegation
                 .depth_remaining

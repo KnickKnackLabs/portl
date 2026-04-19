@@ -3,6 +3,9 @@
 //! Delegated tickets must be monotone: they can only reduce the scope
 //! of a parent capability set, never add new capability families or
 //! broaden any existing family.
+//!
+//! Ticket-chain verification enforces additional non-capability monotonicity
+//! rules, including bearer-token inheritance, in `ticket::verify`.
 
 use crate::ticket::schema::{
     Capabilities, EnvPolicy, FsCaps, MetaCaps, PortRule, ShellCaps, VpnCaps,
