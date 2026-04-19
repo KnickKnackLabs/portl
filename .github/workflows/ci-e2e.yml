@@ -1,0 +1,42 @@
+name: ci-e2e
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cargo check
+        run: env -u RUSTUP_TOOLCHAIN cargo check --workspace --all-features
+      - name: Cargo test
+        run: env -u RUSTUP_TOOLCHAIN cargo test --workspace --all-features
+      - name: Cargo clippy
+        run: env -u RUSTUP_TOOLCHAIN cargo clippy --workspace --all-features -- -D warnings
+      - name: Build portl
+        run: env -u RUSTUP_TOOLCHAIN cargo build --release --bin portl
+      - name: Build reference image
+        run: |
+          mkdir -p adapters/docker-portl/images/bin
+          cp target/release/portl adapters/docker-portl/images/bin/portl-amd64
+          docker build \
+            --platform linux/amd64 \
+            -t portl-agent:ci \
+            --build-arg TARGETARCH=amd64 \
+            -f adapters/docker-portl/images/Dockerfile.reference \
+            adapters/docker-portl/images/
+      - name: Run docker adapter e2e smoke
+        env:
+          PORTL_HOME: /tmp/portl-home
+        run: |
+          mkdir -p "$PORTL_HOME"
+          ./target/release/portl id new
+          ./target/release/portl docker container add t1 --image portl-agent:ci
+          ./target/release/portl docker container add t2 --image portl-agent:ci
+          ./target/release/portl exec t1 -- echo hi
+          ./target/release/portl docker container list
+          ./target/release/portl docker container rm t1
+          ./target/release/portl docker container rm t2

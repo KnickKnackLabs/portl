@@ -202,6 +202,10 @@ impl DockerHandle {
 
 impl DockerBootstrapper {
     async fn pull_image(&self, image: &str) -> Result<()> {
+        if self.docker.inspect_image(image).await.is_ok() {
+            return Ok(());
+        }
+
         let options = Some(CreateImageOptions {
             from_image: normalize_image(image),
             ..CreateImageOptions::default()
@@ -356,7 +360,7 @@ fn render_agent_config(trust_roots: &[[u8; 32]]) -> Result<String> {
         .collect::<Vec<_>>()
         .join(", ");
     Ok(format!(
-        "identity_path = \"{SECRET_MOUNT_PATH}\"\nrevocations_path = \"/var/lib/portl/revocations.json\"\ntrust_roots = [{}]\n",
+        "identity_path = \"{SECRET_MOUNT_PATH}\"\nrevocations_path = \"/var/lib/portl/revocations.json\"\nbind_addr = \"0.0.0.0:0\"\ndiscovery = {{ dns = false, pkarr = true, local = true }}\ntrust_roots = [{}]\n",
         trust_roots
             .split(", ")
             .map(|value| format!("\"{value}\""))
@@ -500,6 +504,8 @@ mod tests {
     fn rendered_agent_config_lists_trust_roots() {
         let config = render_agent_config(&[[7; 32]]).expect("render config");
         assert!(config.contains("identity_path = \"/var/lib/portl/secret\""));
+        assert!(config.contains("bind_addr = \"0.0.0.0:0\""));
+        assert!(config.contains("discovery = { dns = false, pkarr = true, local = true }"));
         assert!(config.contains(&hex::encode([7; 32])));
     }
 }

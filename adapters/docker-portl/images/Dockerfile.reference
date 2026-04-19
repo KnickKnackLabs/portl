@@ -1,0 +1,21 @@
+# syntax=docker/dockerfile:1.7
+FROM debian:stable-slim AS base
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates bash coreutils tini \
+ && rm -rf /var/lib/apt/lists/*
+
+FROM base AS runtime
+ARG TARGETARCH
+COPY bin/portl-${TARGETARCH} /usr/local/bin/portl
+RUN chmod +x /usr/local/bin/portl \
+ && ln -s /usr/local/bin/portl /usr/local/bin/portl-agent \
+ && mkdir -p /var/lib/portl /etc/portl \
+ && chmod 0700 /var/lib/portl
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/portl", "agent", "run"]
+CMD ["--config", "/etc/portl/agent.toml"]
+
+LABEL org.opencontainers.image.title="portl-agent"
+LABEL org.opencontainers.image.source="https://github.com/KnickKnackLabs/portl"
+LABEL org.opencontainers.image.licenses="MIT"

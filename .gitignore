@@ -1,8 +1,13 @@
 # Rust
 /target/
 **/target/
+/target-linux-*/
 **/*.rs.bk
 Cargo.lock.bak
+
+# Docker adapter build artifacts
+/adapters/docker-portl/images/bin/portl-arm64
+/adapters/docker-portl/images/bin/portl-amd64
 
 # Pi agent local state (todos, session scratch)
 .pi/
