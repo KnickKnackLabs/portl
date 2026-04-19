@@ -55,6 +55,7 @@ tempfile   = "3"
 age         = { version = "0.11", default-features = false, features = ["armor"] }
 directories = "5"
 hex         = "0.4"
+rpassword   = "7"
 zeroize     = { version = "1", features = ["derive"] }
 rand        = "0.8"
 rand_core   = "0.6"

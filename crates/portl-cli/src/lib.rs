@@ -7,19 +7,27 @@
 //! on a structured [`Command`] value without caring about
 //! stdout, exit codes, or process setup.
 
-use std::{ffi::OsString, path::Path, process::ExitCode};
+mod commands;
+
+use std::{ffi::OsString, path::Path, path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
 
 /// Structured representation of a parsed invocation.
-///
-/// M0 models only the subset required to exercise multicall
-/// dispatch. Every milestone adds variants here as subcommands
-/// land; the CLI surface in `080-cli.md` is the full roadmap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// `portl agent run` (or its `portl-agent run` symlink form).
     AgentRun,
+    /// `portl id new [--force]`
+    IdNew { force: bool },
+    /// `portl id show`
+    IdShow,
+    /// `portl id export --out <path>`
+    IdExport { out: PathBuf },
+    /// `portl id import --from <path>`
+    IdImport { from: PathBuf },
+    /// `portl mint-root --caps ... --ttl ...`
+    MintRoot { caps: String, ttl: String },
 }
 
 /// Errors returned by [`parse`].
@@ -48,23 +56,34 @@ pub fn parse(argv: Vec<OsString>) -> Result<Command, ParseError> {
 }
 
 /// Library entry point wrapping [`parse`] + dispatch.
-///
-/// M0 ships a minimal dispatcher: successful parses return
-/// `ExitCode::SUCCESS`; parse errors are printed to stderr and
-/// return `ExitCode::FAILURE`. Real subcommand execution lands in
-/// M1+ as each subcommand gets an implementation.
 pub fn run(argv: Vec<OsString>) -> ExitCode {
     match parse(argv) {
-        Ok(_cmd) => ExitCode::SUCCESS,
+        Ok(cmd) => match dispatch(cmd) {
+            Ok(code) => code,
+            Err(err) => {
+                eprintln!("{err:#}");
+                ExitCode::FAILURE
+            }
+        },
         Err(ParseError::EmptyArgv) => {
             eprintln!("portl: argv is empty");
             ExitCode::FAILURE
         }
         Err(ParseError::Clap(err)) => {
-            // clap's Display is the human-friendly error message.
             let _ = err.print();
             ExitCode::FAILURE
         }
+    }
+}
+
+fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
+    match cmd {
+        Command::AgentRun => Ok(ExitCode::SUCCESS),
+        Command::IdNew { force } => commands::id::new::run(force),
+        Command::IdShow => commands::id::show::run(),
+        Command::IdExport { out } => commands::id::export::run(&out),
+        Command::IdImport { from } => commands::id::import::run(&from),
+        Command::MintRoot { caps, ttl } => commands::mint_root::run(&caps, &ttl),
     }
 }
 
@@ -75,9 +94,6 @@ fn rewrite_multicall(mut argv: Vec<OsString>) -> Result<Vec<OsString>, ParseErro
         .and_then(|s| s.to_str())
         .unwrap_or_default();
     if basename == "portl-agent" {
-        // Replace argv[0] with a canonical "portl" and insert "agent"
-        // as the first positional. From clap's perspective the
-        // invocation is indistinguishable from `portl agent ...`.
         argv[0] = OsString::from("portl");
         argv.insert(1, OsString::from("agent"));
     }
@@ -98,6 +114,18 @@ enum TopLevel {
         #[command(subcommand)]
         action: AgentAction,
     },
+    /// Local operator identity management.
+    Id {
+        #[command(subcommand)]
+        action: IdAction,
+    },
+    /// Mint a root ticket with the local operator identity.
+    MintRoot {
+        #[arg(long)]
+        caps: String,
+        #[arg(long)]
+        ttl: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -106,12 +134,46 @@ enum AgentAction {
     Run,
 }
 
+#[derive(Subcommand, Debug)]
+enum IdAction {
+    /// Generate a new local identity.
+    New {
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show the current identity.
+    Show,
+    /// Export the current identity.
+    Export {
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Import an encrypted identity export.
+    Import {
+        #[arg(long)]
+        from: PathBuf,
+    },
+}
+
 impl Cli {
     fn into_command(self) -> Command {
         match self.command {
             TopLevel::Agent {
                 action: AgentAction::Run,
             } => Command::AgentRun,
+            TopLevel::Id {
+                action: IdAction::New { force },
+            } => Command::IdNew { force },
+            TopLevel::Id {
+                action: IdAction::Show,
+            } => Command::IdShow,
+            TopLevel::Id {
+                action: IdAction::Export { out },
+            } => Command::IdExport { out },
+            TopLevel::Id {
+                action: IdAction::Import { from },
+            } => Command::IdImport { from },
+            TopLevel::MintRoot { caps, ttl } => Command::MintRoot { caps, ttl },
         }
     }
 }

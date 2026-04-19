@@ -1,0 +1,244 @@
+use std::process::Command;
+
+use assert_cmd::prelude::*;
+use iroh_tickets::Ticket;
+use portl_core::id::store::{default_path_with_home, load};
+use portl_core::ticket::schema::{Capabilities, EnvPolicy, PortRule, PortlTicket, ShellCaps};
+use tempfile::tempdir;
+
+fn shell_caps() -> Capabilities {
+    Capabilities {
+        presence: 0b0000_0001,
+        shell: Some(ShellCaps {
+            user_allowlist: None,
+            pty_allowed: true,
+            exec_allowed: true,
+            command_allowlist: None,
+            env_policy: EnvPolicy::Deny,
+        }),
+        tcp: None,
+        udp: None,
+        fs: None,
+        vpn: None,
+        meta: None,
+    }
+}
+
+#[test]
+fn id_new_creates_identity_file() {
+    let home = tempdir().unwrap();
+    let identity_path = default_path_with_home(Some(home.path()));
+
+    Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home.path())
+        .args(["id", "new"])
+        .assert()
+        .success();
+
+    assert!(identity_path.exists());
+}
+
+#[test]
+fn id_new_refuses_overwrite_without_force() {
+    let home = tempdir().unwrap();
+
+    Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home.path())
+        .args(["id", "new"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home.path())
+        .args(["id", "new"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn id_new_with_force_overwrites() {
+    let home = tempdir().unwrap();
+    let identity_path = default_path_with_home(Some(home.path()));
+
+    Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home.path())
+        .args(["id", "new"])
+        .assert()
+        .success();
+    let before = load(&identity_path).unwrap().verifying_key();
+
+    Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home.path())
+        .args(["id", "new", "--force"])
+        .assert()
+        .success();
+    let after = load(&identity_path).unwrap().verifying_key();
+
+    assert_ne!(before, after);
+}
+
+#[test]
+fn id_show_prints_endpoint_id() {
+    let home = tempdir().unwrap();
+
+    Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home.path())
+        .args(["id", "new"])
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home.path())
+        .args(["id", "show"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+
+    assert!(
+        stdout.contains("endpoint_id:"),
+        "unexpected stdout: {stdout}"
+    );
+}
+
+#[test]
+fn id_show_errors_when_no_identity() {
+    let home = tempdir().unwrap();
+
+    Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home.path())
+        .args(["id", "show"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn id_export_then_import_roundtrip() {
+    let home_a = tempdir().unwrap();
+    let home_b = tempdir().unwrap();
+    let export_path = home_a.path().join("identity.age");
+    let passphrase = "battery horse staple";
+
+    Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home_a.path())
+        .args(["id", "new"])
+        .assert()
+        .success();
+
+    let original_show = Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home_a.path())
+        .args(["id", "show"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home_a.path())
+        .env("PORTL_PASSPHRASE", passphrase)
+        .args(["id", "export", "--out", export_path.to_str().unwrap()])
+        .assert()
+        .success();
+
+    Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home_b.path())
+        .env("PORTL_PASSPHRASE", passphrase)
+        .args(["id", "import", "--from", export_path.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let imported_show = Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home_b.path())
+        .args(["id", "show"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(
+        String::from_utf8(original_show).unwrap(),
+        String::from_utf8(imported_show).unwrap()
+    );
+}
+
+#[test]
+fn mint_root_emits_portl_prefix_ticket() {
+    let home = tempdir().unwrap();
+
+    Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home.path())
+        .args(["id", "new"])
+        .assert()
+        .success();
+
+    let stdout = Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home.path())
+        .args(["mint-root", "--caps", "shell", "--ttl", "24h"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let ticket = String::from_utf8(stdout).unwrap();
+
+    assert!(
+        ticket.trim().starts_with("portl"),
+        "unexpected ticket: {ticket}"
+    );
+
+    let parsed = PortlTicket::deserialize(ticket.trim()).unwrap();
+    assert_eq!(parsed.body.caps, shell_caps());
+}
+
+#[test]
+fn mint_root_with_tcp_rule() {
+    let home = tempdir().unwrap();
+
+    Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home.path())
+        .args(["id", "new"])
+        .assert()
+        .success();
+
+    let stdout = Command::cargo_bin("portl")
+        .unwrap()
+        .env("PORTL_HOME", home.path())
+        .args(["mint-root", "--caps", "tcp:127.0.0.1:22-22", "--ttl", "1h"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let ticket = String::from_utf8(stdout).unwrap();
+    let parsed = PortlTicket::deserialize(ticket.trim()).unwrap();
+
+    assert_eq!(parsed.body.caps.presence, 0b0000_0010);
+    assert_eq!(
+        parsed.body.caps.tcp,
+        Some(vec![PortRule {
+            host_glob: "127.0.0.1".into(),
+            port_min: 22,
+            port_max: 22,
+        }])
+    );
+}
