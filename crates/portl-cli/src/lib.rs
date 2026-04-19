@@ -83,6 +83,12 @@ pub enum Command {
         peer: String,
         local: Vec<String>,
     },
+    /// `portl revoke --alias <name>` / `portl revoke --ticket <uri>` / `portl revoke --list`
+    Revoke {
+        alias: Option<String>,
+        ticket: Option<String>,
+        list: bool,
+    },
     /// `portl docker container add ...`
     DockerAdd {
         name: String,
@@ -239,6 +245,11 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
         } => commands::exec::run(&peer, cwd.as_deref(), user.as_deref(), &argv),
         Command::Tcp { peer, local } => commands::tcp::run(&peer, &local),
         Command::Udp { peer, local } => commands::udp::run(&peer, &local),
+        Command::Revoke {
+            alias,
+            ticket,
+            list,
+        } => commands::revoke::run(alias.as_deref(), ticket.as_deref(), list),
         Command::DockerAdd {
             name,
             image,
@@ -383,6 +394,15 @@ enum TopLevel {
         peer: String,
         #[arg(short = 'L', required = true)]
         local: Vec<String>,
+    },
+    /// Append a local ticket revocation or list the current revocation log.
+    Revoke {
+        #[arg(long, conflicts_with_all = ["ticket", "list"])]
+        alias: Option<String>,
+        #[arg(long, conflicts_with_all = ["alias", "list"])]
+        ticket: Option<String>,
+        #[arg(long, conflicts_with_all = ["alias", "ticket"])]
+        list: bool,
     },
     /// Docker target management.
     Docker {
@@ -618,6 +638,15 @@ impl Cli {
             },
             TopLevel::Tcp { peer, local } => Command::Tcp { peer, local },
             TopLevel::Udp { peer, local } => Command::Udp { peer, local },
+            TopLevel::Revoke {
+                alias,
+                ticket,
+                list,
+            } => Command::Revoke {
+                alias,
+                ticket,
+                list,
+            },
             TopLevel::Docker {
                 action:
                     DockerAction::Container {

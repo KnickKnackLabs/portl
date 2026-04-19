@@ -214,6 +214,40 @@ fn docker_add_rm_existing_flag_parses() {
 }
 
 #[test]
+fn revoke_subcommands_parse() {
+    let alias = parse(argv(&["portl", "revoke", "--alias", "demo"])).expect("parse alias revoke");
+    assert_eq!(
+        alias,
+        Command::Revoke {
+            alias: Some("demo".to_owned()),
+            ticket: None,
+            list: false,
+        }
+    );
+
+    let ticket =
+        parse(argv(&["portl", "revoke", "--ticket", "portl:demo"])).expect("parse ticket revoke");
+    assert_eq!(
+        ticket,
+        Command::Revoke {
+            alias: None,
+            ticket: Some("portl:demo".to_owned()),
+            list: false,
+        }
+    );
+
+    let list = parse(argv(&["portl", "revoke", "--list"])).expect("parse revoke list");
+    assert_eq!(
+        list,
+        Command::Revoke {
+            alias: None,
+            ticket: None,
+            list: true,
+        }
+    );
+}
+
+#[test]
 fn unknown_subcommand_errors() {
     let result = parse(argv(&["portl", "definitely-not-a-real-subcommand"]));
     assert!(
