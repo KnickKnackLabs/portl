@@ -11,6 +11,7 @@ pub(crate) struct ShellProcess {
     pub(crate) stdin_tx: mpsc::Sender<StdinMessage>,
     pub(crate) stdout_rx: AsyncMutex<Option<mpsc::Receiver<Vec<u8>>>>,
     pub(crate) stderr_rx: AsyncMutex<Option<mpsc::Receiver<Vec<u8>>>>,
+    pub(crate) exit_code: Arc<Mutex<Option<i32>>>,
     pub(crate) exit_tx: watch::Sender<Option<i32>>,
     pub(crate) signal_target: Option<i32>,
     pub(crate) pty_master: Option<Arc<Mutex<Box<dyn MasterPty + Send>>>>,

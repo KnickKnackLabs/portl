@@ -8,19 +8,6 @@ use iroh::endpoint::{Connection, SendStream};
 use nix::sys::signal::{Signal, kill};
 #[cfg(unix)]
 use nix::unistd::{Gid, Pid, Uid, User, geteuid};
-#[cfg(all(
-    unix,
-    not(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "watchos",
-        target_os = "visionos",
-        target_os = "redox",
-        target_os = "haiku"
-    ))
-))]
-use nix::unistd::{setgid, setgroups, setuid};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -149,19 +136,10 @@ async fn serve_control_stream(
     };
     audit::shell_spawn(&session, req.user.as_deref(), req.argv.as_ref());
 
-    let state_for_exit = Arc::clone(&state);
-    let process_for_exit = Arc::clone(&process);
-    tokio::spawn(async move {
-        let mut exit_rx = process_for_exit.exit_rx();
-        if exit_rx.borrow().is_none() {
-            while exit_rx.changed().await.is_ok() {
-                if exit_rx.borrow().is_some() {
-                    break;
-                }
-            }
-        }
-        state_for_exit.shell_registry.remove(&session_id);
-    });
+    // Keep the shell session registered until the control stream drops.
+    // Short-lived exec commands can exit before the client finishes opening
+    // the exit/stdout/stderr substreams; removing the registry immediately on
+    // process exit races those attachments and can produce missing exit frames.
 
     let ack = portl_proto::shell_v1::ShellAck {
         ok: true,
@@ -279,16 +257,24 @@ async fn pump_resizes(mut recv: BufferedRecv, process: &ShellProcess) -> Result<
 }
 
 async fn pump_exit(mut send: SendStream, process: &ShellProcess) -> Result<()> {
-    let mut rx = process.exit_rx();
-    let initial = *rx.borrow();
-    let code = match initial {
-        Some(code) => code,
-        None => loop {
-            rx.changed().await.context("wait for shell exit")?;
-            if let Some(code) = *rx.borrow() {
-                break code;
-            }
-        },
+    let initial = *process
+        .exit_code
+        .lock()
+        .map_err(|_| anyhow!("exit code mutex poisoned"))?;
+    let code = if let Some(code) = initial {
+        code
+    } else {
+        let mut rx = process.exit_rx();
+        let current = *rx.borrow();
+        match current {
+            Some(code) => code,
+            None => loop {
+                rx.changed().await.context("wait for shell exit")?;
+                if let Some(code) = *rx.borrow() {
+                    break code;
+                }
+            },
+        }
     };
 
     let frame = portl_proto::shell_v1::ExitFrame { code };
@@ -339,37 +325,8 @@ fn spawn_exec_process(
     {
         let gid = user.gid;
         let uid = user.uid;
-        #[cfg(not(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "tvos",
-            target_os = "watchos",
-            target_os = "visionos",
-            target_os = "redox",
-            target_os = "haiku"
-        )))]
-        {
-            #[allow(deprecated)]
-            command.as_std_mut().before_exec(move || {
-                setgroups(&[]).map_err(std::io::Error::other)?;
-                setgid(gid).map_err(std::io::Error::other)?;
-                setuid(uid).map_err(std::io::Error::other)?;
-                Ok(())
-            });
-        }
-        #[cfg(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "tvos",
-            target_os = "watchos",
-            target_os = "visionos",
-            target_os = "redox",
-            target_os = "haiku"
-        ))]
-        {
-            command.uid(uid.as_raw());
-            command.gid(gid.as_raw());
-        }
+        command.uid(uid.as_raw());
+        command.gid(gid.as_raw());
     }
 
     let mut child = command
@@ -392,6 +349,7 @@ fn spawn_exec_process(
     let (stdin_tx, stdin_rx) = mpsc::channel(32);
     let (stdout_tx, stdout_rx) = mpsc::channel(32);
     let (stderr_tx, stderr_rx) = mpsc::channel(32);
+    let exit_code = Arc::new(Mutex::new(None));
     let (exit_tx, _) = watch::channel(None);
 
     tokio::spawn(async move {
@@ -410,6 +368,7 @@ fn spawn_exec_process(
         }
     });
 
+    let exit_code_wait = Arc::clone(&exit_code);
     let exit_tx_wait = exit_tx.clone();
     let ticket_id = session.ticket_id;
     let caller_endpoint_id = session.caller_endpoint_id;
@@ -421,6 +380,9 @@ fn spawn_exec_process(
                 1
             }
         };
+        if let Ok(mut guard) = exit_code_wait.lock() {
+            *guard = Some(code);
+        }
         let _ = exit_tx_wait.send(Some(code));
         audit::shell_exit_raw(ticket_id, caller_endpoint_id, pid, code);
     });
@@ -430,6 +392,7 @@ fn spawn_exec_process(
         stdin_tx,
         stdout_rx: tokio::sync::Mutex::new(Some(stdout_rx)),
         stderr_rx: tokio::sync::Mutex::new(Some(stderr_rx)),
+        exit_code,
         exit_tx,
         signal_target: Some(signal_target_from_pid(pid)?),
         pty_master: None,
@@ -501,11 +464,13 @@ fn spawn_pty_process(
     let (stdin_tx, stdin_rx) = mpsc::channel(32);
     let (stdout_tx, stdout_rx) = mpsc::channel(32);
     let (_stderr_tx, stderr_rx) = mpsc::channel(1);
+    let exit_code = Arc::new(Mutex::new(None));
     let (exit_tx, _) = watch::channel(None);
 
     std::thread::spawn(move || pty_stdin_thread(writer, stdin_rx));
     std::thread::spawn(move || pty_stdout_thread(reader, &stdout_tx));
 
+    let exit_code_wait = Arc::clone(&exit_code);
     let exit_tx_wait = exit_tx.clone();
     let ticket_id = session.ticket_id;
     let caller_endpoint_id = session.caller_endpoint_id;
@@ -517,6 +482,9 @@ fn spawn_pty_process(
                 1
             }
         };
+        if let Ok(mut guard) = exit_code_wait.lock() {
+            *guard = Some(code);
+        }
         let _ = exit_tx_wait.send(Some(code));
         audit::shell_exit_raw(ticket_id, caller_endpoint_id, pid, code);
     });
@@ -540,6 +508,7 @@ fn spawn_pty_process(
         stdin_tx,
         stdout_rx: tokio::sync::Mutex::new(Some(stdout_rx)),
         stderr_rx: tokio::sync::Mutex::new(Some(stderr_rx)),
+        exit_code,
         exit_tx,
         signal_target,
         pty_master: Some(master),
@@ -830,6 +799,7 @@ mod tests {
         let (stdin_tx, _stdin_rx) = mpsc::channel(1);
         let (_stdout_tx, stdout_rx) = mpsc::channel(1);
         let (_stderr_tx, stderr_rx) = mpsc::channel(1);
+        let exit_code = std::sync::Arc::new(std::sync::Mutex::new(None));
         let (exit_tx, _) = watch::channel(None);
 
         registry.insert(
@@ -839,6 +809,7 @@ mod tests {
                 stdin_tx,
                 stdout_rx: AsyncMutex::new(Some(stdout_rx)),
                 stderr_rx: AsyncMutex::new(Some(stderr_rx)),
+                exit_code,
                 exit_tx,
                 signal_target: None,
                 pty_master: None,
