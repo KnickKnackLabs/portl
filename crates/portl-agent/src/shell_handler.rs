@@ -827,11 +827,11 @@ fn nix_to_io_error(err: nix::errno::Errno) -> std::io::Error {
     )
 ))]
 fn install_exec_user_switch(command: &mut StdCommand, user: &RequestedUser) -> bool {
+    use std::os::unix::process::CommandExt;
+
     if !user.switch_required {
         return false;
     }
-
-    use std::os::unix::process::CommandExt;
 
     command.uid(user.uid.as_raw());
     command.gid(user.gid.as_raw());
