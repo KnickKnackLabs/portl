@@ -32,3 +32,4 @@ portl-core = { version = "0.0.1", path = "../portl-core", features = ["test-util
 tempfile  = { workspace = true }
 iroh-base = { workspace = true }
 tokio     = { workspace = true }
+n0-future = { workspace = true }

@@ -30,27 +30,47 @@ pub fn run_with_identity_path(peer: &str, identity_path: Option<&Path>) -> Resul
             portl_agent::endpoint::bind(&portl_agent::AgentConfig::default(), &identity)
                 .await
                 .context("bind client endpoint")?;
-        let endpoint = Endpoint::from(raw_endpoint.clone());
-
-        let resolved = resolve_peer(peer, &identity, &raw_endpoint).await?;
-        let (connection, session) = open_ticket_v1(&endpoint, &resolved.ticket, &[], &identity)
-            .await
-            .context("run ticket handshake")?;
-        let rtt = ping(&connection, &session).await?;
-        let info = info(&connection, &session).await?;
-        let path = path_label(&connection);
-        print_status(
-            connection.remote_id(),
-            &path,
-            rtt,
-            &resolved.discovery,
-            &info,
-        );
-
-        connection.close(0u32.into(), b"status complete");
-        raw_endpoint.close().await;
-        Ok(ExitCode::SUCCESS)
+        run_with_endpoint(peer, identity, raw_endpoint).await
     })
+}
+
+pub fn run_with_identity_path_and_endpoint(
+    peer: &str,
+    identity_path: Option<&Path>,
+    raw_endpoint: iroh::Endpoint,
+) -> Result<ExitCode> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let identity_path = resolve_identity_path(identity_path);
+    runtime.block_on(async move {
+        let identity = store::load(&identity_path).context("load local identity")?;
+        run_with_endpoint(peer, identity, raw_endpoint).await
+    })
+}
+
+async fn run_with_endpoint(
+    peer: &str,
+    identity: Identity,
+    raw_endpoint: iroh::Endpoint,
+) -> Result<ExitCode> {
+    let endpoint = Endpoint::from(raw_endpoint.clone());
+    let resolved = resolve_peer(peer, &identity, &raw_endpoint).await?;
+    let (connection, session) = open_ticket_v1(&endpoint, &resolved.ticket, &[], &identity)
+        .await
+        .context("run ticket handshake")?;
+    let rtt = ping(&connection, &session).await?;
+    let info = info(&connection, &session).await?;
+    let path = path_label(&connection);
+    print_status(
+        connection.remote_id(),
+        &path,
+        rtt,
+        &resolved.discovery,
+        &info,
+    );
+
+    connection.close(0u32.into(), b"status complete");
+    raw_endpoint.close().await;
+    Ok(ExitCode::SUCCESS)
 }
 
 struct ResolvedPeer {

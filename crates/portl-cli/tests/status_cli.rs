@@ -53,6 +53,36 @@ async fn status_command_reports_cached_ticket_peer() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn status_command_reports_bare_endpoint_peer() -> Result<()> {
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator).await?;
+
+    let home = tempdir()?;
+    let identity_path = home.path().join("identity.bin");
+    store::save(&operator, &identity_path)?;
+
+    let peer = hex::encode(server.id().as_bytes());
+    let client_endpoint = client.inner().clone();
+    let identity_path_for_status = identity_path.clone();
+    let code = tokio::task::spawn_blocking(move || {
+        portl_cli::run_status_with_identity_path_and_endpoint(
+            &peer,
+            Some(identity_path_for_status.as_path()),
+            client_endpoint,
+        )
+    })
+    .await??;
+    assert_eq!(code, ExitCode::SUCCESS);
+
+    server.inner().close().await;
+    tokio::time::timeout(Duration::from_secs(5), agent)
+        .await
+        .expect("agent join timeout")??;
+    Ok(())
+}
+
 async fn start_agent(
     server: portl_core::endpoint::Endpoint,
     operator: &Identity,

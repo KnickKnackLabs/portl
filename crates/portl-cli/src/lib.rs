@@ -11,6 +11,7 @@ mod commands;
 
 pub use commands::agent::run::load_config as load_agent_config;
 pub use commands::status::run_with_identity_path as run_status_with_identity_path;
+pub use commands::status::run_with_identity_path_and_endpoint as run_status_with_identity_path_and_endpoint;
 
 use std::{ffi::OsString, path::Path, path::PathBuf, process::ExitCode};
 
