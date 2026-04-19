@@ -33,6 +33,7 @@ nix         = { workspace = true }
 tracing-subscriber = { workspace = true }
 bytes       = { workspace = true }
 sha2        = { workspace = true }
+reqwest     = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 tracing-journald = { workspace = true }
 
@@ -43,3 +44,4 @@ iroh-base = { workspace = true }
 tokio      = { workspace = true }
 tokio-util = { workspace = true }
 n0-future  = { workspace = true }
+wiremock   = { workspace = true }

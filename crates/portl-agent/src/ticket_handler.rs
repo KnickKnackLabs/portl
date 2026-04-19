@@ -52,6 +52,7 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
             peer_token,
             caps,
             ticket_id,
+            bearer,
         } => {
             let ack = portl_proto::ticket_v1::TicketAck {
                 ok: true,
@@ -68,6 +69,7 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
                 caps: (**caps).clone(),
                 ticket_id: *ticket_id,
                 caller_endpoint_id: source_id,
+                bearer: bearer.clone(),
             };
             audit::ticket_accepted(&session);
             Some(session)
@@ -137,10 +139,20 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
                             if value
                                 == String::from_utf8_lossy(portl_proto::tcp_v1::ALPN_TCP_V1) =>
                         {
-                            tcp_handler::serve_stream(
-                                connection, session, state, send, recv, preamble,
-                            )
-                            .await
+                            match &state.mode {
+                                crate::AgentMode::Listener => {
+                                    tcp_handler::serve_stream(
+                                        connection, session, state, send, recv, preamble,
+                                    )
+                                    .await
+                                }
+                                crate::AgentMode::Gateway { .. } => {
+                                    crate::gateway::serve_stream(
+                                        connection, session, state, send, recv, preamble,
+                                    )
+                                    .await
+                                }
+                            }
                         }
                         _ => {
                             connection.close(0x1003u32.into(), b"version mismatch");

@@ -30,6 +30,7 @@ pub enum AcceptanceOutcome {
         peer_token: [u8; 16],
         caps: Box<Capabilities>,
         ticket_id: [u8; 16],
+        bearer: Option<Vec<u8>>,
     },
     Rejected {
         reason: AckReason,
@@ -82,6 +83,7 @@ pub fn evaluate_offer(input: &AcceptanceInput<'_>) -> AcceptanceOutcome {
         peer_token: rand::random(),
         caps: Box::new(caps),
         ticket_id: ticket_id(&terminal.sig),
+        bearer: terminal.body.bearer.clone(),
     }
 }
 

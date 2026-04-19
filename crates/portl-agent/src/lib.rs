@@ -14,6 +14,7 @@ pub mod audit;
 pub mod caps_enforce;
 pub mod config;
 pub mod endpoint;
+pub mod gateway;
 pub mod meta_handler;
 pub mod pipeline;
 pub mod rate_limit;
@@ -25,7 +26,7 @@ pub mod stream_io;
 pub mod tcp_handler;
 pub mod ticket_handler;
 
-pub use config::{AgentConfig, DiscoveryConfig, RateLimitConfig};
+pub use config::{AgentConfig, AgentMode, DiscoveryConfig, RateLimitConfig};
 pub use pipeline::{AcceptanceInput, AcceptanceOutcome, evaluate_offer};
 pub use rate_limit::OfferRateLimiter;
 pub use revocations::RevocationSet;
@@ -37,6 +38,7 @@ pub(crate) struct AgentState {
     pub rate_limit: OfferRateLimiter,
     pub started_at: Instant,
     pub shell_registry: shell_registry::ShellRegistry,
+    pub mode: AgentMode,
 }
 
 #[instrument(skip_all)]
@@ -54,6 +56,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
         rate_limit: OfferRateLimiter::new(&cfg.rate_limit)?,
         started_at: Instant::now(),
         shell_registry: shell_registry::ShellRegistry::default(),
+        mode: cfg.mode.clone(),
     });
 
     let endpoint = if let Some(endpoint) = cfg.endpoint.clone() {

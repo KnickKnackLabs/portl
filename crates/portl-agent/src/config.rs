@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use iroh_base::RelayUrl;
 use portl_core::endpoint::Endpoint;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default)]
 pub struct AgentConfig {
@@ -14,6 +14,7 @@ pub struct AgentConfig {
     pub trust_roots: Vec<[u8; 32]>,
     pub revocations_path: Option<PathBuf>,
     pub rate_limit: RateLimitConfig,
+    pub mode: AgentMode,
     #[doc(hidden)]
     pub endpoint: Option<Endpoint>,
 }
@@ -42,6 +43,7 @@ impl AgentConfig {
             trust_roots,
             revocations_path: file.revocations_path,
             rate_limit: RateLimitConfig::default(),
+            mode: AgentMode::Listener,
             endpoint: None,
         };
 
@@ -69,8 +71,28 @@ impl AgentConfig {
             }
         }
 
+        if let Some(mode) = file.mode.as_deref() {
+            config.mode = parse_mode(
+                mode,
+                file.upstream_url.as_deref(),
+                file.upstream_host.as_deref(),
+                file.upstream_port,
+            )?;
+        }
+
         Ok(config)
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentMode {
+    #[default]
+    Listener,
+    Gateway {
+        upstream_url: String,
+        upstream_host: String,
+        upstream_port: u16,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +154,10 @@ struct AgentConfigFile {
     trust_roots: Option<Vec<String>>,
     discovery: Option<DiscoveryConfigFile>,
     rate_limit: Option<RateLimitConfigFile>,
+    mode: Option<String>,
+    upstream_url: Option<String>,
+    upstream_host: Option<String>,
+    upstream_port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,6 +172,35 @@ struct DiscoveryConfigFile {
 struct RateLimitConfigFile {
     period_secs: Option<u64>,
     burst: Option<u32>,
+}
+
+fn parse_mode(
+    mode: &str,
+    upstream_url: Option<&str>,
+    upstream_host: Option<&str>,
+    upstream_port: Option<u16>,
+) -> Result<AgentMode> {
+    match mode {
+        "listener" => Ok(AgentMode::Listener),
+        "gateway" => {
+            let url = upstream_url.context("gateway mode requires upstream_url")?;
+            let parsed = reqwest::Url::parse(url)
+                .with_context(|| format!("parse gateway upstream_url {url}"))?;
+            let host = upstream_host
+                .map(ToOwned::to_owned)
+                .or_else(|| parsed.host_str().map(ToOwned::to_owned))
+                .context("gateway mode requires an upstream host")?;
+            let port = upstream_port
+                .or_else(|| parsed.port_or_known_default())
+                .context("gateway mode requires an upstream port")?;
+            Ok(AgentMode::Gateway {
+                upstream_url: url.to_owned(),
+                upstream_host: host,
+                upstream_port: port,
+            })
+        }
+        other => Err(anyhow!("unsupported agent mode: {other}")),
+    }
 }
 
 fn parse_trust_root_hex(value: &str) -> Result<[u8; 32]> {
