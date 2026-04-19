@@ -8,7 +8,7 @@ use portl_core::id::{Identity, store};
 use portl_core::ticket::verify::TrustRoots;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{instrument, warn};
+use tracing::{info, instrument, warn};
 
 pub mod audit;
 pub mod caps_enforce;
@@ -78,6 +78,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
 
     let signal_tasks = install_signal_tasks(&shutdown)?;
     let udp_gc = spawn_udp_gc_task(Arc::clone(&state), shutdown.clone());
+    let revocation_gc = spawn_revocation_gc_task(Arc::clone(&state), shutdown.clone());
 
     loop {
         tokio::select! {
@@ -117,6 +118,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
     }
     signal_tasks.abort();
     udp_gc.abort();
+    revocation_gc.abort();
 
     Ok(())
 }
@@ -136,6 +138,46 @@ fn spawn_udp_gc_task(state: Arc<AgentState>, shutdown: CancellationToken) -> Joi
                 _ = interval.tick() => {
                     if let Err(err) = state.udp_registry.gc_expired().await {
                         warn!(?err, "udp session gc failed");
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Runs the revocation GC every 60 minutes so expired entries (by
+/// `not_after_of_ticket + REVOCATION_LINGER`) get dropped without an
+/// agent restart.
+fn spawn_revocation_gc_task(state: Arc<AgentState>, shutdown: CancellationToken) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Skip the immediate first tick; GC already ran at load time.
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                _ = interval.tick() => {
+                    let now = match std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                    {
+                        Ok(d) => d.as_secs(),
+                        Err(_) => continue,
+                    };
+                    match state.revocations.write() {
+                        Ok(mut guard) => {
+                            let removed = guard.gc(now);
+                            if removed > 0 {
+                                if let Err(err) = guard.persist() {
+                                    warn!(?err, "persist revocations after gc");
+                                } else {
+                                    info!(removed, "revocation gc reclaimed expired entries");
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            warn!(%err, "revocations lock poisoned; skipping gc pass");
+                        }
                     }
                 }
             }
