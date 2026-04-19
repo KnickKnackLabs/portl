@@ -1,0 +1,26 @@
+#!/bin/bash
+set -euo pipefail
+
+SECRET_SRC="/run/slicer/secrets/{{SECRET_NAME}}"
+SECRET_DST="/var/lib/portl/secret"
+
+install -d -m 0750 /var/lib/portl
+install -d -m 0755 /etc/portl
+
+cp "$SECRET_SRC" "$SECRET_DST"
+chmod 0400 "$SECRET_DST"
+
+if ! command -v portl >/dev/null 2>&1; then
+  curl -fsSL https://{{PORTL_RELEASE_URL}}/portl-aarch64-linux -o /usr/local/bin/portl
+  chmod +x /usr/local/bin/portl
+fi
+ln -sf /usr/local/bin/portl /usr/local/bin/portl-agent
+
+cat > /etc/portl/agent.toml <<'TOML'
+identity_path = "/var/lib/portl/secret"
+
+[discovery]
+relay = {{RELAY_LIST}}
+
+trust_roots = ["{{OPERATOR_PUBKEY}}"]
+TOML
