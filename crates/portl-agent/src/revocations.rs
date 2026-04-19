@@ -112,29 +112,40 @@ impl RevocationSet {
     }
 
     pub fn persist(&self) -> Result<()> {
-        if let Some(parent) = self.file.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-        }
+        write_jsonl(&self.file, &self.records)
+    }
 
-        let mut encoded = String::new();
-        for record in &self.records {
-            encoded.push_str(
-                &serde_json::to_string(record)
-                    .with_context(|| format!("encode revocation {}", record.ticket_id))?,
-            );
-            encoded.push('\n');
-        }
-        fs::write(&self.file, encoded)
-            .with_context(|| format!("write revocations to {}", self.file.display()))
+    /// Borrow the underlying on-disk path (used by async persist).
+    pub fn file_path(&self) -> &Path {
+        &self.file
+    }
+
+    /// Clone the in-memory record vector for off-lock persistence.
+    pub fn snapshot(&self) -> Vec<RevocationRecord> {
+        self.records.clone()
     }
 
     pub fn gc(&mut self, now: u64) -> usize {
         let before = self.records.len();
-        self.records
-            .retain(|record| match record.not_after_of_ticket {
-                Some(not_after) => now < not_after + REVOCATION_LINGER_SECS,
+        self.records.retain(|record| {
+            // Per docs/design/070-security.md §4.12, a record may be
+            // GC'd once both:
+            //   - revoked_at + LINGER has elapsed, AND
+            //   - the underlying ticket has itself expired OR its
+            //     expiry is unknown.
+            // If we lack both timestamps, fall back to the minimal
+            // linger-from-now semantics by pretending revoked_at is
+            // "now" so the record is kept until next hour's GC pass.
+            let linger_ok = match record.revoked_at {
                 None => true,
-            });
+                Some(revoked_at) => now < revoked_at + REVOCATION_LINGER_SECS,
+            };
+            let ticket_still_valid = matches!(
+                record.not_after_of_ticket,
+                Some(not_after) if now < not_after
+            );
+            linger_ok || ticket_still_valid
+        });
         self.ids = self
             .records
             .iter()
@@ -142,6 +153,23 @@ impl RevocationSet {
             .collect();
         before - self.records.len()
     }
+}
+
+/// Low-level JSONL writer shared by [`RevocationSet::persist`] and the
+/// off-task async publish path.
+pub fn write_jsonl(path: &Path, records: &[RevocationRecord]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let mut encoded = String::new();
+    for record in records {
+        encoded.push_str(
+            &serde_json::to_string(record)
+                .with_context(|| format!("encode revocation {}", record.ticket_id))?,
+        );
+        encoded.push('\n');
+    }
+    fs::write(path, encoded).with_context(|| format!("write revocations to {}", path.display()))
 }
 
 pub fn append_record(path: impl AsRef<Path>, record: &RevocationRecord) -> Result<()> {
@@ -292,6 +320,33 @@ mod tests {
 
     #[test]
     fn gc_removes_expired_revocations() {
+        // Matches 070-security §4.12: drop when BOTH the linger window
+        // past revocation has expired AND the ticket itself is no
+        // longer valid. Here both are true so the record is collected.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("revocations.jsonl");
+        let now = unix_now_secs().expect("unix now");
+        let revoked_at = now - REVOCATION_LINGER_SECS - 1;
+        let mut set = RevocationSet {
+            file: path,
+            ids: std::collections::HashSet::from([[0x11; 16]]),
+            records: vec![RevocationRecord::new(
+                [0x11; 16],
+                "docker_rm",
+                revoked_at,
+                Some(revoked_at),
+            )],
+        };
+
+        let removed = set.gc(now);
+        assert_eq!(removed, 1);
+        assert!(!set.contains(&[0x11; 16]));
+    }
+
+    #[test]
+    fn gc_keeps_revocation_within_linger_even_if_ticket_expired() {
+        // Revocation is fresh (now) but the ticket itself was already
+        // expired when revoked. Linger window still protects it.
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("revocations.jsonl");
         let now = unix_now_secs().expect("unix now");
@@ -302,13 +357,37 @@ mod tests {
                 [0x11; 16],
                 "docker_rm",
                 now,
-                Some(now - REVOCATION_LINGER_SECS - 1),
+                Some(now - 1),
+            )],
+        };
+
+        let removed = set.gc(now);
+        assert_eq!(removed, 0);
+        assert!(set.contains(&[0x11; 16]));
+    }
+
+    #[test]
+    fn gc_removes_old_manual_revocation_without_ticket_expiry() {
+        // `portl revoke` records leave `not_after_of_ticket = None`.
+        // After the linger window on revoked_at, GC still collects
+        // them so the set stops growing unboundedly.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("revocations.jsonl");
+        let now = unix_now_secs().expect("unix now");
+        let mut set = RevocationSet {
+            file: path,
+            ids: std::collections::HashSet::from([[0x22; 16]]),
+            records: vec![RevocationRecord::new(
+                [0x22; 16],
+                "manual",
+                now - REVOCATION_LINGER_SECS - 1,
+                None,
             )],
         };
 
         let removed = set.gc(now);
         assert_eq!(removed, 1);
-        assert!(!set.contains(&[0x11; 16]));
+        assert!(!set.contains(&[0x22; 16]));
     }
 
     #[test]
@@ -339,7 +418,12 @@ mod tests {
         .expect("write legacy revocations");
 
         let jsonl_path = dir.path().join("revocations.jsonl");
-        let migrated = migrate_legacy_json_if_needed(&jsonl_path, 42).expect("migrate legacy json");
+        // Migrate with a revoked_at timestamp close to the current
+        // wall clock so RevocationSet::load's GC pass (which uses
+        // real now) keeps the migrated record.
+        let now = unix_now_secs().expect("unix now");
+        let migrated =
+            migrate_legacy_json_if_needed(&jsonl_path, now).expect("migrate legacy json");
         assert_eq!(migrated, jsonl_path);
         assert!(jsonl_path.exists());
         assert!(dir.path().join("revocations.json.migrated").exists());

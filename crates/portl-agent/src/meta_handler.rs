@@ -64,7 +64,7 @@ pub(crate) async fn serve_stream(
             }
         }
         portl_proto::meta_v1::MetaReq::PublishRevocations { items } => {
-            publish_revocations(&state, &session, items)
+            publish_revocations(&state, &session, items).await
         }
     };
 
@@ -80,14 +80,34 @@ fn meta_caps(session: &Session) -> Option<&portl_core::ticket::schema::MetaCaps>
     session.caps.meta.as_ref()
 }
 
-fn publish_revocations(
+/// Per-design (`070-security.md §10.9`) max records a single
+/// `PublishRevocations` request may carry.
+const MAX_PUBLISH_ITEMS: usize = 1000;
+
+async fn publish_revocations(
     state: &Arc<AgentState>,
     session: &Session,
     items: Vec<Vec<u8>>,
 ) -> portl_proto::meta_v1::MetaResp {
-    // `session` exists only because ticket/v1's pipeline (§040-protocols
-    // §1) already verified the caller's chain roots on one of our
-    // `trust_roots`. We do not need a second identity check here.
+    // Authorization: requires that the caller's ticket granted the
+    // `meta.info` capability. `meta.info` is the closest v0.1 cap
+    // that exposes operator-level meta functionality; narrower
+    // delegates (e.g. shell-only) must NOT be able to mutate the
+    // revocation set. A future ticket schema bump will add a
+    // dedicated `meta.publish_revocations` bit.
+    if !meta_caps(session).is_some_and(|caps| caps.info) {
+        return cap_denied("publish revocations requires meta.info capability");
+    }
+
+    if items.len() > MAX_PUBLISH_ITEMS {
+        return portl_proto::meta_v1::MetaResp::Error(portl_proto::error::Error {
+            kind: portl_proto::error::ErrorKind::RateLimited,
+            message: format!(
+                "batch exceeds {MAX_PUBLISH_ITEMS} records; split into smaller requests"
+            ),
+            retry_after_ms: Some(1_000),
+        });
+    }
 
     let now = match unix_now_secs() {
         Ok(value) => value,
@@ -102,8 +122,11 @@ fn publish_revocations(
 
     let mut accepted: u32 = 0;
     let mut rejected: Vec<(Vec<u8>, String)> = Vec::new();
+    let caller_hex = hex::encode(session.caller_endpoint_id);
 
-    {
+    // Build the new records under the write lock, release the lock,
+    // then fsync off the runtime.
+    let (to_persist, persist_path) = {
         let mut revocations = state
             .revocations
             .write()
@@ -114,23 +137,46 @@ fn publish_revocations(
                 continue;
             };
             if revocations.contains(&id) {
-                // Already known; treat as accepted (idempotent).
                 accepted += 1;
                 continue;
             }
             revocations.insert_record(crate::revocations::RevocationRecord::new(
                 id,
-                format!(
-                    "meta_publish_from_{}",
-                    hex::encode(session.caller_endpoint_id)
-                ),
+                format!("meta_publish_from_{caller_hex}"),
                 now,
                 None,
             ));
             accepted += 1;
         }
-        if let Err(err) = revocations.persist() {
-            tracing::warn!(?err, "persist revocations");
+        (
+            revocations.snapshot(),
+            revocations.file_path().to_path_buf(),
+        )
+    };
+
+    // Persist off the async task so a slow fsync doesn't stall the
+    // ticket acceptance pipeline (which reads the same RwLock).
+    let persist_result = tokio::task::spawn_blocking(move || {
+        crate::revocations::write_jsonl(&persist_path, &to_persist)
+    })
+    .await;
+    match persist_result {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            tracing::warn!(?err, "persist revocations after publish");
+            return portl_proto::meta_v1::MetaResp::Error(portl_proto::error::Error {
+                kind: portl_proto::error::ErrorKind::InternalError,
+                message: format!("persist revocations: {err}"),
+                retry_after_ms: None,
+            });
+        }
+        Err(join_err) => {
+            tracing::warn!(?join_err, "persist revocations task panicked");
+            return portl_proto::meta_v1::MetaResp::Error(portl_proto::error::Error {
+                kind: portl_proto::error::ErrorKind::InternalError,
+                message: "persist revocations task panicked".to_owned(),
+                retry_after_ms: None,
+            });
         }
     }
 
