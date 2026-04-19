@@ -6,6 +6,10 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 FROM base AS runtime
+# Shared reference image for docker-portl today and slicer VMs next.
+# M5 intentionally stops short of publishing a GHCR image; M7 wires the
+# release workflow. Slicer-specific guests will likely fork this runtime
+# to add systemd/journald packages while keeping the same multicall binary.
 ARG TARGETARCH
 COPY bin/portl-${TARGETARCH} /usr/local/bin/portl
 RUN chmod +x /usr/local/bin/portl \
