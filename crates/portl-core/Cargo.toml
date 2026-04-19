@@ -21,13 +21,29 @@ workspace = true
 test-util = []
 
 [dependencies]
-iroh         = { workspace = true }
-iroh-base    = { workspace = true }
-tokio        = { workspace = true }
-anyhow       = { workspace = true }
-thiserror    = { workspace = true }
-tracing      = { workspace = true }
+iroh          = { workspace = true }
+iroh-base     = { workspace = true }
+iroh-tickets  = { workspace = true }
+tokio         = { workspace = true }
+anyhow        = { workspace = true }
+thiserror     = { workspace = true }
+tracing       = { workspace = true }
+ed25519-dalek = { workspace = true }
+sha2          = { workspace = true }
+serde           = { workspace = true }
+serde-big-array = { workspace = true }
+postcard        = { workspace = true }
+base32        = { workspace = true }
+zeroize       = { workspace = true }
+rand          = { workspace = true }
+rand_core     = { workspace = true }
+hex           = { workspace = true }
+directories   = { workspace = true }
+age           = { workspace = true }
 
 [dev-dependencies]
 portl-core = { version = "0.0.1", path = ".", features = ["test-util"] }
 tokio      = { workspace = true }
+proptest   = { workspace = true }
+criterion  = { workspace = true }
+tempfile   = { workspace = true }

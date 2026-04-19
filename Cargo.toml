@@ -30,9 +30,10 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 sha2          = "0.10"
 
 # encoding
-serde    = { version = "1", features = ["derive"] }
-postcard = { version = "1", features = ["use-std"] }
-base32   = "0.5"
+serde            = { version = "1", features = ["derive"] }
+serde-big-array  = "0.5"
+postcard         = { version = "1", features = ["use-std"] }
+base32           = "0.5"
 
 # CLI
 clap      = { version = "4", features = ["derive", "env", "wrap_help"] }
@@ -45,6 +46,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # testing
 tokio-test = "0.4"
+proptest   = "1.5"
+criterion  = { version = "0.5", features = ["html_reports"] }
+assert_cmd = "2"
+tempfile   = "3"
+
+# identity + age
+age         = { version = "0.11", default-features = false, features = ["armor"] }
+directories = "5"
+hex         = "0.4"
+zeroize     = { version = "1", features = ["derive"] }
+rand        = "0.8"
+rand_core   = "0.6"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
