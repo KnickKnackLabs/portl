@@ -15,6 +15,7 @@
 pub mod canonical;
 pub mod codec;
 pub mod hash;
+pub mod master;
 pub mod mint;
 pub mod offer;
 pub mod schema;
@@ -23,3 +24,4 @@ pub mod verify;
 
 pub use canonical::{canonical_check, resolved_issuer};
 pub use codec::{decode, encode};
+pub use master::{extract_bearer, mint_master};

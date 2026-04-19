@@ -80,6 +80,11 @@ pub fn canonical_check(body: &PortlBody) -> Result<()> {
     if body.nonce == [0u8; 8] {
         return Err(PortlError::Canonical("nonce must be non-zero"));
     }
+    if matches!(body.bearer.as_deref(), Some([])) {
+        return Err(PortlError::Canonical(
+            "bearer must be Some(non-empty) or None",
+        ));
+    }
 
     // Rule 1 at the body level: if issuer is Some, disallow the
     // common typo of signalling "self-signed" with the wrong form.
