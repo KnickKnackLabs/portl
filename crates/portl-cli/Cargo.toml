@@ -16,11 +16,11 @@ name = "portl"
 path = "src/main.rs"
 
 [dependencies]
-portl-core  = { version = "0.0.1", path = "../portl-core" }
-portl-proto = { version = "0.0.1", path = "../portl-proto" }
-portl-agent  = { version = "0.0.1", path = "../portl-agent" }
-docker-portl = { version = "0.0.1", path = "../../adapters/docker-portl" }
-slicer-portl = { version = "0.0.1", path = "../../adapters/slicer-portl" }
+portl-core  = { version = "0.1.0", path = "../portl-core" }
+portl-proto = { version = "0.1.0", path = "../portl-proto" }
+portl-agent  = { version = "0.1.0", path = "../portl-agent" }
+docker-portl = { version = "0.1.0", path = "../../adapters/docker-portl" }
+slicer-portl = { version = "0.1.0", path = "../../adapters/slicer-portl" }
 clap         = { workspace = true }
 tokio       = { workspace = true }
 anyhow      = { workspace = true }
@@ -46,7 +46,7 @@ nix         = { workspace = true }
 reqwest     = { workspace = true }
 
 [dev-dependencies]
-portl-core = { version = "0.0.1", path = "../portl-core", features = ["test-util"] }
+portl-core = { version = "0.1.0", path = "../portl-core", features = ["test-util"] }
 assert_cmd = { workspace = true }
 tempfile   = { workspace = true }
 iroh-tickets = { workspace = true }

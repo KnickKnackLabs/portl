@@ -19,8 +19,8 @@ name = "portl-slicer-adapter"
 path = "src/main.rs"
 
 [dependencies]
-portl-core  = { version = "0.0.1", path = "../../crates/portl-core" }
-portl-agent = { version = "0.0.1", path = "../../crates/portl-agent" }
+portl-core  = { version = "0.1.0", path = "../../crates/portl-core" }
+portl-agent = { version = "0.1.0", path = "../../crates/portl-agent" }
 anyhow      = { workspace = true }
 async-trait = { workspace = true }
 base64      = { workspace = true }
