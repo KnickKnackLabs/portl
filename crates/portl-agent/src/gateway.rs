@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::{Connection, SendStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, copy};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy};
 use tokio::net::TcpStream;
 
 use crate::AgentState;
@@ -89,12 +89,9 @@ pub(crate) async fn serve_stream(
     .context("write gateway tcp ack")?;
 
     let (mut tcp_read, mut tcp_write) = tcp.into_split();
-    let initial_headers = read_initial_headers(&mut recv).await?;
-    let rewritten = inject_authorization_header(&initial_headers, bearer)?;
-    tcp_write
-        .write_all(&rewritten)
-        .await
-        .context("write rewritten upstream headers")?;
+    if !inject_authorization_header(&mut recv, &mut tcp_write, bearer).await? {
+        bail!("gateway expected an HTTP/1.1 header block");
+    }
 
     let upstream = async {
         copy(&mut recv, &mut tcp_write)
@@ -130,7 +127,10 @@ async fn reject(send: &mut SendStream, error: &str) -> Result<()> {
     Ok(())
 }
 
-async fn read_initial_headers(recv: &mut BufferedRecv) -> Result<Vec<u8>> {
+async fn read_initial_headers<R>(recv: &mut R) -> Result<Option<Vec<u8>>>
+where
+    R: AsyncRead + Unpin,
+{
     let mut bytes = Vec::new();
     loop {
         let mut byte = [0_u8; 1];
@@ -139,19 +139,43 @@ async fn read_initial_headers(recv: &mut BufferedRecv) -> Result<Vec<u8>> {
             .await
             .context("read gateway HTTP headers")?;
         if read == 0 {
-            bail!("gateway expected an HTTP/1.1 header block")
+            return if bytes.is_empty() {
+                Ok(None)
+            } else {
+                Err(anyhow!("gateway expected an HTTP/1.1 header block"))
+            };
         }
         bytes.push(byte[0]);
         if bytes.len() > MAX_HTTP_HEADER_BYTES {
             bail!("gateway header block exceeded 65536 bytes")
         }
         if bytes.ends_with(b"\r\n\r\n") {
-            return Ok(bytes);
+            return Ok(Some(bytes));
         }
     }
 }
 
-fn inject_authorization_header(headers: &[u8], bearer: &[u8]) -> Result<Vec<u8>> {
+pub async fn inject_authorization_header<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    bearer: &[u8],
+) -> Result<bool>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let Some(headers) = read_initial_headers(reader).await? else {
+        return Ok(false);
+    };
+    let rewritten = rewrite_request_headers(&headers, bearer)?;
+    writer
+        .write_all(&rewritten)
+        .await
+        .context("write rewritten upstream headers")?;
+    Ok(true)
+}
+
+fn rewrite_request_headers(headers: &[u8], bearer: &[u8]) -> Result<Vec<u8>> {
     let request_line_end = headers
         .windows(2)
         .position(|window| window == b"\r\n")
@@ -160,11 +184,28 @@ fn inject_authorization_header(headers: &[u8], bearer: &[u8]) -> Result<Vec<u8>>
     validate_http11_request_line(request_line)?;
 
     let header_value = bearer_to_header_value(bearer)?;
-    let mut rewritten = Vec::with_capacity(headers.len() + 32 + header_value.len());
+    let header_block = &headers[request_line_end + 2..headers.len() - 2];
+
+    let mut rewritten = Vec::with_capacity(headers.len() + 64 + header_value.len());
     rewritten.extend_from_slice(request_line);
     rewritten.extend_from_slice(format!("Authorization: Bearer {header_value}\r\n").as_bytes());
-    rewritten.extend_from_slice(&headers[request_line_end + 2..]);
+    rewritten.extend_from_slice(b"Connection: close\r\n");
+    for line in header_block.split(|byte| *byte == b'\n') {
+        if line.is_empty() || line == b"\r" || is_header_named(line, b"connection") {
+            continue;
+        }
+        rewritten.extend_from_slice(line);
+        rewritten.extend_from_slice(b"\n");
+    }
+    rewritten.extend_from_slice(b"\r\n");
     Ok(rewritten)
+}
+
+fn is_header_named(line: &[u8], name: &[u8]) -> bool {
+    let Some(header_name) = line.split(|byte| *byte == b':').next() else {
+        return false;
+    };
+    header_name.eq_ignore_ascii_case(name)
 }
 
 fn bearer_to_header_value(bearer: &[u8]) -> Result<String> {
@@ -199,9 +240,7 @@ fn validate_http11_request_line(line: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        bearer_to_header_value, inject_authorization_header, validate_http11_request_line,
-    };
+    use super::{bearer_to_header_value, rewrite_request_headers, validate_http11_request_line};
 
     #[test]
     fn accepts_http11_request_line() {
@@ -216,15 +255,27 @@ mod tests {
 
     #[test]
     fn injects_authorization_header_after_request_line() {
-        let rewritten = inject_authorization_header(
+        let rewritten = rewrite_request_headers(
             b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n",
             b"slicer-token",
         )
         .expect("inject header");
         let rewritten = String::from_utf8(rewritten).expect("utf-8 header block");
         assert!(rewritten.starts_with(
-            "GET / HTTP/1.1\r\nAuthorization: Bearer slicer-token\r\nHost: example.test"
+            "GET / HTTP/1.1\r\nAuthorization: Bearer slicer-token\r\nConnection: close\r\nHost: example.test"
         ));
+    }
+
+    #[test]
+    fn rewrite_request_headers_forces_connection_close() {
+        let rewritten = rewrite_request_headers(
+            b"GET / HTTP/1.1\r\nHost: example.test\r\nConnection: keep-alive\r\n\r\n",
+            b"slicer-token",
+        )
+        .expect("inject header");
+        let rewritten = String::from_utf8(rewritten).expect("utf-8 header block");
+        assert!(rewritten.contains("\r\nConnection: close\r\n"));
+        assert!(!rewritten.contains("keep-alive"));
     }
 
     #[test]

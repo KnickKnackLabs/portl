@@ -214,6 +214,9 @@ only "port" is the slicer API, with the authorization token pre-loaded
 so the operator's ticket is the only thing on the wire that proves
 authority.
 
+In v0.1 the gateway does **not** support HTTP/1.1 keep-alive. It forces
+`Connection: close`, so each request opens a fresh `tcp/v1` stream.
+
 ## 5. Master ticket mint workflow
 
 ```
