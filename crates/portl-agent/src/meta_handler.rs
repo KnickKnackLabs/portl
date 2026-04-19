@@ -2,7 +2,7 @@ use std::fs;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
@@ -20,8 +20,8 @@ struct MetaEnvelope {
 
 #[instrument(skip_all)]
 pub(crate) async fn serve_stream(
-    connection: &Connection,
-    session: &Session,
+    connection: Connection,
+    session: Session,
     state: Arc<AgentState>,
     mut send: SendStream,
     mut recv: RecvStream,
@@ -36,12 +36,12 @@ pub(crate) async fn serve_stream(
         || envelope.preamble.alpn != String::from_utf8_lossy(portl_proto::meta_v1::ALPN_META_V1)
     {
         connection.close(0x1001u32.into(), b"policy denied");
-        return Ok(());
+        bail!("policy denied");
     }
 
     let response = match envelope.req {
         portl_proto::meta_v1::MetaReq::Ping { .. } => {
-            if meta_caps(session).is_some_and(|caps| caps.ping) {
+            if meta_caps(&session).is_some_and(|caps| caps.ping) {
                 portl_proto::meta_v1::MetaResp::Pong {
                     t_server_us: unix_now_micros()?,
                 }
@@ -50,7 +50,7 @@ pub(crate) async fn serve_stream(
             }
         }
         portl_proto::meta_v1::MetaReq::Info => {
-            if meta_caps(session).is_some_and(|caps| caps.info) {
+            if meta_caps(&session).is_some_and(|caps| caps.info) {
                 portl_proto::meta_v1::MetaResp::Info {
                     agent_version: env!("CARGO_PKG_VERSION").to_owned(),
                     supported_alpns: vec![

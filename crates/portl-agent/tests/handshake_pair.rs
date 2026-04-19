@@ -60,6 +60,44 @@ async fn handshake_pair_accepts_and_serves_meta() -> Result<()> {
 }
 
 #[tokio::test]
+async fn handshake_pair_serves_concurrent_meta_streams() -> Result<()> {
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator).await?;
+    let ticket = root_ticket(
+        &operator,
+        server.addr(),
+        meta_caps(),
+        unix_now_secs(),
+        unix_now_secs() + 300,
+    );
+
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+
+    let (mut stalled_send, _stalled_recv) = connection.open_bi().await?;
+    let ping = tokio::time::timeout(
+        Duration::from_secs(2),
+        meta_request(
+            &connection,
+            session.peer_token,
+            MetaReq::Ping { t_client_us: 7 },
+        ),
+    )
+    .await
+    .expect("second meta stream should not head-of-line block")?;
+    assert!(matches!(ping, MetaResp::Pong { .. }));
+
+    stalled_send.reset(0u32.into())?;
+    connection.close(0u32.into(), b"done");
+    client.inner().close().await;
+    server.inner().close().await;
+    tokio::time::timeout(Duration::from_secs(5), agent)
+        .await
+        .expect("agent join timeout")??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn handshake_pair_rejects_expired_ticket() -> Result<()> {
     let (client, server) = pair().await?;
     let operator = Identity::new();

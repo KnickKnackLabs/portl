@@ -94,9 +94,16 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
             }
         };
 
-        meta_handler::serve_stream(&connection, &session, Arc::clone(&state), send, recv)
-            .await
-            .context("serve authenticated stream")?;
+        let connection = connection.clone();
+        let session = session.clone();
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            if let Err(err) =
+                meta_handler::serve_stream(connection, session, state, send, recv).await
+            {
+                tracing::debug!(%err, "meta stream error");
+            }
+        });
     }
 }
 
