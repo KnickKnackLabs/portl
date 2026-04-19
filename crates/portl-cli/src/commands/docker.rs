@@ -265,6 +265,9 @@ async fn add_with_ticket_spec(
             to: ticket_spec.to,
             labels,
             root_ticket_id: Some(ticket_id(&ticket.sig)),
+            ticket_file_path: None,
+            group_name: None,
+            base_url: None,
         },
     )?;
 

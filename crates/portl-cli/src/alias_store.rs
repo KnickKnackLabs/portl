@@ -30,6 +30,9 @@ pub struct StoredSpec {
     pub to: Option<[u8; 32]>,
     pub labels: Vec<(String, String)>,
     pub root_ticket_id: Option<[u8; 16]>,
+    pub ticket_file_path: Option<PathBuf>,
+    pub group_name: Option<String>,
+    pub base_url: Option<String>,
 }
 
 pub struct AliasStore {
@@ -67,8 +70,9 @@ impl AliasStore {
         .context("upsert alias row")?;
         tx.execute(
             "INSERT OR REPLACE INTO alias_specs (
-                name, caps_json, ttl_secs, to_hex, labels_json, root_ticket_id_hex
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                name, caps_json, ttl_secs, to_hex, labels_json, root_ticket_id_hex,
+                ticket_file_path, group_name, base_url
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 alias.name,
                 serde_json::to_string(&spec.caps).context("encode caps json")?,
@@ -76,6 +80,11 @@ impl AliasStore {
                 spec.to.map(hex::encode),
                 serde_json::to_string(&spec.labels).context("encode labels json")?,
                 spec.root_ticket_id.map(hex::encode),
+                spec.ticket_file_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                spec.group_name,
+                spec.base_url,
             ],
         )
         .context("upsert alias spec row")?;
@@ -108,7 +117,8 @@ impl AliasStore {
     pub fn get_spec(&self, name: &str) -> Result<Option<StoredSpec>> {
         let conn = self.open()?;
         conn.query_row(
-            "SELECT caps_json, ttl_secs, to_hex, labels_json, root_ticket_id_hex
+            "SELECT caps_json, ttl_secs, to_hex, labels_json, root_ticket_id_hex,
+                    ticket_file_path, group_name, base_url
              FROM alias_specs WHERE name = ?1",
             params![name],
             |row| {
@@ -117,6 +127,9 @@ impl AliasStore {
                 let to_hex: Option<String> = row.get(2)?;
                 let labels_json: String = row.get(3)?;
                 let root_ticket_id_hex: Option<String> = row.get(4)?;
+                let ticket_file_path: Option<String> = row.get(5)?;
+                let group_name: Option<String> = row.get(6)?;
+                let base_url: Option<String> = row.get(7)?;
                 Ok(StoredSpec {
                     caps: serde_json::from_str(&caps_json).map_err(json_error_to_sqlite)?,
                     ttl_secs: u64::try_from(ttl_secs).map_err(int_error_to_sqlite)?,
@@ -129,6 +142,9 @@ impl AliasStore {
                         .map(|value| parse_optional_hex16(&value))
                         .transpose()
                         .map_err(json_error_to_sqlite)?,
+                    ticket_file_path: ticket_file_path.map(PathBuf::from),
+                    group_name,
+                    base_url,
                 })
             },
         )
@@ -234,6 +250,9 @@ fn init_schema(conn: &Connection) -> Result<()> {
              to_hex TEXT,
              labels_json TEXT NOT NULL,
              root_ticket_id_hex TEXT,
+             ticket_file_path TEXT,
+             group_name TEXT,
+             base_url TEXT,
              FOREIGN KEY(name) REFERENCES aliases(name) ON DELETE CASCADE
          );
          COMMIT;",
@@ -248,6 +267,21 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
             [],
         )
         .context("add root_ticket_id_hex column to alias_specs")?;
+    }
+    if !table_has_column(conn, "alias_specs", "ticket_file_path")? {
+        conn.execute(
+            "ALTER TABLE alias_specs ADD COLUMN ticket_file_path TEXT",
+            [],
+        )
+        .context("add ticket_file_path column to alias_specs")?;
+    }
+    if !table_has_column(conn, "alias_specs", "group_name")? {
+        conn.execute("ALTER TABLE alias_specs ADD COLUMN group_name TEXT", [])
+            .context("add group_name column to alias_specs")?;
+    }
+    if !table_has_column(conn, "alias_specs", "base_url")? {
+        conn.execute("ALTER TABLE alias_specs ADD COLUMN base_url TEXT", [])
+            .context("add base_url column to alias_specs")?;
     }
     Ok(())
 }
@@ -337,6 +371,9 @@ mod tests {
             to: Some([9; 32]),
             labels: vec![("a".to_owned(), "b".to_owned())],
             root_ticket_id: Some([4; 16]),
+            ticket_file_path: Some(dir.path().join("demo.ticket")),
+            group_name: Some("sbox".to_owned()),
+            base_url: Some("http://127.0.0.1:8080".to_owned()),
         };
 
         store.save(&alias, &spec).expect("save alias");
@@ -370,6 +407,9 @@ mod tests {
                     to: None,
                     labels: vec![],
                     root_ticket_id: None,
+                    ticket_file_path: None,
+                    group_name: None,
+                    base_url: None,
                 };
                 barrier.wait();
                 store.save(&alias, &spec).expect("concurrent save");
