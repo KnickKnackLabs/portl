@@ -16,6 +16,7 @@ pub mod config;
 pub mod endpoint;
 pub mod gateway;
 pub mod meta_handler;
+pub mod metrics;
 pub mod pipeline;
 pub mod rate_limit;
 pub mod revocations;
@@ -42,6 +43,7 @@ pub(crate) struct AgentState {
     pub shell_registry: shell_registry::ShellRegistry,
     pub udp_registry: udp_registry::UdpSessionRegistry,
     pub mode: AgentMode,
+    pub metrics: Arc<metrics::Metrics>,
 }
 
 #[instrument(skip_all)]
@@ -64,6 +66,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
                 .unwrap_or(udp_registry::DEFAULT_UDP_SESSION_LINGER_SECS),
         ),
         mode: cfg.mode.clone(),
+        metrics: Arc::new(metrics::Metrics::default()),
     });
 
     let endpoint = if let Some(endpoint) = cfg.endpoint.clone() {
@@ -79,6 +82,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
     let signal_tasks = install_signal_tasks(&shutdown)?;
     let udp_gc = spawn_udp_gc_task(Arc::clone(&state), shutdown.clone());
     let revocation_gc = spawn_revocation_gc_task(Arc::clone(&state), shutdown.clone());
+    let metrics_task = spawn_metrics_server(&state, shutdown.clone(), &cfg);
 
     loop {
         tokio::select! {
@@ -119,6 +123,9 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
     signal_tasks.abort();
     udp_gc.abort();
     revocation_gc.abort();
+    if let Some(metrics) = metrics_task {
+        metrics.abort();
+    }
 
     Ok(())
 }
@@ -183,6 +190,26 @@ fn spawn_revocation_gc_task(state: Arc<AgentState>, shutdown: CancellationToken)
             }
         }
     })
+}
+
+fn spawn_metrics_server(
+    state: &Arc<AgentState>,
+    shutdown: CancellationToken,
+    cfg: &AgentConfig,
+) -> Option<JoinHandle<()>> {
+    if !cfg.metrics_enabled.unwrap_or(true) {
+        return None;
+    }
+    let path = cfg
+        .metrics_socket_path
+        .clone()
+        .unwrap_or_else(metrics::default_socket_path);
+    let metrics = Arc::clone(&state.metrics);
+    Some(tokio::spawn(async move {
+        if let Err(err) = metrics::serve(metrics, path, shutdown).await {
+            warn!(?err, "metrics server exited with error");
+        }
+    }))
 }
 
 async fn graceful_close_endpoint(endpoint: &iroh::Endpoint) {

@@ -21,6 +21,8 @@ pub struct AgentConfig {
     pub endpoint: Option<Endpoint>,
     #[doc(hidden)]
     pub udp_session_linger_secs: Option<u64>,
+    pub metrics_enabled: Option<bool>,
+    pub metrics_socket_path: Option<PathBuf>,
 }
 
 impl AgentConfig {
@@ -50,6 +52,8 @@ impl AgentConfig {
             mode: AgentMode::Listener,
             endpoint: None,
             udp_session_linger_secs: Some(DEFAULT_UDP_SESSION_LINGER_SECS),
+            metrics_enabled: file.metrics_enabled,
+            metrics_socket_path: file.metrics_socket_path,
         };
 
         if let Some(discovery) = file.discovery {
@@ -171,6 +175,8 @@ struct AgentConfigFile {
     upstream_url: Option<String>,
     upstream_host: Option<String>,
     upstream_port: Option<u16>,
+    metrics_enabled: Option<bool>,
+    metrics_socket_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
