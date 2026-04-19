@@ -8,6 +8,19 @@ use iroh::endpoint::{Connection, SendStream};
 use nix::sys::signal::{Signal, kill};
 #[cfg(unix)]
 use nix::unistd::{Gid, Pid, Uid, User, geteuid};
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "redox",
+        target_os = "haiku"
+    ))
+))]
+use nix::unistd::{setgid, setgroups, setuid};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -298,6 +311,7 @@ fn spawn_process(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn spawn_exec_process(
     session: &Session,
     req: &portl_proto::shell_v1::ShellReq,
@@ -326,8 +340,39 @@ fn spawn_exec_process(
     if let Some(user) = requested_user
         && user.switch_required
     {
-        command.uid(user.uid.as_raw());
-        command.gid(user.gid.as_raw());
+        let gid = user.gid;
+        let uid = user.uid;
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "watchos",
+            target_os = "visionos",
+            target_os = "redox",
+            target_os = "haiku"
+        )))]
+        {
+            #[allow(deprecated)]
+            command.as_std_mut().before_exec(move || {
+                setgroups(&[]).map_err(std::io::Error::other)?;
+                setgid(gid).map_err(std::io::Error::other)?;
+                setuid(uid).map_err(std::io::Error::other)?;
+                Ok(())
+            });
+        }
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "watchos",
+            target_os = "visionos",
+            target_os = "redox",
+            target_os = "haiku"
+        ))]
+        {
+            command.uid(uid.as_raw());
+            command.gid(gid.as_raw());
+        }
     }
 
     let mut child = command

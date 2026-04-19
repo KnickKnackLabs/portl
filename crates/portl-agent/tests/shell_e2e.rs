@@ -2,6 +2,17 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    ))
+))]
+use nix::unistd::{User, geteuid, getgroups};
 use portl_agent::{AgentConfig, DiscoveryConfig, run_task};
 use portl_core::id::Identity;
 use portl_core::net::shell_client::PtyCfg;
@@ -175,6 +186,66 @@ async fn env_policy_deny_does_not_leak_agent_env() -> Result<()> {
     tokio::io::AsyncReadExt::read_to_end(&mut exec.stdout, &mut stdout).await?;
     assert_eq!(String::from_utf8(stdout)?, "UNSET\n");
     assert_eq!(exec.wait_exit().await?, 0);
+
+    shutdown(connection, client, server, agent).await
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    ))
+))]
+#[tokio::test]
+#[ignore = "requires root and a secondary target user such as nobody"]
+async fn exec_user_switch_drops_supplementary_groups() -> Result<()> {
+    if !geteuid().is_root() {
+        anyhow::bail!("test requires root")
+    }
+
+    let target = User::from_name("nobody")?.context("test requires a nobody user")?;
+    let inherited_groups = getgroups()?;
+
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator).await?;
+    let ticket = root_ticket(&operator, server.addr(), shell_caps(true, true));
+
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let mut exec = open_exec(
+        &connection,
+        &session,
+        Some(target.name.clone()),
+        None,
+        vec!["/usr/bin/id".to_owned(), "-G".to_owned()],
+    )
+    .await?;
+    exec.stdin.finish()?;
+
+    let mut stdout = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut exec.stdout, &mut stdout).await?;
+    assert_eq!(exec.wait_exit().await?, 0);
+
+    let groups = String::from_utf8(stdout)?
+        .split_whitespace()
+        .map(str::parse::<u32>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let target_gid = target.gid.as_raw();
+
+    assert!(groups.contains(&target_gid), "groups were {groups:?}");
+    for inherited in inherited_groups {
+        let inherited = inherited.as_raw();
+        if inherited != target_gid {
+            assert!(
+                !groups.contains(&inherited),
+                "supplementary group {inherited} leaked into {groups:?}"
+            );
+        }
+    }
 
     shutdown(connection, client, server, agent).await
 }
