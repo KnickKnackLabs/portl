@@ -4,10 +4,10 @@
 //! leading `ok`/`warn`/`fail` tag. Exit code 0 when every check is
 //! `ok` or `warn`, 1 when any check is `fail`.
 
-use std::net::UdpSocket;
+use std::net::{TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::Path;
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use iroh_tickets::Ticket;
 use portl_core::id::store;
@@ -34,6 +34,8 @@ pub fn run() -> ExitCode {
         check_clock_skew(),
         check_identity(),
         check_listener_bind(),
+        check_discovery_config(),
+        check_relay_reachability(),
         check_stored_ticket_expiry(),
     ];
 
@@ -162,6 +164,91 @@ fn check_listener_bind() -> CheckResult {
             detail: format!("UDP ephemeral bind failed: {err}"),
         },
     }
+}
+
+/// Report the compiled-in default discovery stack + the agent TOML
+/// config at `PORTL_AGENT_CONFIG` if set. Doesn't actually probe DNS
+/// here; that's the relay check's job.
+fn check_discovery_config() -> CheckResult {
+    let config_path = std::env::var_os("PORTL_AGENT_CONFIG");
+    match config_path {
+        Some(path_os) => {
+            let path = std::path::PathBuf::from(&path_os);
+            match portl_agent::AgentConfig::from_toml_path(&path) {
+                Ok(cfg) => {
+                    let discovery = &cfg.discovery;
+                    let relay = cfg
+                        .discovery
+                        .relay
+                        .as_ref()
+                        .map_or_else(|| "none".to_owned(), std::string::ToString::to_string);
+                    let detail = format!(
+                        "config={} dns={} pkarr={} local={} relay={}",
+                        path.display(),
+                        discovery.dns,
+                        discovery.pkarr,
+                        discovery.local,
+                        relay
+                    );
+                    let status = if discovery.dns || discovery.pkarr || discovery.local {
+                        Status::Ok
+                    } else {
+                        Status::Warn
+                    };
+                    CheckResult {
+                        name: "discovery",
+                        status,
+                        detail,
+                    }
+                }
+                Err(err) => CheckResult {
+                    name: "discovery",
+                    status: Status::Fail,
+                    detail: format!("cannot load {}: {err}", path.display()),
+                },
+            }
+        }
+        None => CheckResult {
+            name: "discovery",
+            status: Status::Ok,
+            detail: "no PORTL_AGENT_CONFIG; defaults will resolve dns+pkarr+local+relay".to_owned(),
+        },
+    }
+}
+
+/// Best-effort TCP:443 reachability probe against the default iroh
+/// relay host. Failures warn rather than fail so sandboxed or
+/// offline environments don't accidentally block non-relay workflows.
+fn check_relay_reachability() -> CheckResult {
+    // iroh's default n0 relay map points at a small set of hosts.
+    // Probe one of them on TCP/443 so a typical NAT-escape test
+    // succeeds without requiring DNS-over-HTTPS libraries here.
+    let host = "use1-1.relay.iroh.network:443";
+    match resolve_first(host) {
+        Ok(addr) => match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+            Ok(_) => CheckResult {
+                name: "relay",
+                status: Status::Ok,
+                detail: format!("{host} reachable on tcp/443"),
+            },
+            Err(err) => CheckResult {
+                name: "relay",
+                status: Status::Warn,
+                detail: format!("{host} not reachable: {err}"),
+            },
+        },
+        Err(err) => CheckResult {
+            name: "relay",
+            status: Status::Warn,
+            detail: format!("{host} DNS lookup failed: {err}"),
+        },
+    }
+}
+
+fn resolve_first(host: &str) -> std::io::Result<std::net::SocketAddr> {
+    host.to_socket_addrs()?
+        .next()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no addresses resolved"))
 }
 
 /// Walk stored tickets in the alias store. Warn on any ticket within
