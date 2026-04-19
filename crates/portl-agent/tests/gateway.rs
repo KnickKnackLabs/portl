@@ -84,7 +84,7 @@ async fn gateway_injects_authorization_header_from_master_ticket() -> Result<()>
         .expect("authorization header present");
     assert_eq!(
         auth.to_str().expect("header is utf-8"),
-        "Bearer 736c696365722d746f6b656e"
+        "Bearer slicer-token"
     );
     Ok(())
 }

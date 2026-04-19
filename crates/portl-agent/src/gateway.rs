@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::{Connection, SendStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, copy};
 use tokio::net::TcpStream;
@@ -159,12 +159,26 @@ fn inject_authorization_header(headers: &[u8], bearer: &[u8]) -> Result<Vec<u8>>
     let request_line = &headers[..request_line_end + 2];
     validate_http11_request_line(request_line)?;
 
-    let mut rewritten = Vec::with_capacity(headers.len() + 32 + bearer.len() * 2);
+    let header_value = bearer_to_header_value(bearer)?;
+    let mut rewritten = Vec::with_capacity(headers.len() + 32 + header_value.len());
     rewritten.extend_from_slice(request_line);
-    rewritten
-        .extend_from_slice(format!("Authorization: Bearer {}\r\n", hex::encode(bearer)).as_bytes());
+    rewritten.extend_from_slice(format!("Authorization: Bearer {header_value}\r\n").as_bytes());
     rewritten.extend_from_slice(&headers[request_line_end + 2..]);
     Ok(rewritten)
+}
+
+fn bearer_to_header_value(bearer: &[u8]) -> Result<String> {
+    let value =
+        std::str::from_utf8(bearer).map_err(|_| anyhow!("bearer contains non-UTF-8 bytes"))?;
+    if value.is_empty() {
+        bail!("bearer is empty");
+    }
+    for c in value.chars() {
+        if !matches!(c, '\x21'..='\x7e') {
+            bail!("bearer contains non-printable characters");
+        }
+    }
+    Ok(value.to_owned())
 }
 
 fn validate_http11_request_line(line: &[u8]) -> Result<()> {
@@ -185,7 +199,9 @@ fn validate_http11_request_line(line: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{inject_authorization_header, validate_http11_request_line};
+    use super::{
+        bearer_to_header_value, inject_authorization_header, validate_http11_request_line,
+    };
 
     #[test]
     fn accepts_http11_request_line() {
@@ -200,14 +216,27 @@ mod tests {
 
     #[test]
     fn injects_authorization_header_after_request_line() {
-        let rewritten =
-            inject_authorization_header(b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n", b"abc")
-                .expect("inject header");
+        let rewritten = inject_authorization_header(
+            b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n",
+            b"slicer-token",
+        )
+        .expect("inject header");
         let rewritten = String::from_utf8(rewritten).expect("utf-8 header block");
-        assert!(
-            rewritten.starts_with(
-                "GET / HTTP/1.1\r\nAuthorization: Bearer 616263\r\nHost: example.test"
-            )
-        );
+        assert!(rewritten.starts_with(
+            "GET / HTTP/1.1\r\nAuthorization: Bearer slicer-token\r\nHost: example.test"
+        ));
+    }
+
+    #[test]
+    fn bearer_to_header_value_rejects_non_utf8() {
+        let err = bearer_to_header_value(&[0xff]).expect_err("must reject non-utf8 bearer");
+        assert!(err.to_string().contains("non-UTF-8"));
+    }
+
+    #[test]
+    fn bearer_to_header_value_rejects_non_printable_characters() {
+        let err = bearer_to_header_value(b"bad token")
+            .expect_err("must reject whitespace and other non-printable characters");
+        assert!(err.to_string().contains("non-printable"));
     }
 }
