@@ -1,16 +1,19 @@
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use iroh::endpoint::SendStream;
 use portl_core::io::BufferedRecv;
 use portl_core::net::{ShellClient, open_exec};
 use portl_core::ticket::schema::{Capabilities, EnvPolicy, ShellCaps};
 use tokio::io::{AsyncWriteExt, copy};
+use tracing::debug;
 
 use crate::commands::peer::connect_peer;
 
 pub fn run(peer: &str, cwd: Option<&str>, user: Option<&str>, argv: &[String]) -> Result<ExitCode> {
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async move {
+    let result = runtime.block_on(async move {
         let connected = connect_peer(peer, exec_caps()).await?;
         let exec = open_exec(
             &connected.connection,
@@ -32,13 +35,9 @@ pub fn run(peer: &str, cwd: Option<&str>, user: Option<&str>, argv: &[String]) -
             resize: _,
         } = exec;
 
-        let stdin_task = tokio::spawn(async move {
+        let _stdin_task = tokio::spawn(async move {
             let mut stdin_src = tokio::io::stdin();
-            copy(&mut stdin_src, &mut stdin)
-                .await
-                .context("copy local stdin")?;
-            stdin.finish().context("finish remote stdin")?;
-            Ok::<_, anyhow::Error>(())
+            let _ = stdin_loop(&mut stdin, &mut stdin_src).await;
         });
 
         let stdout_task = tokio::spawn(async move {
@@ -60,13 +59,19 @@ pub fn run(peer: &str, cwd: Option<&str>, user: Option<&str>, argv: &[String]) -
         });
 
         let code = read_exit(&mut exit).await?;
-        stdin_task.await.context("join stdin task")??;
-        stdout_task.await.context("join stdout task")??;
-        stderr_task.await.context("join stderr task")??;
+        await_output_task(stdout_task, "stdout").await?;
+        await_output_task(stderr_task, "stderr").await?;
         connected.connection.close(0u32.into(), b"exec complete");
-        connected.endpoint.close().await;
+        if tokio::time::timeout(Duration::from_millis(250), connected.endpoint.close())
+            .await
+            .is_err()
+        {
+            debug!("timed out closing exec endpoint");
+        }
         Ok(exit_code_from_i32(code))
-    })
+    });
+    runtime.shutdown_background();
+    result
 }
 
 fn exec_caps() -> Capabilities {
@@ -90,6 +95,35 @@ fn exec_caps() -> Capabilities {
 fn exit_code_from_i32(code: i32) -> ExitCode {
     let code = u8::try_from(code).unwrap_or(1);
     ExitCode::from(code)
+}
+
+async fn await_output_task(
+    mut task: tokio::task::JoinHandle<Result<()>>,
+    stream_name: &str,
+) -> Result<()> {
+    if let Ok(joined) = tokio::time::timeout(Duration::from_millis(250), &mut task).await {
+        joined.with_context(|| format!("join {stream_name} task"))??;
+    } else {
+        debug!(
+            stream = stream_name,
+            "timed out waiting for output drain; aborting task"
+        );
+        task.abort();
+    }
+    Ok(())
+}
+
+async fn stdin_loop(send: &mut SendStream, stdin: &mut tokio::io::Stdin) -> Result<()> {
+    if let Err(err) = copy(stdin, send).await.context("copy local stdin") {
+        debug!(%err, "stdin loop ended after remote stdin closed");
+        return Ok(());
+    }
+
+    if let Err(err) = send.finish().context("finish remote stdin") {
+        debug!(%err, "remote stdin already closed");
+    }
+
+    Ok(())
 }
 
 async fn read_exit(recv: &mut BufferedRecv) -> Result<i32> {

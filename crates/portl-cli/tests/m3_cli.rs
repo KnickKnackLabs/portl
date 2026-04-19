@@ -52,6 +52,35 @@ async fn exec_command_connects_and_returns_output() -> Result<()> {
 }
 
 #[tokio::test]
+async fn exec_exits_promptly_when_child_exits_with_stdin_idle() -> Result<()> {
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator).await?;
+    let ticket = root_ticket(&operator, server.addr(), shell_caps()).serialize();
+    let home = tempdir()?;
+    let identity_path = home.path().join("identity.bin");
+    store::save(&Identity::new(), &identity_path)?;
+
+    let mut child = Command::cargo_bin("portl")?
+        .env("PORTL_IDENTITY_KEY", &identity_path)
+        .args(["exec", ticket.as_str(), "--", "true"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let status = wait_for_child_exit(&mut child, Duration::from_secs(5)).await?;
+    if !status.success() {
+        bail!(
+            "portl exec exited with {status}: {}",
+            read_child_stderr(&mut child)?
+        );
+    }
+
+    shutdown(client, server, agent).await
+}
+
+#[tokio::test]
 async fn shell_command_connects_and_dispatches_noninteractive_session() -> Result<()> {
     let (client, server) = pair().await?;
     let operator = Identity::new();
@@ -239,6 +268,29 @@ async fn wait_for_forward(child: &mut std::process::Child, local_port: u16) -> R
                 ));
             }
         }
+    }
+}
+
+async fn wait_for_child_exit(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().context("poll child process")? {
+            return Ok(status);
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            child.kill().context("kill hung child process")?;
+            let status = child.wait().context("wait for killed child process")?;
+            let stderr = read_child_stderr(child)?;
+            bail!(
+                "child process did not exit within {timeout:?}; killed with {status}; stderr: {stderr}"
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 

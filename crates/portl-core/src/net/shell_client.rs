@@ -226,11 +226,11 @@ async fn open_shell_session(
     }
     let session_id = ack.session_id.context("shell ack missing session id")?;
 
-    let (stdin, _) =
-        open_send_stream(connection, session, session_id, ShellStreamKind::Stdin).await?;
+    let exit = open_recv_stream(connection, session, session_id, ShellStreamKind::Exit).await?;
     let stdout = open_recv_stream(connection, session, session_id, ShellStreamKind::Stdout).await?;
     let stderr = open_recv_stream(connection, session, session_id, ShellStreamKind::Stderr).await?;
-    let exit = open_recv_stream(connection, session, session_id, ShellStreamKind::Exit).await?;
+    let (stdin, _) =
+        open_send_stream(connection, session, session_id, ShellStreamKind::Stdin).await?;
     let signal = if interactive {
         Some(
             open_send_stream(connection, session, session_id, ShellStreamKind::Signal)
