@@ -397,7 +397,7 @@ fn render_agent_config(trust_roots: &[[u8; 32]]) -> Result<String> {
         .collect::<Vec<_>>()
         .join(", ");
     Ok(format!(
-        "identity_path = \"{SECRET_MOUNT_PATH}\"\nrevocations_path = \"/var/lib/portl/revocations.json\"\nbind_addr = \"0.0.0.0:0\"\ndiscovery = {{ dns = false, pkarr = true, local = true }}\ntrust_roots = [{}]\n",
+        "identity_path = \"{SECRET_MOUNT_PATH}\"\nrevocations_path = \"/var/lib/portl/revocations.jsonl\"\nbind_addr = \"0.0.0.0:0\"\ndiscovery = {{ dns = false, pkarr = true, local = true }}\ntrust_roots = [{}]\n",
         trust_roots
             .split(", ")
             .map(|value| format!("\"{value}\""))

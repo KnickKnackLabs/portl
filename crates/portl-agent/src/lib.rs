@@ -29,7 +29,7 @@ pub mod ticket_handler;
 pub use config::{AgentConfig, AgentMode, DiscoveryConfig, RateLimitConfig};
 pub use pipeline::{AcceptanceInput, AcceptanceOutcome, evaluate_offer};
 pub use rate_limit::OfferRateLimiter;
-pub use revocations::RevocationSet;
+pub use revocations::{RevocationRecord, RevocationSet};
 
 #[allow(dead_code)]
 pub(crate) struct AgentState {
@@ -210,8 +210,8 @@ fn revocations_path(cfg: &AgentConfig) -> PathBuf {
             .unwrap_or_else(store::default_path)
             .parent()
             .map_or_else(
-                || PathBuf::from("revocations.json"),
-                |parent| parent.join("revocations.json"),
+                || PathBuf::from("revocations.jsonl"),
+                |parent| parent.join("revocations.jsonl"),
             )
     })
 }

@@ -1,10 +1,10 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
 use docker_portl::{ADAPTER_NAME, DockerBootstrapper, DockerHandle};
 use iroh_tickets::Ticket;
+use portl_agent::{RevocationRecord, revocations};
 use portl_core::bootstrap::{Bootstrapper, Handle, ProvisionSpec, TargetStatus, TicketSpec};
 use portl_core::id::store;
 use portl_core::ticket::hash::ticket_id;
@@ -134,7 +134,11 @@ pub fn rm(name: &str, force: bool, keep_tickets: bool) -> Result<ExitCode> {
             && !keep_tickets
             && let Some(root_ticket_id) = spec.root_ticket_id
         {
-            revoke_ticket(root_ticket_id, &local_revocations_path())?;
+            revoke_ticket(
+                root_ticket_id,
+                ticket_not_after(alias.created_at, spec.ttl_secs),
+                &local_revocations_path(),
+            )?;
         }
 
         store.remove(name)?;
@@ -293,35 +297,25 @@ fn ensure_rm_allowed(name: &str, status: &TargetStatus, force: bool) -> Result<(
 
 fn local_revocations_path() -> PathBuf {
     store::default_path().parent().map_or_else(
-        || PathBuf::from("revocations.json"),
-        |parent| parent.join("revocations.json"),
+        || PathBuf::from("revocations.jsonl"),
+        |parent| parent.join("revocations.jsonl"),
     )
 }
 
-fn revoke_ticket(ticket_id: [u8; 16], path: &Path) -> Result<()> {
-    let mut ids: Vec<String> = if path.exists() {
-        serde_json::from_str(
-            &fs::read_to_string(path)
-                .with_context(|| format!("read revocations from {}", path.display()))?,
-        )
-        .with_context(|| format!("parse revocations from {}", path.display()))?
-    } else {
-        Vec::new()
-    };
-    let encoded = hex::encode(ticket_id);
-    if !ids.iter().any(|existing| existing == &encoded) {
-        ids.push(encoded);
-        ids.sort_unstable();
-    }
+fn ticket_not_after(created_at: i64, ttl_secs: u64) -> Option<u64> {
+    u64::try_from(created_at).ok()?.checked_add(ttl_secs)
+}
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    fs::write(
+fn revoke_ticket(ticket_id: [u8; 16], not_after_of_ticket: Option<u64>, path: &Path) -> Result<()> {
+    revocations::append_record(
         path,
-        serde_json::to_string_pretty(&ids).context("encode revocations")?,
+        &RevocationRecord::new(
+            ticket_id,
+            "docker_rm",
+            u64::try_from(now_unix_secs()?)?,
+            not_after_of_ticket,
+        ),
     )
-    .with_context(|| format!("write revocations to {}", path.display()))
 }
 
 fn alias_to_handle(alias: &AliasRecord) -> Handle {
@@ -360,12 +354,14 @@ mod tests {
     #[test]
     fn rm_force_revokes_ticket() {
         let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("revocations.json");
+        let path = dir.path().join("revocations.jsonl");
 
-        revoke_ticket([0x11; 16], &path).expect("write revocation");
+        revoke_ticket([0x11; 16], Some(99), &path).expect("write revocation");
 
         let contents = std::fs::read_to_string(path).expect("read revocations");
         assert!(contents.contains(&hex::encode([0x11; 16])));
+        assert!(contents.contains("docker_rm"));
+        assert!(contents.contains("99"));
     }
 
     #[test]

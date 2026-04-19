@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -7,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::Connection;
 use iroh_tickets::Ticket;
+use portl_agent::{RevocationRecord, revocations};
 use portl_core::bootstrap::{Bootstrapper, ProvisionSpec};
 use portl_core::endpoint::Endpoint;
 use portl_core::id::{Identity, store};
@@ -204,7 +204,11 @@ pub fn vm_delete(name: &str, base_url: Option<&str>) -> Result<ExitCode> {
         client.client.delete_vm(&group, &alias.container_id).await?;
 
         if let Some(root_ticket_id) = spec.root_ticket_id {
-            append_revocation(root_ticket_id, &local_revocations_path())?;
+            append_revocation(
+                root_ticket_id,
+                ticket_not_after(alias.created_at, spec.ttl_secs),
+                &local_revocations_path(),
+            )?;
         }
         if let Some(ticket_path) = spec.ticket_file_path
             && let Err(err) = fs::remove_file(&ticket_path)
@@ -466,39 +470,27 @@ fn local_revocations_path() -> PathBuf {
     slicer_home().join("revocations.jsonl")
 }
 
-fn append_revocation(ticket_id: [u8; 16], path: &Path) -> Result<()> {
-    #[derive(serde::Serialize)]
-    struct RevocationRecord<'a> {
-        ticket_id: &'a str,
-        reason: &'a str,
-        ts: i64,
-    }
+fn ticket_not_after(created_at: i64, ttl_secs: u64) -> Option<u64> {
+    u64::try_from(created_at).ok()?.checked_add(ttl_secs)
+}
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    let encoded = hex::encode(ticket_id);
-    let record = RevocationRecord {
-        ticket_id: &encoded,
-        reason: "vm_deleted",
-        ts: i64::try_from(
+fn append_revocation(
+    ticket_id: [u8; 16],
+    not_after_of_ticket: Option<u64>,
+    path: &Path,
+) -> Result<()> {
+    revocations::append_record(
+        path,
+        &RevocationRecord::new(
+            ticket_id,
+            "slicer_vm_delete",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .context("system clock is before unix epoch")?
                 .as_secs(),
-        )?,
-    };
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("open revocations file {}", path.display()))?;
-    writeln!(
-        file,
-        "{}",
-        serde_json::to_string(&record).context("encode revocation record")?
+            not_after_of_ticket,
+        ),
     )
-    .with_context(|| format!("append revocation record to {}", path.display()))
 }
 
 #[cfg(test)]
@@ -510,10 +502,11 @@ mod tests {
     fn append_revocation_writes_jsonl() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("revocations.jsonl");
-        append_revocation([0x11; 16], &path).expect("append revocation");
+        append_revocation([0x11; 16], Some(99), &path).expect("append revocation");
         let contents = std::fs::read_to_string(path).expect("read revocations");
-        assert!(contents.contains("vm_deleted"));
+        assert!(contents.contains("slicer_vm_delete"));
         assert!(contents.contains(&hex::encode([0x11; 16])));
+        assert!(contents.contains("99"));
     }
 
     #[test]
