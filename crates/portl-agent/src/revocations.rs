@@ -16,12 +16,7 @@ impl RevocationSet {
         let ids = if file.exists() {
             let raw = fs::read_to_string(&file)
                 .with_context(|| format!("read revocations from {}", file.display()))?;
-            let hex_ids: Vec<String> = serde_json::from_str(&raw)
-                .with_context(|| format!("parse revocations from {}", file.display()))?;
-            hex_ids
-                .into_iter()
-                .map(|hex_id| decode_ticket_id(&hex_id))
-                .collect::<Result<HashSet<_>>>()?
+            parse_revocation_ids(&raw, &file)?
         } else {
             HashSet::new()
         };
@@ -51,6 +46,37 @@ impl RevocationSet {
     }
 }
 
+fn parse_revocation_ids(raw: &str, file: &Path) -> Result<HashSet<[u8; 16]>> {
+    if let Ok(hex_ids) = serde_json::from_str::<Vec<String>>(raw) {
+        return hex_ids
+            .into_iter()
+            .map(|hex_id| decode_ticket_id(&hex_id))
+            .collect();
+    }
+
+    let mut ids = HashSet::new();
+    for (index, line) in raw.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let record: RevocationRecord = serde_json::from_str(trimmed).with_context(|| {
+            format!(
+                "parse revocation JSONL line {} from {}",
+                index + 1,
+                file.display()
+            )
+        })?;
+        ids.insert(decode_ticket_id(&record.ticket_id)?);
+    }
+    Ok(ids)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RevocationRecord {
+    ticket_id: String,
+}
+
 fn decode_ticket_id(hex_id: &str) -> Result<[u8; 16]> {
     let bytes = hex::decode(hex_id).with_context(|| format!("decode ticket id {hex_id}"))?;
     let id = bytes
@@ -78,5 +104,19 @@ mod tests {
         let reloaded = RevocationSet::load(&path).expect("reload set");
         assert!(reloaded.contains(&[0x11; 16]));
         assert!(reloaded.contains(&[0x22; 16]));
+    }
+
+    #[test]
+    fn load_accepts_jsonl_records() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("revocations.jsonl");
+        std::fs::write(
+            &path,
+            "{\"ticket_id\":\"11111111111111111111111111111111\",\"reason\":\"vm_deleted\",\"ts\":1}\n",
+        )
+        .expect("write jsonl revocations");
+
+        let reloaded = RevocationSet::load(&path).expect("reload jsonl set");
+        assert!(reloaded.contains(&[0x11; 16]));
     }
 }
