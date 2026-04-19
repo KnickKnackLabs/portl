@@ -13,6 +13,8 @@
 //! See `docs/design/030-tickets.md` for the authoritative spec.
 
 pub mod canonical;
+pub mod codec;
 pub mod schema;
 
 pub use canonical::{canonical_check, resolved_issuer};
+pub use codec::{decode, encode};
