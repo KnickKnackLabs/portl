@@ -60,7 +60,16 @@ pub fn tcp_permits(caps: &Capabilities, req: &TcpReq) -> Result<(), &'static str
 }
 
 fn host_matches(pattern: &str, host: &str) -> bool {
-    pattern == "*" || pattern == host
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        return host.ends_with(&format!(".{suffix}")) || host == suffix;
+    }
+    if let Some(prefix) = pattern.strip_suffix(".*") {
+        return host.starts_with(&format!("{prefix}."));
+    }
+    pattern == host
 }
 
 pub fn shell_caps(caps: &Capabilities) -> Option<&ShellCaps> {
@@ -168,6 +177,81 @@ mod tests {
         };
 
         assert_eq!(tcp_permits(&caps, &req), Ok(()));
+    }
+
+    #[test]
+    fn tcp_supports_suffix_host_globs() {
+        let caps = tcp_caps(vec![PortRule {
+            host_glob: "*.example.com".to_owned(),
+            port_min: 1,
+            port_max: 65535,
+        }]);
+
+        assert_eq!(
+            tcp_permits(
+                &caps,
+                &TcpReq {
+                    preamble: preamble("portl/tcp/v1"),
+                    host: "a.example.com".to_owned(),
+                    port: 443,
+                }
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            tcp_permits(
+                &caps,
+                &TcpReq {
+                    preamble: preamble("portl/tcp/v1"),
+                    host: "example.com".to_owned(),
+                    port: 443,
+                }
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            tcp_permits(
+                &caps,
+                &TcpReq {
+                    preamble: preamble("portl/tcp/v1"),
+                    host: "evil.com".to_owned(),
+                    port: 443,
+                }
+            ),
+            Err("destination not permitted by ticket")
+        );
+    }
+
+    #[test]
+    fn tcp_supports_prefix_host_globs() {
+        let caps = tcp_caps(vec![PortRule {
+            host_glob: "10.0.0.*".to_owned(),
+            port_min: 1,
+            port_max: 65535,
+        }]);
+
+        assert_eq!(
+            tcp_permits(
+                &caps,
+                &TcpReq {
+                    preamble: preamble("portl/tcp/v1"),
+                    host: "10.0.0.5".to_owned(),
+                    port: 22,
+                }
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            tcp_permits(
+                &caps,
+                &TcpReq {
+                    preamble: preamble("portl/tcp/v1"),
+                    host: "10.1.0.5".to_owned(),
+                    port: 22,
+                }
+            ),
+            Err("destination not permitted by ticket")
+        );
     }
 
     #[test]
