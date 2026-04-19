@@ -14,7 +14,9 @@
 
 pub mod canonical;
 pub mod codec;
+pub mod hash;
 pub mod schema;
+pub mod sign;
 
 pub use canonical::{canonical_check, resolved_issuer};
 pub use codec::{decode, encode};
