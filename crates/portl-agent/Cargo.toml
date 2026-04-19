@@ -1,0 +1,24 @@
+[package]
+name         = "portl-agent"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+rust-version.workspace = true
+description  = "portl agent runtime: handshake, discovery, and session acceptance."
+
+[lints]
+workspace = true
+
+[dependencies]
+portl-core  = { version = "0.0.1", path = "../portl-core" }
+portl-proto = { version = "0.0.1", path = "../portl-proto" }
+anyhow      = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+hex         = { workspace = true }
+tracing     = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
