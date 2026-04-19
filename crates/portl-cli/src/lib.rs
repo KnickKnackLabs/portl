@@ -94,6 +94,8 @@ pub enum Command {
         peer: Option<String>,
         all_peers: bool,
     },
+    /// `portl doctor`
+    Doctor,
     /// `portl docker container add ...`
     DockerAdd {
         name: String,
@@ -258,6 +260,7 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
         Command::RevocationsPublish { peer, all_peers } => {
             commands::revocations::publish(peer.as_deref(), all_peers)
         }
+        Command::Doctor => Ok(commands::doctor::run()),
         Command::DockerAdd {
             name,
             image,
@@ -417,6 +420,8 @@ enum TopLevel {
         #[command(subcommand)]
         action: RevocationsAction,
     },
+    /// Print local diagnostics (clock, identity, listener bind, ticket expiry).
+    Doctor,
     /// Docker target management.
     Docker {
         #[command(subcommand)]
@@ -674,6 +679,7 @@ impl Cli {
             TopLevel::Revocations {
                 action: RevocationsAction::Publish { peer, all_peers },
             } => Command::RevocationsPublish { peer, all_peers },
+            TopLevel::Doctor => Command::Doctor,
             TopLevel::Docker {
                 action:
                     DockerAction::Container {
