@@ -7,6 +7,7 @@ use anyhow::Result;
 use portl_core::id::{Identity, store};
 use portl_core::ticket::verify::TrustRoots;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{instrument, warn};
 
 pub mod audit;
@@ -40,6 +41,11 @@ pub(crate) struct AgentState {
 
 #[instrument(skip_all)]
 pub async fn run(cfg: AgentConfig) -> Result<()> {
+    run_with_shutdown(cfg, CancellationToken::new()).await
+}
+
+#[instrument(skip_all)]
+pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) -> Result<()> {
     audit::init();
 
     let state = Arc::new(AgentState {
@@ -60,26 +66,44 @@ pub async fn run(cfg: AgentConfig) -> Result<()> {
         endpoint::bind(&cfg, &identity).await?
     };
 
-    while let Some(incoming) = endpoint.accept().await {
-        let connection = match incoming.await {
-            Ok(connection) => connection,
-            Err(err) => {
-                warn!(?err, "failed to accept incoming connection");
-                continue;
-            }
-        };
+    let signal_tasks = install_pid1_signal_tasks(&shutdown)?;
 
-        if connection.alpn() == portl_proto::ticket_v1::ALPN_TICKET_V1 {
-            let state = Arc::clone(&state);
-            tokio::spawn(async move {
-                if let Err(err) = ticket_handler::serve_connection(connection, state).await {
-                    warn!(?err, "ticket connection failed");
+    loop {
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {
+                break;
+            }
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else {
+                    break;
+                };
+                let connection = match incoming.await {
+                    Ok(connection) => connection,
+                    Err(err) => {
+                        warn!(?err, "failed to accept incoming connection");
+                        continue;
+                    }
+                };
+
+                if connection.alpn() == portl_proto::ticket_v1::ALPN_TICKET_V1 {
+                    let state = Arc::clone(&state);
+                    tokio::spawn(async move {
+                        if let Err(err) = ticket_handler::serve_connection(connection, state).await {
+                            warn!(?err, "ticket connection failed");
+                        }
+                    });
+                } else {
+                    connection.close(0x1003u32.into(), b"unsupported ALPN");
                 }
-            });
-        } else {
-            connection.close(0x1003u32.into(), b"unsupported ALPN");
+            }
         }
     }
+
+    if shutdown.is_cancelled() {
+        graceful_close_endpoint(&endpoint).await;
+    }
+    signal_tasks.abort();
 
     Ok(())
 }
@@ -87,6 +111,87 @@ pub async fn run(cfg: AgentConfig) -> Result<()> {
 #[instrument(skip_all)]
 pub async fn run_task(cfg: AgentConfig) -> Result<JoinHandle<Result<()>>> {
     Ok(tokio::spawn(async move { run(cfg).await }))
+}
+
+async fn graceful_close_endpoint(endpoint: &iroh::Endpoint) {
+    if let Err(err) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), endpoint.close()).await
+    {
+        warn!(?err, "endpoint close exceeded 10 second shutdown budget");
+    }
+}
+
+fn install_pid1_signal_tasks(shutdown: &CancellationToken) -> Result<SignalTasks> {
+    if std::process::id() != 1 {
+        return Ok(SignalTasks::default());
+    }
+
+    #[cfg(unix)]
+    {
+        use nix::errno::Errno;
+        use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+        use nix::unistd::Pid;
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut sigterm = signal(SignalKind::terminate())?;
+        let mut sigint = signal(SignalKind::interrupt())?;
+        let shutdown_for_signals = shutdown.clone();
+        let signal_task = tokio::spawn(async move {
+            tokio::select! {
+                _ = sigterm.recv() => shutdown_for_signals.cancel(),
+                _ = sigint.recv() => shutdown_for_signals.cancel(),
+                () = shutdown_for_signals.cancelled() => {}
+            }
+        });
+
+        let mut sigchld = signal(SignalKind::child())?;
+        let shutdown_for_reaper = shutdown.clone();
+        let reaper_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = shutdown_for_reaper.cancelled() => break,
+                    signal = sigchld.recv() => {
+                        if signal.is_none() {
+                            break;
+                        }
+                        loop {
+                            match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
+                                Ok(WaitStatus::StillAlive) | Err(Errno::ECHILD) => break,
+                                Ok(_) => {}
+                                Err(err) => {
+                                    warn!(?err, "failed to reap child process");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(SignalTasks {
+            handles: vec![signal_task, reaper_task],
+        })
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = shutdown;
+        Ok(SignalTasks::default())
+    }
+}
+
+#[derive(Default)]
+struct SignalTasks {
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl SignalTasks {
+    fn abort(self) {
+        for handle in self.handles {
+            handle.abort();
+        }
+    }
 }
 
 fn load_identity(cfg: &AgentConfig) -> Result<Identity> {
@@ -113,8 +218,9 @@ fn revocations_path(cfg: &AgentConfig) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use portl_core::endpoint::Endpoint;
+    use tokio_util::sync::CancellationToken;
 
-    use super::{AgentConfig, DiscoveryConfig, run_task};
+    use super::{AgentConfig, DiscoveryConfig, run_task, run_with_shutdown};
 
     #[tokio::test]
     async fn run_task_returns_and_stops_when_endpoint_closes() {
@@ -130,5 +236,26 @@ mod tests {
 
         endpoint.inner().close().await;
         handle.await.expect("join handle").expect("run result");
+    }
+
+    #[tokio::test]
+    async fn run_with_shutdown_stops_when_token_is_cancelled() {
+        let endpoint = Endpoint::bind().await.expect("bind endpoint");
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(run_with_shutdown(
+            AgentConfig {
+                discovery: DiscoveryConfig::in_process(),
+                endpoint: Some(endpoint),
+                ..AgentConfig::default()
+            },
+            shutdown.clone(),
+        ));
+
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(3), task)
+            .await
+            .expect("join timeout")
+            .expect("join handle")
+            .expect("run result");
     }
 }

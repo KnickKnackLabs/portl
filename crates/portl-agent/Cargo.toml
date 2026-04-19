@@ -25,6 +25,7 @@ rand        = { workspace = true }
 iroh        = { workspace = true }
 iroh-base   = { workspace = true }
 tokio       = { workspace = true }
+tokio-util  = { workspace = true }
 governor    = { workspace = true }
 dashmap     = { workspace = true }
 portable-pty = { workspace = true }
@@ -39,5 +40,6 @@ tracing-journald = { workspace = true }
 portl-core = { version = "0.0.1", path = "../portl-core", features = ["test-util"] }
 tempfile  = { workspace = true }
 iroh-base = { workspace = true }
-tokio     = { workspace = true }
-n0-future = { workspace = true }
+tokio      = { workspace = true }
+tokio-util = { workspace = true }
+n0-future  = { workspace = true }
