@@ -52,6 +52,7 @@ pub(crate) async fn serve_stream(
                         String::from_utf8_lossy(portl_proto::meta_v1::ALPN_META_V1).into(),
                         String::from_utf8_lossy(portl_proto::shell_v1::ALPN_SHELL_V1).into(),
                         String::from_utf8_lossy(portl_proto::tcp_v1::ALPN_TCP_V1).into(),
+                        String::from_utf8_lossy(portl_proto::udp_v1::ALPN_UDP_V1).into(),
                     ],
                     uptime_s: state.started_at.elapsed().as_secs(),
                     hostname: hostname(),

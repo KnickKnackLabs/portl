@@ -25,6 +25,8 @@ pub mod shell_registry;
 pub mod stream_io;
 pub mod tcp_handler;
 pub mod ticket_handler;
+pub mod udp_handler;
+pub mod udp_registry;
 
 pub use config::{AgentConfig, AgentMode, DiscoveryConfig, RateLimitConfig};
 pub use pipeline::{AcceptanceInput, AcceptanceOutcome, evaluate_offer};
@@ -38,6 +40,7 @@ pub(crate) struct AgentState {
     pub rate_limit: OfferRateLimiter,
     pub started_at: Instant,
     pub shell_registry: shell_registry::ShellRegistry,
+    pub udp_registry: udp_registry::UdpSessionRegistry,
     pub mode: AgentMode,
 }
 
@@ -56,6 +59,10 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
         rate_limit: OfferRateLimiter::new(&cfg.rate_limit)?,
         started_at: Instant::now(),
         shell_registry: shell_registry::ShellRegistry::default(),
+        udp_registry: udp_registry::UdpSessionRegistry::new(
+            cfg.udp_session_linger_secs
+                .unwrap_or(udp_registry::DEFAULT_UDP_SESSION_LINGER_SECS),
+        ),
         mode: cfg.mode.clone(),
     });
 
@@ -70,6 +77,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
     };
 
     let signal_tasks = install_signal_tasks(&shutdown)?;
+    let udp_gc = spawn_udp_gc_task(Arc::clone(&state), shutdown.clone());
 
     loop {
         tokio::select! {
@@ -107,6 +115,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
         graceful_close_endpoint(&endpoint).await;
     }
     signal_tasks.abort();
+    udp_gc.abort();
 
     Ok(())
 }
@@ -114,6 +123,23 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
 #[instrument(skip_all)]
 pub async fn run_task(cfg: AgentConfig) -> Result<JoinHandle<Result<()>>> {
     Ok(tokio::spawn(async move { run(cfg).await }))
+}
+
+fn spawn_udp_gc_task(state: Arc<AgentState>, shutdown: CancellationToken) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                _ = interval.tick() => {
+                    if let Err(err) = state.udp_registry.gc_expired().await {
+                        warn!(?err, "udp session gc failed");
+                    }
+                }
+            }
+        }
+    })
 }
 
 async fn graceful_close_endpoint(endpoint: &iroh::Endpoint) {

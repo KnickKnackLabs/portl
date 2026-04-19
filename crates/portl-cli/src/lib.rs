@@ -78,6 +78,11 @@ pub enum Command {
         peer: String,
         local: Vec<String>,
     },
+    /// `portl udp <peer> -L ...`
+    Udp {
+        peer: String,
+        local: Vec<String>,
+    },
     /// `portl docker container add ...`
     DockerAdd {
         name: String,
@@ -195,6 +200,7 @@ pub fn run(argv: Vec<OsString>) -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
     match cmd {
         Command::AgentRun {
@@ -232,6 +238,7 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             argv,
         } => commands::exec::run(&peer, cwd.as_deref(), user.as_deref(), &argv),
         Command::Tcp { peer, local } => commands::tcp::run(&peer, &local),
+        Command::Udp { peer, local } => commands::udp::run(&peer, &local),
         Command::DockerAdd {
             name,
             image,
@@ -367,6 +374,12 @@ enum TopLevel {
     },
     /// Set up one or more local TCP forwards.
     Tcp {
+        peer: String,
+        #[arg(short = 'L', required = true)]
+        local: Vec<String>,
+    },
+    /// Set up one or more local UDP forwards.
+    Udp {
         peer: String,
         #[arg(short = 'L', required = true)]
         local: Vec<String>,
@@ -604,6 +617,7 @@ impl Cli {
                 argv,
             },
             TopLevel::Tcp { peer, local } => Command::Tcp { peer, local },
+            TopLevel::Udp { peer, local } => Command::Udp { peer, local },
             TopLevel::Docker {
                 action:
                     DockerAction::Container {

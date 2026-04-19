@@ -81,7 +81,7 @@ fn empty_argv_is_rejected() {
 }
 
 #[test]
-fn shell_exec_and_tcp_subcommands_parse() {
+fn shell_exec_and_tcp_and_udp_subcommands_parse() {
     let shell = parse(argv(&[
         "portl",
         "shell",
@@ -138,6 +138,22 @@ fn shell_exec_and_tcp_subcommands_parse() {
         Command::Tcp {
             peer: "peer-ticket".to_owned(),
             local: vec!["127.0.0.1:9000:127.0.0.1:22".to_owned()],
+        }
+    );
+
+    let udp = parse(argv(&[
+        "portl",
+        "udp",
+        "peer-ticket",
+        "-L",
+        "127.0.0.1:9001:127.0.0.1:53",
+    ]))
+    .expect("udp parse should succeed");
+    assert_eq!(
+        udp,
+        Command::Udp {
+            peer: "peer-ticket".to_owned(),
+            local: vec!["127.0.0.1:9001:127.0.0.1:53".to_owned()],
         }
     );
 }

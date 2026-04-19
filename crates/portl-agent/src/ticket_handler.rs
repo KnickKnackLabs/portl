@@ -13,6 +13,7 @@ use crate::session::Session;
 use crate::shell_handler;
 use crate::stream_io::read_postcard_prefix;
 use crate::tcp_handler;
+use crate::udp_handler::{self, UdpConnectionContext};
 
 const MAX_OFFER_BYTES: usize = 64 * 1024;
 const MAX_META_STREAMS: u32 = 64;
@@ -94,6 +95,8 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
         return Ok(());
     };
 
+    let udp_context = Arc::new(UdpConnectionContext::new(state.udp_registry.clone()));
+
     loop {
         let (send, recv) = match connection.accept_bi().await {
             Ok(streams) => streams,
@@ -106,6 +109,7 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
         let connection = connection.clone();
         let session = session.clone();
         let state = Arc::clone(&state);
+        let udp_context = Arc::clone(&udp_context);
         tokio::spawn(async move {
             match read_postcard_prefix::<portl_proto::wire::StreamPreamble>(
                 recv,
@@ -153,6 +157,21 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
                                     .await
                                 }
                             }
+                        }
+                        value
+                            if value
+                                == String::from_utf8_lossy(portl_proto::udp_v1::ALPN_UDP_V1) =>
+                        {
+                            udp_handler::serve_stream(
+                                connection,
+                                session,
+                                state,
+                                send,
+                                recv,
+                                preamble,
+                                udp_context,
+                            )
+                            .await
                         }
                         _ => {
                             connection.close(0x1003u32.into(), b"version mismatch");

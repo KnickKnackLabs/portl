@@ -1,6 +1,7 @@
 use portl_core::ticket::schema::{Capabilities, ShellCaps};
 use portl_proto::shell_v1::{ShellMode, ShellReason, ShellReq};
 use portl_proto::tcp_v1::TcpReq;
+use portl_proto::udp_v1::UdpBind;
 
 pub fn shell_permits(caps: &Capabilities, req: &ShellReq) -> Result<(), ShellReason> {
     let Some(shell_caps) = caps.shell.as_ref() else {
@@ -59,6 +60,22 @@ pub fn tcp_permits(caps: &Capabilities, req: &TcpReq) -> Result<(), &'static str
         .ok_or("destination not permitted by ticket")
 }
 
+pub fn udp_permits(caps: &Capabilities, bind: &UdpBind) -> Result<(), &'static str> {
+    let Some(rules) = caps.udp.as_ref() else {
+        return Err("udp forwarding not allowed");
+    };
+
+    rules
+        .iter()
+        .any(|rule| {
+            host_matches(&rule.host_glob, &bind.target_host)
+                && rule.port_min <= bind.target_port_range.0
+                && bind.target_port_range.1 <= rule.port_max
+        })
+        .then_some(())
+        .ok_or("destination not permitted by ticket")
+}
+
 fn host_matches(pattern: &str, host: &str) -> bool {
     if pattern == "*" {
         return true;
@@ -82,9 +99,10 @@ mod tests {
     use portl_proto::shell_v1::{EnvValue, PtyCfg};
     use portl_proto::wire::StreamPreamble;
 
-    use super::{shell_permits, tcp_permits};
+    use super::{shell_permits, tcp_permits, udp_permits};
     use portl_proto::shell_v1::{ShellMode, ShellReason, ShellReq};
     use portl_proto::tcp_v1::TcpReq;
+    use portl_proto::udp_v1::UdpBind;
 
     #[test]
     fn shell_permits_pty_session_when_caps_allow_it() {
@@ -273,6 +291,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn udp_permits_exact_host_and_port_range() {
+        let caps = udp_caps(vec![PortRule {
+            host_glob: "127.0.0.1".to_owned(),
+            port_min: 5300,
+            port_max: 5301,
+        }]);
+        let bind = UdpBind {
+            local_port_range: (5300, 5300),
+            target_host: "127.0.0.1".to_owned(),
+            target_port_range: (5301, 5301),
+        };
+
+        assert_eq!(udp_permits(&caps, &bind), Ok(()));
+    }
+
+    #[test]
+    fn udp_rejects_destination_outside_allowed_range() {
+        let caps = udp_caps(vec![PortRule {
+            host_glob: "127.0.0.1".to_owned(),
+            port_min: 53,
+            port_max: 53,
+        }]);
+        let bind = UdpBind {
+            local_port_range: (5300, 5300),
+            target_host: "127.0.0.1".to_owned(),
+            target_port_range: (5353, 5353),
+        };
+
+        assert_eq!(
+            udp_permits(&caps, &bind),
+            Err("destination not permitted by ticket")
+        );
+    }
+
     fn shell_caps(
         pty_allowed: bool,
         exec_allowed: bool,
@@ -302,6 +355,18 @@ mod tests {
             shell: None,
             tcp: Some(rules),
             udp: None,
+            fs: None,
+            vpn: None,
+            meta: None,
+        }
+    }
+
+    fn udp_caps(rules: Vec<PortRule>) -> Capabilities {
+        Capabilities {
+            presence: 0b0000_0100,
+            shell: None,
+            tcp: None,
+            udp: Some(rules),
             fs: None,
             vpn: None,
             meta: None,

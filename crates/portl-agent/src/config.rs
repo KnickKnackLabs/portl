@@ -17,6 +17,8 @@ pub struct AgentConfig {
     pub mode: AgentMode,
     #[doc(hidden)]
     pub endpoint: Option<Endpoint>,
+    #[doc(hidden)]
+    pub udp_session_linger_secs: Option<u64>,
 }
 
 impl AgentConfig {
@@ -45,6 +47,7 @@ impl AgentConfig {
             rate_limit: RateLimitConfig::default(),
             mode: AgentMode::Listener,
             endpoint: None,
+            udp_session_linger_secs: None,
         };
 
         if let Some(discovery) = file.discovery {
