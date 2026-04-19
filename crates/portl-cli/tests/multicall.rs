@@ -60,6 +60,68 @@ fn empty_argv_is_rejected() {
 }
 
 #[test]
+fn shell_exec_and_tcp_subcommands_parse() {
+    let shell = parse(argv(&[
+        "portl",
+        "shell",
+        "peer-ticket",
+        "--cwd",
+        "/tmp",
+        "--user",
+        "alice",
+    ]))
+    .expect("shell parse should succeed");
+    assert_eq!(
+        shell,
+        Command::Shell {
+            peer: "peer-ticket".to_owned(),
+            cwd: Some("/tmp".to_owned()),
+            user: Some("alice".to_owned()),
+        }
+    );
+
+    let exec = parse(argv(&[
+        "portl",
+        "exec",
+        "peer-ticket",
+        "--cwd",
+        "/tmp",
+        "--user",
+        "alice",
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo hi",
+    ]))
+    .expect("exec parse should succeed");
+    assert_eq!(
+        exec,
+        Command::Exec {
+            peer: "peer-ticket".to_owned(),
+            cwd: Some("/tmp".to_owned()),
+            user: Some("alice".to_owned()),
+            argv: vec!["/bin/sh".to_owned(), "-c".to_owned(), "echo hi".to_owned()],
+        }
+    );
+
+    let tcp = parse(argv(&[
+        "portl",
+        "tcp",
+        "peer-ticket",
+        "-L",
+        "127.0.0.1:9000:127.0.0.1:22",
+    ]))
+    .expect("tcp parse should succeed");
+    assert_eq!(
+        tcp,
+        Command::Tcp {
+            peer: "peer-ticket".to_owned(),
+            local: vec!["127.0.0.1:9000:127.0.0.1:22".to_owned()],
+        }
+    );
+}
+
+#[test]
 fn unknown_subcommand_errors() {
     let result = parse(argv(&["portl", "definitely-not-a-real-subcommand"]));
     assert!(

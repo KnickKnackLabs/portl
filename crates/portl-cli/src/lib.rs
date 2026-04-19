@@ -48,6 +48,21 @@ pub enum Command {
     },
     /// `portl status <peer>`
     Status { peer: String },
+    /// `portl shell <peer>`
+    Shell {
+        peer: String,
+        cwd: Option<String>,
+        user: Option<String>,
+    },
+    /// `portl exec <peer> -- <argv...>`
+    Exec {
+        peer: String,
+        cwd: Option<String>,
+        user: Option<String>,
+        argv: Vec<String>,
+    },
+    /// `portl tcp <peer> -L ...`
+    Tcp { peer: String, local: Vec<String> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -126,6 +141,16 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             print,
         } => commands::mint_root::run(&endpoint, &caps, &ttl, to.as_deref(), depth, print),
         Command::Status { peer } => commands::status::run(&peer),
+        Command::Shell { peer, cwd, user } => {
+            commands::shell::run(&peer, cwd.as_deref(), user.as_deref())
+        }
+        Command::Exec {
+            peer,
+            cwd,
+            user,
+            argv,
+        } => commands::exec::run(&peer, cwd.as_deref(), user.as_deref(), &argv),
+        Command::Tcp { peer, local } => commands::tcp::run(&peer, &local),
     }
 }
 
@@ -178,6 +203,30 @@ enum TopLevel {
     },
     /// Query peer reachability and metadata.
     Status { peer: String },
+    /// Open an interactive remote PTY shell.
+    Shell {
+        peer: String,
+        #[arg(long)]
+        cwd: Option<String>,
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// Run a remote command without a PTY.
+    Exec {
+        peer: String,
+        #[arg(long)]
+        cwd: Option<String>,
+        #[arg(long)]
+        user: Option<String>,
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
+    },
+    /// Set up one or more local TCP forwards.
+    Tcp {
+        peer: String,
+        #[arg(short = 'L', required = true)]
+        local: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -266,6 +315,19 @@ impl Cli {
                 print,
             },
             TopLevel::Status { peer } => Command::Status { peer },
+            TopLevel::Shell { peer, cwd, user } => Command::Shell { peer, cwd, user },
+            TopLevel::Exec {
+                peer,
+                cwd,
+                user,
+                argv,
+            } => Command::Exec {
+                peer,
+                cwd,
+                user,
+                argv,
+            },
+            TopLevel::Tcp { peer, local } => Command::Tcp { peer, local },
         }
     }
 }
