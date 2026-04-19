@@ -5,9 +5,9 @@ trait. All frames are **postcard**-encoded (matching the ticket wire
 format; see `030-tickets.md §2.1`). All streams are QUIC bidirectional
 streams. Datagrams are QUIC datagrams (RFC 9221).
 
-## 1. Common handshake: `ticket/v1`
+## 1. Common handshake: `portl/ticket/v1`
 
-Every connection begins with exactly one `ticket/v1` stream. No other
+Every connection begins with exactly one `portl/ticket/v1` stream. No other
 streams are served until `TicketAck.ok == true`. The wire format is
 specified canonically here; `030-tickets.md §9` cross-references this
 section for proof-of-possession semantics.
@@ -15,7 +15,7 @@ section for proof-of-possession semantics.
 ```
  Client                                                       Agent
    │                                                             │
-   │── open bi-stream (ALPN=ticket/v1) ─────────────────────────►│
+   │── open bi-stream (ALPN=portl/ticket/v1) ─────────────────────────►│
    │                                                             │
    │── send postcard:                                             │
    │    TicketOffer {                                             │
@@ -95,14 +95,14 @@ The agent maps `peer_token → effective_caps` and uses it to avoid
 re-verifying the ticket on each stream open. `peer_token` is valid for
 the lifetime of the QUIC connection only.
 
-## 2. `meta/v1` — ping, info, revocation push
+## 2. `portl/meta/v1` — ping, info, revocation push
 
 ### 2.1 Ping
 
 ```
 Client                                                   Agent
    │                                                       │
-   │── open bi-stream (ALPN=meta/v1) ─────────────────────►│
+   │── open bi-stream (ALPN=portl/meta/v1) ─────────────────────►│
    │── Preamble + MetaReq::Ping { t_client_us: u64 } ─────►│
    │                                                       │
    │◄── MetaResp::Pong { t_server_us: u64 } ───────────────│
@@ -145,7 +145,7 @@ Operator (holds revoker ticket)                          Agent
    │   } ──────────────────────────────────────────────────│
 ```
 
-## 3. `shell/v1` — PTY + exec
+## 3. `portl/shell/v1` — PTY + exec
 
 A shell session uses **multiple QUIC sub-streams** opened from a single
 control stream. Each data direction gets its own QUIC stream so
@@ -154,7 +154,7 @@ never head-of-line-blocks stdin.
 
 ### 3.1 Control stream
 
-The first stream opened for `shell/v1` is the control stream.
+The first stream opened for `portl/shell/v1` is the control stream.
 
 ```
 ShellReq {
@@ -192,9 +192,9 @@ Agent on control stream:
         resize  : client → agent, CBOR frames { cols: u16, rows: u16 }
         exit    : agent  → client, single CBOR frame { code: i32 }
 
-StreamPreamble (for shell/v1 sub-streams) {
+StreamPreamble (for portl/shell/v1 sub-streams) {
     peer_token : Bytes(16),
-    alpn       : "shell/v1",
+    alpn       : "portl/shell/v1",
     session_id : Bytes(16),
     kind       : "stdin" | "stdout" | "stderr" |
                  "signal" | "resize" | "exit"
@@ -228,9 +228,9 @@ or Merge → Deny) but cannot widen it.
 ```
 Client                                              Agent
   │                                                   │
-  │── ticket/v1 handshake done ──────────────────────│
+  │── portl/ticket/v1 handshake done ────────────────│
   │                                                   │
-  │── open control stream ALPN=shell/v1 ─────────────►│
+  │── open control stream ALPN=portl/shell/v1 ─────────────►│
   │── ShellReq { mode:"shell", pty, user:"ubuntu" } ─►│
   │                                                   │
   │                                         spawn bash -l in PTY
@@ -258,7 +258,7 @@ QUIC handles flow-control and head-of-line isolation per-stream, so
 stdout back-pressure can never block the client from sending a resize
 event or a SIGINT.
 
-## 4. `tcp/v1` — TCP port forward
+## 4. `portl/tcp/v1` — TCP port forward
 
 One stream **per forwarded TCP connection**. Simple, stateless on the agent.
 
@@ -271,7 +271,7 @@ Client                                            Agent                service
   │  local app connects to 127.0.0.1:3000           │                    │
   │  (bound by portl tcp peer -L 3000:127.0.0.1:22) │                    │
   │                                                 │                    │
-  │── open stream ALPN=tcp/v1 ─────────────────────►│                    │
+  │── open stream ALPN=portl/tcp/v1 ─────────────────────►│                    │
   │── TcpReq {                                      │                    │
   │     preamble,                                   │                    │
   │     host:"127.0.0.1",                           │                    │
@@ -304,7 +304,7 @@ can't drain fast enough, the local `portl-cli` sees the stream back off
 and in turn applies TCP backpressure on the local socket. No explicit
 windowing frames needed.
 
-## 5. `udp/v1` — UDP port forward
+## 5. `portl/udp/v1` — UDP port forward
 
 One **control stream** to set up the session, then **QUIC datagrams** for
 payload.
@@ -413,9 +413,9 @@ client uses that to `sendto` back to the original local source.
 - Oversize payloads are rejected with an error datagram to src_tag; apps
   fall back per their own policies.
 
-## 6. `fs/v1` — minimal file operations (deferred to v0.2)
+## 6. `portl/fs/v1` — minimal file operations (deferred to v0.2)
 
-> **Deferred from v0.1.** `fs/v1` is a nontrivial rabbit hole (symlink
+> **Deferred from v0.1.** `portl/fs/v1` is a nontrivial rabbit hole (symlink
 > traversal, sparse files, cross-OS permission bits, chunking,
 > resumability) and the v0.1 workaround is adequate:
 >
@@ -440,7 +440,7 @@ Sequence for `portl cp peer:/etc/issue /tmp/issue`:
 
 ```
 Client                                            Agent
-  │── open stream ALPN=fs/v1 ──────────────────►│
+  │── open stream ALPN=portl/fs/v1 ──────────────────►│
   │── FsReq::Get { path:"/etc/issue" } ────────│
   │                                              │
   │                            verify /etc/issue ∈ roots
@@ -450,7 +450,7 @@ Client                                            Agent
   │◄── FIN                                       │
 ```
 
-## 7. `vpn/v1` — TUN-based overlay (optional)
+## 7. `portl/vpn/v1` — TUN-based overlay (optional)
 
 Feature-gated; requires TUN privileges on both ends.
 
@@ -494,7 +494,7 @@ connection, no session multiplexing is needed.
    ▼                                                  │
   portl vpn driver (client)                           │
     reads packet from TUN                             │
-    opens QUIC datagram on vpn/v1 conn ──────────────►│
+    opens QUIC datagram on portl/vpn/v1 conn ────────►│
                                                       │
                                                       ▼
                                            portl-agent vpn service
@@ -534,7 +534,7 @@ ErrorKind =
 
 Error propagation:
 
-- At `ticket/v1` phase: stream carries `TicketAck { ok:false, reason }`
+- At `portl/ticket/v1` phase: stream carries `TicketAck { ok:false, reason }`
   then closes; connection stays up so the client can print a clear
   message and retry.
 - At per-protocol phase: protocol-specific response with `ok:false`; stream
@@ -558,20 +558,20 @@ not support every ALPN. If/when that happens, the full
 
 | ALPN | Streams | Datagrams | Interactive | Notes |
 | --- | --- | --- | --- | --- |
-| `ticket/v1` | ✓ | — | no | required on every connection |
-| `meta/v1` | ✓ | — | no | ping, info, revocation push |
-| `shell/v1` | ✓ (many) | — | yes | PTY latency matters; multi-stream |
-| `tcp/v1` | ✓ | — | no | one stream per forwarded conn |
-| `udp/v1` | ✓ control | ✓ data | often | needs datagrams |
-| `fs/v1` | ✓ | — | no | v0.2; deferred |
-| `vpn/v1` | ✓ control | ✓ data | depends | needs datagrams |
+| `portl/ticket/v1` | ✓ | — | no | required on every connection |
+| `portl/meta/v1` | ✓ | — | no | ping, info, revocation push |
+| `portl/shell/v1` | ✓ (many) | — | yes | PTY latency matters; multi-stream |
+| `portl/tcp/v1` | ✓ | — | no | one stream per forwarded conn |
+| `portl/udp/v1` | ✓ control | ✓ data | often | needs datagrams |
+| `portl/fs/v1` | ✓ | — | no | v0.2; deferred |
+| `portl/vpn/v1` | ✓ control | ✓ data | depends | needs datagrams |
 
 ## 9. Versioning
 
 Each ALPN carries a `/vN` suffix. A peer supports a specific version per
 ALPN; mismatches are detected at `open_bi()` time (the endpoint rejects
-unknown ALPNs). When we revise `shell/v1` incompatibly, it becomes
-`shell/v2`; the agent can advertise both during a transition period by
+unknown ALPNs). When we revise `portl/shell/v1` incompatibly, it becomes
+`portl/shell/v2`; the agent can advertise both during a transition period by
 registering two handlers.
 
 The ticket's `alpns` array declares what the ticket authorises. Agent

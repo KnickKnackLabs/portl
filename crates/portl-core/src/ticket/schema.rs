@@ -37,7 +37,8 @@ pub struct PortlBody {
     /// Signed target endpoint id. MUST equal `addr.endpoint_id`.
     #[serde(with = "BigArray")]
     pub target: [u8; 32],
-    /// Reserved; MUST be empty in v0.1.
+    /// Reserved for app-specific ALPNs such as `portl/example/v1`;
+    /// MUST be empty in v0.1.
     pub alpns_extra: Vec<String>,
     /// Unix seconds; inclusive.
     pub not_before: u64,
@@ -100,7 +101,7 @@ pub struct ShellCaps {
     pub env_policy: EnvPolicy,
 }
 
-/// Environment-variable policy for `shell/v1`.
+/// Environment-variable policy for `portl/shell/v1`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EnvPolicy {
     /// All environment vars stripped.
@@ -111,7 +112,7 @@ pub enum EnvPolicy {
     Replace { base: Vec<(String, String)> },
 }
 
-/// Filesystem capability bundle. `fs/v1` is deferred to v0.2.
+/// Filesystem capability bundle. `portl/fs/v1` is deferred to v0.2.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FsCaps {
     pub roots: Vec<String>,

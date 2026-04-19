@@ -462,7 +462,7 @@ The set of revocations for a given agent is a small file:
 Ways a revocation enters an agent:
 
 1. **Operator push**: `portl revocations publish --to <peer>` sends records
-   over `meta/v1`.
+   over `portl/meta/v1`.
 2. **Automatic on delete**: `portl slicer vm delete <name>` auto-revokes
    all tickets targeting that node_id.
 3. **Manual sync**: admin copies the file over out-of-band.
@@ -487,7 +487,7 @@ Master ticket for a slicer host gateway
 ───────────────────────────────────────
   node_id  : <node-id of the portl-agent --mode gateway
               running beside slicer-mac>
-  alpns    : ["tcp/v1"]
+  alpns    : ["portl/tcp/v1"]
   caps     : tcp: [{ host: "127.0.0.1", port: 8080 }]
   bearer   : <base64 slicer API token; the gateway-mode agent injects
              "Authorization: Bearer <...>" into each tunnelled HTTP

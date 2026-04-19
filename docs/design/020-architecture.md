@@ -36,7 +36,7 @@
 │   journald / audit log    per-session records                │
 │   /run/portl/metrics.sock prometheus text-format scrape      │
 │                                                              │
-│   optional: TUN iface "portl0"   (vpn/v1 enabled)            │
+│   optional: TUN iface "portl0"   (portl/vpn/v1 enabled)      │
 │                                                              │
 └──────────────────────────────────────────────────────────────┘
                      ▲
@@ -90,7 +90,7 @@ client                        relay?                       agent
   │                              │◄── (direct path found) ────│
   │◄─── 0-RTT/1-RTT QUIC up ─────┴────────────────────────────┤
   │                                                           │
-  │   open stream ALPN=ticket/v1                              │
+  │   open stream ALPN=portl/ticket/v1                              │
   │──────────────────────────────────────────────────────────►│
   │   send CBOR TicketOffer { ticket_bytes }                  │
   │                                                           │
@@ -100,13 +100,13 @@ client                        relay?                       agent
   │                                                           │
   │◄── CBOR TicketAck { ok, peer_token, effective_caps } ─────│
   │                                                           │
-  │   open stream ALPN=shell/v1  (carrying peer_token)        │
+  │   open stream ALPN=portl/shell/v1  (carrying peer_token)        │
   │──────────────────────────────────────────────────────────►│
   │   ShellReq { pty, argv, env }                             │
   │◄── ShellAck { ok }                                        │
   │   ════════════════ duplex bytes ═══════════════════       │
   │                                                           │
-  │   open stream ALPN=tcp/v1                                 │
+  │   open stream ALPN=portl/tcp/v1                                 │
   │──────────────────────────────────────────────────────────►│
   │   TcpReq { host:"127.0.0.1", port: 22 }                   │
   │◄── TcpAck { ok }                                          │
@@ -202,27 +202,27 @@ agent from becoming a free oracle about `trust.roots`.
 ## 5. Stream multiplex / per-protocol dispatch
 
 ```
-                            ┌──── ALPN = ticket/v1 ───── TicketService
+                            ┌──── ALPN = portl/ticket/v1 ───── TicketService
                             │
-                            ├──── ALPN = meta/v1 ─────── MetaService
+                            ├──── ALPN = portl/meta/v1 ─────── MetaService
                             │                           (ping, info,
                             │                            revocation push)
                             │
-   QUIC Connection  ────────┼──── ALPN = shell/v1 ────── ShellService
+   QUIC Connection  ────────┼──── ALPN = portl/shell/v1 ────── ShellService
    (one per peer)           │                           (1 stream/session,
                             │                            with PTY)
                             │
-                            ├──── ALPN = tcp/v1 ──────── TcpService
+                            ├──── ALPN = portl/tcp/v1 ──────── TcpService
                             │                           (1 stream per
                             │                            forwarded conn)
                             │
-                            ├──── ALPN = udp/v1 ──────── UdpService
+                            ├──── ALPN = portl/udp/v1 ──────── UdpService
                             │                           (1 control stream +
                             │                            N QUIC datagrams)
                             │
-                            ├──── ALPN = fs/v1 ────────  FsService
+                            ├──── ALPN = portl/fs/v1 ────────  FsService
                             │
-                            └──── ALPN = vpn/v1 ──────── VpnService
+                            └──── ALPN = portl/vpn/v1 ──────── VpnService
                                                         (1 control stream +
                                                          raw IP datagrams)
 ```
@@ -306,7 +306,7 @@ agent from becoming a free oracle about `trust.roots`.
                     │
                     │ accept()
                     ▼
-               portl-cli ── open QUIC stream (tcp/v1) ──▶ agent
+               portl-cli ── open QUIC stream (portl/tcp/v1) ──▶ agent
                                                            │
                                                            │ connect()
                                                            ▼
@@ -351,7 +351,7 @@ agent from becoming a free oracle about `trust.roots`.
  +---------+----------+                                   +---------+----------+
            │                                                        │
            ▼                                                        │
- +--------------------+     QUIC datagrams (vpn/v1)        +────────┴───────────+
+ +--------------------+  QUIC datagrams (portl/vpn/v1)     +────────┴───────────+
  | portl vpn driver   │◄──────────────────────────────────►│ portl-agent vpn    │
  +--------------------+                                   +--------------------+
 ```
