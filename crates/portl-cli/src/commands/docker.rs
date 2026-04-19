@@ -1,19 +1,23 @@
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
 use docker_portl::{ADAPTER_NAME, DockerBootstrapper, DockerHandle};
 use iroh_tickets::Ticket;
-use portl_core::bootstrap::{Bootstrapper, Handle, ProvisionSpec, TicketSpec};
+use portl_core::bootstrap::{Bootstrapper, Handle, ProvisionSpec, TargetStatus, TicketSpec};
 use portl_core::id::store;
+use portl_core::ticket::hash::ticket_id;
 use portl_core::ticket::mint::mint_root;
+use portl_core::ticket::verify::MAX_DELEGATION_DEPTH;
 
 use crate::alias_store::{AliasRecord, AliasStore, StoredSpec, now_unix_secs};
 use crate::commands::mint_root::{parse_caps, parse_endpoint_bytes, parse_ttl};
 
 const DEFAULT_IMAGE: &str = "ghcr.io/knickknacklabs/portl-agent:latest";
 const DEFAULT_NETWORK: &str = "bridge";
-const DEFAULT_CAPS: &str = "shell";
 
+#[allow(clippy::too_many_arguments)]
 pub fn add(
     name: &str,
     image: Option<&str>,
@@ -22,68 +26,28 @@ pub fn add(
     ttl: &str,
     to: Option<&str>,
     labels: &[String],
+    rm_existing: bool,
 ) -> Result<ExitCode> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
         let operator = store::load(&store::default_path()).context("load operator identity")?;
-        let caps = parse_caps(agent_caps)?;
-        let ttl_secs = parse_ttl(ttl)?;
-        let to_bytes = to.map(parse_endpoint_bytes).transpose()?;
-        let labels = parse_labels(labels)?;
-        let bootstrapper =
-            DockerBootstrapper::connect_with_local_defaults(vec![operator.verifying_key()])?;
-        let provision_spec = ProvisionSpec {
-            name: name.to_owned(),
-            adapter_params: serde_json::json!({
-                "image": image.unwrap_or(DEFAULT_IMAGE),
-                "network": network.unwrap_or(DEFAULT_NETWORK),
-            }),
-            labels: labels.clone(),
-        };
         let ticket_spec = TicketSpec {
-            caps: caps.clone(),
-            ttl_secs,
-            to: to_bytes,
-            depth: portl_core::ticket::verify::MAX_DELEGATION_DEPTH,
+            caps: parse_caps(agent_caps)?,
+            ttl_secs: parse_ttl(ttl)?,
+            to: to.map(parse_endpoint_bytes).transpose()?,
+            depth: MAX_DELEGATION_DEPTH,
         };
-        let handle = bootstrapper.provision(&provision_spec).await?;
-        let docker_handle = DockerHandle::from_handle(&handle)?;
-        let endpoint_bytes = parse_endpoint_bytes(&docker_handle.endpoint_id)?;
-        let endpoint_id =
-            iroh_base::EndpointId::from_bytes(&endpoint_bytes).context("decode endpoint id")?;
-        bootstrapper.register(&handle, endpoint_id).await?;
-
-        let now = u64::try_from(now_unix_secs()?)?;
-        let ticket = mint_root(
-            operator.signing_key(),
-            iroh_base::EndpointAddr::new(endpoint_id),
-            ticket_spec.caps.clone(),
-            now,
-            now.checked_add(ticket_spec.ttl_secs)
-                .context("ticket ttl overflow")?,
-            ticket_spec.to,
-        )?;
-
-        AliasStore::default().save(
-            &AliasRecord {
-                name: name.to_owned(),
-                adapter: ADAPTER_NAME.to_owned(),
-                container_id: docker_handle.container_id,
-                endpoint_id: docker_handle.endpoint_id,
-                image: image.unwrap_or(DEFAULT_IMAGE).to_owned(),
-                network: network.unwrap_or(DEFAULT_NETWORK).to_owned(),
-                created_at: now_unix_secs()?,
-            },
-            &StoredSpec {
-                caps,
-                ttl_secs: ticket_spec.ttl_secs,
-                to: ticket_spec.to,
-                labels,
-            },
-        )?;
-
-        println!("{}", ticket.serialize());
-        Ok(ExitCode::SUCCESS)
+        let label_pairs = parse_labels(labels)?;
+        add_with_ticket_spec(
+            name,
+            image.unwrap_or(DEFAULT_IMAGE),
+            network.unwrap_or(DEFAULT_NETWORK),
+            label_pairs,
+            rm_existing,
+            ticket_spec,
+            &operator,
+        )
+        .await
     })
 }
 
@@ -91,11 +55,22 @@ pub fn list(json_output: bool) -> Result<ExitCode> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
         let bootstrapper = DockerBootstrapper::connect_with_local_defaults(Vec::new())?;
+        let listed_handles = bootstrapper
+            .list_portl_containers()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|handle| (handle.container_id, handle.network))
+            .collect::<std::collections::HashMap<_, _>>();
         let aliases = AliasStore::default().list()?;
         let rows = aliases
             .into_iter()
             .map(|alias| {
                 let bootstrapper = bootstrapper.clone();
+                let network = listed_handles
+                    .get(&alias.container_id)
+                    .cloned()
+                    .unwrap_or_else(|| alias.network.clone());
                 async move {
                     let handle = alias_to_handle(&alias);
                     let status = bootstrapper.resolve(&handle).await?;
@@ -104,7 +79,7 @@ pub fn list(json_output: bool) -> Result<ExitCode> {
                         "container_id": alias.container_id,
                         "endpoint_id": alias.endpoint_id,
                         "image": alias.image,
-                        "network": alias.network,
+                        "network": network,
                         "status": format!("{status:?}"),
                     }))
                 }
@@ -120,13 +95,14 @@ pub fn list(json_output: bool) -> Result<ExitCode> {
         } else if rendered.is_empty() {
             println!("No docker aliases found.");
         } else {
-            println!("NAME\tSTATUS\tENDPOINT\tIMAGE");
+            println!("NAME\tSTATUS\tENDPOINT\tNETWORK\tIMAGE");
             for row in &rendered {
                 println!(
-                    "{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}",
                     row["name"].as_str().unwrap_or_default(),
                     row["status"].as_str().unwrap_or_default(),
                     row["endpoint_id"].as_str().unwrap_or_default(),
+                    row["network"].as_str().unwrap_or_default(),
                     row["image"].as_str().unwrap_or_default(),
                 );
             }
@@ -135,48 +111,80 @@ pub fn list(json_output: bool) -> Result<ExitCode> {
     })
 }
 
-pub fn rm(name: &str, _force: bool, _keep_tickets: bool) -> Result<ExitCode> {
+pub fn rm(name: &str, force: bool, keep_tickets: bool) -> Result<ExitCode> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
         let store = AliasStore::default();
         let Some(alias) = store.get(name)? else {
             bail!("unknown docker alias {name}");
         };
+        let spec = store
+            .get_spec(name)?
+            .ok_or_else(|| anyhow!("missing stored spec for docker alias {name}"))?;
         let bootstrapper = DockerBootstrapper::connect_with_local_defaults(Vec::new())?;
-        bootstrapper.teardown(&alias_to_handle(&alias)).await?;
+        let handle = alias_to_handle(&alias);
+        let status = bootstrapper.resolve(&handle).await?;
+        ensure_rm_allowed(name, &status, force)?;
+
+        if force || matches!(status, TargetStatus::Exited { .. }) {
+            bootstrapper.teardown(&handle).await?;
+        }
+
+        if force
+            && !keep_tickets
+            && let Some(root_ticket_id) = spec.root_ticket_id
+        {
+            revoke_ticket(root_ticket_id, &local_revocations_path())?;
+        }
+
         store.remove(name)?;
         Ok(ExitCode::SUCCESS)
     })
 }
 
 pub fn rebuild(name: &str) -> Result<ExitCode> {
-    let store = AliasStore::default();
-    let alias = store
-        .get(name)?
-        .ok_or_else(|| anyhow!("unknown docker alias {name}"))?;
-    let spec = store
-        .get_spec(name)?
-        .ok_or_else(|| anyhow!("missing stored spec for docker alias {name}"))?;
-    rm(name, false, false)?;
-    let label_args = spec
-        .labels
-        .into_iter()
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect::<Vec<_>>();
-    let caps_json = serde_json::to_string(&spec.caps)?;
-    let caps: portl_core::ticket::schema::Capabilities = serde_json::from_str(&caps_json)?;
-    add(
-        &alias.name,
-        Some(&alias.image),
-        Some(&alias.network),
-        &render_caps(&caps),
-        &format!("{}s", spec.ttl_secs),
-        spec.to.map(hex::encode).as_deref(),
-        &label_args,
-    )
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async move {
+        let store = AliasStore::default();
+        let alias = store
+            .get(name)?
+            .ok_or_else(|| anyhow!("unknown docker alias {name}"))?;
+        let spec = store
+            .get_spec(name)?
+            .ok_or_else(|| anyhow!("missing stored spec for docker alias {name}"))?;
+        let operator = store::load(&store::default_path()).context("load operator identity")?;
+
+        rm(name, true, true)?;
+        add_with_ticket_spec(
+            &alias.name,
+            &alias.image,
+            &alias.network,
+            spec.labels,
+            false,
+            TicketSpec {
+                caps: spec.caps,
+                ttl_secs: spec.ttl_secs,
+                to: spec.to,
+                depth: MAX_DELEGATION_DEPTH,
+            },
+            &operator,
+        )
+        .await
+    })
 }
 
-pub fn logs(name: &str, follow: bool, tail: Option<&str>) -> Result<ExitCode> {
+pub fn logs(
+    name: &str,
+    follow: bool,
+    tail: Option<&str>,
+    deprecated_container_alias: bool,
+) -> Result<ExitCode> {
+    if deprecated_container_alias {
+        eprintln!(
+            "warning: `portl docker container logs` is deprecated; use `portl docker logs` instead"
+        );
+    }
+
     let store = AliasStore::default();
     let alias = store
         .get(name)?
@@ -201,6 +209,116 @@ pub fn logs(name: &str, follow: bool, tail: Option<&str>) -> Result<ExitCode> {
     } else {
         ExitCode::FAILURE
     })
+}
+
+async fn add_with_ticket_spec(
+    name: &str,
+    image: &str,
+    network: &str,
+    labels: Vec<(String, String)>,
+    rm_existing: bool,
+    ticket_spec: TicketSpec,
+    operator: &portl_core::id::Identity,
+) -> Result<ExitCode> {
+    let bootstrapper =
+        DockerBootstrapper::connect_with_local_defaults(vec![operator.verifying_key()])?;
+    let provision_spec = ProvisionSpec {
+        name: name.to_owned(),
+        adapter_params: serde_json::json!({
+            "image": image,
+            "network": network,
+            "rm_existing": rm_existing,
+        }),
+        labels: labels.clone(),
+    };
+    let handle = bootstrapper.provision(&provision_spec).await?;
+    let docker_handle = DockerHandle::from_handle(&handle)?;
+    let endpoint_bytes = parse_endpoint_bytes(&docker_handle.endpoint_id)?;
+    let endpoint_id =
+        iroh_base::EndpointId::from_bytes(&endpoint_bytes).context("decode endpoint id")?;
+    bootstrapper.register(&handle, endpoint_id).await?;
+
+    let now = u64::try_from(now_unix_secs()?)?;
+    let ticket = mint_root(
+        operator.signing_key(),
+        iroh_base::EndpointAddr::new(endpoint_id),
+        ticket_spec.caps.clone(),
+        now,
+        now.checked_add(ticket_spec.ttl_secs)
+            .context("ticket ttl overflow")?,
+        ticket_spec.to,
+    )?;
+
+    AliasStore::default().save(
+        &AliasRecord {
+            name: name.to_owned(),
+            adapter: ADAPTER_NAME.to_owned(),
+            container_id: docker_handle.container_id,
+            endpoint_id: docker_handle.endpoint_id,
+            image: image.to_owned(),
+            network: network.to_owned(),
+            created_at: now_unix_secs()?,
+        },
+        &StoredSpec {
+            caps: ticket_spec.caps.clone(),
+            ttl_secs: ticket_spec.ttl_secs,
+            to: ticket_spec.to,
+            labels,
+            root_ticket_id: Some(ticket_id(&ticket.sig)),
+        },
+    )?;
+
+    println!("{}", ticket.serialize());
+    Ok(ExitCode::SUCCESS)
+}
+
+fn ensure_rm_allowed(name: &str, status: &TargetStatus, force: bool) -> Result<()> {
+    if force {
+        return Ok(());
+    }
+
+    match status {
+        TargetStatus::Exited { .. } | TargetStatus::NotFound => Ok(()),
+        TargetStatus::Running | TargetStatus::Provisioning => bail!(
+            "container '{name}' is still running; use `portl docker container rm {name} --force`"
+        ),
+        TargetStatus::Unknown(other) => bail!(
+            "container '{name}' is not known to be stopped (status: {other}); use `portl docker container rm {name} --force`"
+        ),
+    }
+}
+
+fn local_revocations_path() -> PathBuf {
+    store::default_path().parent().map_or_else(
+        || PathBuf::from("revocations.json"),
+        |parent| parent.join("revocations.json"),
+    )
+}
+
+fn revoke_ticket(ticket_id: [u8; 16], path: &Path) -> Result<()> {
+    let mut ids: Vec<String> = if path.exists() {
+        serde_json::from_str(
+            &fs::read_to_string(path)
+                .with_context(|| format!("read revocations from {}", path.display()))?,
+        )
+        .with_context(|| format!("parse revocations from {}", path.display()))?
+    } else {
+        Vec::new()
+    };
+    let encoded = hex::encode(ticket_id);
+    if !ids.iter().any(|existing| existing == &encoded) {
+        ids.push(encoded);
+        ids.sort_unstable();
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    fs::write(
+        path,
+        serde_json::to_string_pretty(&ids).context("encode revocations")?,
+    )
+    .with_context(|| format!("write revocations to {}", path.display()))
 }
 
 fn alias_to_handle(alias: &AliasRecord) -> Handle {
@@ -229,10 +347,31 @@ fn parse_labels(labels: &[String]) -> Result<Vec<(String, String)>> {
         .collect()
 }
 
-fn render_caps(caps: &portl_core::ticket::schema::Capabilities) -> String {
-    if caps.presence == 0b0000_0001 && caps.shell.is_some() {
-        "shell".to_owned()
-    } else {
-        DEFAULT_CAPS.to_owned()
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::{ensure_rm_allowed, revoke_ticket};
+    use portl_core::bootstrap::TargetStatus;
+
+    #[test]
+    fn rm_force_revokes_ticket() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("revocations.json");
+
+        revoke_ticket([0x11; 16], &path).expect("write revocation");
+
+        let contents = std::fs::read_to_string(path).expect("read revocations");
+        assert!(contents.contains(&hex::encode([0x11; 16])));
+    }
+
+    #[test]
+    fn rm_without_force_refuses_running_container() {
+        let err = ensure_rm_allowed("demo", &TargetStatus::Running, false)
+            .expect_err("running container must be refused");
+        assert!(
+            err.to_string()
+                .contains("container 'demo' is still running")
+        );
     }
 }
