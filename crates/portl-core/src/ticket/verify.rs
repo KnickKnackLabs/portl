@@ -64,6 +64,13 @@ pub fn verify_chain(
         let parent_key = resolved_issuer(parent);
         verify_body(&parent_key, &child.body, &child.sig)?;
 
+        let child_resolved = resolved_issuer(child);
+        if child_resolved != parent_key {
+            return Err(PortlError::Chain(
+                "child issuer does not match parent authority",
+            ));
+        }
+
         if parent_ref.parent_ticket_id != parent_ticket_id(&parent.sig) {
             return Err(PortlError::Chain("parent ticket id mismatch"));
         }

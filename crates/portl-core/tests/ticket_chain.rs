@@ -286,6 +286,50 @@ fn verify_rejects_forged_target_on_operator_issued_ticket() {
 }
 
 #[test]
+fn verify_rejects_child_whose_resolved_issuer_mismatches_parent_key() {
+    let operator = SigningKey::from_bytes(&[44u8; 32]);
+    let target = SigningKey::from_bytes(&[45u8; 32]);
+    let pivot = SigningKey::from_bytes(&[46u8; 32]);
+    let root = mint_root(
+        &operator,
+        endpoint_addr_from_key(&target),
+        shell_caps(),
+        1_000,
+        4_600,
+        None,
+    )
+    .unwrap();
+    let body = PortlBody {
+        caps: shell_caps(),
+        target: root.body.target,
+        alpns_extra: vec![],
+        not_before: 1_100,
+        not_after: 4_500,
+        issuer: Some(pivot.verifying_key().to_bytes()),
+        parent: Some(Delegation {
+            parent_ticket_id: parent_ticket_id(&root.sig),
+            depth_remaining: MAX_DELEGATION_DEPTH - 1,
+        }),
+        nonce: [47u8; 8],
+        bearer: None,
+        to: None,
+    };
+    let sig = sign_body(&operator, &body).unwrap();
+    let child = PortlTicket {
+        v: 1,
+        addr: root.addr.clone(),
+        body,
+        sig,
+    };
+
+    let err = verify_chain(&child, &[root], &trust_root_for(&operator), 1_200).unwrap_err();
+    assert!(matches!(
+        err,
+        PortlError::Chain("child issuer does not match parent authority")
+    ));
+}
+
+#[test]
 fn verify_chain_verifies_before_hashing_parent_signature() {
     let signer = SigningKey::from_bytes(&[40u8; 32]);
     let root = mint_root(
