@@ -31,7 +31,7 @@ use crate::AgentState;
 use crate::audit;
 use crate::caps_enforce::{shell_caps, shell_permits};
 use crate::session::Session;
-use crate::shell_registry::{ShellProcess, StdinMessage};
+use crate::shell_registry::{ShellProcess, ShellRegistry, StdinMessage};
 use crate::stream_io::BufferedRecv;
 
 const MAX_CONTROL_BYTES: usize = 64 * 1024;
@@ -67,6 +67,19 @@ pub(crate) async fn serve_stream(
         }
         portl_proto::shell_v1::ShellFirstFrame::Sub(tail) => {
             serve_substream(connection, session, state, send, recv, preamble, tail).await
+        }
+    }
+}
+
+struct ShellSessionGuard<'a> {
+    registry: &'a ShellRegistry,
+    session_id: [u8; 16],
+}
+
+impl Drop for ShellSessionGuard<'_> {
+    fn drop(&mut self) {
+        if let Some((_, process)) = self.registry.remove(&self.session_id) {
+            terminate_process(process.signal_target);
         }
     }
 }
@@ -130,7 +143,25 @@ async fn serve_control_stream(
     state
         .shell_registry
         .insert(session_id, Arc::clone(&process));
+    let _session_guard = ShellSessionGuard {
+        registry: &state.shell_registry,
+        session_id,
+    };
     audit::shell_spawn(&session, req.user.as_deref(), req.argv.as_ref());
+
+    let state_for_exit = Arc::clone(&state);
+    let process_for_exit = Arc::clone(&process);
+    tokio::spawn(async move {
+        let mut exit_rx = process_for_exit.exit_rx();
+        if exit_rx.borrow().is_none() {
+            while exit_rx.changed().await.is_ok() {
+                if exit_rx.borrow().is_some() {
+                    break;
+                }
+            }
+        }
+        state_for_exit.shell_registry.remove(&session_id);
+    });
 
     let ack = portl_proto::shell_v1::ShellAck {
         ok: true,
@@ -147,8 +178,6 @@ async fn serve_control_stream(
             .await
             .context("read control stream")?;
         if read == 0 {
-            terminate_process(process.signal_target);
-            state.shell_registry.remove(&session_id);
             let _ = send.finish();
             return Ok(());
         }
@@ -785,5 +814,44 @@ fn fresh_session_id() -> [u8; 16] {
         if id[0] >= 2 {
             return id;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ShellProcess, ShellSessionGuard};
+    use crate::shell_registry::ShellRegistry;
+    use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
+
+    #[test]
+    fn shell_registry_is_empty_after_control_stream_error() {
+        let registry = ShellRegistry::default();
+        let session_id = [9; 16];
+        let (stdin_tx, _stdin_rx) = mpsc::channel(1);
+        let (_stdout_tx, stdout_rx) = mpsc::channel(1);
+        let (_stderr_tx, stderr_rx) = mpsc::channel(1);
+        let (exit_tx, _) = watch::channel(None);
+
+        registry.insert(
+            session_id,
+            std::sync::Arc::new(ShellProcess {
+                pid: 42,
+                stdin_tx,
+                stdout_rx: AsyncMutex::new(Some(stdout_rx)),
+                stderr_rx: AsyncMutex::new(Some(stderr_rx)),
+                exit_tx,
+                signal_target: None,
+                pty_master: None,
+            }),
+        );
+
+        {
+            let _guard = ShellSessionGuard {
+                registry: &registry,
+                session_id,
+            };
+        }
+
+        assert!(registry.is_empty());
     }
 }
