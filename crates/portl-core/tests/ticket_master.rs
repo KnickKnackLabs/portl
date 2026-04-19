@@ -34,7 +34,7 @@ fn master_ticket_roundtrips_bearer_extraction() {
         tcp_caps(8080),
         b"slicer-token".to_vec(),
         600,
-        Some([7u8; 32]),
+        [7u8; 32],
     )
     .expect("mint master ticket");
 
@@ -51,7 +51,7 @@ fn canonical_rejects_empty_bearer_bytes() {
         tcp_caps(8080),
         b"ok".to_vec(),
         600,
-        None,
+        [8u8; 32],
     )
     .expect("mint master ticket");
     ticket.body.bearer = Some(Vec::new());
@@ -61,15 +61,30 @@ fn canonical_rejects_empty_bearer_bytes() {
 }
 
 #[test]
-fn mint_master_rejects_empty_bearer() {
+fn mint_master_requires_to() {
     let issuer = ed25519_dalek::SigningKey::from_bytes(&[65u8; 32]);
-    let err = mint_master(
+    let ticket = mint_master(
         &issuer,
         addr_from_seed(66),
         tcp_caps(8080),
+        b"token".to_vec(),
+        60,
+        [0xabu8; 32],
+    )
+    .expect("master ticket should require a concrete holder binding");
+    assert_eq!(ticket.body.to, Some([0xabu8; 32]));
+}
+
+#[test]
+fn mint_master_rejects_empty_bearer() {
+    let issuer = ed25519_dalek::SigningKey::from_bytes(&[67u8; 32]);
+    let err = mint_master(
+        &issuer,
+        addr_from_seed(68),
+        tcp_caps(8080),
         Vec::new(),
         60,
-        None,
+        [9u8; 32],
     )
     .expect_err("empty bearer must fail");
     assert!(err.to_string().contains("non-empty"));

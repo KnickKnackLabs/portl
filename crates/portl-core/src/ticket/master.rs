@@ -18,7 +18,7 @@ pub fn mint_master(
     caps: Capabilities,
     bearer: Vec<u8>,
     ttl_secs: u64,
-    to: Option<[u8; 32]>,
+    to: [u8; 32],
 ) -> Result<PortlTicket> {
     if bearer.is_empty() {
         return Err(PortlError::Ticket("master ticket bearer must be non-empty"));
@@ -44,7 +44,7 @@ pub fn mint_master(
         parent: None,
         nonce: fresh_nonce(),
         bearer: Some(bearer),
-        to,
+        to: Some(to),
     };
     let sig = sign_body(sk, &body)?;
     let ticket = PortlTicket {

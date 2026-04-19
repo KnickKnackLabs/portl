@@ -36,9 +36,7 @@ struct SlicerLoginRecord {
 
 pub fn login(master_ticket_uri: &str, base_url: Option<&str>) -> Result<ExitCode> {
     let ticket = read_ticket(master_ticket_uri)?;
-    if ticket.body.bearer.as_deref().is_none_or(<[u8]>::is_empty) {
-        bail!("slicer login requires a master ticket with a non-empty bearer");
-    }
+    validate_master_ticket_for_login(&ticket)?;
 
     let record = SlicerLoginRecord {
         ticket_file_path: slicer_home().join("master-tickets").join("slicer.ticket"),
@@ -425,6 +423,18 @@ fn resolve_base_url(flag: Option<&str>) -> String {
         .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned())
 }
 
+fn validate_master_ticket_for_login(ticket: &PortlTicket) -> Result<()> {
+    if ticket.body.bearer.as_deref().is_none_or(<[u8]>::is_empty) {
+        bail!("slicer login requires a master ticket with a non-empty bearer");
+    }
+    if ticket.body.bearer.is_some() && ticket.body.to.is_none() {
+        return Err(anyhow!(
+            "master tickets MUST be bound to a holder via --to; this ticket is bearer-only and would grant unrestricted access to anyone"
+        ));
+    }
+    Ok(())
+}
+
 fn read_ticket(spec: &str) -> Result<PortlTicket> {
     if Path::new(spec).exists() {
         return read_ticket_from_path(Path::new(spec));
@@ -493,7 +503,7 @@ fn append_revocation(ticket_id: [u8; 16], path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_revocation, master_ticket_target};
+    use super::{append_revocation, master_ticket_target, validate_master_ticket_for_login};
     use tempfile::tempdir;
 
     #[test]
@@ -504,6 +514,43 @@ mod tests {
         let contents = std::fs::read_to_string(path).expect("read revocations");
         assert!(contents.contains("vm_deleted"));
         assert!(contents.contains(&hex::encode([0x11; 16])));
+    }
+
+    #[test]
+    fn slicer_login_rejects_bearer_without_to() {
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[70u8; 32]);
+        let addr = iroh_base::EndpointAddr::new(
+            iroh_base::EndpointId::from_bytes(&issuer.verifying_key().to_bytes()).unwrap(),
+        );
+        let mut ticket = portl_core::ticket::master::mint_master(
+            &issuer,
+            addr,
+            portl_core::ticket::schema::Capabilities {
+                presence: 0b0000_0010,
+                shell: None,
+                tcp: Some(vec![portl_core::ticket::schema::PortRule {
+                    host_glob: "127.0.0.1".to_owned(),
+                    port_min: 8080,
+                    port_max: 8080,
+                }]),
+                udp: None,
+                fs: None,
+                vpn: None,
+                meta: None,
+            },
+            b"slicer-token".to_vec(),
+            60,
+            [1u8; 32],
+        )
+        .expect("mint master ticket");
+        ticket.body.to = None;
+
+        let err = validate_master_ticket_for_login(&ticket)
+            .expect_err("bearer-only master ticket must be rejected");
+        assert!(
+            err.to_string()
+                .contains("master tickets MUST be bound to a holder")
+        );
     }
 
     #[test]
@@ -530,7 +577,7 @@ mod tests {
             },
             vec![1],
             60,
-            None,
+            [2u8; 32],
         )
         .expect("mint master ticket");
         assert_eq!(

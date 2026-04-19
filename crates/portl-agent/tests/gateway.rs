@@ -42,7 +42,7 @@ async fn gateway_injects_authorization_header_from_master_ticket() -> Result<()>
         gateway_caps(upstream.address().port()),
         b"slicer-token".to_vec(),
         300,
-        Some(operator.verifying_key()),
+        operator.verifying_key(),
     )?;
 
     let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator)
