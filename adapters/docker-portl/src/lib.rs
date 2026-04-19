@@ -12,7 +12,7 @@ use bollard::container::{
 };
 use bollard::errors::Error as DockerError;
 use bollard::image::CreateImageOptions;
-use bollard::models::{ContainerInspectResponse, HostConfig};
+use bollard::models::{ContainerInspectResponse, HostConfig, RestartPolicy, RestartPolicyNameEnum};
 use bollard::secret::ContainerStateStatusEnum;
 use futures_util::stream::TryStreamExt;
 use portl_core::bootstrap::{Bootstrapper, Handle, ProvisionSpec, TargetStatus};
@@ -85,18 +85,7 @@ impl Bootstrapper for DockerBootstrapper {
 
         let labels = docker_labels(spec, &endpoint_id);
         let binds = docker_binds(&secret_path, &config_path);
-        let host_config = HostConfig {
-            binds: Some(binds),
-            network_mode: Some(params.network.clone()),
-            ..HostConfig::default()
-        };
-        let config = Config {
-            image: Some(params.image.clone()),
-            labels: Some(labels),
-            host_config: Some(host_config),
-            cmd: Some(vec!["--config".to_owned(), CONFIG_MOUNT_PATH.to_owned()]),
-            ..Config::default()
-        };
+        let config = build_container_config(&params, labels, binds);
 
         let options = Some(CreateContainerOptions {
             name: spec.name.clone(),
@@ -390,6 +379,35 @@ fn render_agent_config(trust_roots: &[[u8; 32]]) -> Result<String> {
     ))
 }
 
+fn build_container_config(
+    params: &DockerProvisionParams,
+    labels: HashMap<String, String>,
+    binds: Vec<String>,
+) -> Config<String> {
+    let host_config = HostConfig {
+        binds: Some(binds),
+        network_mode: Some(params.network.clone()),
+        restart_policy: Some(RestartPolicy {
+            name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
+            maximum_retry_count: None,
+        }),
+        ..HostConfig::default()
+    };
+
+    Config {
+        image: Some(params.image.clone()),
+        labels: Some(labels),
+        host_config: Some(host_config),
+        entrypoint: Some(vec![
+            "portl".to_owned(),
+            "agent".to_owned(),
+            "run".to_owned(),
+        ]),
+        cmd: Some(vec!["--config".to_owned(), CONFIG_MOUNT_PATH.to_owned()]),
+        ..Config::default()
+    }
+}
+
 fn docker_labels(spec: &ProvisionSpec, endpoint_id: &str) -> HashMap<String, String> {
     let mut labels = HashMap::from([
         ("portl.adapter".to_owned(), ADAPTER_NAME.to_owned()),
@@ -463,8 +481,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ADAPTER_NAME, CONFIG_MOUNT_PATH, DEFAULT_NETWORK, SECRET_MOUNT_PATH, docker_binds,
-        docker_labels, normalize_image, parse_adapter_params, render_agent_config,
+        ADAPTER_NAME, CONFIG_MOUNT_PATH, DEFAULT_NETWORK, DockerProvisionParams, SECRET_MOUNT_PATH,
+        build_container_config, docker_binds, docker_labels, normalize_image, parse_adapter_params,
+        render_agent_config,
     };
 
     #[test]
@@ -504,6 +523,49 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("docker adapter_params must be an object")
+        );
+    }
+
+    #[test]
+    fn container_config_sets_entrypoint_cmd_and_restart_policy() {
+        let config = build_container_config(
+            &DockerProvisionParams {
+                image: "portl-agent:latest".to_owned(),
+                network: DEFAULT_NETWORK.to_owned(),
+                rm_existing: false,
+            },
+            docker_labels(
+                &ProvisionSpec {
+                    name: "demo".to_owned(),
+                    adapter_params: json!({
+                        "image": "portl-agent:latest",
+                        "network": DEFAULT_NETWORK,
+                    }),
+                    labels: vec![],
+                },
+                "endpoint-1",
+            ),
+            docker_binds(Path::new("/tmp/secret"), Path::new("/tmp/agent.toml")),
+        );
+
+        assert_eq!(
+            config.entrypoint,
+            Some(vec![
+                "portl".to_owned(),
+                "agent".to_owned(),
+                "run".to_owned()
+            ])
+        );
+        assert_eq!(
+            config.cmd,
+            Some(vec!["--config".to_owned(), CONFIG_MOUNT_PATH.to_owned()])
+        );
+        assert_eq!(
+            config
+                .host_config
+                .and_then(|host| host.restart_policy)
+                .and_then(|policy| policy.name),
+            Some(bollard::models::RestartPolicyNameEnum::UNLESS_STOPPED)
         );
     }
 
