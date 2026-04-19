@@ -448,7 +448,8 @@ fn spawn_pty_process(
         && user.switch_required
     {
         return Err(portl_proto::shell_v1::ShellReason::BadUser(
-            "portable-pty uid switching is not implemented".to_owned(),
+            "pty mode does not support --user in v0.1; use `portl exec --user <name>` or run the agent as the target user"
+                .to_owned(),
         ));
     }
 

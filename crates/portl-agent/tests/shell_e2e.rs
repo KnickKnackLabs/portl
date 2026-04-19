@@ -251,6 +251,46 @@ async fn exec_user_switch_drops_supplementary_groups() -> Result<()> {
     shutdown(connection, client, server, agent).await
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn pty_user_switch_returns_actionable_error() -> Result<()> {
+    if !nix::unistd::geteuid().is_root() {
+        return Ok(());
+    }
+    let Some(target) = nix::unistd::User::from_name("nobody")? else {
+        return Ok(());
+    };
+
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator).await?;
+    let ticket = root_ticket(&operator, server.addr(), shell_caps(true, true));
+
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let Err(err) = open_shell(
+        &connection,
+        &session,
+        Some(target.name),
+        None,
+        PtyCfg {
+            term: "xterm-256color".to_owned(),
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    else {
+        anyhow::bail!("pty user switch should be rejected in v0.1")
+    };
+    assert!(
+        err.to_string()
+            .contains("pty mode does not support --user in v0.1"),
+        "error was: {err:#}"
+    );
+
+    shutdown(connection, client, server, agent).await
+}
+
 #[tokio::test]
 async fn shell_rejects_mode_not_permitted_by_caps() -> Result<()> {
     let (client, server) = pair().await?;
