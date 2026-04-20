@@ -69,6 +69,7 @@ prose still use `node_id`. Treat them as synonymous.
 | 110 | `110-workspace.md` | Cargo workspace layout, crate boundaries, dependencies. |
 | 120 | `120-roadmap.md` | Milestones M0–M10 with exit criteria (M4 docker, M5 slicer). |
 | 130 | `130-open-questions.md` | Decisions the author wants confirmed before scaffolding. |
+| 140 | `140-v0.2-cleanup.md` | **v0.2.0 cleanup plan.** Breaking simplifications; supersedes parts of 060/080/090 on ship. |
 
 Design artifacts for deferred/post-v0.1 work (in `future/`):
 

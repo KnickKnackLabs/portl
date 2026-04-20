@@ -22,17 +22,33 @@
          ▼  v0.1.0 release
 
   ─── post-v0.1 ───
-  M8 ─ fs/v1
-  M9 ─ vpn mode (stretch)
- M10 ─ publish to crates.io ─────────► v0.2.0
+  v0.1.x patch line ─ shell-handler stability (rlimits, pgroup
+                      kill on disconnect, revoke kills live
+                      sessions, session-start audit, stdout
+                      drain timeout).
 
-  Future (demand-driven, not on critical path):
+  v0.2.0 ─ "The Big Cleanup" — breaking simplification.
+           Full plan: `140-v0.2-cleanup.md`.
+           Headline: `portl init` + `portl docker run <image>`
+           = shelled in, in two commands.
+
+  v0.3+ ─ demand-driven, not committed:
+     fs/v1
+     vpn mode
+     publish to crates.io
      Alternate data planes (WebRTC, Loom/AWDL) — `OverlayTransport`
          design landed then; see `future/140-transport-abstraction.md`
      Tailscale passthrough — if `tailscale-rs` stabilises
      SSH-as-transport
      Post-quantum hybrid signatures
 ```
+
+The v0.1.0 release shipped on 2026-04-20. The post-v0.1 plan
+diverged from the pre-release roadmap after operator feedback:
+fs/v1 is pushed out in favour of a shape-cleanup release (v0.2)
+that uses the only window we'll ever have to break CLI and
+env-var shapes without maintenance burden. See
+`140-v0.2-cleanup.md`.
 
 ## 2. Milestone detail
 
