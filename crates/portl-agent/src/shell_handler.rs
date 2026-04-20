@@ -87,6 +87,7 @@ async fn serve_control_stream(
     }
 
     if let Err(reason) = shell_permits(&session.caps, &req) {
+        audit::shell_reject(&session, "caps_denied");
         let ack = portl_proto::shell_v1::ShellAck {
             ok: false,
             reason: Some(reason),
@@ -101,6 +102,7 @@ async fn serve_control_stream(
     let requested_user = match resolve_requested_user(req.user.as_deref()) {
         Ok(user) => user,
         Err(reason) => {
+            audit::shell_reject(&session, classify_user_reject(req.user.as_deref()));
             let ack = portl_proto::shell_v1::ShellAck {
                 ok: false,
                 reason: Some(reason),
@@ -115,6 +117,7 @@ async fn serve_control_stream(
     let process = match spawn_process(&session, &req, requested_user.as_ref()) {
         Ok(process) => process,
         Err(reason) => {
+            audit::shell_reject(&session, classify_spawn_reject(&req, &reason));
             let ack = portl_proto::shell_v1::ShellAck {
                 ok: false,
                 reason: Some(reason),
@@ -1025,6 +1028,44 @@ fn install_exec_user_switch(command: &mut StdCommand, user: &RequestedUser) -> b
     command.uid(user.uid.as_raw());
     command.gid(user.gid.as_raw());
     true
+}
+
+/// Classify a `resolve_requested_user` failure into one of the
+/// enumerated `audit.shell_reject` reason strings.
+///
+/// A rejection with no requested user means the failure originated in
+/// the agent's own euid lookup (`uid_lookup_failed`); a rejection with
+/// a requested user is always a refusal to switch to that target
+/// (`user_switch_refused`), whether because the name is unknown, the
+/// agent is non-root, or the user-allowlist denies the switch.
+fn classify_user_reject(requested: Option<&str>) -> &'static str {
+    if requested.is_some() {
+        "user_switch_refused"
+    } else {
+        "uid_lookup_failed"
+    }
+}
+
+/// Classify a `spawn_process` failure into one of the enumerated
+/// `audit.shell_reject` reason strings based on the request shape and
+/// the returned `ShellReason`.
+fn classify_spawn_reject(
+    req: &portl_proto::shell_v1::ShellReq,
+    reason: &portl_proto::shell_v1::ShellReason,
+) -> &'static str {
+    match req.mode {
+        portl_proto::shell_v1::ShellMode::Exec => {
+            if req.argv.as_ref().is_none_or(Vec::is_empty) {
+                "argv_empty"
+            } else {
+                "path_probe_failed"
+            }
+        }
+        portl_proto::shell_v1::ShellMode::Shell => match reason {
+            portl_proto::shell_v1::ShellReason::BadUser(_) => "user_switch_refused",
+            _ => "pty_allocation_failed",
+        },
+    }
 }
 
 fn fresh_session_id() -> [u8; 16] {

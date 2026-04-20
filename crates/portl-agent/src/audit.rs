@@ -49,6 +49,21 @@ pub(crate) fn shell_spawn(session: &Session, user: Option<&str>, argv: Option<&V
     );
 }
 
+/// Emit an `audit.shell_reject` record when a shell/exec request is
+/// refused before spawn. `reason` is one of the enumerated strings
+/// defined in spec 150 §3.2 (`path_probe_failed`, `uid_lookup_failed`,
+/// `user_switch_refused`, `pty_allocation_failed`, `caps_denied`,
+/// `argv_empty`).
+pub(crate) fn shell_reject(session: &Session, reason: &'static str) {
+    tracing::event!(
+        Level::INFO,
+        event = "audit.shell_reject",
+        caller_endpoint_id = %hex::encode(session.caller_endpoint_id),
+        ticket_id_hex = %hex::encode(session.ticket_id),
+        reason = reason,
+    );
+}
+
 pub(crate) fn shell_exit_raw(
     ticket_id: [u8; 16],
     caller_endpoint_id: [u8; 32],
