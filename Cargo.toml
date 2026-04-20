@@ -82,7 +82,9 @@ reqwest     = { version = "0.13", default-features = false, features = ["rustls"
 wiremock    = "0.6"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# deny (not forbid) so we can narrowly allow unsafe in
+# shell_handler's fork/exec user-switch hook on Linux.
+unsafe_code = "deny"
 rust_2018_idioms = { level = "warn", priority = -1 }
 
 [workspace.lints.clippy]

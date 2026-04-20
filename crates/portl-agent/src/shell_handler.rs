@@ -781,23 +781,30 @@ fn signal_target_from_pid(
         target_os = "visionos"
     ))
 ))]
-#[allow(deprecated)]
+#[allow(unsafe_code)]
 fn install_exec_user_switch(command: &mut StdCommand, user: &RequestedUser) -> bool {
+    use std::os::unix::process::CommandExt;
     if !user.switch_required {
         return false;
     }
 
     let target_gid = user.gid.as_raw();
     let target_uid = user.uid.as_raw();
-    command.before_exec(move || {
-        // Drop supplementary groups BEFORE setgid/setuid. Order matters:
-        // setgroups requires uid 0.
-        nix::unistd::setgroups(&[]).map_err(nix_to_io_error)?;
-        // Set the primary gid before uid.
-        nix::unistd::setgid(Gid::from_raw(target_gid)).map_err(nix_to_io_error)?;
-        nix::unistd::setuid(Uid::from_raw(target_uid)).map_err(nix_to_io_error)?;
-        Ok(())
-    });
+    // SAFETY: pre_exec runs in the child process between fork(2) and
+    // execve(2). The closure only calls async-signal-safe syscalls
+    // (setgroups/setgid/setuid) and returns an io::Result, which is
+    // the documented contract.
+    unsafe {
+        command.pre_exec(move || {
+            // Drop supplementary groups BEFORE setgid/setuid. Order matters:
+            // setgroups requires uid 0.
+            nix::unistd::setgroups(&[]).map_err(nix_to_io_error)?;
+            // Set the primary gid before uid.
+            nix::unistd::setgid(Gid::from_raw(target_gid)).map_err(nix_to_io_error)?;
+            nix::unistd::setuid(Uid::from_raw(target_uid)).map_err(nix_to_io_error)?;
+            Ok(())
+        });
+    }
 
     true
 }
