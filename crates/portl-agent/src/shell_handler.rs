@@ -601,6 +601,19 @@ fn spawn_pty_blocking(
 
     let nix::pty::OpenptyResult { master, slave } =
         nix::pty::openpty(Some(&size), None).map_err(std::io::Error::from)?;
+    // Set FD_CLOEXEC on the master so it is not inherited by the forked
+    // child. Without this the child retains a copy of the master fd
+    // which (a) breaks PTY hangup semantics because the master's
+    // refcount stays > 0 after the parent closes it, and (b) leaks a
+    // read/write handle to the controlling tty into the process tree.
+    // The slave intentionally does NOT get CLOEXEC because it is
+    // dup2'd to 0/1/2 in pre_exec and dup2 clears CLOEXEC on the
+    // destination fds.
+    nix::fcntl::fcntl(
+        &master,
+        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+    )
+    .map_err(std::io::Error::from)?;
     let slave_fd = slave.as_raw_fd();
 
     let mut command = TokioCommand::new(program);
