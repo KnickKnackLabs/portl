@@ -161,7 +161,7 @@ async fn connect_and_open(
     session_id: Option<[u8; 8]>,
 ) -> Result<OpenedUdp> {
     let ticket =
-        <portl_core::ticket::schema::PortlTicket as iroh_tickets::Ticket>::deserialize(ticket)
+        <PortlTicket as Ticket>::deserialize(ticket)
             .context("deserialize udp ticket")?;
     let (connection, session) = open_ticket_v1(client, &ticket, &[], identity).await?;
     let control = open_udp(

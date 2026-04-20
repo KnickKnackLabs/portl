@@ -86,7 +86,7 @@ pub fn evaluate_offer(input: &AcceptanceInput<'_>) -> AcceptanceOutcome {
         peer_token: derive_peer_token(input.source_id, terminal_ticket_id),
         caps: Box::new(caps),
         ticket_id: terminal_ticket_id,
-        bearer: terminal.body.bearer.clone(),
+        bearer: terminal.body.bearer,
     }
 }
 

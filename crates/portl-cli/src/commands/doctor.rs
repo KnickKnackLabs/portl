@@ -181,7 +181,7 @@ fn check_discovery_config() -> CheckResult {
                         .discovery
                         .relay
                         .as_ref()
-                        .map_or_else(|| "none".to_owned(), std::string::ToString::to_string);
+                        .map_or_else(|| "none".to_owned(), ToString::to_string);
                     let detail = format!(
                         "config={} dns={} pkarr={} local={} relay={}",
                         path.display(),

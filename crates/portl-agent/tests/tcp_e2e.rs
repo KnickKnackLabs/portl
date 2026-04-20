@@ -36,7 +36,7 @@ async fn tcp_forward_echo() -> Result<()> {
     send.finish()?;
 
     let mut echoed = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut recv, &mut echoed).await?;
+    AsyncReadExt::read_to_end(&mut recv, &mut echoed).await?;
     assert_eq!(echoed, b"hello over tcp");
 
     echo_task.await??;
@@ -82,7 +82,7 @@ async fn tcp_forward_large_transfer_10mb_no_corruption() -> Result<()> {
     });
 
     let mut echoed = Vec::with_capacity(10 * 1024 * 1024);
-    tokio::io::AsyncReadExt::read_to_end(&mut recv, &mut echoed).await?;
+    AsyncReadExt::read_to_end(&mut recv, &mut echoed).await?;
     send_task.await??;
 
     let echoed_digest = Sha256::digest(&echoed).to_vec();
@@ -131,7 +131,7 @@ async fn tcp_preserves_server_data_sent_immediately_after_ack() -> Result<()> {
     send.finish()?;
 
     let mut echoed = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut recv, &mut echoed).await?;
+    AsyncReadExt::read_to_end(&mut recv, &mut echoed).await?;
     assert_eq!(echoed, b"echo");
 
     server_task.await??;
@@ -166,7 +166,7 @@ async fn tcp_forward_propagates_eof_both_directions() -> Result<()> {
     send.finish()?;
 
     let mut server_payload = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut recv, &mut server_payload).await?;
+    AsyncReadExt::read_to_end(&mut recv, &mut server_payload).await?;
     let client_payload = client_seen_rx.await.context("client payload channel")?;
 
     assert_eq!(server_payload, b"server hello");

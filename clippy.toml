@@ -1,2 +1,12 @@
-# Extra lint configuration can go here.
-# Currently no overrides; lints are declared in workspace Cargo.toml.
+# Clippy configuration. Lint levels themselves live in workspace
+# Cargo.toml under [workspace.lints]; this file configures the
+# behaviour of individual lints.
+
+# Pin MSRV so MSRV-sensitive lints (e.g. manual_let_else,
+# option_if_let_else, unnested_or_patterns) don't suggest syntax
+# that isn't available on 1.89. Defaults to rust-version in
+# Cargo.toml, but setting it explicitly is the documented idiom.
+msrv = "1.89"
+
+# Keep the default for cognitive-complexity / type-complexity
+# thresholds; no call sites currently trigger them.

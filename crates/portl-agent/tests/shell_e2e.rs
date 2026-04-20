@@ -45,7 +45,7 @@ async fn shell_exec_echo_returns_output_and_exit_code() -> Result<()> {
     exec.stdin.finish()?;
 
     let mut stdout = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut exec.stdout, &mut stdout).await?;
+    AsyncReadExt::read_to_end(&mut exec.stdout, &mut stdout).await?;
     let code = exec.wait_exit().await?;
 
     assert_eq!(String::from_utf8(stdout)?.trim(), "hello");
@@ -120,7 +120,7 @@ async fn shell_with_pty_resize_mid_session_applies_winsz() -> Result<()> {
     shell.stdin.write_all(b"\n").await?;
     shell.stdin.finish()?;
 
-    tokio::io::AsyncReadExt::read_to_end(&mut shell.stdout, &mut stdout).await?;
+    AsyncReadExt::read_to_end(&mut shell.stdout, &mut stdout).await?;
     let output = String::from_utf8(stdout)?;
     assert!(output.contains("__PORTL__"), "output was: {output:?}");
     assert!(output.contains("40 120"), "output was: {output:?}");
@@ -184,7 +184,7 @@ async fn env_policy_deny_does_not_leak_agent_env() -> Result<()> {
     exec.stdin.finish()?;
 
     let mut stdout = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut exec.stdout, &mut stdout).await?;
+    AsyncReadExt::read_to_end(&mut exec.stdout, &mut stdout).await?;
     assert_eq!(String::from_utf8(stdout)?, "UNSET\n");
     assert_eq!(exec.wait_exit().await?, 0);
 

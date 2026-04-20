@@ -84,16 +84,51 @@ wiremock    = "0.6"
 [workspace.lints.rust]
 # deny (not forbid) so we can narrowly allow unsafe in
 # shell_handler's fork/exec user-switch hook on Linux.
-unsafe_code = "deny"
-rust_2018_idioms = { level = "warn", priority = -1 }
+unsafe_code          = "deny"
+rust_2018_idioms     = { level = "warn", priority = -1 }
+# unreachable_pub + use_self + option_if_let_else deliberately
+# NOT enabled workspace-wide — tightening those is a separate
+# refactor and would produce ~70 drive-by changes per clippy run.
+# Revisit in v0.2 once the CLI namespace collapse (140 §4)
+# touches every affected file anyway.
+unused_qualifications = "warn"
 
 [workspace.lints.clippy]
-all = { level = "warn", priority = -1 }
+# Groups. pedantic is enabled wholesale with targeted allows (see
+# rust-clippy book: enabling whole pedantic is acceptable when
+# paired with a generous #[allow] list for the annoying ones).
+all      = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+cargo    = { level = "warn", priority = -1 }
+
+# Pedantic allows (unchanged from v0.1).
 module_name_repetitions = "allow"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-must_use_candidate = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+must_use_candidate      = "allow"
+
+# Cargo group: workspaces inevitably pull multiple minor versions
+# of common deps (tokio, futures, rand); this one is known-noisy.
+multiple_crate_versions = "allow"
+# We aren't publishing to crates.io yet; shut the "missing metadata"
+# lints off at the workspace level. When we turn on publishing
+# (post-v0.2), remove these two allows and add the required fields.
+cargo_common_metadata   = "allow"
+
+# Selected restriction lints (the rust-clippy book's canonical
+# "strict-coding-style" cherry-picks).
+dbg_macro     = "deny"
+todo          = "warn"
+unimplemented = "warn"
+# print_stdout / print_stderr are NOT enabled workspace-wide
+# because the CLI crate legitimately prints to stdout/stderr.
+# If we later split "library code" vs "CLI code" more cleanly,
+# library crates can opt in per-crate.
+
+# Selected nursery lint that has stabilised in production use
+# (tokio, sqlx). Whole-nursery is upstream-discouraged; this one
+# is individually vetted.
+redundant_clone = "warn"
 
 [profile.release]
 lto           = "thin"

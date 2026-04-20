@@ -364,7 +364,7 @@ fn verify_chain_verifies_before_hashing_parent_signature() {
         None,
     )
     .unwrap();
-    let mut forged_parent = root.clone();
+    let mut forged_parent = root;
     forged_parent.sig[0] ^= 0x80;
 
     let child = forge_child(

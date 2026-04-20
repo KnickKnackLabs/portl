@@ -610,7 +610,7 @@ async fn start_udp_echo_server() -> Result<EchoServer> {
 }
 
 async fn start_agent(
-    server: portl_core::endpoint::Endpoint,
+    server: Endpoint,
     operator: &Identity,
     linger_secs: Option<u64>,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
@@ -703,8 +703,8 @@ fn close_connection(connection: &iroh::endpoint::Connection) {
 }
 
 async fn shutdown(
-    client: portl_core::endpoint::Endpoint,
-    server: portl_core::endpoint::Endpoint,
+    client: Endpoint,
+    server: Endpoint,
     agent: tokio::task::JoinHandle<Result<()>>,
 ) -> Result<()> {
     client.inner().close().await;

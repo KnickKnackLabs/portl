@@ -127,7 +127,7 @@ fn age_error(err: impl std::fmt::Display) -> PortlError {
     PortlError::Age(err.to_string())
 }
 
-fn open_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+fn open_private_file(path: &Path) -> std::io::Result<fs::File> {
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
 
