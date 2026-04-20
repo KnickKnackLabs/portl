@@ -62,6 +62,25 @@ async fn invalid_user_switch_emits_shell_reject() -> Result<()> {
         rejects[0].fields.get("reason").map(String::as_str),
         Some("user_switch_refused"),
     );
+    // Spec 150 §3.2 field schema on shell_reject.
+    assert!(
+        rejects[0].fields.contains_key("ticket_id"),
+        "shell_reject missing ticket_id: {:?}",
+        rejects[0].fields
+    );
+    assert!(
+        rejects[0].fields.contains_key("caller_endpoint_id"),
+        "shell_reject missing caller_endpoint_id: {:?}",
+        rejects[0].fields
+    );
+    assert!(
+        !rejects[0].fields.contains_key("ticket_id_hex"),
+        "shell_reject should not use legacy ticket_id_hex"
+    );
+    assert!(
+        !rejects[0].fields.contains_key("caller_endpoint_id_hex"),
+        "shell_reject should not use legacy caller_endpoint_id_hex"
+    );
 
     connection.close(0u32.into(), b"done");
     client.inner().close().await;

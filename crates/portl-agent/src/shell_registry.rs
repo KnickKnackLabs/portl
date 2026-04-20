@@ -1,5 +1,6 @@
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use dashmap::DashMap;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
@@ -17,11 +18,23 @@ pub(crate) struct ShellProcess {
     /// Master side of the pty pair; kept alive in the agent for
     /// TIOCSWINSZ resize. `None` for the non-PTY exec path.
     pub(crate) pty_master: Option<Arc<OwnedFd>>,
+    /// Wall-clock marker set when `audit.shell_start` is emitted.
+    /// The wait-for-child task reads it to compute `duration_ms`
+    /// for the `audit.shell_exit` record (spec 150 §3.2).
+    pub(crate) started_at: Arc<Mutex<Option<Instant>>>,
 }
 
 impl ShellProcess {
     pub(crate) fn exit_rx(&self) -> watch::Receiver<Option<i32>> {
         self.exit_tx.subscribe()
+    }
+
+    /// Record the instant associated with the paired `shell_start`
+    /// audit record so the exit path can emit `duration_ms`.
+    pub(crate) fn set_started_at(&self, instant: Instant) {
+        if let Ok(mut guard) = self.started_at.lock() {
+            *guard = Some(instant);
+        }
     }
 }
 

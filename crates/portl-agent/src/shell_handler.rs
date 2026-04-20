@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::process::{Command as StdCommand, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::{Connection, SendStream};
@@ -139,9 +140,16 @@ async fn serve_control_stream(
         registry: &state.shell_registry,
         session_id,
     };
+    let mode_str: &'static str = match req.mode {
+        portl_proto::shell_v1::ShellMode::Exec => "exec",
+        portl_proto::shell_v1::ShellMode::Shell => "pty",
+    };
+    process.set_started_at(Instant::now());
     audit::shell_start(
         &session,
         &audit_session_id,
+        mode_str,
+        process.pid,
         req.user.as_deref(),
         req.argv.as_ref(),
     );
@@ -400,6 +408,8 @@ fn spawn_exec_process(
     let ticket_id = session.ticket_id;
     let caller_endpoint_id = session.caller_endpoint_id;
     let audit_session_id = audit_session_id.to_owned();
+    let started_at = Arc::new(Mutex::new(None::<Instant>));
+    let started_at_wait = Arc::clone(&started_at);
     tokio::spawn(async move {
         let code = match child.wait().await {
             Ok(status) => status.code().unwrap_or(1),
@@ -412,7 +422,21 @@ fn spawn_exec_process(
             *guard = Some(code);
         }
         let _ = exit_tx_wait.send(Some(code));
-        audit::shell_exit_raw(ticket_id, caller_endpoint_id, &audit_session_id, pid, code);
+        let duration_ms = started_at_wait
+            .lock()
+            .ok()
+            .and_then(|guard| *guard)
+            .map_or(0, |instant| {
+                u64::try_from(instant.elapsed().as_millis()).unwrap_or(u64::MAX)
+            });
+        audit::shell_exit_raw(
+            ticket_id,
+            caller_endpoint_id,
+            &audit_session_id,
+            pid,
+            code,
+            duration_ms,
+        );
     });
 
     Ok(Arc::new(ShellProcess {
@@ -424,6 +448,7 @@ fn spawn_exec_process(
         exit_tx,
         signal_target: Some(signal_target_from_pid(pid)?),
         pty_master: None,
+        started_at,
     }))
 }
 
@@ -493,6 +518,8 @@ fn spawn_pty_process(
     let ticket_id = session.ticket_id;
     let caller_endpoint_id = session.caller_endpoint_id;
     let audit_session_id = audit_session_id.to_owned();
+    let started_at = Arc::new(Mutex::new(None::<Instant>));
+    let started_at_wait = Arc::clone(&started_at);
     tokio::spawn(async move {
         let code = match child.wait().await {
             Ok(status) => status.code().unwrap_or(1),
@@ -505,7 +532,21 @@ fn spawn_pty_process(
             *guard = Some(code);
         }
         let _ = exit_tx_wait.send(Some(code));
-        audit::shell_exit_raw(ticket_id, caller_endpoint_id, &audit_session_id, pid, code);
+        let duration_ms = started_at_wait
+            .lock()
+            .ok()
+            .and_then(|guard| *guard)
+            .map_or(0, |instant| {
+                u64::try_from(instant.elapsed().as_millis()).unwrap_or(u64::MAX)
+            });
+        audit::shell_exit_raw(
+            ticket_id,
+            caller_endpoint_id,
+            &audit_session_id,
+            pid,
+            code,
+            duration_ms,
+        );
     });
 
     // The child called setsid() in pre_exec, so its pid is also the
@@ -526,6 +567,7 @@ fn spawn_pty_process(
         exit_tx,
         signal_target,
         pty_master: Some(master),
+        started_at,
     }))
 }
 
@@ -1127,6 +1169,7 @@ mod tests {
                 exit_tx,
                 signal_target: None,
                 pty_master: None,
+                started_at: std::sync::Arc::new(std::sync::Mutex::new(None)),
             }),
         );
 

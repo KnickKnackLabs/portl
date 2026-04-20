@@ -17,6 +17,7 @@ use tokio::io::AsyncReadExt;
 
 mod common;
 
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn accepted_session_emits_start_and_exit_with_same_session_id() -> Result<()> {
     let capture = common::install_audit_capture();
@@ -55,17 +56,80 @@ async fn accepted_session_emits_start_and_exit_with_same_session_id() -> Result<
         .collect();
     assert_eq!(starts.len(), 1, "expected 1 shell_start, got {records:#?}");
     assert_eq!(exits.len(), 1, "expected 1 shell_exit, got {records:#?}");
-    let start_sid = starts[0]
+    let start = starts[0];
+    let exit = exits[0];
+    let start_sid = start
         .fields
         .get("session_id")
         .expect("shell_start missing session_id");
-    let exit_sid = exits[0]
+    let exit_sid = exit
         .fields
         .get("session_id")
         .expect("shell_exit missing session_id");
     assert_eq!(start_sid, exit_sid, "session_id mismatch");
     // Sanity: UUIDv4 hyphenated form is 36 chars.
     assert_eq!(start_sid.len(), 36, "session_id not a UUID: {start_sid}");
+
+    // Spec 150 §3.2 field schema.
+    for rec in [start, exit] {
+        assert!(
+            rec.fields.contains_key("ticket_id"),
+            "{} missing ticket_id: {:?}",
+            rec.event,
+            rec.fields
+        );
+        assert!(
+            rec.fields.contains_key("caller_endpoint_id"),
+            "{} missing caller_endpoint_id: {:?}",
+            rec.event,
+            rec.fields
+        );
+        assert!(
+            !rec.fields.contains_key("ticket_id_hex"),
+            "{} should not use legacy ticket_id_hex",
+            rec.event
+        );
+        assert!(
+            !rec.fields.contains_key("caller_endpoint_id_hex"),
+            "{} should not use legacy caller_endpoint_id_hex",
+            rec.event
+        );
+    }
+    // shell_start-specific: pid > 0 and mode is exec|pty.
+    let audited_pid: u32 = start
+        .fields
+        .get("pid")
+        .expect("shell_start missing pid")
+        .parse()
+        .expect("shell_start pid u32");
+    assert!(audited_pid > 0, "pid must be > 0, got {audited_pid}");
+    let mode = start
+        .fields
+        .get("mode")
+        .expect("shell_start missing mode");
+    assert!(
+        mode == "exec" || mode == "pty",
+        "mode must be exec|pty, got {mode}"
+    );
+    // shell_exit-specific: exit_code (not `code`) and duration_ms >= 0.
+    let exit_code: i32 = exit
+        .fields
+        .get("exit_code")
+        .expect("shell_exit missing exit_code")
+        .parse()
+        .expect("shell_exit exit_code i32");
+    assert_eq!(exit_code, 0);
+    assert!(
+        !exit.fields.contains_key("code"),
+        "shell_exit should not use legacy `code` field"
+    );
+    let duration_ms: u64 = exit
+        .fields
+        .get("duration_ms")
+        .expect("shell_exit missing duration_ms")
+        .parse()
+        .expect("shell_exit duration_ms u64");
+    let _ = duration_ms; // u64 is always >= 0
 
     connection.close(0u32.into(), b"done");
     client.inner().close().await;

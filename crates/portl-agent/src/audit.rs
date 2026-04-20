@@ -34,13 +34,15 @@ pub(crate) fn ticket_accepted(session: &Session) {
         Level::INFO,
         event = "audit.ticket_accepted",
         caller_endpoint_id = %hex::encode(session.caller_endpoint_id),
-        ticket_id_hex = %hex::encode(session.ticket_id),
+        ticket_id = %hex::encode(session.ticket_id),
     );
 }
 
 pub(crate) fn shell_start(
     session: &Session,
     session_id: &str,
+    mode: &'static str,
+    pid: u32,
     user: Option<&str>,
     argv: Option<&Vec<String>>,
 ) {
@@ -48,8 +50,10 @@ pub(crate) fn shell_start(
         Level::INFO,
         event = "audit.shell_start",
         caller_endpoint_id = %hex::encode(session.caller_endpoint_id),
-        ticket_id_hex = %hex::encode(session.ticket_id),
+        ticket_id = %hex::encode(session.ticket_id),
         session_id = session_id,
+        pid,
+        mode,
         shell_user = user.unwrap_or(""),
         shell_argv0 = argv.and_then(|argv| argv.first()).map_or("", String::as_str),
     );
@@ -65,7 +69,7 @@ pub(crate) fn shell_reject(session: &Session, reason: &'static str) {
         Level::INFO,
         event = "audit.shell_reject",
         caller_endpoint_id = %hex::encode(session.caller_endpoint_id),
-        ticket_id_hex = %hex::encode(session.ticket_id),
+        ticket_id = %hex::encode(session.ticket_id),
         reason = reason,
     );
 }
@@ -75,16 +79,18 @@ pub(crate) fn shell_exit_raw(
     caller_endpoint_id: [u8; 32],
     session_id: &str,
     pid: u32,
-    code: i32,
+    exit_code: i32,
+    duration_ms: u64,
 ) {
     tracing::event!(
         Level::INFO,
         event = "audit.shell_exit",
         caller_endpoint_id = %hex::encode(caller_endpoint_id),
-        ticket_id_hex = %hex::encode(ticket_id),
+        ticket_id = %hex::encode(ticket_id),
         session_id = session_id,
         pid,
-        code,
+        exit_code,
+        duration_ms,
     );
 }
 
@@ -93,7 +99,7 @@ pub(crate) fn tcp_connect(session: &Session, host: &str, port: u16) {
         Level::INFO,
         event = "audit.tcp_connect",
         caller_endpoint_id = %hex::encode(session.caller_endpoint_id),
-        ticket_id_hex = %hex::encode(session.ticket_id),
+        ticket_id = %hex::encode(session.ticket_id),
         tcp_host = host,
         tcp_port = port,
     );
@@ -104,7 +110,7 @@ pub(crate) fn tcp_disconnect(session: &Session, host: &str, port: u16) {
         Level::INFO,
         event = "audit.tcp_disconnect",
         caller_endpoint_id = %hex::encode(session.caller_endpoint_id),
-        ticket_id_hex = %hex::encode(session.ticket_id),
+        ticket_id = %hex::encode(session.ticket_id),
         tcp_host = host,
         tcp_port = port,
     );
