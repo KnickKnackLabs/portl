@@ -8,7 +8,8 @@ use iroh::endpoint::{Connection, SendStream};
 use nix::sys::signal::{Signal, kill};
 #[cfg(unix)]
 use nix::unistd::{Gid, Pid, Uid, User, geteuid};
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::{mpsc, watch};
@@ -240,18 +241,32 @@ async fn pump_resizes(mut recv: BufferedRecv, process: &ShellProcess) -> Result<
         .read_frame::<portl_proto::shell_v1::ResizeFrame>(MAX_RESIZE_BYTES)
         .await?
     {
+        #[cfg(unix)]
         if let Some(master) = process.pty_master.as_ref() {
-            master
-                .lock()
-                .map_err(|_| anyhow!("pty master poisoned"))?
-                .resize(PtySize {
-                    rows: frame.rows,
-                    cols: frame.cols,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })
-                .context("resize pty")?;
+            resize_pty(master, frame.rows, frame.cols).context("resize pty")?;
         }
+        #[cfg(not(unix))]
+        let _ = frame;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn resize_pty(master: &OwnedFd, rows: u16, cols: u16) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let ws = nix::libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY(unsafe_code): TIOCSWINSZ on a valid pty master fd is a
+    // well-defined ioctl; we borrow the fd via AsRawFd for the duration
+    // of the call only.
+    #[allow(unsafe_code)]
+    let rc = unsafe { nix::libc::ioctl(master.as_raw_fd(), nix::libc::TIOCSWINSZ, &ws) };
+    if rc == -1 {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
@@ -394,6 +409,7 @@ fn spawn_exec_process(
     }))
 }
 
+#[cfg(unix)]
 fn spawn_pty_process(
     session: &Session,
     req: &portl_proto::shell_v1::ShellReq,
@@ -412,49 +428,37 @@ fn spawn_pty_process(
         .pty
         .as_ref()
         .ok_or(portl_proto::shell_v1::ShellReason::InvalidPty)?;
-    let pty_pair = native_pty_system()
-        .openpty(PtySize {
-            rows: pty.rows,
-            cols: pty.cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|err| portl_proto::shell_v1::ShellReason::SpawnFailed(err.to_string()))?;
+    let winsize = nix::libc::winsize {
+        ws_row: pty.rows,
+        ws_col: pty.cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
 
-    let master = Arc::new(Mutex::new(pty_pair.master));
     let shell_program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
-    let mut cmd = CommandBuilder::new(shell_program);
-    cmd.arg("-l");
-    if let Some(cwd) = req.cwd.as_deref() {
-        cmd.cwd(cwd);
-    }
-    apply_env_to_pty_command(
-        &mut cmd,
-        effective_env(shell_caps(&session.caps), req, requested_user),
-    );
+    let env = effective_env(shell_caps(&session.caps), req, requested_user);
+    let argv: Vec<String> = vec!["-l".to_owned()];
 
-    let mut child = pty_pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(|err| portl_proto::shell_v1::ShellReason::SpawnFailed(err.to_string()))?;
-    let pid = child.process_id().ok_or_else(|| {
+    let (master, mut child) = spawn_pty_blocking(
+        &shell_program,
+        &argv,
+        winsize,
+        env,
+        req.cwd.as_deref(),
+    )
+    .map_err(|err| portl_proto::shell_v1::ShellReason::SpawnFailed(err.to_string()))?;
+
+    let pid = child.id().ok_or_else(|| {
         portl_proto::shell_v1::ShellReason::SpawnFailed("missing child pid".to_owned())
     })?;
 
-    let reader = master
-        .lock()
-        .map_err(|_| {
-            portl_proto::shell_v1::ShellReason::SpawnFailed("pty master poisoned".to_owned())
-        })?
-        .try_clone_reader()
+    let reader_fd = master
+        .try_clone()
         .map_err(|err| portl_proto::shell_v1::ShellReason::SpawnFailed(err.to_string()))?;
-    let writer = master
-        .lock()
-        .map_err(|_| {
-            portl_proto::shell_v1::ShellReason::SpawnFailed("pty master poisoned".to_owned())
-        })?
-        .take_writer()
+    let writer_fd = master
+        .try_clone()
         .map_err(|err| portl_proto::shell_v1::ShellReason::SpawnFailed(err.to_string()))?;
+    let master = Arc::new(master);
 
     let (stdin_tx, stdin_rx) = mpsc::channel(32);
     let (stdout_tx, stdout_rx) = mpsc::channel(32);
@@ -462,16 +466,16 @@ fn spawn_pty_process(
     let exit_code = Arc::new(Mutex::new(None));
     let (exit_tx, _) = watch::channel(None);
 
-    std::thread::spawn(move || pty_stdin_thread(writer, stdin_rx));
-    std::thread::spawn(move || pty_stdout_thread(reader, &stdout_tx));
+    std::thread::spawn(move || pty_stdin_thread(Box::new(std::fs::File::from(writer_fd)), stdin_rx));
+    std::thread::spawn(move || pty_stdout_thread(Box::new(std::fs::File::from(reader_fd)), &stdout_tx));
 
     let exit_code_wait = Arc::clone(&exit_code);
     let exit_tx_wait = exit_tx.clone();
     let ticket_id = session.ticket_id;
     let caller_endpoint_id = session.caller_endpoint_id;
-    tokio::task::spawn_blocking(move || {
-        let code = match child.wait() {
-            Ok(status) => i32::try_from(status.exit_code()).unwrap_or(1),
+    tokio::spawn(async move {
+        let code = match child.wait().await {
+            Ok(status) => status.code().unwrap_or(1),
             Err(err) => {
                 warn!(?err, "wait on pty child failed");
                 1
@@ -484,19 +488,14 @@ fn spawn_pty_process(
         audit::shell_exit_raw(ticket_id, caller_endpoint_id, pid, code);
     });
 
-    #[cfg(unix)]
-    let signal_target = master
-        .lock()
+    // The child called setsid() in pre_exec, so its pid is also the
+    // session/process-group leader. Deliver signals to the whole group
+    // via a negative pid.
+    let signal_target = i32::try_from(pid)
+        .map(|raw| Some(-raw))
         .map_err(|_| {
-            portl_proto::shell_v1::ShellReason::SpawnFailed("pty master poisoned".to_owned())
-        })?
-        .process_group_leader()
-        .map_or_else(
-            || Ok(Some(signal_target_from_pid(pid)?)),
-            |pgid| Ok(Some(-pgid)),
-        )?;
-    #[cfg(not(unix))]
-    let signal_target = Some(pid as i32);
+            portl_proto::shell_v1::ShellReason::SpawnFailed("child pid out of range".to_owned())
+        })?;
 
     Ok(Arc::new(ShellProcess {
         pid,
@@ -508,6 +507,102 @@ fn spawn_pty_process(
         signal_target,
         pty_master: Some(master),
     }))
+}
+
+#[cfg(not(unix))]
+fn spawn_pty_process(
+    _session: &Session,
+    _req: &portl_proto::shell_v1::ShellReq,
+    _requested_user: Option<&RequestedUser>,
+) -> std::result::Result<Arc<ShellProcess>, portl_proto::shell_v1::ShellReason> {
+    Err(portl_proto::shell_v1::ShellReason::SpawnFailed(
+        "pty mode requires a unix platform".to_owned(),
+    ))
+}
+
+/// Open a pty and spawn `program` as the session leader on its slave.
+///
+/// The returned fd is the master side of the pair. The child has stdin,
+/// stdout, and stderr wired to the slave, has called `setsid()` and
+/// `ioctl(TIOCSCTTY)`, and inherits the supplied environment exactly
+/// (the current process's env is cleared first).
+#[cfg(unix)]
+fn spawn_pty_blocking(
+    program: &str,
+    argv: &[String],
+    size: nix::libc::winsize,
+    env: Vec<(String, String)>,
+    cwd: Option<&str>,
+) -> std::io::Result<(OwnedFd, tokio::process::Child)> {
+    use std::os::fd::AsRawFd;
+
+    let nix::pty::OpenptyResult { master, slave } =
+        nix::pty::openpty(Some(&size), None).map_err(std::io::Error::from)?;
+    let slave_fd = slave.as_raw_fd();
+
+    let mut command = TokioCommand::new(program);
+    command.args(argv);
+    command.env_clear();
+    for (k, v) in env {
+        command.env(k, v);
+    }
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+
+    // SAFETY(unsafe_code): pre_exec runs in the forked child between
+    // fork(2) and execve(2). The closure only invokes async-signal-safe
+    // syscalls (setsid, ioctl TIOCSCTTY, dup2, close) and returns an
+    // io::Result, matching the documented contract.
+    #[allow(unsafe_code)]
+    unsafe {
+        command.pre_exec(move || {
+            // Become a new session and process-group leader so the pty
+            // slave can be claimed as the controlling terminal.
+            if nix::libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Make the slave the controlling tty for this session.
+            #[allow(clippy::cast_lossless)]
+            let req = nix::libc::TIOCSCTTY as nix::libc::c_ulong;
+            if nix::libc::ioctl(slave_fd, req, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Wire stdio to the slave.
+            for target in [0, 1, 2] {
+                if nix::libc::dup2(slave_fd, target) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            // The inherited slave fd is no longer needed once it's
+            // aliased at 0/1/2.
+            if slave_fd > 2 {
+                let _ = nix::libc::close(slave_fd);
+            }
+            Ok(())
+        });
+    }
+
+    let child = command.spawn()?;
+    drop(slave); // close the parent's copy of the slave
+    Ok((master, child))
+}
+
+/// Test-only wrapper exposing `spawn_pty_blocking` with a minimal
+/// signature and a sensible default window size.
+#[cfg(unix)]
+pub fn spawn_pty_for_test(
+    program: &str,
+    argv: &[&str],
+) -> std::io::Result<(OwnedFd, tokio::process::Child)> {
+    let size = nix::libc::winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let argv: Vec<String> = argv.iter().map(|s| (*s).to_owned()).collect();
+    spawn_pty_blocking(program, &argv, size, Vec::new(), None)
 }
 
 async fn exec_stdin_task(
@@ -579,13 +674,6 @@ fn pty_stdout_thread(mut reader: Box<dyn std::io::Read + Send>, tx: &mpsc::Sende
 fn apply_env_to_command(command: &mut StdCommand, envs: Vec<(String, String)>) {
     command.env_clear();
     command.envs(envs);
-}
-
-fn apply_env_to_pty_command(command: &mut CommandBuilder, envs: Vec<(String, String)>) {
-    command.env_clear();
-    for (key, value) in envs {
-        command.env(key, value);
-    }
 }
 
 fn effective_env(

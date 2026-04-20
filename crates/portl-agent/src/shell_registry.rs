@@ -1,7 +1,7 @@
+use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
-use portable_pty::MasterPty;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 
 pub(crate) type ShellRegistry = DashMap<[u8; 16], Arc<ShellProcess>>;
@@ -14,7 +14,9 @@ pub(crate) struct ShellProcess {
     pub(crate) exit_code: Arc<Mutex<Option<i32>>>,
     pub(crate) exit_tx: watch::Sender<Option<i32>>,
     pub(crate) signal_target: Option<i32>,
-    pub(crate) pty_master: Option<Arc<Mutex<Box<dyn MasterPty + Send>>>>,
+    /// Master side of the pty pair; kept alive in the agent for
+    /// TIOCSWINSZ resize. `None` for the non-PTY exec path.
+    pub(crate) pty_master: Option<Arc<OwnedFd>>,
 }
 
 impl ShellProcess {
