@@ -127,10 +127,13 @@ async fn publish_revocations(
     // Build the new records under the write lock, release the lock,
     // then fsync off the runtime.
     let (to_persist, persist_path) = {
-        let mut revocations = state
-            .revocations
-            .write()
-            .expect("revocations lock poisoned");
+        let Ok(mut revocations) = state.revocations.write() else {
+            return portl_proto::meta_v1::MetaResp::Error(portl_proto::error::Error {
+                kind: portl_proto::error::ErrorKind::InternalError,
+                message: "revocations lock poisoned".to_owned(),
+                retry_after_ms: None,
+            });
+        };
         for raw in items {
             let Ok(id) = <[u8; 16]>::try_from(raw.as_slice()) else {
                 rejected.push((raw, "ticket_id must be 16 bytes".to_owned()));

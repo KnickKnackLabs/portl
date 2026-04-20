@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use iroh::endpoint::Connection;
 use tracing::{instrument, warn};
 
@@ -35,14 +35,20 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
     let source_id = remote_node_id(&connection);
 
     let outcome = match postcard::from_bytes::<portl_proto::ticket_v1::TicketOffer>(&offer_bytes) {
-        Ok(offer) => evaluate_offer(&AcceptanceInput {
-            offer: &offer,
-            source_id,
-            trust_roots: &state.trust_roots,
-            revocations: &state.revocations.read().expect("revocations lock"),
-            now: unix_now_secs()?,
-            rate_limit: &state.rate_limit,
-        }),
+        Ok(offer) => {
+            let revocations = state
+                .revocations
+                .read()
+                .map_err(|_| anyhow!("revocations lock poisoned"))?;
+            evaluate_offer(&AcceptanceInput {
+                offer: &offer,
+                source_id,
+                trust_roots: &state.trust_roots,
+                revocations: &revocations,
+                now: unix_now_secs()?,
+                rate_limit: &state.rate_limit,
+            })
+        }
         Err(_) => AcceptanceOutcome::Rejected {
             reason: portl_proto::ticket_v1::AckReason::BadSignature,
         },

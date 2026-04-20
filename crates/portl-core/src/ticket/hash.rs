@@ -26,5 +26,7 @@ fn hash16(domain: &[u8], sig: &[u8; 64]) -> [u8; 16] {
     hasher.update(domain);
     hasher.update(sig);
     let digest = hasher.finalize();
+    // SAFETY(panic): `Sha256::finalize()` always returns a 32-byte
+    // output, so slicing to 16 and converting to `[u8; 16]` never fails.
     digest[..16].try_into().expect("sha256 digest is 32 bytes")
 }

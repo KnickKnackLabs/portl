@@ -222,6 +222,8 @@ fn derive_peer_token(source_id: [u8; 32], ticket_id: [u8; 16]) -> [u8; 16] {
     hasher.update(ticket_id);
     hasher.update(PEER_TOKEN_DOMAIN);
     let digest: [u8; 32] = hasher.finalize().into();
+    // SAFETY(panic): `digest` is a 32-byte SHA-256 output, so slicing
+    // the first 16 bytes into `[u8; 16]` is infallible.
     digest[..16].try_into().expect("peer token length")
 }
 

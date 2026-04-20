@@ -47,6 +47,9 @@ impl Identity {
     /// Convert the verifying key into an iroh endpoint id.
     #[must_use]
     pub fn endpoint_id(&self) -> EndpointId {
+        // SAFETY(panic): `verifying_key()` returns the 32-byte ed25519
+        // public key; `EndpointId::from_bytes` only rejects lengths other
+        // than 32, so this conversion is infallible by construction.
         EndpointId::from_bytes(&self.verifying_key())
             .expect("ed25519 verifying key is a valid endpoint id")
     }
