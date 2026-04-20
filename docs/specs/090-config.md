@@ -3,7 +3,7 @@
 > **Note:** this document describes the v0.1 layout, including
 > `agent.toml` and the SQLite alias store. v0.2 replaces both with
 > env-var-only config and a JSON alias store; see
-> [`140-v0.2-cleanup.md §5-§6`](140-v0.2-cleanup.md#5-environment-and-configuration).
+> [`140-v0.2-operability.md §8-§9`](140-v0.2-operability.md#8-environment-and-configuration).
 
 ## 1. Client (operator) layout
 

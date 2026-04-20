@@ -22,15 +22,26 @@
          ▼  v0.1.0 release
 
   ─── post-v0.1 ───
-  v0.1.x patch line ─ shell-handler stability (rlimits, pgroup
-                      kill on disconnect, revoke kills live
-                      sessions, session-start audit, stdout
-                      drain timeout).
+  v0.1.1 ─ "Safety Net" — non-breaking runtime stability.
+           Rlimits on every spawn, balanced audit, panic=abort
+           + supervisor contract. Spec: `150-v0.1.1-safety-net.md`.
+           Plan: `../plans/010-v0.1.1-safety-net.md`.
 
-  v0.2.0 ─ "The Big Cleanup" — breaking simplification.
-           Full plan: `140-v0.2-cleanup.md`.
-           Headline: `portl init` + `portl docker run <image>`
-           = shelled in, in two commands.
+  v0.1.2 ─ "Alias Isolation" — non-breaking dep-graph cleanup.
+           Replace rusqlite alias store with JSON + fd-lock.
+           Forensic experiment: tests the rusqlite hypothesis
+           for the macOS release-mode SIGABRT in isolation.
+           Spec: `160-v0.1.2-alias-isolation.md`.
+           Plan: `../plans/020-v0.1.2-alias-isolation.md`.
+
+  v0.2.0 ─ "Operability: Shape + Session Lifecycle" — breaking.
+           Flat CLI, env-only config, docker orchestrate-by-default,
+           multicall-only daemon, session-lifecycle hardening
+           (pgroup kill, revocation-kills-live, graceful shutdown,
+           revocations ceiling, slow-task detection, PTY drain).
+           Spec: `140-v0.2-operability.md`.
+           Plan: `../plans/030-v0.2-operability.md` (deferred;
+           written after v0.1.1 + v0.1.2 land).
 
   v0.3+ ─ demand-driven, not committed:
      fs/v1
@@ -44,11 +55,20 @@
 ```
 
 The v0.1.0 release shipped on 2026-04-20. The post-v0.1 plan
-diverged from the pre-release roadmap after operator feedback:
-fs/v1 is pushed out in favour of a shape-cleanup release (v0.2)
-that uses the only window we'll ever have to break CLI and
-env-var shapes without maintenance burden. See
-`140-v0.2-cleanup.md`.
+diverged from the pre-release roadmap after operator feedback
+and a roundtable review on the v0.2 proposal:
+
+- fs/v1 and crates.io publish push out to v0.3+.
+- Runtime stability ships ahead of v0.2 as the non-breaking
+  v0.1.1 "Safety Net" patch.
+- The rusqlite hypothesis for the macOS crash gets an isolated
+  bisect via v0.1.2 "Alias Isolation" before v0.2's larger diff.
+- v0.2.0 bundles the remaining shape cleanup with the session-
+  lifecycle items that are too entangled to land piecewise.
+
+See `140-v0.2-operability.md` for the full release sequence
+rationale; `150-v0.1.1-safety-net.md` and
+`160-v0.1.2-alias-isolation.md` for each point release's scope.
 
 ## 2. Milestone detail
 
