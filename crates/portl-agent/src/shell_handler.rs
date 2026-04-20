@@ -102,11 +102,11 @@ async fn serve_control_stream(
 
     let requested_user = match resolve_requested_user(req.user.as_deref()) {
         Ok(user) => user,
-        Err(reason) => {
-            audit::shell_reject(&session, classify_user_reject(req.user.as_deref()));
+        Err(reject) => {
+            audit::shell_reject(&session, reject.kind.reason_str());
             let ack = portl_proto::shell_v1::ShellAck {
                 ok: false,
-                reason: Some(reason),
+                reason: Some(reject.wire),
                 pid: None,
                 session_id: None,
             };
@@ -118,11 +118,11 @@ async fn serve_control_stream(
     let audit_session_id = uuid::Uuid::new_v4().to_string();
     let process = match spawn_process(&session, &req, requested_user.as_ref(), &audit_session_id) {
         Ok(process) => process,
-        Err(reason) => {
-            audit::shell_reject(&session, classify_spawn_reject(&req, &reason));
+        Err(reject) => {
+            audit::shell_reject(&session, reject.kind.reason_str());
             let ack = portl_proto::shell_v1::ShellAck {
                 ok: false,
-                reason: Some(reason),
+                reason: Some(reject.wire),
                 pid: None,
                 session_id: None,
             };
@@ -315,12 +315,88 @@ async fn pump_exit(mut send: SendStream, process: &ShellProcess) -> Result<()> {
     Ok(())
 }
 
+/// Enumerated reject reasons from spec docs/specs/150-v0.1.1-safety-net.md §3.2.
+///
+/// The wire-visible `ShellReason` is a free-form enum for client-facing
+/// error messages; the audit reject reasons are a closed set. This
+/// local enum carries the spec reason alongside every pre-spawn
+/// failure so audit dispatch can match on the variant rather than
+/// inferring from the request shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RejectKind {
+    ArgvEmpty,
+    PathProbeFailed,
+    PtyAllocationFailed,
+    UidLookupFailed,
+    UserSwitchRefused,
+}
+
+impl RejectKind {
+    pub(crate) fn reason_str(self) -> &'static str {
+        match self {
+            Self::ArgvEmpty => "argv_empty",
+            Self::PathProbeFailed => "path_probe_failed",
+            Self::PtyAllocationFailed => "pty_allocation_failed",
+            Self::UidLookupFailed => "uid_lookup_failed",
+            Self::UserSwitchRefused => "user_switch_refused",
+        }
+    }
+}
+
+/// Paired audit kind + wire reason returned from `spawn_process`
+/// and `resolve_requested_user` so the control-stream handler can
+/// emit both the spec-enumerated audit string and the client-visible
+/// `ShellAck.reason` without re-deriving one from the other.
+#[derive(Debug)]
+pub(crate) struct SpawnReject {
+    pub(crate) kind: RejectKind,
+    pub(crate) wire: portl_proto::shell_v1::ShellReason,
+}
+
+impl SpawnReject {
+    fn new(kind: RejectKind, wire: portl_proto::shell_v1::ShellReason) -> Self {
+        Self { kind, wire }
+    }
+
+    fn argv_empty() -> Self {
+        Self::new(
+            RejectKind::ArgvEmpty,
+            portl_proto::shell_v1::ShellReason::SpawnFailed("missing argv".to_owned()),
+        )
+    }
+
+    fn path_probe_failed(msg: impl Into<String>) -> Self {
+        Self::new(
+            RejectKind::PathProbeFailed,
+            portl_proto::shell_v1::ShellReason::SpawnFailed(msg.into()),
+        )
+    }
+
+    fn pty_allocation_failed(wire: portl_proto::shell_v1::ShellReason) -> Self {
+        Self::new(RejectKind::PtyAllocationFailed, wire)
+    }
+
+    fn uid_lookup_failed(msg: impl Into<String>) -> Self {
+        Self::new(
+            RejectKind::UidLookupFailed,
+            portl_proto::shell_v1::ShellReason::BadUser(msg.into()),
+        )
+    }
+
+    fn user_switch_refused(msg: impl Into<String>) -> Self {
+        Self::new(
+            RejectKind::UserSwitchRefused,
+            portl_proto::shell_v1::ShellReason::BadUser(msg.into()),
+        )
+    }
+}
+
 fn spawn_process(
     session: &Session,
     req: &portl_proto::shell_v1::ShellReq,
     requested_user: Option<&RequestedUser>,
     audit_session_id: &str,
-) -> std::result::Result<Arc<ShellProcess>, portl_proto::shell_v1::ShellReason> {
+) -> std::result::Result<Arc<ShellProcess>, SpawnReject> {
     match req.mode {
         portl_proto::shell_v1::ShellMode::Exec => {
             spawn_exec_process(session, req, requested_user, audit_session_id)
@@ -337,14 +413,12 @@ fn spawn_exec_process(
     req: &portl_proto::shell_v1::ShellReq,
     requested_user: Option<&RequestedUser>,
     audit_session_id: &str,
-) -> std::result::Result<Arc<ShellProcess>, portl_proto::shell_v1::ShellReason> {
+) -> std::result::Result<Arc<ShellProcess>, SpawnReject> {
     let argv = req
         .argv
         .as_ref()
         .filter(|argv| !argv.is_empty())
-        .ok_or_else(|| {
-            portl_proto::shell_v1::ShellReason::SpawnFailed("missing argv".to_owned())
-        })?;
+        .ok_or_else(SpawnReject::argv_empty)?;
     let mut command = StdCommand::new(&argv[0]);
     command.args(&argv[1..]);
     command.stdin(Stdio::piped());
@@ -366,20 +440,23 @@ fn spawn_exec_process(
 
     let mut child = TokioCommand::from(command)
         .spawn()
-        .map_err(|err| portl_proto::shell_v1::ShellReason::SpawnFailed(err.to_string()))?;
-    let pid = child.id().ok_or_else(|| {
-        portl_proto::shell_v1::ShellReason::SpawnFailed("missing child pid".to_owned())
-    })?;
+        .map_err(|err| SpawnReject::path_probe_failed(err.to_string()))?;
+    let pid = child
+        .id()
+        .ok_or_else(|| SpawnReject::path_probe_failed("missing child pid"))?;
 
-    let stdin = child.stdin.take().ok_or_else(|| {
-        portl_proto::shell_v1::ShellReason::SpawnFailed("missing child stdin".to_owned())
-    })?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        portl_proto::shell_v1::ShellReason::SpawnFailed("missing child stdout".to_owned())
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| {
-        portl_proto::shell_v1::ShellReason::SpawnFailed("missing child stderr".to_owned())
-    })?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| SpawnReject::path_probe_failed("missing child stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| SpawnReject::path_probe_failed("missing child stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| SpawnReject::path_probe_failed("missing child stderr"))?;
 
     let (stdin_tx, stdin_rx) = mpsc::channel(32);
     let (stdout_tx, stdout_rx) = mpsc::channel(32);
@@ -453,25 +530,24 @@ fn spawn_exec_process(
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_lines)]
 fn spawn_pty_process(
     session: &Session,
     req: &portl_proto::shell_v1::ShellReq,
     requested_user: Option<&RequestedUser>,
     audit_session_id: &str,
-) -> std::result::Result<Arc<ShellProcess>, portl_proto::shell_v1::ShellReason> {
+) -> std::result::Result<Arc<ShellProcess>, SpawnReject> {
     if let Some(user) = requested_user
         && user.switch_required
     {
-        return Err(portl_proto::shell_v1::ShellReason::BadUser(
-            "pty mode does not support --user in v0.1; use `portl exec --user <name>` or run the agent as the target user"
-                .to_owned(),
+        return Err(SpawnReject::user_switch_refused(
+            "pty mode does not support --user in v0.1; use `portl exec --user <name>` or run the agent as the target user",
         ));
     }
 
-    let pty = req
-        .pty
-        .as_ref()
-        .ok_or(portl_proto::shell_v1::ShellReason::InvalidPty)?;
+    let pty = req.pty.as_ref().ok_or_else(|| {
+        SpawnReject::pty_allocation_failed(portl_proto::shell_v1::ShellReason::InvalidPty)
+    })?;
     let winsize = nix::libc::winsize {
         ws_row: pty.rows,
         ws_col: pty.cols,
@@ -490,18 +566,28 @@ fn spawn_pty_process(
         env,
         req.cwd.as_deref(),
     )
-    .map_err(|err| portl_proto::shell_v1::ShellReason::SpawnFailed(err.to_string()))?;
-
-    let pid = child.id().ok_or_else(|| {
-        portl_proto::shell_v1::ShellReason::SpawnFailed("missing child pid".to_owned())
+    .map_err(|err| {
+        SpawnReject::pty_allocation_failed(portl_proto::shell_v1::ShellReason::SpawnFailed(
+            err.to_string(),
+        ))
     })?;
 
-    let reader_fd = master
-        .try_clone()
-        .map_err(|err| portl_proto::shell_v1::ShellReason::SpawnFailed(err.to_string()))?;
-    let writer_fd = master
-        .try_clone()
-        .map_err(|err| portl_proto::shell_v1::ShellReason::SpawnFailed(err.to_string()))?;
+    let pid = child.id().ok_or_else(|| {
+        SpawnReject::pty_allocation_failed(portl_proto::shell_v1::ShellReason::SpawnFailed(
+            "missing child pid".to_owned(),
+        ))
+    })?;
+
+    let reader_fd = master.try_clone().map_err(|err| {
+        SpawnReject::pty_allocation_failed(portl_proto::shell_v1::ShellReason::SpawnFailed(
+            err.to_string(),
+        ))
+    })?;
+    let writer_fd = master.try_clone().map_err(|err| {
+        SpawnReject::pty_allocation_failed(portl_proto::shell_v1::ShellReason::SpawnFailed(
+            err.to_string(),
+        ))
+    })?;
     let master = Arc::new(master);
 
     let (stdin_tx, stdin_rx) = mpsc::channel(32);
@@ -552,11 +638,11 @@ fn spawn_pty_process(
     // The child called setsid() in pre_exec, so its pid is also the
     // session/process-group leader. Deliver signals to the whole group
     // via a negative pid.
-    let signal_target = i32::try_from(pid)
-        .map(|raw| Some(-raw))
-        .map_err(|_| {
-            portl_proto::shell_v1::ShellReason::SpawnFailed("child pid out of range".to_owned())
-        })?;
+    let signal_target = i32::try_from(pid).map(|raw| Some(-raw)).map_err(|_| {
+        SpawnReject::pty_allocation_failed(portl_proto::shell_v1::ShellReason::SpawnFailed(
+            "child pid out of range".to_owned(),
+        ))
+    })?;
 
     Ok(Arc::new(ShellProcess {
         pid,
@@ -577,9 +663,11 @@ fn spawn_pty_process(
     _req: &portl_proto::shell_v1::ShellReq,
     _requested_user: Option<&RequestedUser>,
     _audit_session_id: &str,
-) -> std::result::Result<Arc<ShellProcess>, portl_proto::shell_v1::ShellReason> {
-    Err(portl_proto::shell_v1::ShellReason::SpawnFailed(
-        "pty mode requires a unix platform".to_owned(),
+) -> std::result::Result<Arc<ShellProcess>, SpawnReject> {
+    Err(SpawnReject::pty_allocation_failed(
+        portl_proto::shell_v1::ShellReason::SpawnFailed(
+            "pty mode requires a unix platform".to_owned(),
+        ),
     ))
 }
 
@@ -941,29 +1029,29 @@ struct RequestedUser;
 
 fn resolve_requested_user(
     user: Option<&str>,
-) -> std::result::Result<Option<RequestedUser>, portl_proto::shell_v1::ShellReason> {
+) -> std::result::Result<Option<RequestedUser>, SpawnReject> {
     #[cfg(unix)]
     {
         let current = geteuid();
         let current_user = User::from_uid(current)
-            .map_err(|err| portl_proto::shell_v1::ShellReason::BadUser(err.to_string()))?
+            .map_err(|err| SpawnReject::uid_lookup_failed(err.to_string()))?
             .ok_or_else(|| {
-                portl_proto::shell_v1::ShellReason::BadUser(format!(
+                SpawnReject::uid_lookup_failed(format!(
                     "unknown current user: {}",
                     current.as_raw()
                 ))
             })?;
         let requested = match user {
             Some(user) => User::from_name(user)
-                .map_err(|err| portl_proto::shell_v1::ShellReason::BadUser(err.to_string()))?
+                .map_err(|err| SpawnReject::user_switch_refused(err.to_string()))?
                 .ok_or_else(|| {
-                    portl_proto::shell_v1::ShellReason::BadUser(format!("unknown user: {user}"))
+                    SpawnReject::user_switch_refused(format!("unknown user: {user}"))
                 })?,
             None => current_user,
         };
         if !current.is_root() && requested.uid != current {
-            return Err(portl_proto::shell_v1::ShellReason::BadUser(
-                "cannot drop uid as non-root".to_owned(),
+            return Err(SpawnReject::user_switch_refused(
+                "cannot drop uid as non-root",
             ));
         }
         let shell = requested.shell.to_string_lossy().into_owned();
@@ -984,8 +1072,8 @@ fn resolve_requested_user(
     #[cfg(not(unix))]
     {
         match user {
-            Some(_) => Err(portl_proto::shell_v1::ShellReason::BadUser(
-                "user switching is unsupported on this platform".to_owned(),
+            Some(_) => Err(SpawnReject::user_switch_refused(
+                "user switching is unsupported on this platform",
             )),
             None => Ok(None),
         }
@@ -1019,12 +1107,8 @@ fn terminate_process(target: Option<i32>) {
     }
 }
 
-fn signal_target_from_pid(
-    pid: u32,
-) -> std::result::Result<i32, portl_proto::shell_v1::ShellReason> {
-    i32::try_from(pid).map_err(|_| {
-        portl_proto::shell_v1::ShellReason::SpawnFailed("child pid out of range".to_owned())
-    })
+fn signal_target_from_pid(pid: u32) -> std::result::Result<i32, SpawnReject> {
+    i32::try_from(pid).map_err(|_| SpawnReject::path_probe_failed("child pid out of range"))
 }
 
 #[cfg(all(
@@ -1101,43 +1185,7 @@ fn install_exec_user_switch(command: &mut StdCommand, user: &RequestedUser) -> b
     true
 }
 
-/// Classify a `resolve_requested_user` failure into one of the
-/// enumerated `audit.shell_reject` reason strings.
-///
-/// A rejection with no requested user means the failure originated in
-/// the agent's own euid lookup (`uid_lookup_failed`); a rejection with
-/// a requested user is always a refusal to switch to that target
-/// (`user_switch_refused`), whether because the name is unknown, the
-/// agent is non-root, or the user-allowlist denies the switch.
-fn classify_user_reject(requested: Option<&str>) -> &'static str {
-    if requested.is_some() {
-        "user_switch_refused"
-    } else {
-        "uid_lookup_failed"
-    }
-}
 
-/// Classify a `spawn_process` failure into one of the enumerated
-/// `audit.shell_reject` reason strings based on the request shape and
-/// the returned `ShellReason`.
-fn classify_spawn_reject(
-    req: &portl_proto::shell_v1::ShellReq,
-    reason: &portl_proto::shell_v1::ShellReason,
-) -> &'static str {
-    match req.mode {
-        portl_proto::shell_v1::ShellMode::Exec => {
-            if req.argv.as_ref().is_none_or(Vec::is_empty) {
-                "argv_empty"
-            } else {
-                "path_probe_failed"
-            }
-        }
-        portl_proto::shell_v1::ShellMode::Shell => match reason {
-            portl_proto::shell_v1::ShellReason::BadUser(_) => "user_switch_refused",
-            _ => "pty_allocation_failed",
-        },
-    }
-}
 
 fn fresh_session_id() -> [u8; 16] {
     loop {
