@@ -8,6 +8,13 @@ authors.workspace      = true
 rust-version.workspace = true
 description  = "portl agent runtime: handshake, discovery, and session acceptance."
 
+[features]
+# Enables a `maybe_test_panic()` hook at the top of `run` that panics
+# when `PORTL_TEST_PANIC_AT=startup` is set in the environment. Used
+# by `tests/panic_abort.rs` to verify release-profile `panic = "abort"`
+# actually aborts. Never enable in production builds.
+test-panic-trigger = []
+
 [lints]
 workspace = true
 

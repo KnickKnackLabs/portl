@@ -48,8 +48,24 @@ pub(crate) struct AgentState {
 
 #[instrument(skip_all)]
 pub async fn run(cfg: AgentConfig) -> Result<()> {
+    maybe_test_panic();
     run_with_shutdown(cfg, CancellationToken::new()).await
 }
+
+/// Test-only panic hook. Enabled by the `test-panic-trigger` feature
+/// (never enable in production); panics if `PORTL_TEST_PANIC_AT=startup`
+/// is set so `tests/panic_abort.rs` can observe the release profile's
+/// `panic = "abort"` take effect.
+#[cfg(feature = "test-panic-trigger")]
+fn maybe_test_panic() {
+    assert!(
+        std::env::var("PORTL_TEST_PANIC_AT").as_deref() != Ok("startup"),
+        "test-only panic trigger",
+    );
+}
+
+#[cfg(not(feature = "test-panic-trigger"))]
+fn maybe_test_panic() {}
 
 #[instrument(skip_all)]
 pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) -> Result<()> {
