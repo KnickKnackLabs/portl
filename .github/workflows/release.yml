@@ -28,8 +28,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - name: Install target toolchain (for the pinned rust-toolchain.toml)
+        # rust-toolchain.toml pins the compiler; the `targets:` input
+        # on the action above only adds targets to the *stable* alias,
+        # which the pin overrides. Install against the pinned version
+        # explicitly so musl / darwin cross-targets are available.
+        run: rustup target add ${{ matrix.target }}
       - name: Install zig (linux only)
         if: matrix.linux
         uses: mlugg/setup-zig@v2
