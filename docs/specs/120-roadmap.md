@@ -66,7 +66,7 @@ Exit:
 - `portl-core::test_util::pair()` returns two wired-in-process Endpoints
   (replaces the pre-review `portl-overlay-loopback` crate).
 - CI green: `cargo check + cargo test + clippy + rustfmt + cargo-deny`.
-- `docs/design/` with this document set committed.
+- `docs/specs/` with this document set committed.
 - Reproducible dev environment (`rust-toolchain.toml` pinned).
 
 Non-goals: no real functionality yet.

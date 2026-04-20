@@ -69,7 +69,27 @@ prose still use `node_id`. Treat them as synonymous.
 | 110 | `110-workspace.md` | Cargo workspace layout, crate boundaries, dependencies. |
 | 120 | `120-roadmap.md` | Milestones M0–M10 with exit criteria (M4 docker, M5 slicer). |
 | 130 | `130-open-questions.md` | Decisions the author wants confirmed before scaffolding. |
-| 140 | `140-v0.2-cleanup.md` | **v0.2.0 cleanup plan.** Breaking simplifications; supersedes parts of 060/080/090 on ship. |
+| 140 | `140-v0.2-operability.md` | **v0.2.0 design spec.** Shape cleanup + session-lifecycle hardening; supersedes parts of 060/080/090 on ship. |
+| 150 | `150-v0.1.1-safety-net.md` | **v0.1.1 design spec.** Three non-breaking runtime-stability items shipped ahead of v0.2. |
+| 160 | `160-v0.1.2-alias-isolation.md` | **v0.1.2 design spec.** Forensic experiment: isolate rusqlite removal to test the macOS release-mode crash hypothesis. |
+
+## Specs vs plans — where does what go
+
+This directory holds **specs**: architectural decisions and per-release design docs. Specs answer *what & why*. They are durable: someone reading them a year later should understand what was decided and why. They do not contain TDD step lists, exact commit messages, or implementation timelines.
+
+Implementation recipes live in [`../plans/`](../plans/). A plan answers *how*: bite-sized TDD tasks, exact file paths, exact code to write, exact commands to run. Plans retire when the feature ships — their content graduates to the `CHANGELOG.md`.
+
+This split matches the Superpowers `brainstorming` → `writing-plans` flow, adapted to keep portl's 3-digit numbering convention instead of date-prefixed filenames.
+
+Quick reference:
+
+| Question | Look here |
+| --- | --- |
+| Why does the agent use env vars instead of a TOML file? | spec |
+| What exact test should I write to verify setrlimit inheritance? | plan |
+| What are the v0.2 CLI invariants? | spec |
+| In what order should the v0.1.1 commits land? | plan |
+| Did this ship? | `CHANGELOG.md` |
 
 Design artifacts for deferred/post-v0.1 work (in `future/`):
 
