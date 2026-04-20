@@ -335,6 +335,8 @@ fn spawn_exec_process(
         effective_env(session.caps.shell.as_ref(), req, requested_user),
     );
     #[cfg(unix)]
+    install_exec_rlimits_pre_exec(&mut command);
+    #[cfg(unix)]
     if let Some(user) = requested_user {
         install_exec_user_switch(&mut command, user);
     }
@@ -557,6 +559,9 @@ fn spawn_pty_blocking(
     #[allow(unsafe_code)]
     unsafe {
         command.pre_exec(move || {
+            // Apply v0.1.1 resource limits before any fd wiring so a
+            // broken pty setup can't escape the caps.
+            apply_rlimits()?;
             // Become a new session and process-group leader so the pty
             // slave can be claimed as the controlling terminal.
             if nix::libc::setsid() == -1 {
@@ -603,6 +608,95 @@ pub fn spawn_pty_for_test(
     };
     let argv: Vec<String> = argv.iter().map(|s| (*s).to_owned()).collect();
     spawn_pty_blocking(program, &argv, size, Vec::new(), None)
+}
+
+/// Apply the v0.1.1 resource limits to the calling process.
+///
+/// Called from inside `pre_exec` closures (async-signal-safe path) on
+/// both the exec and PTY spawn paths. Values:
+/// - `RLIMIT_NOFILE` = 4096
+/// - `RLIMIT_CORE`   = 0       (no core dumps)
+/// - `RLIMIT_CPU`    = 86400 s
+/// - `RLIMIT_FSIZE`  = 10 GiB
+/// - `RLIMIT_NPROC`  = 512     (Linux only; Darwin `RLIMIT_NPROC`
+///   is per-process and cannot contain a fork bomb at the uid level)
+#[cfg(unix)]
+fn apply_rlimits() -> std::io::Result<()> {
+    fn set(resource: nix::libc::c_int, value: u64) -> std::io::Result<()> {
+        let rl = nix::libc::rlimit {
+            rlim_cur: value as nix::libc::rlim_t,
+            rlim_max: value as nix::libc::rlim_t,
+        };
+        // SAFETY(unsafe_code): setrlimit with a valid &rlimit is a
+        // standard libc call; it cannot escape memory or aliasing rules.
+        #[allow(unsafe_code)]
+        let rc = unsafe { nix::libc::setrlimit(resource, &raw const rl) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    set(nix::libc::RLIMIT_NOFILE, 4096)?;
+    set(nix::libc::RLIMIT_CORE, 0)?;
+    set(nix::libc::RLIMIT_CPU, 86_400)?;
+    set(nix::libc::RLIMIT_FSIZE, 10 * 1024 * 1024 * 1024)?;
+    #[cfg(target_os = "linux")]
+    set(nix::libc::RLIMIT_NPROC, 512)?;
+    Ok(())
+}
+
+/// Install a `pre_exec` hook that applies the v0.1.1 rlimits. This
+/// is the first closure registered on the exec path so it runs
+/// before the optional user-switch hook.
+#[cfg(unix)]
+fn install_exec_rlimits_pre_exec(command: &mut StdCommand) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY(unsafe_code): pre_exec runs post-fork, pre-exec. The
+    // closure calls `apply_rlimits()` which only invokes
+    // async-signal-safe syscalls (setrlimit) and returns an io::Result.
+    #[allow(unsafe_code)]
+    unsafe {
+        command.pre_exec(apply_rlimits);
+    }
+}
+
+/// Captured output of a single exec-path spawn. Used by the
+/// `tests/rlimits.rs` integration test suite to observe
+/// `apply_rlimits()` effects from outside the crate.
+#[derive(Debug)]
+pub struct ExecCapture {
+    pub status: std::process::ExitStatus,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Test helper that runs `program argv` through the same rlimits hook
+/// the production exec path uses, then collects stdout/stderr.
+#[cfg(unix)]
+pub async fn run_exec_capture(
+    program: &str,
+    argv: &[&str],
+    env: Vec<(String, String)>,
+) -> std::io::Result<ExecCapture> {
+    let mut command = StdCommand::new(program);
+    command.args(argv);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    command.env_clear();
+    for (k, v) in env {
+        command.env(k, v);
+    }
+    // Inherit a minimal PATH so `/bin/sh` can resolve builtins.
+    command.env("PATH", "/usr/local/bin:/usr/bin:/bin");
+    install_exec_rlimits_pre_exec(&mut command);
+    let output = TokioCommand::from(command).output().await?;
+    Ok(ExecCapture {
+        status: output.status,
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
 }
 
 async fn exec_stdin_task(
