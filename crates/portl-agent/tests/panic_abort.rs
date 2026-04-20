@@ -11,6 +11,7 @@
 
 #![cfg(all(unix, not(debug_assertions)))]
 
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -107,7 +108,17 @@ fn release_build_panics_exit_nonzero() {
         !exit.success(),
         "panic=abort should exit non-zero, got {exit:?}"
     );
-    // Signal-terminated processes have code() == None on Unix. Either
-    // shape is acceptable as a "non-zero exit".
-    assert!(exit.code() != Some(0));
+    // panic = abort on Unix terminates via SIGABRT. Depending on how
+    // the shell / wrapper relays the signal, we observe either:
+    //   - signal(SIGABRT)  (raw wait(2) exit status)
+    //   - code(Some(134))  (128 + SIGABRT; shell-style wrapped exit)
+    //   - code(None)       (signal-terminated, no exit code)
+    // An unwinding panic followed by a clean non-zero Err exit would
+    // give code(Some(1)), which is NOT abort semantics and must fail.
+    assert!(
+        exit.signal() == Some(nix::libc::SIGABRT)
+            || exit.code() == Some(134)
+            || exit.code().is_none(),
+        "expected abort semantics (SIGABRT / 134 / no code), got {exit:?}"
+    );
 }
