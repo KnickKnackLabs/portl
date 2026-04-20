@@ -114,7 +114,8 @@ async fn serve_control_stream(
             return Ok(());
         }
     };
-    let process = match spawn_process(&session, &req, requested_user.as_ref()) {
+    let audit_session_id = uuid::Uuid::new_v4().to_string();
+    let process = match spawn_process(&session, &req, requested_user.as_ref(), &audit_session_id) {
         Ok(process) => process,
         Err(reason) => {
             audit::shell_reject(&session, classify_spawn_reject(&req, &reason));
@@ -138,7 +139,12 @@ async fn serve_control_stream(
         registry: &state.shell_registry,
         session_id,
     };
-    audit::shell_spawn(&session, req.user.as_deref(), req.argv.as_ref());
+    audit::shell_start(
+        &session,
+        &audit_session_id,
+        req.user.as_deref(),
+        req.argv.as_ref(),
+    );
 
     // Keep the shell session registered until the control stream drops.
     // Short-lived exec commands can exit before the client finishes opening
@@ -305,10 +311,15 @@ fn spawn_process(
     session: &Session,
     req: &portl_proto::shell_v1::ShellReq,
     requested_user: Option<&RequestedUser>,
+    audit_session_id: &str,
 ) -> std::result::Result<Arc<ShellProcess>, portl_proto::shell_v1::ShellReason> {
     match req.mode {
-        portl_proto::shell_v1::ShellMode::Exec => spawn_exec_process(session, req, requested_user),
-        portl_proto::shell_v1::ShellMode::Shell => spawn_pty_process(session, req, requested_user),
+        portl_proto::shell_v1::ShellMode::Exec => {
+            spawn_exec_process(session, req, requested_user, audit_session_id)
+        }
+        portl_proto::shell_v1::ShellMode::Shell => {
+            spawn_pty_process(session, req, requested_user, audit_session_id)
+        }
     }
 }
 
@@ -317,6 +328,7 @@ fn spawn_exec_process(
     session: &Session,
     req: &portl_proto::shell_v1::ShellReq,
     requested_user: Option<&RequestedUser>,
+    audit_session_id: &str,
 ) -> std::result::Result<Arc<ShellProcess>, portl_proto::shell_v1::ShellReason> {
     let argv = req
         .argv
@@ -387,6 +399,7 @@ fn spawn_exec_process(
     let exit_tx_wait = exit_tx.clone();
     let ticket_id = session.ticket_id;
     let caller_endpoint_id = session.caller_endpoint_id;
+    let audit_session_id = audit_session_id.to_owned();
     tokio::spawn(async move {
         let code = match child.wait().await {
             Ok(status) => status.code().unwrap_or(1),
@@ -399,7 +412,7 @@ fn spawn_exec_process(
             *guard = Some(code);
         }
         let _ = exit_tx_wait.send(Some(code));
-        audit::shell_exit_raw(ticket_id, caller_endpoint_id, pid, code);
+        audit::shell_exit_raw(ticket_id, caller_endpoint_id, &audit_session_id, pid, code);
     });
 
     Ok(Arc::new(ShellProcess {
@@ -419,6 +432,7 @@ fn spawn_pty_process(
     session: &Session,
     req: &portl_proto::shell_v1::ShellReq,
     requested_user: Option<&RequestedUser>,
+    audit_session_id: &str,
 ) -> std::result::Result<Arc<ShellProcess>, portl_proto::shell_v1::ShellReason> {
     if let Some(user) = requested_user
         && user.switch_required
@@ -478,6 +492,7 @@ fn spawn_pty_process(
     let exit_tx_wait = exit_tx.clone();
     let ticket_id = session.ticket_id;
     let caller_endpoint_id = session.caller_endpoint_id;
+    let audit_session_id = audit_session_id.to_owned();
     tokio::spawn(async move {
         let code = match child.wait().await {
             Ok(status) => status.code().unwrap_or(1),
@@ -490,7 +505,7 @@ fn spawn_pty_process(
             *guard = Some(code);
         }
         let _ = exit_tx_wait.send(Some(code));
-        audit::shell_exit_raw(ticket_id, caller_endpoint_id, pid, code);
+        audit::shell_exit_raw(ticket_id, caller_endpoint_id, &audit_session_id, pid, code);
     });
 
     // The child called setsid() in pre_exec, so its pid is also the
@@ -519,6 +534,7 @@ fn spawn_pty_process(
     _session: &Session,
     _req: &portl_proto::shell_v1::ShellReq,
     _requested_user: Option<&RequestedUser>,
+    _audit_session_id: &str,
 ) -> std::result::Result<Arc<ShellProcess>, portl_proto::shell_v1::ShellReason> {
     Err(portl_proto::shell_v1::ShellReason::SpawnFailed(
         "pty mode requires a unix platform".to_owned(),

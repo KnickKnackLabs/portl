@@ -1,0 +1,124 @@
+//! Verifies that an accepted exec session emits exactly one
+//! `audit.shell_start` and one `audit.shell_exit` record, and that
+//! both carry the same `session_id` (`UUIDv4`) field.
+
+#![cfg(unix)]
+
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result};
+use portl_agent::{AgentConfig, DiscoveryConfig, run_task};
+use portl_core::id::Identity;
+use portl_core::net::{open_exec, open_ticket_v1};
+use portl_core::test_util::pair;
+use portl_core::ticket::mint::mint_root;
+use portl_core::ticket::schema::{Capabilities, EnvPolicy, PortlTicket, ShellCaps};
+use tokio::io::AsyncReadExt;
+
+mod common;
+
+#[tokio::test]
+async fn accepted_session_emits_start_and_exit_with_same_session_id() -> Result<()> {
+    let capture = common::install_audit_capture();
+
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator).await?;
+    let ticket = root_ticket(&operator, server.addr(), shell_caps_exec_only());
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+
+    let mut exec = open_exec(
+        &connection,
+        &session,
+        None,
+        None,
+        vec!["/bin/sh".to_owned(), "-c".to_owned(), "true".to_owned()],
+    )
+    .await?;
+    exec.stdin.finish()?;
+    let mut stdout = Vec::new();
+    AsyncReadExt::read_to_end(&mut exec.stdout, &mut stdout).await?;
+    let code = exec.wait_exit().await?;
+    assert_eq!(code, 0);
+
+    // Drain any in-flight audit emits.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let records = capture.records();
+    let starts: Vec<_> = records
+        .iter()
+        .filter(|r| r.event == "audit.shell_start")
+        .collect();
+    let exits: Vec<_> = records
+        .iter()
+        .filter(|r| r.event == "audit.shell_exit")
+        .collect();
+    assert_eq!(starts.len(), 1, "expected 1 shell_start, got {records:#?}");
+    assert_eq!(exits.len(), 1, "expected 1 shell_exit, got {records:#?}");
+    let start_sid = starts[0]
+        .fields
+        .get("session_id")
+        .expect("shell_start missing session_id");
+    let exit_sid = exits[0]
+        .fields
+        .get("session_id")
+        .expect("shell_exit missing session_id");
+    assert_eq!(start_sid, exit_sid, "session_id mismatch");
+    // Sanity: UUIDv4 hyphenated form is 36 chars.
+    assert_eq!(start_sid.len(), 36, "session_id not a UUID: {start_sid}");
+
+    connection.close(0u32.into(), b"done");
+    client.inner().close().await;
+    server.inner().close().await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), agent).await;
+    Ok(())
+}
+
+async fn start_agent(
+    server: portl_core::endpoint::Endpoint,
+    operator: &Identity,
+) -> Result<tokio::task::JoinHandle<Result<()>>> {
+    let revocations_path = std::env::temp_dir().join(format!(
+        "portl-agent-audit-balance-revocations-{}.json",
+        rand::random::<u64>()
+    ));
+    run_task(AgentConfig {
+        discovery: DiscoveryConfig::in_process(),
+        trust_roots: vec![operator.verifying_key()],
+        revocations_path: Some(revocations_path),
+        endpoint: Some(server),
+        ..AgentConfig::default()
+    })
+    .await
+    .context("spawn agent")
+}
+
+fn root_ticket(
+    operator: &Identity,
+    addr: iroh_base::EndpointAddr,
+    caps: Capabilities,
+) -> PortlTicket {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("unix time")
+        .as_secs();
+    mint_root(operator.signing_key(), addr, caps, now, now + 300, None).expect("mint root")
+}
+
+fn shell_caps_exec_only() -> Capabilities {
+    Capabilities {
+        presence: 0b0000_0001,
+        shell: Some(ShellCaps {
+            user_allowlist: None,
+            pty_allowed: false,
+            exec_allowed: true,
+            command_allowlist: None,
+            env_policy: EnvPolicy::Merge { allow: None },
+        }),
+        tcp: None,
+        udp: None,
+        fs: None,
+        vpn: None,
+        meta: None,
+    }
+}

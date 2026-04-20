@@ -38,12 +38,18 @@ pub(crate) fn ticket_accepted(session: &Session) {
     );
 }
 
-pub(crate) fn shell_spawn(session: &Session, user: Option<&str>, argv: Option<&Vec<String>>) {
+pub(crate) fn shell_start(
+    session: &Session,
+    session_id: &str,
+    user: Option<&str>,
+    argv: Option<&Vec<String>>,
+) {
     tracing::event!(
         Level::INFO,
-        event = "audit.shell_spawn",
+        event = "audit.shell_start",
         caller_endpoint_id = %hex::encode(session.caller_endpoint_id),
         ticket_id_hex = %hex::encode(session.ticket_id),
+        session_id = session_id,
         shell_user = user.unwrap_or(""),
         shell_argv0 = argv.and_then(|argv| argv.first()).map_or("", String::as_str),
     );
@@ -67,6 +73,7 @@ pub(crate) fn shell_reject(session: &Session, reason: &'static str) {
 pub(crate) fn shell_exit_raw(
     ticket_id: [u8; 16],
     caller_endpoint_id: [u8; 32],
+    session_id: &str,
     pid: u32,
     code: i32,
 ) {
@@ -75,6 +82,7 @@ pub(crate) fn shell_exit_raw(
         event = "audit.shell_exit",
         caller_endpoint_id = %hex::encode(caller_endpoint_id),
         ticket_id_hex = %hex::encode(ticket_id),
+        session_id = session_id,
         pid,
         code,
     );
