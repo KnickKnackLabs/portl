@@ -106,11 +106,37 @@ scan across the alias store.
 
 ## Operator install
 
-Release artifacts are published for `linux/amd64`, `linux/arm64`,
-`darwin/amd64`, `darwin/arm64` on each tag. Binaries are static
-enough to drop into a minimal image. See
-[`docs/design/060-docker.md §13`](docs/design/060-docker.md) for the
-reference Dockerfile.
+Release artifacts are published for four targets on every tag:
+
+- `x86_64-unknown-linux-musl`
+- `aarch64-unknown-linux-musl`
+- `x86_64-apple-darwin`
+- `aarch64-apple-darwin`
+
+Linux builds are fully statically linked (musl), so a single
+`portl` binary drops into Alpine, distroless, BusyBox, CentOS 7 and
+every modern glibc distro without additional runtime dependencies.
+macOS builds link only against always-present system frameworks.
+
+Install from a tag:
+
+```sh
+VER=v0.1.1
+TARGET=x86_64-unknown-linux-musl      # pick your target
+curl -L -o portl.tar.zst \
+  https://github.com/KnickKnackLabs/portl/releases/download/$VER/portl-$VER-$TARGET.tar.zst
+tar --zstd -xf portl.tar.zst
+sudo install -m 0755 portl-$VER-$TARGET/portl /usr/local/bin/portl
+sudo ln -sf portl /usr/local/bin/portl-agent
+```
+
+Tarballs are `zstd -19` compressed (~7 MiB each). Any `tar` built on
+top of GNU tar 1.31+ or bsdtar with libarchive can extract them; if
+you see `unrecognized option --zstd`, install the `zstd` package.
+
+See [`docs/design/060-docker.md §13`](docs/design/060-docker.md) for
+the reference Dockerfile — with a musl binary you can FROM
+`gcr.io/distroless/static-debian12` or even `scratch`.
 
 ## Design docs
 

@@ -3,7 +3,7 @@
 All notable changes land here. This project follows
 [Semantic Versioning](https://semver.org/) from v0.1.0 onward.
 
-## 0.1.0 — 2026-04-19
+## 0.1.0 — 2026-04-20
 
 First end-to-end release. The v0.1 feature set spans milestones M0
 through M7 of the roadmap.
@@ -52,7 +52,16 @@ through M7 of the roadmap.
 - **`portl doctor`** — local diagnostics (clock sanity, identity
   load + permissions, UDP ephemeral bind, ticket expiry scan).
 - **GitHub Actions** — `ci-e2e.yml` builds and exercises a full
-  add → exec → shell → tcp → rm cycle on every push.
+  add → exec → shell → tcp → rm cycle on every push. The
+  `release.yml` workflow publishes musl linux binaries and
+  macOS-native binaries as `.tar.zst` (zstd -19) artifacts per
+  tag, cross-compiled via `cargo-zigbuild` on a single Ubuntu
+  runner.
+- **Static Linux builds.** Release tarballs target
+  `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`,
+  yielding fully statically linked binaries that drop into
+  Alpine, distroless, BusyBox, CentOS 7 and every modern glibc
+  distro without additional runtime dependencies.
 
 ### Notes
 

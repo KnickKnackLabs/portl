@@ -40,3 +40,5 @@ Cargo.lock.bak
 # OS thumbnails / metadata
 Thumbs.db
 ehthumbs.db
+/dist/
+/staging-test/
