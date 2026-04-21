@@ -3,6 +3,39 @@
 All notable changes land here. This project follows
 [Semantic Versioning](https://semver.org/) from v0.1.0 onward.
 
+## 0.2.1 — 2026-04-21
+
+Gateway-isolation and dependency-hygiene patch release. No user-facing
+CLI changes; focus is on making `AgentMode` a first-class trust
+boundary and removing vestigial dependencies from `portl-agent`.
+
+### Changed
+
+- **Agent-mode contract enforced at handshake.** `AcceptanceInput`
+  now carries the agent mode and `evaluate_offer` rejects tickets
+  whose bearer shape does not match the mode: listener mode refuses
+  master tickets, gateway mode requires one. Previously this was
+  only checked inside `gateway::serve_stream` on the `tcp/v1` path,
+  after the handshake had already succeeded.
+- **Gateway-mode ALPN dispatch is narrowed.** Gateway agents now
+  only serve `meta/v1` and `tcp/v1` streams. Incoming `shell/v1`
+  and `udp/v1` streams are closed at dispatch with an explicit
+  reason, closing the defense-in-depth gap where a gateway build
+  still linked shell/udp handlers.
+
+### Removed
+
+- **`reqwest` direct dependency from `portl-agent`.** It was only
+  used as a URL parser inside `parse_gateway_mode`. Replaced with
+  `url::Url`, which was already pulled in transitively. No runtime
+  or feature change.
+- **Ignored wiremock-backed gateway integration test.** The
+  aspirational end-to-end header-injection test was permanently
+  `#[ignore]`'d due to iroh in-process endpoint timing; deleted.
+  The `wiremock` dev-dependency is dropped from `portl-agent`.
+  Header-injection coverage remains in `src/gateway.rs` unit tests
+  against `tokio::io::duplex`.
+
 ## 0.2.0 — 2026-04-21
 
 Operability release. This is the first intentionally breaking

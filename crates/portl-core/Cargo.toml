@@ -48,7 +48,7 @@ socket2       = { workspace = true }
  prometheus-client = { workspace = true }
 
 [dev-dependencies]
-portl-core = { version = "0.2.0", path = ".", features = ["test-util"] }
+portl-core = { version = "0.2.1", path = ".", features = ["test-util"] }
 tokio      = { workspace = true }
 proptest   = { workspace = true }
 criterion  = { workspace = true }
