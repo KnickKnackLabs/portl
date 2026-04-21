@@ -15,6 +15,7 @@ use portl_core::ticket::mint::mint_root;
 use portl_core::ticket::schema::{Capabilities, EnvPolicy, PortlTicket, ShellCaps};
 use tokio::io::AsyncReadExt;
 
+#[allow(dead_code)]
 mod common;
 
 #[allow(clippy::too_many_lines)]

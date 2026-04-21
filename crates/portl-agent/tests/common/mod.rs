@@ -12,8 +12,11 @@
 //! waiting on the public n0 relay infrastructure — from wedging
 //! `cargo test --workspace` for minutes at a time. Set
 //! `PORTL_TEST_WATCHDOG_SECS=0` to disable for local debugging.
-
-#![allow(dead_code)]
+//!
+//! Each test file that uses this module writes
+//! `#[allow(dead_code)] mod common;` (outer form). We deliberately
+//! do NOT duplicate that as an inner `#![allow(dead_code)]` here;
+//! clippy's `duplicated_attributes` flags that.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
