@@ -27,22 +27,20 @@ env:
 #  - `save-if: ${{ github.ref == 'refs/heads/main' }}` restricts
 #    writes to main, so PR branches only read main's cache — keeps
 #    us comfortably under the 10 GB repo budget.
+#  - `cache-on-failure: true` saves the cache even when the job
+#    fails. Safe because Swatinem's pre-save clean strips workspace
+#    crates + incremental artifacts; only successfully-compiled
+#    deps survive. Gives warm-cache recovery on flaky test runs.
+#
+# Job topology:
+#  - `test` compiles all-targets in test cfg → subsumes `cargo check`.
+#  - `clippy` compiles all-targets with the clippy driver → also
+#    subsumes `cargo check`. A dedicated `check` job would be a
+#    strictly-weaker duplicate, so it is omitted.
+#  - `fmt` and `deny` stay separate: neither invokes rustc, both
+#    are <30 s, and they surface orthogonal red-X signals on PRs.
 
 jobs:
-  check:
-    name: cargo check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.89.0
-        with:
-          components: rustfmt, clippy
-      - uses: mozilla-actions/sccache-action@v0.0.9
-      - uses: Swatinem/rust-cache@v2.8.2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo check --workspace --all-features --all-targets
-
   test:
     name: cargo test
     runs-on: ubuntu-latest
@@ -53,6 +51,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2.8.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - run: cargo test --workspace --all-features
 
   fmt:
@@ -81,6 +80,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2.8.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
 
   deny:

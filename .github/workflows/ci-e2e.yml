@@ -23,6 +23,7 @@ jobs:
         with:
           shared-key: "linux-native"
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - name: Cargo check
         run: env -u RUSTUP_TOOLCHAIN cargo check --workspace --all-features
       - name: Cargo test

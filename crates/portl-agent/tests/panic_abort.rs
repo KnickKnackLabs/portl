@@ -64,11 +64,7 @@ fn release_build_panics_exit_nonzero() {
     assert!(status.success(), "cargo build failed: {status:?}");
 
     let bin = root.join("target").join("release").join("portl");
-    assert!(
-        bin.is_file(),
-        "expected portl binary at {}",
-        bin.display()
-    );
+    assert!(bin.is_file(), "expected portl binary at {}", bin.display());
 
     // Minimal config — the agent should panic before it gets this far,
     // but the arg parser needs a valid-looking invocation.

@@ -559,18 +559,14 @@ fn spawn_pty_process(
     let env = effective_env(shell_caps(&session.caps), req, requested_user);
     let argv: Vec<String> = vec!["-l".to_owned()];
 
-    let (master, mut child) = spawn_pty_blocking(
-        &shell_program,
-        &argv,
-        winsize,
-        env,
-        req.cwd.as_deref(),
-    )
-    .map_err(|err| {
-        SpawnReject::pty_allocation_failed(portl_proto::shell_v1::ShellReason::SpawnFailed(
-            err.to_string(),
-        ))
-    })?;
+    let (master, mut child) =
+        spawn_pty_blocking(&shell_program, &argv, winsize, env, req.cwd.as_deref()).map_err(
+            |err| {
+                SpawnReject::pty_allocation_failed(portl_proto::shell_v1::ShellReason::SpawnFailed(
+                    err.to_string(),
+                ))
+            },
+        )?;
 
     let pid = child.id().ok_or_else(|| {
         SpawnReject::pty_allocation_failed(portl_proto::shell_v1::ShellReason::SpawnFailed(
@@ -596,8 +592,12 @@ fn spawn_pty_process(
     let exit_code = Arc::new(Mutex::new(None));
     let (exit_tx, _) = watch::channel(None);
 
-    std::thread::spawn(move || pty_stdin_thread(Box::new(std::fs::File::from(writer_fd)), stdin_rx));
-    std::thread::spawn(move || pty_stdout_thread(Box::new(std::fs::File::from(reader_fd)), &stdout_tx));
+    std::thread::spawn(move || {
+        pty_stdin_thread(Box::new(std::fs::File::from(writer_fd)), stdin_rx);
+    });
+    std::thread::spawn(move || {
+        pty_stdout_thread(Box::new(std::fs::File::from(reader_fd)), &stdout_tx);
+    });
 
     let exit_code_wait = Arc::clone(&exit_code);
     let exit_tx_wait = exit_tx.clone();
@@ -800,7 +800,7 @@ fn apply_rlimits() -> std::io::Result<()> {
     // (E0308: expected i32, found u32). The `nix` shim abstracts that
     // away and is still async-signal-safe (thin wrapper over libc::
     // setrlimit, which POSIX lists as AS-safe).
-    use nix::sys::resource::{setrlimit, Resource};
+    use nix::sys::resource::{Resource, setrlimit};
 
     fn set(resource: Resource, value: u64) -> std::io::Result<()> {
         setrlimit(resource, value, value).map_err(std::io::Error::from)
@@ -1057,9 +1057,7 @@ fn resolve_requested_user(
         let requested = match user {
             Some(user) => User::from_name(user)
                 .map_err(|err| SpawnReject::user_switch_refused(err.to_string()))?
-                .ok_or_else(|| {
-                    SpawnReject::user_switch_refused(format!("unknown user: {user}"))
-                })?,
+                .ok_or_else(|| SpawnReject::user_switch_refused(format!("unknown user: {user}")))?,
             None => current_user,
         };
         if !current.is_root() && requested.uid != current {
@@ -1197,8 +1195,6 @@ fn install_exec_user_switch(command: &mut StdCommand, user: &RequestedUser) -> b
     command.gid(user.gid.as_raw());
     true
 }
-
-
 
 fn fresh_session_id() -> [u8; 16] {
     loop {

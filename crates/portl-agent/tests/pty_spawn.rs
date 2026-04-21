@@ -43,8 +43,7 @@ async fn pty_master_is_cloexec_in_child() {
     let fd_dir = "/dev/fd";
 
     let script = format!("ls {fd_dir}; exit 0");
-    let (master, mut child) =
-        spawn_pty_for_test("/bin/sh", &["-c", &script]).expect("spawn pty");
+    let (master, mut child) = spawn_pty_for_test("/bin/sh", &["-c", &script]).expect("spawn pty");
     let master_fd = master.as_raw_fd();
     let output = read_until_eof(master).await;
     let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
@@ -53,9 +52,7 @@ async fn pty_master_is_cloexec_in_child() {
         .expect("child wait");
     assert!(status.success(), "shell exited non-zero: {status:?}");
     let fd_str = master_fd.to_string();
-    let inherited = output
-        .split_whitespace()
-        .any(|token| token == fd_str);
+    let inherited = output.split_whitespace().any(|token| token == fd_str);
     assert!(
         !inherited,
         "pty master fd {master_fd} leaked into child fd table: {output:?}"

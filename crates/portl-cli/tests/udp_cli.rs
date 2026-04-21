@@ -160,9 +160,7 @@ async fn connect_and_open(
     remote_port: u16,
     session_id: Option<[u8; 8]>,
 ) -> Result<OpenedUdp> {
-    let ticket =
-        <PortlTicket as Ticket>::deserialize(ticket)
-            .context("deserialize udp ticket")?;
+    let ticket = <PortlTicket as Ticket>::deserialize(ticket).context("deserialize udp ticket")?;
     let (connection, session) = open_ticket_v1(client, &ticket, &[], identity).await?;
     let control = open_udp(
         &connection,

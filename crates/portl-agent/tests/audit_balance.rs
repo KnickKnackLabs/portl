@@ -104,10 +104,7 @@ async fn accepted_session_emits_start_and_exit_with_same_session_id() -> Result<
         .parse()
         .expect("shell_start pid u32");
     assert!(audited_pid > 0, "pid must be > 0, got {audited_pid}");
-    let mode = start
-        .fields
-        .get("mode")
-        .expect("shell_start missing mode");
+    let mode = start.fields.get("mode").expect("shell_start missing mode");
     assert!(
         mode == "exec" || mode == "pty",
         "mode must be exec|pty, got {mode}"
