@@ -6,6 +6,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use iroh::endpoint::{Connection, SendStream};
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::error::TrySendError;
 
@@ -58,12 +59,27 @@ struct SrcTagEntry {
     last_used: Instant,
 }
 
+/// Target receive-buffer size for the ingress UDP socket.
+///
+/// The Linux default (`net.core.rmem_default`) is ≈208 KiB — only
+/// ~1,500 of our 140-byte encoded datagrams — which is tight under
+/// any burst pressure even with the decoupled reader/sender split
+/// in `upstream_loop`. 1 MiB gives us roughly an order of magnitude
+/// of headroom for scheduler-induced gaps in the reader task on a
+/// contended host (e.g. a 2-vCPU CI runner with parallel test
+/// binaries).
+///
+/// This is a *hint*: Linux clamps to `net.core.rmem_max`; on
+/// macOS the effective cap is `kern.ipc.maxsockbuf`. `set_recv_
+/// buffer_size` silently clamps without error, so we just log a
+/// debug line if the read-back value came in lower than we asked.
+const INGRESS_RCVBUF_TARGET_BYTES: usize = 1 << 20;
+
 impl LocalUdpForwardHandle {
-    pub async fn bind(local_addr: &str) -> Result<Self> {
+    pub fn bind(local_addr: &str) -> Result<Self> {
         Ok(Self {
             local_socket: Arc::new(
-                UdpSocket::bind(local_addr)
-                    .await
+                bind_ingress_socket(local_addr)
                     .with_context(|| format!("bind local udp socket on {local_addr}"))?,
             ),
             src_tags: Arc::new(Mutex::new(SrcTagTable::default())),
@@ -109,6 +125,37 @@ impl LocalUdpForwardHandle {
             }
         }
     }
+}
+
+/// Bind an ingress UDP socket with a tuned receive buffer.
+///
+/// Using `socket2` here (rather than `tokio::net::UdpSocket::bind`
+/// directly) so we can `set_recv_buffer_size` before the socket
+/// sees any traffic. The tokio wrapper is applied last.
+///
+/// Errors propagate for the actual bind — `set_recv_buffer_size`
+/// failures are swallowed (best-effort; the hardcoded default
+/// kernel cap is better than nothing).
+fn bind_ingress_socket(local_addr: &str) -> Result<UdpSocket> {
+    let addr: SocketAddr = local_addr
+        .parse()
+        .with_context(|| format!("parse local udp address {local_addr}"))?;
+    let domain = match addr {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+    let sock =
+        Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).context("create udp socket")?;
+    sock.set_nonblocking(true)
+        .context("set udp socket non-blocking")?;
+    // Best-effort; ignore error (insufficient capability or
+    // net.core.rmem_max hit is non-fatal — kernel default still
+    // works, just smaller).
+    let _ = sock.set_recv_buffer_size(INGRESS_RCVBUF_TARGET_BYTES);
+    sock.bind(&addr.into())
+        .with_context(|| format!("bind udp socket on {local_addr}"))?;
+    let std_sock: std::net::UdpSocket = sock.into();
+    UdpSocket::from_std(std_sock).context("wrap std udp socket for tokio")
 }
 
 pub async fn open_udp(
@@ -157,7 +204,7 @@ pub async fn run_local_forward(
     local_addr: &str,
     target_port: u16,
 ) -> Result<()> {
-    let handle = LocalUdpForwardHandle::bind(local_addr).await?;
+    let handle = LocalUdpForwardHandle::bind(local_addr)?;
     handle
         .run_with_control(connection, control, target_port)
         .await

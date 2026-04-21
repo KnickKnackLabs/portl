@@ -472,10 +472,9 @@ async fn udp_src_tag_lru_eviction() -> Result<()> {
         // for a single loopback roundtrip; if we ever observe a real
         // regression crossing that threshold, the iteration count
         // (1,025) is the load we want to catch regressing.
-        let (_, from) =
-            tokio::time::timeout(Duration::from_secs(1), remote.recv_from(&mut buf))
-                .await
-                .with_context(|| format!("recv_from timed out at src_tag={src_tag}"))??;
+        let (_, from) = tokio::time::timeout(Duration::from_secs(1), remote.recv_from(&mut buf))
+            .await
+            .with_context(|| format!("recv_from timed out at src_tag={src_tag}"))??;
         if src_tag == 1 {
             first_addr = Some(from);
         }

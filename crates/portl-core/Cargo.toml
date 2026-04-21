@@ -43,6 +43,7 @@ directories   = { workspace = true }
 age           = { workspace = true }
 n0-error      = "0.1"
 bytes         = { workspace = true }
+socket2       = { workspace = true }
 async-trait   = { workspace = true }
 
 [dev-dependencies]

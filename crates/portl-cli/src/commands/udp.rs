@@ -33,7 +33,7 @@ pub fn run(peer: &str, specs: &[String]) -> Result<ExitCode> {
             let identity = identity.clone();
             let endpoint = bind_client_endpoint(&identity).await?;
             let mut shutdown_rx = shutdown_tx.subscribe();
-            let forward = LocalUdpForwardHandle::bind(&parsed.local_addr()).await?;
+    let forward = LocalUdpForwardHandle::bind(&parsed.local_addr())?;
             tasks.push(tokio::spawn(async move {
                 let mut backoff = Duration::from_millis(100);
                 loop {

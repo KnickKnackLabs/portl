@@ -86,7 +86,9 @@ async fn udp_forward_handle_reconnects_and_preserves_session() -> Result<()> {
     let ticket = root_ticket(&operator, server.addr(), udp_caps(remote_port)).serialize();
     let identity = Identity::new();
     let local_port = reserve_udp_port()?;
-    let forward = Arc::new(LocalUdpForwardHandle::bind(&format!("127.0.0.1:{local_port}")).await?);
+    let forward = Arc::new(LocalUdpForwardHandle::bind(&format!(
+        "127.0.0.1:{local_port}"
+    ))?);
     let app = UdpSocket::bind(("127.0.0.1", 0)).await?;
 
     let first = connect_and_open(
@@ -112,9 +114,7 @@ async fn udp_forward_handle_reconnects_and_preserves_session() -> Result<()> {
     let mut buf = [0_u8; 32];
     let (read, _) = app.recv_from(&mut buf).await?;
     assert_eq!(&buf[..read], b"first");
-    let session_id = forward
-        .session_id()
-        .expect("session id after first attach");
+    let session_id = forward.session_id().expect("session id after first attach");
 
     first_connection.close(0u32.into(), b"force reconnect");
     assert!(
