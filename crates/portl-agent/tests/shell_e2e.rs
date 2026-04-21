@@ -231,7 +231,7 @@ async fn exec_user_switch_drops_supplementary_groups() -> Result<()> {
     exec.stdin.finish()?;
 
     let mut stdout = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut exec.stdout, &mut stdout).await?;
+    AsyncReadExt::read_to_end(&mut exec.stdout, &mut stdout).await?;
     assert_eq!(exec.wait_exit().await?, 0);
 
     let groups = String::from_utf8(stdout)?
@@ -254,13 +254,22 @@ async fn exec_user_switch_drops_supplementary_groups() -> Result<()> {
     shutdown(connection, client, server, agent).await
 }
 
-#[cfg(unix)]
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    ))
+))]
 #[tokio::test]
 async fn pty_user_switch_returns_actionable_error() -> Result<()> {
-    if !nix::unistd::geteuid().is_root() {
+    if !geteuid().is_root() {
         return Ok(());
     }
-    let Some(target) = nix::unistd::User::from_name("nobody")? else {
+    let Some(target) = User::from_name("nobody")? else {
         return Ok(());
     };
 

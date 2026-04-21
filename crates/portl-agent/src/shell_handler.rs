@@ -1139,8 +1139,8 @@ fn install_exec_user_switch(command: &mut StdCommand, user: &RequestedUser) -> b
         return false;
     }
 
-    let target_gid = user.gid.as_raw();
-    let target_uid = user.uid.as_raw();
+    let gid_raw = user.gid.as_raw();
+    let uid_raw = user.uid.as_raw();
     // SAFETY: pre_exec runs in the child process between fork(2) and
     // execve(2). The closure only calls async-signal-safe syscalls
     // (setgroups/setgid/setuid) and returns an io::Result, which is
@@ -1151,8 +1151,8 @@ fn install_exec_user_switch(command: &mut StdCommand, user: &RequestedUser) -> b
             // setgroups requires uid 0.
             nix::unistd::setgroups(&[]).map_err(nix_to_io_error)?;
             // Set the primary gid before uid.
-            nix::unistd::setgid(Gid::from_raw(target_gid)).map_err(nix_to_io_error)?;
-            nix::unistd::setuid(Uid::from_raw(target_uid)).map_err(nix_to_io_error)?;
+            nix::unistd::setgid(Gid::from_raw(gid_raw)).map_err(nix_to_io_error)?;
+            nix::unistd::setuid(Uid::from_raw(uid_raw)).map_err(nix_to_io_error)?;
             Ok(())
         });
     }

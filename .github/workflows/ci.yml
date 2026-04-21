@@ -86,8 +86,21 @@ jobs:
   deny:
     name: cargo deny
     runs-on: ubuntu-latest
+    # cargo-deny only reads Cargo.lock / Cargo.toml, but the underlying
+    # `cargo metadata` call honors rust-toolchain.toml and the
+    # rustc-wrapper from .cargo/config.toml. Avoid both headaches by
+    # running cargo-deny natively on the host runner (not in the
+    # EmbarkStudios Docker action, which ships a musl container that
+    # doesn't match our musl-targetless toolchain file). The
+    # rustc-wrapper is cleared because sccache is not installed in
+    # this job (we skip its setup for non-rustc jobs).
+    env:
+      CARGO_BUILD_RUSTC_WRAPPER: ""
+      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: baptiste0928/cargo-install@v3
         with:
-          command: check
+          crate: cargo-deny
+      - run: cargo deny --all-features check
