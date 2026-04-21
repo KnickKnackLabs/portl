@@ -235,10 +235,6 @@ pub fn run(argv: Vec<OsString>) -> ExitCode {
         }
     };
 
-    if let Some(code) = removed_invocation_exit(&argv) {
-        return code;
-    }
-
     let cli = match Cli::try_parse_from(argv) {
         Ok(cli) => cli,
         Err(err) => {
@@ -373,28 +369,6 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
         Command::Gateway { upstream_url } => {
             commands::agent::run::run(Some(AgentModeArg::Gateway), Some(&upstream_url))
         }
-    }
-}
-
-fn removed_invocation_exit(argv: &[OsString]) -> Option<ExitCode> {
-    match argv.get(1).and_then(|arg| arg.to_str()) {
-        Some("mint-root") => {
-            eprintln!("portl: `portl mint-root` was removed in v0.2.0. Use `portl mint` instead.");
-            Some(ExitCode::FAILURE)
-        }
-        Some("agent") => {
-            eprintln!(
-                "portl: `portl agent *` was removed in v0.2.0. Use `portl-agent` instead.\n      See https://github.com/KnickKnackLabs/portl/blob/v0.2.0/docs/specs/140-v0.2-operability.md#12-multicall-only-daemon"
-            );
-            Some(ExitCode::from(2))
-        }
-        Some("id") => {
-            eprintln!(
-                "portl: `portl id *` was removed in v0.2.0. Use `portl init`, `portl doctor`, and direct file copies of identity.bin instead."
-            );
-            Some(ExitCode::FAILURE)
-        }
-        _ => None,
     }
 }
 
