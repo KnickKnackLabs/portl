@@ -18,8 +18,11 @@ portl/
 ├── justfile                       common tasks
 ├── .github/
 │   └── workflows/
-│       ├── ci.yml                 check + test + clippy + rustfmt
-│       ├── release.yml            static musl builds on tag
+│       ├── ci.yml                 fmt + deny + clippy + nextest + docker-
+│       │                          smoke; on tag pushes also builds the
+│       │                          cross-compiled release matrix and
+│       │                          publishes the GitHub release (gated on
+│       │                          every CI job being green).
 │       └── docs.yml               mdbook → gh-pages
 ├── README.md
 ├── CHANGELOG.md
@@ -270,8 +273,10 @@ release-check:
     cargo test  --release --workspace
 
 release:
-    # kicks off GH Actions workflow
-    gh workflow run release.yml
+    # Tag to release. The `ci.yml` workflow builds + publishes on
+    # any `v*` tag push (release jobs gated on all CI jobs green).
+    git tag -a v0.1.0 -m "portl v0.1.0"
+    git push origin v0.1.0
 
 agent-local:
     cargo run -p portl-cli -- agent run --config dev/agent.toml

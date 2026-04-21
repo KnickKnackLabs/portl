@@ -389,7 +389,7 @@ RUN apt-get update \
 
 FROM base AS runtime
 ARG TARGETARCH
-# Built by release.yml and baked into the context at image-build time.
+# Built by the release-build job in ci.yml and baked into the context at image-build time.
 COPY portl-${TARGETARCH} /usr/local/bin/portl
 RUN chmod +x /usr/local/bin/portl \
  && ln -s /usr/local/bin/portl /usr/local/bin/portl-agent \

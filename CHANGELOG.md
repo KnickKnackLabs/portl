@@ -70,9 +70,45 @@ Full scope and invariants:
   side's open-count stayed > 0 from the child's inherited handle
   and the slave side missed `SIGHUP` when the parent closed
   master.
+- **UDP forwarder starved its own ingress socket under QUIC
+  congestion.** The single `upstream_loop` task interleaved
+  `local_socket.recv_from` with `connection.send_datagram_wait`
+  — while QUIC was backpressuring, nothing drained the kernel's
+  UDP rx queue and packets dropped silently. Split into reader +
+  QUIC-sender futures joined by `tokio::select!`, with a bounded
+  mpsc (cap 256) between them. Queue-full drops the newest
+  datagram (matches UDP best-effort semantics) instead of
+  propagating the stall back to the kernel.
+- **`tokio::sync::Mutex` on purely-synchronous HashMap state.**
+  `SrcTagTable` and the forward handle's `session_id` were wrapped
+  in async-aware mutexes but the lock never crossed an `.await`
+  point — all that got us was scheduling overhead per packet.
+  Swapped to `std::sync::Mutex`; `LocalUdpForwardHandle::session_id`
+  and `::bind` are no longer `async`.
+- **`udp_src_tag_lru_eviction` could hang indefinitely on any
+  single dropped datagram.** `remote.recv_from` was unwrapped
+  with no timeout, so one QUIC-level drop (explicitly allowed by
+  the transport) turned the 1,025-iteration sweep into an
+  unbounded hang that only nextest's SIGKILL could break.
+  Wrapped each `recv_from` in `tokio::time::timeout(1 s)` so a
+  drop fails fast with the src_tag index.
 
 ### Infrastructure
 
+- **Release workflow merged into `ci.yml`.** Previously
+  `release.yml` built and published on `v*` tag pushes
+  independently of CI, so a tag could ship binaries from a
+  commit that failed tests. The `release-build` (matrix, 4
+  targets) and `release-publish` jobs now live in `ci.yml`
+  gated on `needs: [test, clippy, fmt, deny, docker-smoke]`
+  and `if: startsWith(github.ref, 'refs/tags/v')`. Release
+  artifacts can no longer ship unless every CI job passes on
+  the exact tagged commit.
+- **Ingress UDP socket `SO_RCVBUF` tuned to 1 MiB.** Best-effort
+  via `socket2`; silently clamps to `net.core.rmem_max` (Linux)
+  or `kern.ipc.maxsockbuf` (macOS) without error. Complements
+  the forwarder reader/sender decouple under heavy CPU
+  contention (e.g. shared CI runners).
 - Clippy tightened (`clippy::cargo` + selected `restriction` /
   `nursery` picks; `dbg_macro = deny`). CI gate unchanged
   (`-D warnings`).
