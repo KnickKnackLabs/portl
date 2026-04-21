@@ -11,7 +11,7 @@ use nix::sys::signal::{Signal, kill, killpg};
 use nix::unistd::{Gid, Pid, Uid, User, geteuid};
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, unix::AsyncFd};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, warn};
@@ -20,7 +20,7 @@ use crate::AgentState;
 use crate::audit;
 use crate::caps_enforce::{shell_caps, shell_permits};
 use crate::session::Session;
-use crate::shell_registry::{ShellProcess, ShellRegistry, StdinMessage};
+use crate::shell_registry::{PtyCommand, ShellProcess, ShellRegistry, StdinMessage};
 use crate::stream_io::BufferedRecv;
 
 const MAX_CONTROL_BYTES: usize = 64 * 1024;
@@ -28,6 +28,7 @@ const MAX_SIGNAL_BYTES: usize = 1024;
 const MAX_RESIZE_BYTES: usize = 1024;
 const IO_CHUNK: usize = 16 * 1024;
 const SESSION_REAPER_GRACE: Duration = Duration::from_secs(5);
+const PTY_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) async fn serve_stream(
     connection: Connection,
@@ -69,6 +70,7 @@ struct ShellSessionGuard<'a> {
 impl Drop for ShellSessionGuard<'_> {
     fn drop(&mut self) {
         if let Some((_, process)) = self.registry.remove(&self.session_id) {
+            request_pty_close(process.pty_tx.as_ref(), false);
             SessionReaper::from_process(process.as_ref()).spawn();
         }
     }
@@ -361,8 +363,14 @@ async fn pump_resizes(mut recv: BufferedRecv, process: &ShellProcess) -> Result<
         .await?
     {
         #[cfg(unix)]
-        if let Some(master) = process.pty_master.as_ref() {
-            resize_pty(master, frame.rows, frame.cols).context("resize pty")?;
+        if let Some(pty_tx) = process.pty_tx.as_ref() {
+            pty_tx
+                .send(PtyCommand::Resize {
+                    rows: frame.rows,
+                    cols: frame.cols,
+                })
+                .map_err(|_| anyhow!("pty resize channel closed"))
+                .context("forward pty resize")?;
         }
         #[cfg(not(unix))]
         let _ = frame;
@@ -371,8 +379,7 @@ async fn pump_resizes(mut recv: BufferedRecv, process: &ShellProcess) -> Result<
 }
 
 #[cfg(unix)]
-fn resize_pty(master: &OwnedFd, rows: u16, cols: u16) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
+fn resize_pty(master: &impl std::os::fd::AsRawFd, rows: u16, cols: u16) -> std::io::Result<()> {
     let ws = nix::libc::winsize {
         ws_row: rows,
         ws_col: cols,
@@ -626,7 +633,7 @@ fn spawn_exec_process(
         exit_code,
         exit_tx,
         signal_target: Some(process_group_signal_target_from_pid(pid)?),
-        pty_master: None,
+        pty_tx: None,
         started_at,
     }))
 }
@@ -676,29 +683,19 @@ fn spawn_pty_process(
         ))
     })?;
 
-    let reader_fd = master.try_clone().map_err(|err| {
-        SpawnReject::pty_allocation_failed(portl_proto::shell_v1::ShellReason::SpawnFailed(
-            err.to_string(),
-        ))
-    })?;
-    let writer_fd = master.try_clone().map_err(|err| {
-        SpawnReject::pty_allocation_failed(portl_proto::shell_v1::ShellReason::SpawnFailed(
-            err.to_string(),
-        ))
-    })?;
-    let master = Arc::new(master);
-
     let (stdin_tx, stdin_rx) = mpsc::channel(32);
+    let (pty_tx, pty_rx) = mpsc::unbounded_channel();
     let (stdout_tx, stdout_rx) = mpsc::channel(32);
     let (_stderr_tx, stderr_rx) = mpsc::channel(1);
     let exit_code = Arc::new(Mutex::new(None));
     let (exit_tx, _) = watch::channel(None);
 
-    std::thread::spawn(move || {
-        pty_stdin_thread(Box::new(std::fs::File::from(writer_fd)), stdin_rx);
-    });
-    std::thread::spawn(move || {
-        pty_stdout_thread(Box::new(std::fs::File::from(reader_fd)), &stdout_tx);
+    tokio::spawn(async move {
+        if let Err(err) =
+            pty_master_task(master, stdout_tx, stdin_rx, pty_rx, PTY_DRAIN_TIMEOUT).await
+        {
+            debug!(%err, "pty master task ended with error");
+        }
     });
 
     let exit_code_wait = Arc::clone(&exit_code);
@@ -754,7 +751,7 @@ fn spawn_pty_process(
         exit_code,
         exit_tx,
         signal_target,
-        pty_master: Some(master),
+        pty_tx: Some(pty_tx),
         started_at,
     }))
 }
@@ -1022,39 +1019,119 @@ where
     }
 }
 
-fn pty_stdin_thread(
-    mut writer: Box<dyn std::io::Write + Send>,
-    mut rx: mpsc::Receiver<StdinMessage>,
-) {
-    while let Some(message) = rx.blocking_recv() {
-        match message {
-            StdinMessage::Data(bytes) => {
-                if writer.write_all(&bytes).is_err() {
-                    return;
-                }
-                let _ = writer.flush();
+#[cfg(unix)]
+async fn pty_master_task(
+    master: OwnedFd,
+    stdout_tx: mpsc::Sender<Vec<u8>>,
+    mut stdin_rx: mpsc::Receiver<StdinMessage>,
+    mut pty_rx: mpsc::UnboundedReceiver<PtyCommand>,
+    drain_timeout: Duration,
+) -> Result<()> {
+    set_nonblocking(&master)?;
+    let master = AsyncFd::new(master).context("register pty master fd")?;
+    let mut stdin_open = true;
+    let mut drain_deadline = None;
+    let mut read_buf = vec![0_u8; IO_CHUNK];
+
+    loop {
+        let drain_sleep = async {
+            if let Some(deadline) = drain_deadline {
+                tokio::time::sleep_until(deadline).await;
+            } else {
+                std::future::pending::<()>().await;
             }
-            StdinMessage::Close => return,
+        };
+
+        tokio::select! {
+            biased;
+            Some(cmd) = pty_rx.recv() => {
+                match cmd {
+                    PtyCommand::Resize { rows, cols } => {
+                        if drain_deadline.is_none() {
+                            resize_pty(master.get_ref(), rows, cols).context("resize pty")?;
+                        }
+                    }
+                    PtyCommand::Close { force } => {
+                        if force {
+                            return Ok(());
+                        }
+                        drain_deadline
+                            .get_or_insert_with(|| tokio::time::Instant::now() + drain_timeout);
+                    }
+                }
+            }
+            Some(message) = stdin_rx.recv(), if stdin_open && drain_deadline.is_none() => {
+                match message {
+                    StdinMessage::Data(bytes) => write_pty_all(&master, &bytes).await.context("write pty stdin")?,
+                    StdinMessage::Close => stdin_open = false,
+                }
+            }
+            () = drain_sleep => {
+                return Ok(());
+            }
+            chunk = read_pty_chunk(&master, &mut read_buf) => {
+                match chunk.context("read pty output")? {
+                    Some(chunk) => {
+                        if stdout_tx.send(chunk).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    None => return Ok(()),
+                }
+            }
+            else => return Ok(()),
         }
     }
 }
 
-fn pty_stdout_thread(mut reader: Box<dyn std::io::Read + Send>, tx: &mpsc::Sender<Vec<u8>>) {
-    let mut buf = vec![0_u8; IO_CHUNK];
+#[cfg(unix)]
+async fn read_pty_chunk(
+    master: &AsyncFd<OwnedFd>,
+    buf: &mut [u8],
+) -> std::io::Result<Option<Vec<u8>>> {
     loop {
-        match reader.read(&mut buf) {
-            Ok(0) => return,
-            Ok(read) => {
-                if tx.blocking_send(buf[..read].to_vec()).is_err() {
-                    return;
-                }
+        let mut guard = master.readable().await?;
+        match nix::unistd::read(master.get_ref(), buf) {
+            Ok(0) | Err(nix::errno::Errno::EIO) => return Ok(None),
+            Ok(read) => return Ok(Some(buf[..read].to_vec())),
+            Err(nix::errno::Errno::EAGAIN) => {
+                guard.clear_ready();
             }
-            Err(err) => {
-                warn!(?err, "pty stdout thread read failed");
-                return;
-            }
+            Err(err) => return Err(std::io::Error::from(err)),
         }
     }
+}
+
+#[cfg(unix)]
+async fn write_pty_all(master: &AsyncFd<OwnedFd>, mut bytes: &[u8]) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        let mut guard = master.writable().await?;
+        match nix::unistd::write(master.get_ref(), bytes) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "pty write returned zero bytes",
+                ));
+            }
+            Ok(written) => {
+                bytes = &bytes[written..];
+            }
+            Err(nix::errno::Errno::EAGAIN) => {
+                guard.clear_ready();
+            }
+            Err(err) => return Err(std::io::Error::from(err)),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_nonblocking(fd: &OwnedFd) -> std::io::Result<()> {
+    let flags =
+        nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFL).map_err(std::io::Error::from)?;
+    let flags = nix::fcntl::OFlag::from_bits_truncate(flags) | nix::fcntl::OFlag::O_NONBLOCK;
+    nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_SETFL(flags)).map_err(std::io::Error::from)?;
+    Ok(())
 }
 
 fn apply_env_to_command(command: &mut StdCommand, envs: Vec<(String, String)>) {
@@ -1221,6 +1298,12 @@ fn send_signal(target: Option<i32>, sig: u8) {
 #[cfg(not(unix))]
 fn send_signal(_target: Option<i32>, _sig: u8) {}
 
+fn request_pty_close(pty_tx: Option<&mpsc::UnboundedSender<PtyCommand>>, force: bool) {
+    if let Some(pty_tx) = pty_tx {
+        let _ = pty_tx.send(PtyCommand::Close { force });
+    }
+}
+
 fn process_group_signal_target_from_pid(pid: u32) -> std::result::Result<i32, SpawnReject> {
     let pid =
         i32::try_from(pid).map_err(|_| SpawnReject::path_probe_failed("child pid out of range"))?;
@@ -1317,6 +1400,7 @@ mod tests {
     #[cfg(unix)]
     use super::{RequestedUser, SessionReaper, install_exec_user_switch};
     use super::{ShellProcess, ShellSessionGuard};
+    use crate::shell_registry::PtyCommand;
     use crate::shell_registry::ShellRegistry;
     #[cfg(unix)]
     use nix::errno::Errno;
@@ -1326,6 +1410,8 @@ mod tests {
     use nix::unistd::{Gid, Pid, Uid};
     #[cfg(unix)]
     use std::fs;
+    #[cfg(unix)]
+    use std::os::fd::AsRawFd;
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt as _;
     #[cfg(unix)]
@@ -1356,7 +1442,7 @@ mod tests {
                 exit_code,
                 exit_tx,
                 signal_target: None,
-                pty_master: None,
+                pty_tx: None,
                 started_at: std::sync::Arc::new(std::sync::Mutex::new(None)),
             }),
         );
@@ -1497,6 +1583,90 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn pty_drain_completes_on_normal_exit() {
+        let mut harness = spawn_pty_task_harness(
+            &["-c", "printf 'pty-drain-ok'; exit 0"],
+            Duration::from_millis(200),
+        );
+
+        harness
+            .pty_tx
+            .send(PtyCommand::Close { force: false })
+            .expect("queue pty close");
+
+        let output = collect_output(&mut harness.stdout_rx).await;
+        assert!(output.contains("pty-drain-ok"), "output was: {output:?}");
+        harness
+            .task
+            .await
+            .expect("pty task join")
+            .expect("pty task result");
+        let status = harness
+            .child_wait
+            .await
+            .expect("child wait join")
+            .expect("child wait status");
+        assert!(status.success(), "child status was {status:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pty_drain_force_closes_at_30s() {
+        let harness = spawn_pty_task_harness(
+            &["-c", "printf 'held-open'; while :; do sleep 1; done"],
+            Duration::from_millis(100),
+        );
+
+        harness
+            .pty_tx
+            .send(PtyCommand::Close { force: false })
+            .expect("queue pty close");
+
+        tokio::time::timeout(Duration::from_secs(1), harness.task)
+            .await
+            .expect("pty task timeout")
+            .expect("pty task join")
+            .expect("pty task result");
+
+        let _ = kill(Pid::from_raw(harness.child_pid), Signal::SIGKILL);
+        let _ = harness
+            .child_wait
+            .await
+            .expect("child wait join")
+            .expect("child wait status");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn pty_master_fd_closed_after_session_end() {
+        let mut harness = spawn_pty_task_harness(
+            &["-c", "printf 'fd-close'; exit 0"],
+            Duration::from_millis(200),
+        );
+        let fd = harness.master_fd;
+
+        harness
+            .pty_tx
+            .send(PtyCommand::Close { force: false })
+            .expect("queue pty close");
+
+        let _ = collect_output(&mut harness.stdout_rx).await;
+        harness
+            .task
+            .await
+            .expect("pty task join")
+            .expect("pty task result");
+        let _ = harness
+            .child_wait
+            .await
+            .expect("child wait join")
+            .expect("child wait status");
+
+        assert!(!fd_path_exists(fd), "pty master fd {fd} should be closed");
+    }
+
+    #[cfg(unix)]
     #[test]
     fn session_reaper_helper_entrypoint() {
         let Ok(mode) = std::env::var("PORTL_SESSION_REAPER_HELPER") else {
@@ -1602,6 +1772,63 @@ mod tests {
             Ok(status)
         });
         (pid, exit_rx, wait_task)
+    }
+
+    #[cfg(unix)]
+    struct PtyTaskHarness {
+        child_pid: i32,
+        master_fd: i32,
+        pty_tx: mpsc::UnboundedSender<PtyCommand>,
+        stdout_rx: mpsc::Receiver<Vec<u8>>,
+        task: tokio::task::JoinHandle<anyhow::Result<()>>,
+        child_wait: tokio::task::JoinHandle<std::io::Result<std::process::ExitStatus>>,
+    }
+
+    #[cfg(unix)]
+    fn spawn_pty_task_harness(argv: &[&str], drain_timeout: Duration) -> PtyTaskHarness {
+        let (master, mut child) =
+            super::spawn_pty_for_test("/bin/sh", argv).expect("spawn pty task harness");
+        let master_fd = master.as_raw_fd();
+        let child_pid = i32::try_from(child.id().expect("child pid")).expect("pid fits in i32");
+        let (stdin_tx, stdin_rx) = mpsc::channel(32);
+        let (pty_tx, pty_rx) = mpsc::unbounded_channel();
+        let (stdout_tx, stdout_rx) = mpsc::channel(32);
+        let task = tokio::spawn(super::pty_master_task(
+            master,
+            stdout_tx,
+            stdin_rx,
+            pty_rx,
+            drain_timeout,
+        ));
+        let child_wait = tokio::spawn(async move { child.wait().await });
+        let _ = stdin_tx;
+        PtyTaskHarness {
+            child_pid,
+            master_fd,
+            pty_tx,
+            stdout_rx,
+            task,
+            child_wait,
+        }
+    }
+
+    #[cfg(unix)]
+    async fn collect_output(stdout_rx: &mut mpsc::Receiver<Vec<u8>>) -> String {
+        let mut output = Vec::new();
+        while let Some(chunk) = stdout_rx.recv().await {
+            output.extend_from_slice(&chunk);
+        }
+        String::from_utf8_lossy(&output).into_owned()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn fd_path_exists(fd: i32) -> bool {
+        #[cfg(target_os = "linux")]
+        let fd_dir = "/proc/self/fd";
+        #[cfg(target_os = "macos")]
+        let fd_dir = "/dev/fd";
+
+        std::path::Path::new(fd_dir).join(fd.to_string()).exists()
     }
 
     #[cfg(unix)]

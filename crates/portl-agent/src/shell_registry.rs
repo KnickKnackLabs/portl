@@ -1,4 +1,3 @@
-use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -15,9 +14,9 @@ pub(crate) struct ShellProcess {
     pub(crate) exit_code: Arc<Mutex<Option<i32>>>,
     pub(crate) exit_tx: watch::Sender<Option<i32>>,
     pub(crate) signal_target: Option<i32>,
-    /// Master side of the pty pair; kept alive in the agent for
-    /// TIOCSWINSZ resize. `None` for the non-PTY exec path.
-    pub(crate) pty_master: Option<Arc<OwnedFd>>,
+    /// Control channel for PTY-only operations handled by the single
+    /// async PTY master task. `None` for the non-PTY exec path.
+    pub(crate) pty_tx: Option<mpsc::UnboundedSender<PtyCommand>>,
     /// Wall-clock marker set when `audit.shell_start` is emitted.
     /// The wait-for-child task reads it to compute `duration_ms`
     /// for the `audit.shell_exit` record (spec 150 §3.2).
@@ -42,4 +41,10 @@ impl ShellProcess {
 pub(crate) enum StdinMessage {
     Data(Vec<u8>),
     Close,
+}
+
+#[derive(Debug)]
+pub(crate) enum PtyCommand {
+    Resize { rows: u16, cols: u16 },
+    Close { force: bool },
 }
