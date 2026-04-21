@@ -244,8 +244,8 @@ through M7 of the roadmap.
   portl multicall binary. `portl docker container {add,list,rm,
   rebuild,logs}` and a reference multi-arch-ready Dockerfile.
 - **Slicer adapter** (`adapters/slicer-portl`) — provisions a Slicer
-  VM with a systemd `portl-agent.service`. Includes `portl agent run
-  --mode gateway` for bridging the Slicer HTTP API via master
+  VM with a systemd `portl-agent.service`. Includes `portl-gateway`
+  for bridging the Slicer HTTP API via master
   tickets, with per-connection bearer injection.
 - **Master tickets** — `mint_master` requires holder binding (`to`);
   empty bearer bytes rejected; bearer widening in delegation chains

@@ -18,7 +18,7 @@ RUN chmod +x /usr/local/bin/portl \
  && chmod 0700 /var/lib/portl
 
 ENV PORTL_HOME=/var/lib/portl
-ENTRYPOINT ["/usr/local/bin/portl", "agent", "run"]
+ENTRYPOINT ["/usr/local/bin/portl-agent"]
 
 LABEL org.opencontainers.image.title="portl-agent"
 LABEL org.opencontainers.image.source="https://github.com/KnickKnackLabs/portl"

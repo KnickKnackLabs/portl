@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::AgentModeArg;
 
-const NO_TRUST_ROOTS_WARNING: &str = "portl agent run: no trust roots configured, handshakes will reject legitimate tickets. Set PORTL_TRUST_ROOTS.";
+const NO_TRUST_ROOTS_WARNING: &str = "portl-agent: no trust roots configured, handshakes will reject legitimate tickets. Set PORTL_TRUST_ROOTS.";
 
 pub fn run(mode: Option<AgentModeArg>, upstream_url: Option<&str>) -> Result<ExitCode> {
     let cfg = load_config(mode, upstream_url)?;

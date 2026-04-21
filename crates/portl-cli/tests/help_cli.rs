@@ -42,7 +42,7 @@ fn top_level_help_snapshots_match() {
     let cases = [
         (
             &["--help"][..],
-            r#"portl CLI — single multicall binary for `portl` (operator) and `portl agent` (target-side).
+            r#"portl CLI — multicall surface for `portl`, `portl-agent`, and `portl-gateway`.
 
 Usage: portl <COMMAND>
 

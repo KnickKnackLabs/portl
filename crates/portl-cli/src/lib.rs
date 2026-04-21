@@ -420,15 +420,18 @@ fn rewrite_multicall(mut argv: Vec<OsString>) -> Result<Vec<OsString>, ParseErro
     Ok(argv)
 }
 
+const PORTL_ABOUT: &str =
+    "portl CLI — multicall surface for `portl`, `portl-agent`, and `portl-gateway`.";
+
 #[derive(Parser, Debug)]
-#[command(name = "portl", bin_name = "portl", version, about, long_about = None)]
+#[command(name = "portl", bin_name = "portl", version, about = PORTL_ABOUT, long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: TopLevel,
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "portl-agent", bin_name = "portl-agent", version, about = "portl daemon", long_about = None)]
+#[command(name = "portl-agent", bin_name = "portl-agent", version, about = "portl-agent daemon entrypoint", long_about = None)]
 struct AgentCli {}
 
 #[derive(Subcommand, Debug)]

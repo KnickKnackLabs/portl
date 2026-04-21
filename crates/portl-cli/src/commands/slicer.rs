@@ -154,6 +154,7 @@ pub fn vm_add(
                 base_url: Some(client.original_base_url.clone()),
                 docker_exec_id: None,
                 docker_injected_binary_path: None,
+                docker_injected_binary_preexisted: false,
             },
         )?;
 

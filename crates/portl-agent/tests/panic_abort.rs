@@ -2,19 +2,21 @@
 //! the process with a non-zero exit status.
 //!
 //! Builds the `portl` binary in --release with the `test-panic-trigger`
-//! feature enabled on `portl-agent`, invokes `portl agent run` with a
-//! synthetic config, and expects the process to die non-zero once the
-//! test-only panic fires at the top of `run`.
+//! feature enabled on `portl-agent`, invokes it via a `portl-agent`
+//! symlink so argv[0] enters daemon mode, and expects the process to die
+//! non-zero once the test-only panic fires at the top of `run`.
 //!
 //! Release-only: the test is `#[cfg]`d out in debug builds because
 //! `panic = "abort"` applies to the release profile only.
 
 #![cfg(all(unix, not(debug_assertions)))]
 
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::{fs::symlink, process::ExitStatusExt};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
+
+use tempfile::tempdir;
 
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -66,13 +68,16 @@ fn release_build_panics_exit_nonzero() {
     let bin = root.join("target").join("release").join("portl");
     assert!(bin.is_file(), "expected portl binary at {}", bin.display());
 
+    let temp = tempdir().expect("tempdir for portl-agent symlink");
+    let portl_agent = temp.path().join("portl-agent");
+    symlink(&bin, &portl_agent).expect("create portl-agent symlink");
+
     let start = Instant::now();
-    let mut child = Command::new(&bin)
-        .args(["agent", "run"])
+    let mut child = Command::new(&portl_agent)
         .env("PORTL_TEST_PANIC_AT", "startup")
         .env("RUSTUP_TOOLCHAIN", &toolchain)
         .spawn()
-        .expect("spawn portl agent run");
+        .expect("spawn portl-agent");
 
     // Poll for exit — cap at 10s so a misconfigured test can't hang CI.
     let exit = loop {
@@ -81,11 +86,11 @@ fn release_build_panics_exit_nonzero() {
             Ok(None) => {
                 if start.elapsed() > Duration::from_secs(10) {
                     let _ = child.kill();
-                    panic!("portl agent did not exit within 10s of panic trigger");
+                    panic!("portl-agent did not exit within 10s of panic trigger");
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(err) => panic!("wait on portl agent failed: {err}"),
+            Err(err) => panic!("wait on portl-agent failed: {err}"),
         }
     };
 

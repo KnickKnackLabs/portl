@@ -9,8 +9,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use bollard::Docker;
 use bollard::container::{
-    Config, CreateContainerOptions, InspectContainerOptions, StartContainerOptions,
-    UploadToContainerOptions,
+    Config, CreateContainerOptions, DownloadFromContainerOptions, InspectContainerOptions,
+    StartContainerOptions, UploadToContainerOptions,
 };
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
@@ -20,9 +20,6 @@ use bytes::Bytes;
 use docker_portl::{ADAPTER_NAME, DockerBootstrapper};
 use futures_util::stream::{BoxStream, StreamExt, TryStreamExt};
 use iroh_tickets::Ticket;
-use nix::errno::Errno;
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
 use portl_agent::{RevocationRecord, revocations};
 use portl_core::bootstrap::{Bootstrapper, Handle, TargetStatus};
 use portl_core::id::{Identity, store};
@@ -116,8 +113,7 @@ pub fn detach(container: &str) -> Result<ExitCode> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
         let docker = RealDockerOps::connect()?;
-        let host = RealHostOps;
-        detach_saved_container(&docker, &host, &AliasStore::default(), container).await?;
+        detach_saved_container(&docker, &AliasStore::default(), container).await?;
         Ok(ExitCode::SUCCESS)
     })
 }
@@ -255,6 +251,7 @@ struct InjectionPlan {
 struct InjectionOutcome {
     container: ContainerSnapshot,
     binary_path: PathBuf,
+    binary_path_preexisted: bool,
     exec_id: String,
     plan: InjectionPlan,
 }
@@ -302,8 +299,6 @@ trait HostOps {
     fn current_exe(&self) -> Result<PathBuf>;
     fn host_os(&self) -> &'static str;
     fn host_arch(&self) -> &'static str;
-    fn kill_pid(&self, pid: i32) -> Result<()>;
-    fn remove_container_file(&self, container_pid: i64, path: &Path) -> Result<()>;
 }
 
 struct RealHostOps;
@@ -319,33 +314,6 @@ impl HostOps for RealHostOps {
 
     fn host_arch(&self) -> &'static str {
         std::env::consts::ARCH
-    }
-
-    fn kill_pid(&self, pid: i32) -> Result<()> {
-        match kill(Pid::from_raw(pid), Signal::SIGTERM) {
-            Ok(()) | Err(Errno::ESRCH) => Ok(()),
-            Err(err) => Err(anyhow!(err)).context("send SIGTERM to injected agent"),
-        }
-    }
-
-    fn remove_container_file(&self, container_pid: i64, path: &Path) -> Result<()> {
-        #[cfg(target_os = "linux")]
-        {
-            let rel = path.strip_prefix("/").unwrap_or(path);
-            let host_path = PathBuf::from(format!("/proc/{container_pid}/root")).join(rel);
-            match std::fs::remove_file(&host_path) {
-                Ok(()) => Ok(()),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(err) => Err(err)
-                    .with_context(|| format!("remove injected binary {}", host_path.display())),
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = container_pid;
-            let _ = path;
-            bail!("detaching injected docker agents is currently supported on Linux hosts only")
-        }
     }
 }
 
@@ -373,6 +341,8 @@ trait DockerOps {
         exec_id: &str,
     ) -> Result<BoxStream<'static, Result<String>>>;
     async fn inspect_exec(&self, exec_id: &str) -> Result<ExecSnapshot>;
+    async fn path_exists(&self, container: &str, path: &Path) -> Result<bool>;
+    async fn run_command(&self, container: &str, cmd: Vec<String>) -> Result<()>;
     fn container_events(&self, container: &str) -> BoxStream<'static, Result<ContainerEvent>>;
 }
 
@@ -561,6 +531,35 @@ impl DockerOps for RealDockerOps {
         })
     }
 
+    async fn path_exists(&self, container: &str, path: &Path) -> Result<bool> {
+        match self
+            .docker
+            .download_from_container(
+                container,
+                Some(DownloadFromContainerOptions {
+                    path: path.display().to_string(),
+                }),
+            )
+            .try_collect::<Vec<_>>()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(false),
+            Err(err) => Err(anyhow!(err)).with_context(|| {
+                format!(
+                    "check whether {} exists in container {container}",
+                    path.display()
+                )
+            }),
+        }
+    }
+
+    async fn run_command(&self, container: &str, cmd: Vec<String>) -> Result<()> {
+        run_container_command(self, container, cmd).await
+    }
+
     fn container_events(&self, container: &str) -> BoxStream<'static, Result<ContainerEvent>> {
         let mut filters = HashMap::new();
         filters.insert("type".to_owned(), vec!["container".to_owned()]);
@@ -643,7 +642,8 @@ async fn inject_container<D: DockerOps, H: HostOps>(
         );
     }
     let binary = resolve_binary_path(host, binary_source, &container)?;
-    let binary_path = copy_binary_with_fallback(docker, &binary, &container.id).await?;
+    let (binary_path, binary_path_preexisted) =
+        copy_binary_with_fallback(docker, &binary, &container.id).await?;
     let exec_env = injected_agent_env(&plan.identity, operator);
     let exec_id = docker
         .create_exec(
@@ -657,14 +657,14 @@ async fn inject_container<D: DockerOps, H: HostOps>(
     Ok(InjectionOutcome {
         container,
         binary_path,
+        binary_path_preexisted,
         exec_id,
         plan,
     })
 }
 
-async fn detach_saved_container<D: DockerOps, H: HostOps>(
+async fn detach_saved_container<D: DockerOps>(
     docker: &D,
-    host: &H,
     store: &AliasStore,
     container: &str,
 ) -> Result<()> {
@@ -681,22 +681,35 @@ async fn detach_saved_container<D: DockerOps, H: HostOps>(
         )
     })?;
 
-    if host.host_os() != "linux" {
-        bail!("detaching injected docker agents is currently supported on Linux hosts only");
-    }
-
     if let Ok(exec) = docker.inspect_exec(exec_id).await
         && exec.running
         && let Some(pid) = exec.pid
     {
-        host.kill_pid(i32::try_from(pid).context("exec pid exceeds i32")?)?;
+        docker
+            .run_command(
+                &alias.container_id,
+                vec![
+                    "/bin/sh".to_owned(),
+                    "-lc".to_owned(),
+                    format!("kill -TERM {pid} 2>/dev/null || true"),
+                ],
+            )
+            .await?;
     }
 
-    if let Some(path) = spec.docker_injected_binary_path.as_deref() {
-        let container_snapshot = docker.inspect_container(&alias.container_id).await?;
-        if let Some(container_pid) = container_snapshot.pid {
-            host.remove_container_file(container_pid, path)?;
-        }
+    if let Some(path) = spec.docker_injected_binary_path.as_deref()
+        && !spec.docker_injected_binary_preexisted
+    {
+        docker
+            .run_command(
+                &alias.container_id,
+                vec![
+                    "/bin/sh".to_owned(),
+                    "-lc".to_owned(),
+                    format!("rm -f {}", shell_quote(&path.display().to_string())),
+                ],
+            )
+            .await?;
     }
 
     store.remove(&alias.name)?;
@@ -801,11 +814,12 @@ async fn copy_binary_with_fallback<D: DockerOps>(
     docker: &D,
     binary: &Path,
     container: &str,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, bool)> {
     let mut errors = Vec::new();
     for candidate in INJECTION_PATHS.map(PathBuf::from) {
+        let existed = docker.path_exists(container, &candidate).await?;
         match docker.copy_file(binary, container, &candidate).await {
-            Ok(()) => return Ok(candidate),
+            Ok(()) => return Ok((candidate, existed)),
             Err(err) => errors.push(format!("{}: {err}", candidate.display())),
         }
     }
@@ -1250,6 +1264,7 @@ fn save_injected_alias(outcome: &InjectionOutcome) -> Result<()> {
             base_url: None,
             docker_exec_id: Some(outcome.exec_id.clone()),
             docker_injected_binary_path: Some(outcome.binary_path.clone()),
+            docker_injected_binary_preexisted: outcome.binary_path_preexisted,
         },
     )
 }
@@ -1317,6 +1332,38 @@ fn alias_to_handle(alias: &AliasRecord) -> Handle {
     }
 }
 
+async fn run_container_command<D: DockerOps>(
+    docker: &D,
+    container: &str,
+    cmd: Vec<String>,
+) -> Result<()> {
+    let rendered = cmd.join(" ");
+    let exec_id = docker.create_exec(container, cmd, Vec::new()).await?;
+    let mut logs = docker.start_exec_with_logs(&exec_id).await?;
+    let mut output = String::new();
+    while let Some(line) = logs.next().await {
+        output.push_str(&line?);
+    }
+
+    loop {
+        let inspect = docker.inspect_exec(&exec_id).await?;
+        if !inspect.running {
+            let exit_code = inspect.exit_code.unwrap_or_default();
+            if exit_code == 0 {
+                return Ok(());
+            }
+            let detail = output.trim();
+            if detail.is_empty() {
+                bail!("run `{rendered}` in container {container} exited with status {exit_code}");
+            }
+            bail!(
+                "run `{rendered}` in container {container} exited with status {exit_code}: {detail}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 fn normalize_image(image: &str) -> String {
     if image.contains('@') {
         return image.to_owned();
@@ -1339,8 +1386,6 @@ mod tests {
     #[derive(Default)]
     struct MockHostOps {
         current_exe: Mutex<Option<PathBuf>>,
-        killed_pids: Mutex<Vec<i32>>,
-        removed_files: Mutex<Vec<(i64, PathBuf)>>,
         host_os: &'static str,
         host_arch: &'static str,
     }
@@ -1351,7 +1396,6 @@ mod tests {
                 current_exe: Mutex::new(Some(path)),
                 host_os: std::env::consts::OS,
                 host_arch: std::env::consts::ARCH,
-                ..Self::default()
             }
         }
     }
@@ -1372,19 +1416,6 @@ mod tests {
 
         fn host_arch(&self) -> &'static str {
             self.host_arch
-        }
-
-        fn kill_pid(&self, pid: i32) -> Result<()> {
-            self.killed_pids.lock().expect("lock").push(pid);
-            Ok(())
-        }
-
-        fn remove_container_file(&self, container_pid: i64, path: &Path) -> Result<()> {
-            self.removed_files
-                .lock()
-                .expect("lock")
-                .push((container_pid, path.to_path_buf()));
-            Ok(())
         }
     }
 
@@ -1429,10 +1460,12 @@ mod tests {
         inspect_by_container: Mutex<HashMap<String, ContainerSnapshot>>,
         copy_failures: Mutex<HashMap<String, anyhow::Error>>,
         execs: Mutex<HashMap<String, ExecSnapshot>>,
+        existing_paths: Mutex<HashMap<String, bool>>,
         exec_id: String,
         recorded_exec_cmd: Mutex<Option<Vec<String>>>,
         recorded_exec_env: Mutex<Option<Vec<String>>>,
         recorded_runtime: Mutex<Option<RunRuntimeSpec>>,
+        command_runs: Mutex<Vec<(String, Vec<String>)>>,
         start_logs: Mutex<Vec<String>>,
         events: Mutex<Vec<ContainerEvent>>,
     }
@@ -1454,10 +1487,12 @@ mod tests {
                         exit_code: None,
                     },
                 )])),
+                existing_paths: Mutex::new(HashMap::new()),
                 exec_id: "exec-1".to_owned(),
                 recorded_exec_cmd: Mutex::new(None),
                 recorded_exec_env: Mutex::new(None),
                 recorded_runtime: Mutex::new(None),
+                command_runs: Mutex::new(Vec::new()),
                 start_logs: Mutex::new(vec![READY_LOG_TOKEN.to_owned()]),
                 events: Mutex::new(Vec::new()),
             }
@@ -1472,6 +1507,20 @@ mod tests {
                 failures
                     .into_iter()
                     .map(|(path, message)| (path.to_owned(), anyhow!(message)))
+                    .collect(),
+            );
+            this
+        }
+
+        fn with_existing_paths(
+            self,
+            paths: impl IntoIterator<Item = (&'static str, bool)>,
+        ) -> Self {
+            let mut this = self;
+            this.existing_paths = Mutex::new(
+                paths
+                    .into_iter()
+                    .map(|(path, exists)| (path.to_owned(), exists))
                     .collect(),
             );
             this
@@ -1580,6 +1629,31 @@ mod tests {
                 .get(exec_id)
                 .cloned()
                 .ok_or_else(|| anyhow!("missing exec {exec_id}"))
+        }
+
+        async fn path_exists(&self, container: &str, path: &Path) -> Result<bool> {
+            self.actions
+                .lock()
+                .expect("lock")
+                .push(format!("exists:{container}:{}", path.display()));
+            Ok(*self
+                .existing_paths
+                .lock()
+                .expect("lock")
+                .get(&path.display().to_string())
+                .unwrap_or(&false))
+        }
+
+        async fn run_command(&self, container: &str, cmd: Vec<String>) -> Result<()> {
+            self.actions
+                .lock()
+                .expect("lock")
+                .push(format!("run:{container}:{}", cmd.join(" ")));
+            self.command_runs
+                .lock()
+                .expect("lock")
+                .push((container.to_owned(), cmd));
+            Ok(())
         }
 
         fn container_events(&self, _container: &str) -> BoxStream<'static, Result<ContainerEvent>> {
@@ -1713,22 +1787,28 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let binary = dir.path().join("portl");
         fs::write(&binary, b"portl").expect("write binary");
-        let docker = MockDockerOps::new(running_container()).with_copy_failures([
-            (INJECTION_PATHS[0], "read-only root"),
-            (INJECTION_PATHS[1], "tmp unavailable"),
-        ]);
+        let docker = MockDockerOps::new(running_container())
+            .with_copy_failures([
+                (INJECTION_PATHS[0], "read-only root"),
+                (INJECTION_PATHS[1], "tmp unavailable"),
+            ])
+            .with_existing_paths([(INJECTION_PATHS[2], true)]);
 
-        let chosen = copy_binary_with_fallback(&docker, &binary, "demo-id")
+        let (chosen, existed) = copy_binary_with_fallback(&docker, &binary, "demo-id")
             .await
             .expect("copy with fallback");
 
         assert_eq!(chosen, PathBuf::from(INJECTION_PATHS[2]));
+        assert!(existed);
         let actions = docker.actions.lock().expect("lock").clone();
         assert_eq!(
             actions,
             vec![
+                format!("exists:demo-id:{}", INJECTION_PATHS[0]),
                 format!("copy:demo-id:{}", INJECTION_PATHS[0]),
+                format!("exists:demo-id:{}", INJECTION_PATHS[1]),
                 format!("copy:demo-id:{}", INJECTION_PATHS[1]),
+                format!("exists:demo-id:{}", INJECTION_PATHS[2]),
                 format!("copy:demo-id:{}", INJECTION_PATHS[2]),
             ]
         );
@@ -1787,7 +1867,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detach_removes_injected_binary_and_terminates_injected_agent() {
+    async fn detach_terminates_injected_agent_and_removes_created_binary() {
         let dir = tempdir().expect("tempdir");
         let store = AliasStore::new(dir.path().join("aliases.json"));
         store
@@ -1812,30 +1892,42 @@ mod tests {
                     base_url: None,
                     docker_exec_id: Some("exec-1".to_owned()),
                     docker_injected_binary_path: Some(PathBuf::from(INJECTION_PATHS[1])),
+                    docker_injected_binary_preexisted: false,
                 },
             )
             .expect("save alias");
 
         let docker = MockDockerOps::new(running_container());
-        let host = MockHostOps {
-            host_os: "linux",
-            host_arch: std::env::consts::ARCH,
-            ..MockHostOps::default()
-        };
-        detach_saved_container(&docker, &host, &store, "demo")
+        detach_saved_container(&docker, &store, "demo")
             .await
             .expect("detach container");
 
-        assert_eq!(*host.killed_pids.lock().expect("lock"), vec![4242]);
         assert_eq!(
-            *host.removed_files.lock().expect("lock"),
-            vec![(99, PathBuf::from(INJECTION_PATHS[1]))]
+            *docker.command_runs.lock().expect("lock"),
+            vec![
+                (
+                    "demo-id".to_owned(),
+                    vec![
+                        "/bin/sh".to_owned(),
+                        "-lc".to_owned(),
+                        "kill -TERM 4242 2>/dev/null || true".to_owned(),
+                    ],
+                ),
+                (
+                    "demo-id".to_owned(),
+                    vec![
+                        "/bin/sh".to_owned(),
+                        "-lc".to_owned(),
+                        format!("rm -f {}", shell_quote(INJECTION_PATHS[1])),
+                    ],
+                ),
+            ]
         );
         assert!(store.get("demo").expect("read alias").is_none());
     }
 
     #[tokio::test]
-    async fn detach_refuses_non_linux_hosts_before_touching_exec_pid() {
+    async fn detach_leaves_preexisting_binary_in_place() {
         let dir = tempdir().expect("tempdir");
         let store = AliasStore::new(dir.path().join("aliases.json"));
         store
@@ -1860,21 +1952,27 @@ mod tests {
                     base_url: None,
                     docker_exec_id: Some("exec-1".to_owned()),
                     docker_injected_binary_path: Some(PathBuf::from(INJECTION_PATHS[1])),
+                    docker_injected_binary_preexisted: true,
                 },
             )
             .expect("save alias");
 
         let docker = MockDockerOps::new(running_container());
-        let host = MockHostOps {
-            host_os: "macos",
-            host_arch: std::env::consts::ARCH,
-            ..MockHostOps::default()
-        };
-        let err = detach_saved_container(&docker, &host, &store, "demo")
+        detach_saved_container(&docker, &store, "demo")
             .await
-            .expect_err("non-linux host must be refused");
-        assert!(err.to_string().contains("Linux hosts only"));
-        assert!(host.killed_pids.lock().expect("lock").is_empty());
+            .expect("detach container with preexisting binary");
+
+        assert_eq!(
+            *docker.command_runs.lock().expect("lock"),
+            vec![(
+                "demo-id".to_owned(),
+                vec![
+                    "/bin/sh".to_owned(),
+                    "-lc".to_owned(),
+                    "kill -TERM 4242 2>/dev/null || true".to_owned(),
+                ],
+            )]
+        );
     }
 
     #[test]

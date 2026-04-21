@@ -45,6 +45,8 @@ pub struct StoredSpec {
     pub docker_exec_id: Option<String>,
     #[serde(default)]
     pub docker_injected_binary_path: Option<PathBuf>,
+    #[serde(default)]
+    pub docker_injected_binary_preexisted: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -396,6 +398,7 @@ mod tests {
             base_url: Some("http://127.0.0.1:8080".to_owned()),
             docker_exec_id: None,
             docker_injected_binary_path: None,
+            docker_injected_binary_preexisted: false,
         }
     }
 
@@ -411,6 +414,7 @@ mod tests {
             base_url: None,
             docker_exec_id: None,
             docker_injected_binary_path: None,
+            docker_injected_binary_preexisted: false,
         }
     }
 

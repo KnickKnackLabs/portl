@@ -6,7 +6,7 @@ license.workspace      = true
 repository.workspace   = true
 authors.workspace      = true
 rust-version.workspace = true
-description  = "portl CLI — single multicall binary for `portl` (operator) and `portl agent` (target-side)."
+description  = "portl CLI — multicall surface for `portl`, `portl-agent`, and `portl-gateway`."
 
 [lints]
 workspace = true

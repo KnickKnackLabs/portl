@@ -147,6 +147,7 @@ mod tests {
                     base_url: None,
                     docker_exec_id: None,
                     docker_injected_binary_path: None,
+                    docker_injected_binary_preexisted: false,
                 },
             )
             .expect("save alias");
@@ -245,6 +246,7 @@ mod tests {
                     base_url: None,
                     docker_exec_id: None,
                     docker_injected_binary_path: None,
+                    docker_injected_binary_preexisted: false,
                 },
             )
             .expect("save alias");
