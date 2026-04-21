@@ -16,6 +16,18 @@ env:
   # the action.
   SCCACHE_GHA_ENABLED: "true"
 
+# Caching strategy (see docs/specs/ for context):
+#  - Swatinem/rust-cache caches ~/.cargo + target/ as bulk blobs, keyed
+#    by Cargo.lock + rustc version. Fast restore on same lockfile.
+#  - sccache caches per-rustc-invocation output via the GHA cache
+#    backend. Survives lockfile churn; hits individual crates even
+#    when the tree drifts.
+#  - Both together: Swatinem wins on warm branches; sccache wins
+#    on fresh lockfiles and cross-branch propagation.
+#  - `save-if: ${{ github.ref == 'refs/heads/main' }}` restricts
+#    writes to main, so PR branches only read main's cache — keeps
+#    us comfortably under the 10 GB repo budget.
+
 jobs:
   check:
     name: cargo check
@@ -26,7 +38,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: mozilla-actions/sccache-action@v0.0.9
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.8.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --workspace --all-features --all-targets
 
   test:
@@ -36,7 +50,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.89.0
       - uses: mozilla-actions/sccache-action@v0.0.9
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.8.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --workspace --all-features
 
   fmt:
@@ -62,7 +78,9 @@ jobs:
         with:
           components: clippy
       - uses: mozilla-actions/sccache-action@v0.0.9
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.8.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
 
   deny:

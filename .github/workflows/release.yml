@@ -39,14 +39,31 @@ jobs:
         # which the pin overrides. Install against the pinned version
         # explicitly so musl / darwin cross-targets are available.
         run: rustup target add ${{ matrix.target }}
+      # Per-target Swatinem cache. `shared-key: release-<target>` so
+      # successive release tags (v0.1.1 → v0.1.2 → …) warm-start from
+      # each other on the same target even though the tag ref changes.
+      # First release on a new target is cold; after that, same-target
+      # releases benefit. Cross-target sharing is not possible because
+      # rustc output differs per target triple. `save-if` only writes
+      # on tag pushes so ad-hoc workflow_dispatch runs don't pollute
+      # the release cache line.
+      - uses: Swatinem/rust-cache@v2.8.2
+        with:
+          shared-key: "release-${{ matrix.target }}"
+          save-if: ${{ startsWith(github.ref, 'refs/tags/v') }}
       - name: Install zig (linux only)
         if: matrix.linux
         uses: mlugg/setup-zig@v2
         with:
           version: 0.13.0
       - name: Install cargo-zigbuild (linux only)
+        # baptiste0928/cargo-install caches the compiled binary under
+        # ~/.cargo-install so subsequent release runs skip the ~1min
+        # `cargo install --locked cargo-zigbuild` compile.
         if: matrix.linux
-        run: cargo install --locked cargo-zigbuild
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: cargo-zigbuild
       - name: Build (linux musl via zigbuild)
         if: matrix.linux
         run: cargo zigbuild --release --target ${{ matrix.target }} --bin portl

@@ -16,6 +16,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: mozilla-actions/sccache-action@v0.0.9
+      # Bulk dep cache for the e2e workflow. Shared with ci.yml's
+      # native-target builds via the same `Cargo.lock` + rustc key;
+      # `save-if: main` keeps PR branches from bloating the 10 GB budget.
+      - uses: Swatinem/rust-cache@v2.8.2
+        with:
+          shared-key: "linux-native"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Cargo check
         run: env -u RUSTUP_TOOLCHAIN cargo check --workspace --all-features
       - name: Cargo test
