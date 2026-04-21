@@ -6,7 +6,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use tokio_util::sync::CancellationToken;
-use tracing::info;
 
 pub const REVOCATION_LINGER_SECS: u64 = 7 * 86_400;
 pub const DEFAULT_REVOCATIONS_MAX_BYTES: u64 = 10 * 1024 * 1024;
@@ -37,15 +36,6 @@ impl RevocationRecord {
         }
     }
 
-    fn legacy(ticket_id: [u8; 16], now: u64) -> Self {
-        Self {
-            ticket_id: hex::encode(ticket_id),
-            reason: String::from("legacy_json_import"),
-            revoked_at: Some(now),
-            not_after_of_ticket: None,
-        }
-    }
-
     fn ticket_id_bytes(&self) -> Result<[u8; 16]> {
         decode_ticket_id(&self.ticket_id)
     }
@@ -66,9 +56,8 @@ impl RevocationSet {
     }
 
     pub fn load_with_max_bytes(path: impl AsRef<Path>, max_bytes: u64) -> Result<Self> {
-        let requested = path.as_ref().to_path_buf();
+        let file = path.as_ref().to_path_buf();
         let now = unix_now_secs()?;
-        let file = migrate_legacy_json_if_needed(&requested, now)?;
         let records = if file.exists() {
             let raw = fs::read_to_string(&file)
                 .with_context(|| format!("read revocations from {}", file.display()))?;
@@ -389,59 +378,7 @@ fn sibling_tmp_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{file_name}.tmp"))
 }
 
-fn migrate_legacy_json_if_needed(path: &Path, now: u64) -> Result<PathBuf> {
-    if path.exists() || path.extension().is_some_and(|ext| ext == "json") {
-        return Ok(path.to_path_buf());
-    }
-
-    let Some(file_name) = path.file_name() else {
-        return Ok(path.to_path_buf());
-    };
-    if file_name != "revocations.jsonl" {
-        return Ok(path.to_path_buf());
-    }
-
-    let legacy = path.with_file_name("revocations.json");
-    if !legacy.exists() {
-        return Ok(path.to_path_buf());
-    }
-
-    let raw = fs::read_to_string(&legacy)
-        .with_context(|| format!("read legacy revocations from {}", legacy.display()))?;
-    let records = parse_revocation_records(&raw, &legacy, now)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    let mut encoded = String::new();
-    for record in &records {
-        encoded.push_str(
-            &serde_json::to_string(record)
-                .with_context(|| format!("encode migrated revocation {}", record.ticket_id))?,
-        );
-        encoded.push('\n');
-    }
-    fs::write(path, encoded)
-        .with_context(|| format!("write migrated revocations to {}", path.display()))?;
-    let migrated = legacy.with_file_name("revocations.json.migrated");
-    fs::rename(&legacy, &migrated).with_context(|| {
-        format!(
-            "rename legacy revocations {} to {}",
-            legacy.display(),
-            migrated.display()
-        )
-    })?;
-    info!(from = %legacy.display(), to = %path.display(), archived = %migrated.display(), "converted legacy revocations.json to jsonl");
-    Ok(path.to_path_buf())
-}
-
-fn parse_revocation_records(raw: &str, file: &Path, now: u64) -> Result<Vec<RevocationRecord>> {
-    if let Ok(hex_ids) = serde_json::from_str::<Vec<String>>(raw) {
-        return hex_ids
-            .into_iter()
-            .map(|hex_id| Ok(RevocationRecord::legacy(decode_ticket_id(&hex_id)?, now)))
-            .collect();
-    }
-
+fn parse_revocation_records(raw: &str, file: &Path, _now: u64) -> Result<Vec<RevocationRecord>> {
     let mut records = Vec::new();
     for (index, line) in raw.lines().enumerate() {
         let trimmed = line.trim();
@@ -481,7 +418,7 @@ mod tests {
 
     use super::{
         AppendError, REVOCATION_LINGER_SECS, RevocationRecord, RevocationSet, append_record,
-        migrate_legacy_json_if_needed, unix_now_secs,
+        unix_now_secs,
     };
 
     #[test]
@@ -653,29 +590,5 @@ mod tests {
         let removed = set.gc(now + REVOCATION_LINGER_SECS - 1);
         assert_eq!(removed, 0);
         assert!(set.contains(&[0x11; 16]));
-    }
-
-    #[test]
-    fn load_migrates_legacy_json_array() {
-        let dir = tempdir().expect("tempdir");
-        let json_path = dir.path().join("revocations.json");
-        std::fs::write(
-            &json_path,
-            serde_json::to_string(&vec![hex::encode([0x11; 16])]).expect("encode legacy json"),
-        )
-        .expect("write legacy revocations");
-
-        let jsonl_path = dir.path().join("revocations.jsonl");
-        // Migrate with a revoked_at timestamp close to the current
-        // wall clock so RevocationSet::load's GC pass (which uses
-        // real now) keeps the migrated record.
-        let now = unix_now_secs().expect("unix now");
-        let migrated =
-            migrate_legacy_json_if_needed(&jsonl_path, now).expect("migrate legacy json");
-        assert_eq!(migrated, jsonl_path);
-        assert!(jsonl_path.exists());
-        assert!(dir.path().join("revocations.json.migrated").exists());
-        let reloaded = RevocationSet::load(&jsonl_path).expect("load migrated jsonl");
-        assert!(reloaded.contains(&[0x11; 16]));
     }
 }

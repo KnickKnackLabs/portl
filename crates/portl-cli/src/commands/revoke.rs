@@ -124,7 +124,7 @@ mod tests {
     #[test]
     fn revoke_alias_appends_record() {
         let dir = tempdir().expect("tempdir");
-        let store = AliasStore::new(dir.path().join("aliases.sqlite"));
+        let store = AliasStore::new(dir.path().join("aliases.json"));
         store
             .save(
                 &AliasRecord {
@@ -209,7 +209,7 @@ mod tests {
     #[test]
     fn alias_ticket_id_falls_back_to_ticket_file() {
         let dir = tempdir().expect("tempdir");
-        let store = AliasStore::new(dir.path().join("aliases.sqlite"));
+        let store = AliasStore::new(dir.path().join("aliases.json"));
         let operator = Identity::new();
         let endpoint_id =
             iroh_base::EndpointId::from_bytes(&operator.verifying_key()).expect("endpoint id");
