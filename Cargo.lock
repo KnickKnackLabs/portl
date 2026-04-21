@@ -1263,7 +1263,7 @@ dependencies = [
 
 [[package]]
 name = "docker-portl"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2847,7 +2847,7 @@ checksum = "d3d25b0e0b648a86960ac23b7ad4abb9717601dec6f66c165f5b037f3f03065f"
 
 [[package]]
 name = "manual-portl"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "portl-core",
@@ -3544,7 +3544,7 @@ dependencies = [
 
 [[package]]
 name = "portl-agent"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3579,7 +3579,7 @@ dependencies = [
 
 [[package]]
 name = "portl-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3616,7 +3616,7 @@ dependencies = [
 
 [[package]]
 name = "portl-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "age",
  "anyhow",
@@ -3650,7 +3650,7 @@ dependencies = [
 
 [[package]]
 name = "portl-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bytes",
  "iroh",
@@ -4803,7 +4803,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slicer-portl"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",

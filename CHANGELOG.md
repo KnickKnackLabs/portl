@@ -3,6 +3,80 @@
 All notable changes land here. This project follows
 [Semantic Versioning](https://semver.org/) from v0.1.0 onward.
 
+## 0.1.2 — 2026-04-21
+
+Alias-isolation patch release. Non-breaking at the CLI / config /
+env surface. The on-disk alias store changes format; no migration
+(pre-1.0, no external users). This release exists specifically to
+isolate the `rusqlite`-bundled dependency as the suspected cause
+of the macOS release-mode host-client SIGABRT recorded in v0.1.0.
+
+Full scope and invariants:
+[`docs/specs/160-v0.1.2-alias-isolation.md`](docs/specs/160-v0.1.2-alias-isolation.md).
+
+### Changed
+
+- **Alias-store backend**: `aliases.sqlite` (rusqlite, bundled) is
+  replaced by `aliases.json` (`serde_json` + `fd-lock`). Writers
+  take an exclusive advisory lock on a companion `aliases.json.lock`
+  file for the full read-modify-write-rename cycle; readers take a
+  shared lock on the same companion file. Atomic durability is
+  provided by temp-file fsync + rename + parent-directory fsync.
+- Public API of `crate::alias_store` (`AliasStore`, `AliasRecord`,
+  `StoredSpec`, `default_db_path`, `now_unix_secs`) is preserved
+  byte-for-byte; every caller under `crates/portl-cli/src/commands/`
+  is source-compatible.
+- **File permissions hardened**: `aliases.json` and
+  `aliases.json.lock` are created with mode `0600` on Unix so that
+  hex-encoded `endpoint_id` and `root_ticket_id` values are not
+  world-readable. The v0.1.1 SQLite file inherited the process
+  umask (typically `0644`).
+- **Schema-version gate**: the JSON file carries
+  `"version": <u32>` at the top level. Readers reject files whose
+  version exceeds the current version (1) with a clear error,
+  preventing silent downgrade of newer state when rolling back for
+  a bisect. Unknown fields inside each alias entry are
+  round-tripped (preserved via `#[serde(flatten)]`) so a v0.1.2
+  binary can safely read and re-save a v0.1.3 file without losing
+  added fields.
+- **Endpoint-id uniqueness preserved**: `save()` rejects a record
+  whose `endpoint_id` is already claimed by a different alias,
+  matching the `UNIQUE INDEX idx_aliases_endpoint_id` constraint
+  that v0.1.1 enforced at the SQLite layer.
+
+### Removed
+
+- `rusqlite` and `libsqlite3-sys` leave the workspace entirely.
+  Expected binary-size delta vs v0.1.1 (release, zstd -19):
+  approximately 1.5-2 MiB smaller per tarball. Cold-build time
+  drops comparably; the `cc` build script for `libsqlite3-sys` was
+  the single longest-running step in the v0.1.1 release build.
+- **No migration from `aliases.sqlite`.** A stray SQLite file left
+  over from v0.1.1 is silently ignored. Operators recreate aliases
+  with `portl ticket accept … --save-as` (pre-1.0 stance; see
+  `docs/specs/160-v0.1.2-alias-isolation.md §3.3`).
+
+### Infrastructure
+
+- **New `dep-guard` CI job** (`.github/workflows/ci.yml`) fails
+  the build if `rusqlite` or `libsqlite3-sys` re-enter the
+  workspace dependency tree. Added to the `release-build` `needs:`
+  list so tag-triggered releases cannot ship with SQLite reintroduced.
+- Nextest profile `ci` gains a per-test override for
+  `alias_store::tests::many_writers_converge_to_full_set` — the
+  1,000-save durability test is intentionally fsync-heavy, so it
+  gets a 90 s slow-timeout with `terminate-after = 3` and one
+  retry to absorb disk-contention noise on shared runners.
+
+### Forensic note
+
+This release is the clean bisect target for the macOS release-mode
+host-client SIGABRT recorded in v0.1.0. Outcome (confirmed /
+falsified) will be captured in
+`scratch/2026-0X-XX-v0.1.2-mac-bisect.md` after the 50×raw-ticket
+and 50×alias-resolved acceptance loops run against vn3 from a
+macOS arm64 release build. Protocol: spec 160 §4.3.
+
 ## 0.1.1 — 2026-04-21
 
 Safety-net patch release. Non-breaking at the CLI / config / env
