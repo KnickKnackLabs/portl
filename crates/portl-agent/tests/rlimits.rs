@@ -58,7 +58,11 @@ async fn exec_path_applies_cpu() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn exec_path_applies_nproc_linux() {
-    let out = run_exec_capture("/bin/sh", &["-c", "ulimit -u"], vec![])
+    // `ulimit -u` is a bash-ism: dash (which is /bin/sh on Debian /
+    // Ubuntu) rejects it with "Illegal option -u". Use bash explicitly
+    // so this test runs on both Alpine-like and Debian-like distros.
+    // bash is guaranteed available on every Linux target we ship to.
+    let out = run_exec_capture("/bin/bash", &["-c", "ulimit -u"], vec![])
         .await
         .expect("run exec");
     assert!(out.status.success(), "exec exited non-zero: {out:?}");
