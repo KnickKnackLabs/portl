@@ -9,6 +9,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # .cargo/config.toml sets `rustc-wrapper = "sccache"`. Every cargo
+  # invocation below needs sccache on PATH; mozilla-actions/sccache-
+  # action installs it and wires the GitHub Actions cache backend via
+  # this env var. `fmt` and `deny` don't invoke rustc, so they skip
+  # the action.
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   check:
@@ -19,6 +25,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: rustfmt, clippy
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-features --all-targets
 
@@ -28,12 +35,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features
 
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
+    # cargo fmt does not invoke rustc, so sccache is not needed and the
+    # wrapper would never be consulted.
+    env:
+      CARGO_BUILD_RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.89.0
@@ -49,6 +61,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: clippy
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
 
