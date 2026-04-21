@@ -682,7 +682,7 @@ fn spawn_pty_process(
         && user.switch_required
     {
         return Err(SpawnReject::user_switch_refused(
-            "pty mode does not support --user in v0.1; use `portl exec --user <name>` or run the agent as the target user",
+            "pty mode does not support --user; use `portl exec --user <name>` or run the agent as the target user",
         ));
     }
 

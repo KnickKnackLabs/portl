@@ -1,26 +1,22 @@
 # autoresearch ideas
 
-## v0.2.1 — Gateway crate extraction
+## Gateway crate split — deferred indefinitely
 
-Extract gateway code from `portl-agent` into its own
-`portl-gateway` crate. Drop `reqwest` as a direct dep of
-`portl-agent` (gateway was its only consumer). Move
-master-ticket bearer validation out of `portl-core` /
-`portl-proto` into `portl-gateway::master_ticket` so the ticket
-crate stops knowing what a "master" ticket is. Move
-`wiremock` dev-dep with the gateway integration tests.
+v0.2.1 shipped the "gateway isolation" subset: `reqwest` direct
+dep dropped from `portl-agent`, ignored wiremock-backed test
+deleted, and `AgentMode` now gates at handshake + ALPN dispatch
+(commits `cae40c5`, `55be9b1`).
 
-Scoped out of v0.2.0 because it is a ≥19-file refactor
-entangled with `AgentState`, `Session`, `caps_enforce`,
-`stream_io`, and `audit`. Shipping it in the same release as
-§4 CLI collapse + §5 docker orchestrate + §13 runtime safety
-multiplies regression risk.
+The fuller crate split — pulling gateway forwarding, master-ticket
+handling, and the HTTP bearer-injection path into a dedicated
+`portl-gateway` crate (ideally with a shared `portl-runtime`
+library underneath both daemons) — remains deferred. It only pays
+off when there is a second gateway consumer or a real push to
+publish a stable runtime library API. Until then the 309-line
+`gateway.rs` inside `portl-agent` is cheaper to maintain than a
+split that forces a pipeline API to stabilize on a single consumer.
 
- User-observable §10 behaviour (the `portl-gateway` multicall
- entrypoint) ships in v0.2.0 via the small-scope Task 1.2. The
- binary-size / build-time wins are deferred by one release.
-
-## v0.2.1 — `portl revoke --compact`
+## `portl revoke --compact`
 
 Add a maintenance subcommand that compacts expired-and-revoked
 entries out of `revocations.jsonl` once they are past both the

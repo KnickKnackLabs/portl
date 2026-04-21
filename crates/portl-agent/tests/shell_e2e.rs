@@ -293,11 +293,10 @@ async fn pty_user_switch_returns_actionable_error() -> Result<()> {
     )
     .await
     else {
-        anyhow::bail!("pty user switch should be rejected in v0.1")
+        anyhow::bail!("pty user switch should be rejected")
     };
     assert!(
-        err.to_string()
-            .contains("pty mode does not support --user in v0.1"),
+        err.to_string().contains("pty mode does not support --user"),
         "error was: {err:#}"
     );
 

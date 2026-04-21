@@ -27,7 +27,8 @@ pub fn load_agent_config() -> anyhow::Result<portl_agent::AgentConfig> {
 /// Structured representation of a parsed invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// Hidden compatibility path for `portl-agent` until Task 3.5 lands.
+    /// `portl-agent` daemon entrypoint. Also reached by `portl-gateway`
+    /// after the multicall rewrite sets `mode = Gateway`.
     AgentRun {
         mode: Option<AgentModeArg>,
         upstream_url: Option<String>,
