@@ -1,6 +1,6 @@
 //! Verifies that an accepted exec session emits exactly one
 //! `audit.shell_start` and one `audit.shell_exit` record, and that
-//! both carry the same `session_id` (`UUIDv4`) field.
+//! both carry the same hex-encoded wire `session_id` field.
 
 #![cfg(unix)]
 
@@ -68,8 +68,8 @@ async fn accepted_session_emits_start_and_exit_with_same_session_id() -> Result<
         .get("session_id")
         .expect("shell_exit missing session_id");
     assert_eq!(start_sid, exit_sid, "session_id mismatch");
-    // Sanity: UUIDv4 hyphenated form is 36 chars.
-    assert_eq!(start_sid.len(), 36, "session_id not a UUID: {start_sid}");
+    assert_eq!(start_sid.len(), 32, "session_id not hex: {start_sid}");
+    assert!(start_sid.chars().all(|ch| ch.is_ascii_hexdigit()));
 
     // Spec 150 §3.2 field schema.
     for rec in [start, exit] {

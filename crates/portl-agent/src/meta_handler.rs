@@ -2,8 +2,9 @@ use std::fs;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::{Connection, SendStream};
+use portl_core::runtime::slow_task;
 use tracing::instrument;
 
 use crate::AgentState;
@@ -64,7 +65,7 @@ pub(crate) async fn serve_stream(
             }
         }
         portl_proto::meta_v1::MetaReq::PublishRevocations { items } => {
-            publish_revocations(&state, &session, items)
+            publish_revocations(Arc::clone(&state), session.clone(), items).await
         }
     };
 
@@ -84,9 +85,9 @@ fn meta_caps(session: &Session) -> Option<&portl_core::ticket::schema::MetaCaps>
 /// `PublishRevocations` request may carry.
 const MAX_PUBLISH_ITEMS: usize = 1000;
 
-fn publish_revocations(
-    state: &Arc<AgentState>,
-    session: &Session,
+async fn publish_revocations(
+    state: Arc<AgentState>,
+    session: Session,
     items: Vec<Vec<u8>>,
 ) -> portl_proto::meta_v1::MetaResp {
     // Authorization: requires that the caller's ticket granted the
@@ -95,7 +96,7 @@ fn publish_revocations(
     // delegates (e.g. shell-only) must NOT be able to mutate the
     // revocation set. A future ticket schema bump will add a
     // dedicated `meta.publish_revocations` bit.
-    if !meta_caps(session).is_some_and(|caps| caps.info) {
+    if !meta_caps(&session).is_some_and(|caps| caps.info) {
         return cap_denied("publish revocations requires meta.info capability");
     }
 
@@ -123,53 +124,62 @@ fn publish_revocations(
     let mut accepted: u32 = 0;
     let mut rejected: Vec<(Vec<u8>, String)> = Vec::new();
     let caller_hex = hex::encode(session.caller_endpoint_id);
-
-    let Ok(mut revocations) = state.revocations.write() else {
-        return portl_proto::meta_v1::MetaResp::Error(portl_proto::error::Error {
-            kind: portl_proto::error::ErrorKind::InternalError,
-            message: "revocations lock poisoned".to_owned(),
-            retry_after_ms: None,
-        });
-    };
+    let mut batch = Vec::new();
     for raw in items {
         let Ok(id) = <[u8; 16]>::try_from(raw.as_slice()) else {
             rejected.push((raw, "ticket_id must be 16 bytes".to_owned()));
             continue;
         };
-        match revocations.append(crate::revocations::RevocationRecord::new(
+        accepted = accepted.saturating_add(1);
+        batch.push(crate::revocations::RevocationRecord::new(
             id,
             format!("meta_publish_from_{caller_hex}"),
             now,
             None,
-        )) {
-            Ok(_) => {
-                accepted += 1;
-            }
-            Err(crate::revocations::AppendError::SizeCeilingExceeded {
-                max_bytes,
-                current_bytes,
-                append_bytes,
-            }) => {
-                return portl_proto::meta_v1::MetaResp::Error(portl_proto::error::Error {
-                    kind: portl_proto::error::ErrorKind::ResourceExhausted,
-                    message: format!(
-                        "revocations.jsonl ceiling exceeded: current={current_bytes} append={append_bytes} max={max_bytes}"
-                    ),
-                    retry_after_ms: None,
-                });
-            }
-            Err(err) => {
-                tracing::warn!(?err, "append revocations after publish");
-                return portl_proto::meta_v1::MetaResp::Error(portl_proto::error::Error {
-                    kind: portl_proto::error::ErrorKind::InternalError,
-                    message: format!("append revocations: {err}"),
-                    retry_after_ms: None,
-                });
-            }
-        }
+        ));
     }
 
-    portl_proto::meta_v1::MetaResp::PublishedRevocations { accepted, rejected }
+    let append = slow_task(
+        "publish_revocations_append",
+        tokio::task::spawn_blocking(move || {
+            let mut revocations = state.revocations.write().map_err(|_| {
+                crate::revocations::AppendError::Io(anyhow!("revocations lock poisoned"))
+            })?;
+            revocations.append_batch_atomic(batch)
+        }),
+    )
+    .await;
+
+    match append {
+        Ok(Ok(_)) => portl_proto::meta_v1::MetaResp::PublishedRevocations { accepted, rejected },
+        Ok(Err(crate::revocations::AppendError::SizeCeilingExceeded {
+            max_bytes,
+            current_bytes,
+            append_bytes,
+        })) => portl_proto::meta_v1::MetaResp::Error(portl_proto::error::Error {
+            kind: portl_proto::error::ErrorKind::ResourceExhausted,
+            message: format!(
+                "revocations.jsonl ceiling exceeded: current={current_bytes} append={append_bytes} max={max_bytes}"
+            ),
+            retry_after_ms: None,
+        }),
+        Ok(Err(err)) => {
+            tracing::warn!(?err, "append revocations after publish");
+            portl_proto::meta_v1::MetaResp::Error(portl_proto::error::Error {
+                kind: portl_proto::error::ErrorKind::InternalError,
+                message: format!("append revocations: {err}"),
+                retry_after_ms: None,
+            })
+        }
+        Err(err) => {
+            tracing::warn!(?err, "publish revocations task panicked");
+            portl_proto::meta_v1::MetaResp::Error(portl_proto::error::Error {
+                kind: portl_proto::error::ErrorKind::InternalError,
+                message: format!("append revocations task: {err}"),
+                retry_after_ms: None,
+            })
+        }
+    }
 }
 
 fn unix_now_secs() -> Result<u64> {

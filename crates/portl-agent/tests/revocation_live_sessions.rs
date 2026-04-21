@@ -109,6 +109,58 @@ async fn revocation_of_parent_ticket_cancels_delegated_session() -> Result<()> {
 }
 
 #[tokio::test]
+async fn local_revocation_file_append_cancels_live_shell_session_within_2s() -> Result<()> {
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let revocations_path = std::env::temp_dir().join(format!(
+        "portl-agent-local-revocations-{}.jsonl",
+        rand::random::<u64>()
+    ));
+    let agent = start_agent_at_path(
+        server.clone(),
+        &operator,
+        revocations_path.clone(),
+        portl_agent::revocations::DEFAULT_REVOCATIONS_MAX_BYTES,
+    )
+    .await?;
+    let ticket = root_ticket(&operator, server.addr(), shell_and_meta_caps());
+
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let mut shell = open_shell(
+        &connection,
+        &session,
+        None,
+        None,
+        PtyCfg {
+            term: "xterm-256color".to_owned(),
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await?;
+    shell
+        .stdin
+        .write_all(b"trap 'exit 0' HUP TERM\nwhile :; do sleep 1; done\n")
+        .await?;
+
+    portl_agent::revocations::append_record(
+        &revocations_path,
+        &portl_agent::RevocationRecord::new(
+            ticket_id(&ticket.sig),
+            "manual",
+            unix_now_secs(),
+            None,
+        ),
+    )?;
+
+    let _exit = tokio::time::timeout(Duration::from_secs(2), shell.wait_exit())
+        .await
+        .context("shell session was not cancelled from local file append within 2s")??;
+
+    shutdown(connection, client, server, agent).await
+}
+
+#[tokio::test]
 async fn publish_revocations_replies_resource_exhausted_on_ceiling() -> Result<()> {
     let (client, server) = pair().await?;
     let operator = Identity::new();
@@ -150,10 +202,24 @@ async fn start_agent_with_max_bytes(
     operator: &Identity,
     revocations_max_bytes: u64,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
-    let revocations_path = std::env::temp_dir().join(format!(
-        "portl-agent-live-revocations-{}.json",
-        rand::random::<u64>()
-    ));
+    start_agent_at_path(
+        server,
+        operator,
+        std::env::temp_dir().join(format!(
+            "portl-agent-live-revocations-{}.jsonl",
+            rand::random::<u64>()
+        )),
+        revocations_max_bytes,
+    )
+    .await
+}
+
+async fn start_agent_at_path(
+    server: portl_core::endpoint::Endpoint,
+    operator: &Identity,
+    revocations_path: std::path::PathBuf,
+    revocations_max_bytes: u64,
+) -> Result<tokio::task::JoinHandle<Result<()>>> {
     run_task(AgentConfig {
         discovery: DiscoveryConfig::in_process(),
         trust_roots: vec![operator.verifying_key()],

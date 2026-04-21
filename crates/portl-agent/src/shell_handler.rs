@@ -238,7 +238,8 @@ async fn serve_control_stream(
             return Ok(());
         }
     };
-    let audit_session_id = uuid::Uuid::new_v4().to_string();
+    let session_id = fresh_session_id();
+    let audit_session_id = hex::encode(session_id);
     let process = match spawn_process(&session, &req, requested_user.as_ref(), &audit_session_id) {
         Ok(process) => process,
         Err(reject) => {
@@ -255,7 +256,6 @@ async fn serve_control_stream(
         }
     };
 
-    let session_id = fresh_session_id();
     let cancel = CancellationToken::new();
     state
         .shell_registry
@@ -639,7 +639,6 @@ fn spawn_exec_process(
         if let Ok(mut guard) = exit_code_wait.lock() {
             *guard = Some(code);
         }
-        let _ = exit_tx_wait.send(Some(code));
         let duration_ms = started_at_wait
             .lock()
             .ok()
@@ -655,6 +654,7 @@ fn spawn_exec_process(
             code,
             duration_ms,
         );
+        let _ = exit_tx_wait.send(Some(code));
     });
 
     Ok(Arc::new(ShellProcess {
@@ -748,7 +748,6 @@ fn spawn_pty_process(
         if let Ok(mut guard) = exit_code_wait.lock() {
             *guard = Some(code);
         }
-        let _ = exit_tx_wait.send(Some(code));
         let duration_ms = started_at_wait
             .lock()
             .ok()
@@ -764,6 +763,7 @@ fn spawn_pty_process(
             code,
             duration_ms,
         );
+        let _ = exit_tx_wait.send(Some(code));
     });
 
     // The child called setsid() in pre_exec, so its pid is also the

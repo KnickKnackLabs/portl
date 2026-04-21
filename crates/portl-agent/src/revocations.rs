@@ -124,11 +124,57 @@ impl RevocationSet {
         if self.ids.contains(&id) {
             return Ok(false);
         }
-        append_record_limited(&self.file, &record, self.max_bytes)?;
-        self.ids.insert(id);
-        self.records.push(record);
-        self.cancel_live_sessions(id);
+        self.append_batch_atomic(vec![record])?;
         Ok(true)
+    }
+
+    pub fn append_batch_atomic(
+        &mut self,
+        records: Vec<RevocationRecord>,
+    ) -> std::result::Result<usize, AppendError> {
+        if records.is_empty() {
+            return Ok(0);
+        }
+
+        let current_bytes = fs::metadata(&self.file).map_or(0, |metadata| metadata.len());
+        let mut append_bytes = 0_u64;
+        let mut new_ids = self.ids.clone();
+        let mut pending = Vec::new();
+        let mut pending_ids = Vec::new();
+        for record in records {
+            let id = record
+                .ticket_id_bytes()
+                .map_err(|err| AppendError::InvalidRecord {
+                    message: err.to_string(),
+                })?;
+            if !new_ids.insert(id) {
+                continue;
+            }
+            append_bytes = append_bytes.saturating_add(encoded_record_len(&record)?);
+            pending_ids.push(id);
+            pending.push(record);
+        }
+
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        if current_bytes.saturating_add(append_bytes) > self.max_bytes {
+            return Err(AppendError::SizeCeilingExceeded {
+                current_bytes,
+                append_bytes,
+                max_bytes: self.max_bytes,
+            });
+        }
+
+        let mut updated = self.records.clone();
+        updated.extend(pending.clone());
+        write_jsonl(&self.file, &updated).map_err(AppendError::Io)?;
+        self.records = updated;
+        self.ids = new_ids;
+        for id in pending_ids {
+            self.cancel_live_sessions(id);
+        }
+        Ok(pending.len())
     }
 
     /// Insert a fully-formed `RevocationRecord` into memory only.
@@ -175,6 +221,31 @@ impl RevocationSet {
 
     pub fn persist(&self) -> Result<()> {
         write_jsonl(&self.file, &self.records)
+    }
+
+    pub fn sync_from_disk(&mut self) -> Result<usize> {
+        let now = unix_now_secs()?;
+        if !self.file.exists() {
+            return Ok(0);
+        }
+        let raw = fs::read_to_string(&self.file)
+            .with_context(|| format!("read revocations from {}", self.file.display()))?;
+        let records = parse_revocation_records(&raw, &self.file, now)?;
+        let ids = records
+            .iter()
+            .map(RevocationRecord::ticket_id_bytes)
+            .collect::<Result<HashSet<_>>>()?;
+        let added = ids
+            .iter()
+            .filter(|id| !self.ids.contains(*id))
+            .copied()
+            .collect::<Vec<_>>();
+        self.records = records;
+        self.ids = ids;
+        for id in &added {
+            self.cancel_live_sessions(*id);
+        }
+        Ok(added.len())
     }
 
     /// Borrow the underlying on-disk path (used by async persist).
@@ -239,7 +310,11 @@ pub fn write_jsonl(path: &Path, records: &[RevocationRecord]) -> Result<()> {
         );
         encoded.push('\n');
     }
-    fs::write(path, encoded).with_context(|| format!("write revocations to {}", path.display()))
+    let tmp_path = sibling_tmp_path(path);
+    fs::write(&tmp_path, encoded)
+        .with_context(|| format!("write revocations to {}", tmp_path.display()))?;
+    fs::rename(&tmp_path, path)
+        .with_context(|| format!("rename {} to {}", tmp_path.display(), path.display()))
 }
 
 pub fn append_record(path: impl AsRef<Path>, record: &RevocationRecord) -> Result<()> {
@@ -297,6 +372,21 @@ pub fn append_record_limited(
     file.write_all(encoded.as_bytes())
         .with_context(|| format!("append revocation record to {}", path.display()))
         .map_err(AppendError::Io)
+}
+
+fn encoded_record_len(record: &RevocationRecord) -> std::result::Result<u64, AppendError> {
+    let encoded = serde_json::to_string(record)
+        .with_context(|| format!("encode revocation {}", record.ticket_id))
+        .map_err(AppendError::Io)?;
+    Ok(u64::try_from(encoded.len() + 1).unwrap_or(u64::MAX))
+}
+
+fn sibling_tmp_path(path: &Path) -> PathBuf {
+    let file_name = path.file_name().map_or_else(
+        || "revocations.jsonl".into(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    path.with_file_name(format!(".{file_name}.tmp"))
 }
 
 fn migrate_legacy_json_if_needed(path: &Path, now: u64) -> Result<PathBuf> {
@@ -436,6 +526,38 @@ mod tests {
             .append(RevocationRecord::new([0x11; 16], "manual", 7, None))
             .expect_err("append should hit size ceiling");
         assert!(matches!(err, AppendError::SizeCeilingExceeded { .. }));
+    }
+
+    #[test]
+    fn append_batch_fails_closed_when_ceiling_would_be_exceeded() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("revocations.jsonl");
+        let mut set = RevocationSet::load_with_max_bytes(&path, 1_000).expect("load set");
+        set.append(RevocationRecord::new([0x11; 16], "manual", 7, None))
+            .expect("seed revocation");
+
+        let existing = std::fs::read_to_string(&path).expect("read seeded file");
+        let ceiling = u64::try_from(existing.len()).expect("file length")
+            + super::encoded_record_len(&RevocationRecord::new([0x22; 16], "manual", 7, None))
+                .expect("encoded len")
+            + super::encoded_record_len(&RevocationRecord::new([0x33; 16], "manual", 7, None))
+                .expect("encoded len")
+            - 1;
+        set.max_bytes = ceiling;
+
+        let err = set
+            .append_batch_atomic(vec![
+                RevocationRecord::new([0x22; 16], "manual", 7, None),
+                RevocationRecord::new([0x33; 16], "manual", 7, None),
+            ])
+            .expect_err("batch should fail closed");
+        assert!(matches!(err, AppendError::SizeCeilingExceeded { .. }));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read unchanged file"),
+            existing
+        );
+        assert!(!set.contains(&[0x22; 16]));
+        assert!(!set.contains(&[0x33; 16]));
     }
 
     #[test]

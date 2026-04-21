@@ -104,6 +104,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
     let signal_tasks = install_signal_tasks(&shutdown, &signal_shutdown)?;
     let udp_gc = spawn_udp_gc_task(Arc::clone(&state), shutdown.clone());
     let revocation_gc = spawn_revocation_gc_task(Arc::clone(&state), shutdown.clone());
+    let revocation_reload = spawn_revocation_reload_task(Arc::clone(&state), shutdown.clone());
     let metrics_task = spawn_metrics_server(&state, shutdown.clone(), &cfg);
 
     loop {
@@ -151,6 +152,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
     signal_tasks.abort();
     udp_gc.abort();
     revocation_gc.abort();
+    revocation_reload.abort();
     if let Some(metrics) = metrics_task {
         metrics.abort();
     }
@@ -216,6 +218,48 @@ fn spawn_revocation_gc_task(state: Arc<AgentState>, shutdown: CancellationToken)
                         }
                         Err(err) => {
                             warn!(%err, "revocations lock poisoned; skipping gc pass");
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn spawn_revocation_reload_task(
+    state: Arc<AgentState>,
+    shutdown: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                _ = interval.tick() => {
+                    match portl_core::runtime::slow_task(
+                        "revocations_reload",
+                        tokio::task::spawn_blocking({
+                            let state = Arc::clone(&state);
+                            move || {
+                                let mut revocations = state
+                                    .revocations
+                                    .write()
+                                    .map_err(|err| anyhow::anyhow!("revocations lock poisoned: {err}"))?;
+                                revocations.sync_from_disk()
+                            }
+                        }),
+                    ).await {
+                        Ok(Ok(added)) if added > 0 => {
+                            info!(added, "reloaded revocations from disk");
+                        }
+                        Ok(Ok(_)) => {}
+                        Ok(Err(err)) => {
+                            warn!(?err, "revocation reload failed");
+                        }
+                        Err(err) => {
+                            warn!(?err, "revocation reload task panicked");
                         }
                     }
                 }
