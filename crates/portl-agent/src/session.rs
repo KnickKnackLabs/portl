@@ -5,6 +5,7 @@ pub struct Session {
     pub peer_token: [u8; 16],
     pub caps: Capabilities,
     pub ticket_id: [u8; 16],
+    pub ticket_chain_ids: Vec<[u8; 16]>,
     pub caller_endpoint_id: [u8; 32],
     pub bearer: Option<Vec<u8>>,
 }

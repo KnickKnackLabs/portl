@@ -59,6 +59,7 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
             peer_token,
             caps,
             ticket_id,
+            ticket_chain_ids,
             bearer,
         } => {
             let ack = portl_proto::ticket_v1::TicketAck {
@@ -75,6 +76,7 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
                 peer_token: *peer_token,
                 caps: (**caps).clone(),
                 ticket_id: *ticket_id,
+                ticket_chain_ids: ticket_chain_ids.clone(),
                 caller_endpoint_id: source_id,
                 bearer: bearer.clone(),
             };

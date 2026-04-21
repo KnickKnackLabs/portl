@@ -1,10 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 pub const REVOCATION_LINGER_SECS: u64 = 7 * 86_400;
@@ -49,11 +50,12 @@ impl RevocationRecord {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct RevocationSet {
     file: PathBuf,
     ids: HashSet<[u8; 16]>,
     records: Vec<RevocationRecord>,
+    live_sessions: HashMap<[u8; 16], HashMap<[u8; 16], CancellationToken>>,
 }
 
 impl RevocationSet {
@@ -73,7 +75,12 @@ impl RevocationSet {
             .iter()
             .map(RevocationRecord::ticket_id_bytes)
             .collect::<Result<HashSet<_>>>()?;
-        let mut set = Self { file, ids, records };
+        let mut set = Self {
+            file,
+            ids,
+            records,
+            live_sessions: HashMap::new(),
+        };
         if set.gc(now) > 0 {
             set.persist()?;
         }
@@ -95,6 +102,7 @@ impl RevocationSet {
             revoked_at: None,
             not_after_of_ticket: None,
         });
+        self.cancel_live_sessions(id);
         true
     }
 
@@ -108,7 +116,36 @@ impl RevocationSet {
             return false;
         }
         self.records.push(record);
+        self.cancel_live_sessions(id);
         true
+    }
+
+    pub fn register_live_session(
+        &mut self,
+        session_id: [u8; 16],
+        ticket_chain_ids: &[[u8; 16]],
+        token: &CancellationToken,
+    ) {
+        for ticket_id in ticket_chain_ids.iter().copied().collect::<HashSet<_>>() {
+            self.live_sessions
+                .entry(ticket_id)
+                .or_default()
+                .insert(session_id, token.clone());
+        }
+    }
+
+    pub fn deregister_live_session(&mut self, session_id: [u8; 16], ticket_chain_ids: &[[u8; 16]]) {
+        for ticket_id in ticket_chain_ids.iter().copied().collect::<HashSet<_>>() {
+            let remove_entry = if let Some(sessions) = self.live_sessions.get_mut(&ticket_id) {
+                sessions.remove(&session_id);
+                sessions.is_empty()
+            } else {
+                false
+            };
+            if remove_entry {
+                self.live_sessions.remove(&ticket_id);
+            }
+        }
     }
 
     pub fn persist(&self) -> Result<()> {
@@ -152,6 +189,14 @@ impl RevocationSet {
             .filter_map(|record| record.ticket_id_bytes().ok())
             .collect();
         before - self.records.len()
+    }
+
+    fn cancel_live_sessions(&self, ticket_id: [u8; 16]) {
+        if let Some(sessions) = self.live_sessions.get(&ticket_id) {
+            for token in sessions.values() {
+                token.cancel();
+            }
+        }
     }
 }
 
@@ -336,6 +381,7 @@ mod tests {
                 revoked_at,
                 Some(revoked_at),
             )],
+            live_sessions: std::collections::HashMap::new(),
         };
 
         let removed = set.gc(now);
@@ -359,6 +405,7 @@ mod tests {
                 now,
                 Some(now - 1),
             )],
+            live_sessions: std::collections::HashMap::new(),
         };
 
         let removed = set.gc(now);
@@ -383,6 +430,7 @@ mod tests {
                 now - REVOCATION_LINGER_SECS - 1,
                 None,
             )],
+            live_sessions: std::collections::HashMap::new(),
         };
 
         let removed = set.gc(now);

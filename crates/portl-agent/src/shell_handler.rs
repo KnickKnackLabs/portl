@@ -14,6 +14,7 @@ use std::os::fd::OwnedFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, unix::AsyncFd};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::{mpsc, watch};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::AgentState;
@@ -64,11 +65,16 @@ pub(crate) async fn serve_stream(
 
 struct ShellSessionGuard<'a> {
     registry: &'a ShellRegistry,
+    revocations: &'a std::sync::RwLock<crate::revocations::RevocationSet>,
     session_id: [u8; 16],
+    ticket_chain_ids: Vec<[u8; 16]>,
 }
 
 impl Drop for ShellSessionGuard<'_> {
     fn drop(&mut self) {
+        if let Ok(mut revocations) = self.revocations.write() {
+            revocations.deregister_live_session(self.session_id, &self.ticket_chain_ids);
+        }
         if let Some((_, process)) = self.registry.remove(&self.session_id) {
             request_pty_close(process.pty_tx.as_ref(), false);
             SessionReaper::from_process(process.as_ref()).spawn();
@@ -177,6 +183,7 @@ impl SessionReaper {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn serve_control_stream(
     _connection: Connection,
     session: Session,
@@ -237,12 +244,20 @@ async fn serve_control_stream(
     };
 
     let session_id = fresh_session_id();
+    let cancel = CancellationToken::new();
     state
         .shell_registry
         .insert(session_id, Arc::clone(&process));
+    if let Ok(mut revocations) = state.revocations.write() {
+        revocations.register_live_session(session_id, &session.ticket_chain_ids, &cancel);
+    } else {
+        warn!(session_id = %hex::encode(session_id), "revocations lock poisoned; live shell session will not be revocation-cancellable");
+    }
     let _session_guard = ShellSessionGuard {
         registry: &state.shell_registry,
+        revocations: &state.revocations,
         session_id,
+        ticket_chain_ids: session.ticket_chain_ids.clone(),
     };
     let mode_str: &'static str = match req.mode {
         portl_proto::shell_v1::ShellMode::Exec => "exec",
@@ -273,13 +288,18 @@ async fn serve_control_stream(
 
     let mut control_buffer = [0_u8; 1024];
     loop {
-        let read = recv
-            .read(&mut control_buffer)
-            .await
-            .context("read control stream")?;
-        if read == 0 {
-            let _ = send.finish();
-            return Ok(());
+        tokio::select! {
+            () = cancel.cancelled() => {
+                let _ = send.finish();
+                return Ok(());
+            }
+            read = recv.read(&mut control_buffer) => {
+                let read = read.context("read control stream")?;
+                if read == 0 {
+                    let _ = send.finish();
+                    return Ok(());
+                }
+            }
         }
     }
 }
@@ -1446,11 +1466,20 @@ mod tests {
                 started_at: std::sync::Arc::new(std::sync::Mutex::new(None)),
             }),
         );
+        let revocations = std::sync::RwLock::new(
+            crate::revocations::RevocationSet::load(std::env::temp_dir().join(format!(
+                "portl-shell-guard-revocations-{}.jsonl",
+                uuid::Uuid::new_v4()
+            )))
+            .expect("load revocations set"),
+        );
 
         {
             let _guard = ShellSessionGuard {
                 registry: &registry,
+                revocations: &revocations,
                 session_id,
+                ticket_chain_ids: vec![[0x11; 16]],
             };
         }
 

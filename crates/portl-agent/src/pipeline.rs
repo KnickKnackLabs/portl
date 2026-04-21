@@ -32,6 +32,7 @@ pub enum AcceptanceOutcome {
         peer_token: [u8; 16],
         caps: Box<Capabilities>,
         ticket_id: [u8; 16],
+        ticket_chain_ids: Vec<[u8; 16]>,
         bearer: Option<Vec<u8>>,
     },
     Rejected {
@@ -82,10 +83,16 @@ pub fn evaluate_offer(input: &AcceptanceInput<'_>) -> AcceptanceOutcome {
     }
 
     let terminal_ticket_id = ticket_id(&terminal.sig);
+    let ticket_chain_ids = chain
+        .iter()
+        .map(|ticket| ticket_id(&ticket.sig))
+        .chain(std::iter::once(terminal_ticket_id))
+        .collect();
     AcceptanceOutcome::Accepted {
         peer_token: derive_peer_token(input.source_id, terminal_ticket_id),
         caps: Box::new(caps),
         ticket_id: terminal_ticket_id,
+        ticket_chain_ids,
         bearer: terminal.body.bearer,
     }
 }
