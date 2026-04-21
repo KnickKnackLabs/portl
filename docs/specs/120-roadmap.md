@@ -30,14 +30,14 @@
   v0.1.1 ─ "Safety Net" — non-breaking runtime stability.
            Rlimits on every spawn, balanced audit, panic=abort
            + supervisor contract. Spec: `150-v0.1.1-safety-net.md`.
-           Plan: `../plans/010-v0.1.1-safety-net.md`.
+           Shipped in `v0.1.1`.
 
   v0.1.2 ─ "Alias Isolation" — non-breaking dep-graph cleanup.
            Replace rusqlite alias store with JSON + fd-lock.
            Forensic experiment: tests the rusqlite hypothesis
            for the macOS release-mode SIGABRT in isolation.
            Spec: `160-v0.1.2-alias-isolation.md`.
-           Plan: `../plans/020-v0.1.2-alias-isolation.md`.
+           Shipped in `v0.1.2`.
 
   v0.2.0 ─ "Operability: Shape + Session Lifecycle" — breaking.
            Flat CLI, env-only config, docker orchestrate-by-default,
@@ -45,8 +45,7 @@
            (pgroup kill, revocation-kills-live, graceful shutdown,
            revocations ceiling, slow-task detection, PTY drain).
            Spec: `140-v0.2-operability.md`.
-           Plan: `../plans/030-v0.2-operability.md` (deferred;
-           written after v0.1.1 + v0.1.2 land).
+           Shipped in `v0.2.0`.
 
   v0.3+ ─ demand-driven, not committed:
      fs/v1

@@ -19,11 +19,11 @@ subproject it implements, not the spec number.
 
 ## Current plans
 
-| # | File | Implements | Status |
-| --- | --- | --- | --- |
-| 010 | `010-v0.1.1-safety-net.md` | `specs/150-v0.1.1-safety-net.md` | shipped in `v0.1.1` |
-| 020 | `020-v0.1.2-alias-isolation.md` | `specs/160-v0.1.2-alias-isolation.md` | shipped in `v0.1.2` |
-| 030 | `030-v0.2-operability.md` | `specs/140-v0.2-operability.md` | shipped in `v0.2.0` |
+*(None. The v0.1.1, v0.1.2, and v0.2.0 recipes were retired after
+their features shipped, per the policy above. Their substance is
+recorded in [`../../CHANGELOG.md`](../../CHANGELOG.md) and in the
+matching specs under [`../specs/`](../specs/). New plans land here
+when the next release cycle starts.)*
 
 ## Structure of a plan
 
