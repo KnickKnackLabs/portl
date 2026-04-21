@@ -112,7 +112,6 @@ mod mode_dispatch_tests {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) struct AgentState {
     pub trust_roots: TrustRoots,
     pub revocations: std::sync::RwLock<RevocationSet>,

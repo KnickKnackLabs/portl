@@ -146,8 +146,7 @@ are adapters"). That temptation trades one renumbering crisis
   k8s, manual) follow the same pattern.
 - **One multicall ELF, three entrypoints.** `portl` is the operator
   CLI; `portl-agent` is the daemon entrypoint; `portl-gateway` is
-  the gateway daemon entrypoint. The v0.2.x binary still accepts
-  `portl agent ...` only as a deprecation shim.
+  the gateway daemon entrypoint.
 
 ## Reading order
 
