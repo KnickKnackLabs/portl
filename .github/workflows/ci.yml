@@ -108,6 +108,14 @@ jobs:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
       - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+      - name: Forbid unwrapped spawn_blocking in portl-agent
+        run: |
+          set -u
+          if grep -rn 'spawn_blocking' crates/portl-agent | grep -v 'slow_task'; then
+            echo "::error ::every portl-agent spawn_blocking callsite must be wrapped with slow_task"
+            exit 1
+          fi
+          echo "OK: all portl-agent spawn_blocking callsites mention slow_task"
 
   deny:
     name: cargo deny

@@ -60,7 +60,8 @@ async fn pty_master_is_cloexec_in_child() {
 }
 
 async fn read_until_eof(master: OwnedFd) -> String {
-    let handle = tokio::task::spawn_blocking(move || {
+    #[rustfmt::skip]
+    let handle = portl_core::runtime::slow_task("pty_spawn_read_until_eof", tokio::task::spawn_blocking(move || {
         let mut f = File::from(master);
         let mut buf = Vec::new();
         let mut chunk = [0u8; 1024];
@@ -74,7 +75,7 @@ async fn read_until_eof(master: OwnedFd) -> String {
             }
         }
         String::from_utf8_lossy(&buf).into_owned()
-    });
+    }));
     tokio::time::timeout(Duration::from_secs(5), handle)
         .await
         .expect("read timeout")

@@ -44,14 +44,16 @@ age           = { workspace = true }
 n0-error      = "0.1"
 bytes         = { workspace = true }
 socket2       = { workspace = true }
-async-trait   = { workspace = true }
+ async-trait      = { workspace = true }
+ prometheus-client = { workspace = true }
 
 [dev-dependencies]
 portl-core = { version = "0.1.0", path = ".", features = ["test-util"] }
 tokio      = { workspace = true }
 proptest   = { workspace = true }
 criterion  = { workspace = true }
-tempfile   = { workspace = true }
+ tempfile           = { workspace = true }
+ tracing-subscriber = { workspace = true }
 
 [[bench]]
 name = "mint_verify"

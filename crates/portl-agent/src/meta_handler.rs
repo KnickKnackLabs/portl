@@ -159,9 +159,10 @@ async fn publish_revocations(
 
     // Persist off the async task so a slow fsync doesn't stall the
     // ticket acceptance pipeline (which reads the same RwLock).
-    let persist_result = tokio::task::spawn_blocking(move || {
+    #[rustfmt::skip]
+    let persist_result = portl_core::runtime::slow_task("meta_publish_revocations_persist", tokio::task::spawn_blocking(move || {
         crate::revocations::write_jsonl(&persist_path, &to_persist)
-    })
+    }))
     .await;
     match persist_result {
         Ok(Ok(())) => {}

@@ -92,6 +92,8 @@ impl Default for Metrics {
             active_udp_sessions.clone(),
         );
 
+        portl_core::runtime::register_metrics(&mut registry);
+
         Self {
             registry,
             tickets_accepted,

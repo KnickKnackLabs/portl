@@ -138,7 +138,8 @@ async fn env_policy_deny_does_not_leak_agent_env() -> Result<()> {
     const SECRET: &str = "PORTL_E2E_SECRET";
 
     if std::env::var_os(MARKER).is_none() {
-        let output = tokio::task::spawn_blocking(|| {
+        #[rustfmt::skip]
+        let output = portl_core::runtime::slow_task("shell_e2e_env_deny_subprocess", tokio::task::spawn_blocking(|| {
             Command::new(std::env::current_exe().context("resolve current test binary")?)
                 .env(MARKER, "1")
                 .env(SECRET, "hunter2")
@@ -150,7 +151,7 @@ async fn env_policy_deny_does_not_leak_agent_env() -> Result<()> {
                 ])
                 .output()
                 .context("spawn env deny regression subprocess")
-        })
+        }))
         .await??;
 
         assert!(
