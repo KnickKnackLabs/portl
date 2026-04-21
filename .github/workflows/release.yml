@@ -25,9 +25,14 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
     runs-on: ${{ matrix.os }}
+    env:
+      # .cargo/config.toml sets `rustc-wrapper = "sccache"`. sccache is
+      # installed below; GHA backend so the cache survives across jobs.
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - name: Install target toolchain (for the pinned rust-toolchain.toml)
         # rust-toolchain.toml pins the compiler; the `targets:` input
         # on the action above only adds targets to the *stable* alias,

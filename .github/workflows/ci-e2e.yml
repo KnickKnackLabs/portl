@@ -7,9 +7,15 @@ on:
 jobs:
   e2e:
     runs-on: ubuntu-latest
+    env:
+      # .cargo/config.toml sets `rustc-wrapper = "sccache"`. sccache is
+      # installed by mozilla-actions/sccache-action below; this env var
+      # tells sccache to use the GitHub Actions cache as its backend.
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - name: Cargo check
         run: env -u RUSTUP_TOOLCHAIN cargo check --workspace --all-features
       - name: Cargo test
