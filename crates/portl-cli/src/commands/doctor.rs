@@ -58,9 +58,10 @@ pub fn run() -> ExitCode {
     }
 }
 
-/// Sanity-check the wall clock against `UNIX_EPOCH`. We don't hit the
-/// network in v0.1 so NTP drift is out of scope; this surfaces the
-/// commonly-broken case where the host clock is decades off.
+/// Sanity-check the wall clock against `UNIX_EPOCH`. `doctor` is
+/// strictly local and does not hit the network, so NTP drift is out
+/// of scope; this surfaces the commonly-broken case where the host
+/// clock is decades off.
 fn check_clock_skew() -> CheckResult {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(dur) => {

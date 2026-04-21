@@ -13,8 +13,8 @@ pub(super) fn effective_env(
     req: &portl_proto::shell_v1::ShellReq,
     requested_user: Option<&RequestedUser>,
 ) -> Vec<(String, String)> {
-    // v0.1 uses a minimal sanitized env; v0.2 may add PAM login-env
-    // synthesis for Merge policy.
+    // Uses a minimal sanitized env. PAM login-env synthesis for the
+    // Merge policy is not yet implemented.
     let deny_base = sanitized_env_base(requested_user, req);
 
     let env = match shell_caps.map(|caps| &caps.env_policy) {
