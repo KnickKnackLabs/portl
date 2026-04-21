@@ -59,7 +59,7 @@ pub(crate) async fn connect_peer_with_endpoint(
     })
 }
 
-async fn resolve_peer_ticket(
+pub(crate) async fn resolve_peer_ticket(
     peer: &str,
     identity: &Identity,
     endpoint: &iroh::Endpoint,

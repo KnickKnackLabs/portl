@@ -30,6 +30,7 @@ use serde::Deserialize;
 
 use crate::alias_store::{AliasRecord, AliasStore, StoredSpec, now_unix_secs};
 use crate::commands::mint_root::{parse_caps, parse_ttl};
+use crate::commands::peer::{bind_client_endpoint, resolve_peer_ticket};
 use crate::release_binary;
 
 const DEFAULT_NETWORK: &str = "bridge";
@@ -66,7 +67,7 @@ pub fn run(
             network: network.map(str::to_owned),
             user: user.map(str::to_owned),
         };
-        let outcome = orchestrate_run(
+        let mut outcome = orchestrate_run(
             &docker,
             &host,
             image,
@@ -76,6 +77,7 @@ pub fn run(
             &operator,
         )
         .await?;
+        finalize_connectable_ticket(&operator, &mut outcome.plan).await?;
         save_injected_alias(&outcome)?;
         println!("{}", outcome.plan.ticket.serialize());
         if watch {
@@ -103,7 +105,9 @@ pub fn attach(
         let docker = RealDockerOps::connect()?;
         let host = RealHostOps;
         let binary_source = resolve_binary_source(from_binary, from_release)?;
-        let outcome = attach_existing(&docker, &host, container, &binary_source, &operator).await?;
+        let mut outcome =
+            attach_existing(&docker, &host, container, &binary_source, &operator).await?;
+        finalize_connectable_ticket(&operator, &mut outcome.plan).await?;
         save_injected_alias(&outcome)?;
         println!("{}", outcome.plan.ticket.serialize());
         Ok(ExitCode::SUCCESS)
@@ -715,6 +719,34 @@ async fn detach_saved_container<D: DockerOps>(
 
     store.remove(&alias.name)?;
     Ok(())
+}
+
+async fn finalize_connectable_ticket(operator: &Identity, plan: &mut InjectionPlan) -> Result<()> {
+    let endpoint = bind_client_endpoint(operator).await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match resolve_peer_ticket(
+            &plan.endpoint_id_hex,
+            operator,
+            &endpoint,
+            plan.caps.clone(),
+        )
+        .await
+        {
+            Ok(ticket) => {
+                plan.root_ticket_id = ticket_id(&ticket.sig);
+                plan.ticket = ticket;
+                return Ok(());
+            }
+            Err(err) if tokio::time::Instant::now() < deadline => {
+                let _ = err;
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(err) => {
+                return Err(err).context("resolve injected agent address into connectable ticket");
+            }
+        }
+    }
 }
 
 fn prepare_injection_plan(operator: &Identity) -> Result<InjectionPlan> {
