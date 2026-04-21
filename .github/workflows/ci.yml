@@ -111,11 +111,26 @@ jobs:
       - name: Forbid unwrapped spawn_blocking in portl-agent
         run: |
           set -u
-          if grep -rn 'spawn_blocking' crates/portl-agent | grep -v 'slow_task'; then
-            echo "::error ::every portl-agent spawn_blocking callsite must be wrapped with slow_task"
-            exit 1
-          fi
-          echo "OK: all portl-agent spawn_blocking callsites mention slow_task"
+          uv run --isolated python - <<'PY'
+          from pathlib import Path
+          import sys
+
+          offenders = []
+          for path in Path("crates/portl-agent").rglob("*.rs"):
+              lines = path.read_text().splitlines()
+              for i, line in enumerate(lines):
+                  if "spawn_blocking" not in line:
+                      continue
+                  start = max(0, i - 3)
+                  end = min(len(lines), i + 4)
+                  if not any("slow_task" in candidate for candidate in lines[start:end]):
+                      offenders.append(f"{path}:{i + 1}: {line.strip()}")
+          if offenders:
+              print("::error ::every portl-agent spawn_blocking callsite must be wrapped with slow_task")
+              print("\n".join(offenders))
+              sys.exit(1)
+          print("OK: all portl-agent spawn_blocking callsites are wrapped with slow_task")
+          PY
 
   deny:
     name: cargo deny
