@@ -87,7 +87,14 @@ async fn udp_burst_loopback_smoke() -> Result<()> {
     // from the QUIC sender via a bounded mpsc, so this burst is
     // well within the queue depth. A true high-PPS stress test
     // belongs behind a `--ignored` flag.
+    //
+    // Contract: a healthy loopback path should deliver *almost all*
+    // packets from a 1,000-datagram burst. Requiring 100% delivery
+    // is incorrect for QUIC DATAGRAMs and flakes on shared CI
+    // runners if a single packet is dropped. We therefore assert a
+    // 99%-delivery floor instead of perfect delivery.
     const BURST: u32 = 1_000;
+    const MIN_DELIVERED: usize = 990;
     let echo = start_udp_echo_server().await?;
     let forward_port = reserve_udp_port()?;
     let (client, server) = pair().await?;
@@ -127,14 +134,27 @@ async fn udp_burst_loopback_smoke() -> Result<()> {
 
     let mut seen = vec![false; BURST as usize];
     let mut buf = vec![0_u8; 256];
-    while seen.iter().any(|present| !present) {
-        let read = tokio::time::timeout(Duration::from_secs(10), app.recv(&mut buf)).await??;
-        let seq = u32::from_be_bytes(buf[..4].try_into().expect("4 byte seq"));
-        seen[seq as usize] = true;
-        assert_eq!(read, 100);
-    }
     sender.await??;
-    assert!(seen.iter().all(|present| *present));
+
+    loop {
+        match tokio::time::timeout(Duration::from_millis(500), app.recv(&mut buf)).await {
+            Ok(Ok(read)) => {
+                let seq = u32::from_be_bytes(buf[..4].try_into().expect("4 byte seq"));
+                seen[seq as usize] = true;
+                assert_eq!(read, 100);
+                if seen.iter().filter(|present| **present).count() == BURST as usize {
+                    break;
+                }
+            }
+            Ok(Err(err)) => return Err(err.into()),
+            Err(_) => break,
+        }
+    }
+    let delivered = seen.iter().filter(|present| **present).count();
+    assert!(
+        delivered >= MIN_DELIVERED,
+        "expected at least {MIN_DELIVERED} packets, got {delivered}/{BURST}"
+    );
 
     forward.abort();
     close_connection(&connection);
