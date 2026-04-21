@@ -3,8 +3,14 @@ name: CI
 on:
   push:
     branches: [main]
+    # Tag pushes run the full CI suite + release-build + release-publish.
+    # The release jobs at the bottom of this file are gated on all
+    # lint / test / smoke jobs being green, so we can't publish an
+    # artifact from a tag that doesn't pass CI.
+    tags: ["v*"]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -188,3 +194,119 @@ jobs:
         with:
           tool: cargo-deny
       - run: cargo deny --all-features check
+
+  # ─────────────────────────── Release jobs ───────────────────────────
+  # Fire only on tag pushes (v*). Gated on every CI job above being
+  # green, so we can't publish an artifact from a tag that fails
+  # tests, clippy, fmt, deny, or docker smoke. The cross-compile
+  # matrix is expensive (~5-10 min); `if: startsWith(github.ref,
+  # 'refs/tags/v')` prevents it running on main pushes and PRs.
+
+  release-build:
+    name: release build (${{ matrix.target }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, clippy, fmt, deny, docker-smoke]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux builds use musl for a fully static binary that runs
+          # on any glibc version, Alpine, distroless, etc.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            linux: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            linux: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      # Per-target cache. `shared-key: release-<target>` so successive
+      # release tags (v0.1.1 → v0.1.2 → …) warm-start each other on the
+      # same target. First release on a new target is cold; after
+      # that, same-target releases benefit. Cross-target sharing is
+      # impossible because rustc output differs per target triple.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+          cache-shared-key: "release-${{ matrix.target }}"
+          cache-save-if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          cache-on-failure: true
+      - name: Install zig (linux only)
+        if: matrix.linux
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+      - name: Install cargo-zigbuild (linux only)
+        # taiki-e/install-action downloads the prebuilt cargo-zigbuild
+        # binary — ~5 s vs ~1 min source build, decoupled from our
+        # pinned 1.89 toolchain.
+        if: matrix.linux
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Build (linux musl via zigbuild)
+        if: matrix.linux
+        run: cargo zigbuild --release --target ${{ matrix.target }} --bin portl
+      - name: Build (macOS native)
+        if: matrix.linux != true
+        run: cargo build --release --target ${{ matrix.target }} --bin portl
+      - name: Package (tar.zst level 19)
+        env:
+          # Disable macOS AppleDouble metadata so tarballs produced on
+          # the macos-latest runners stay clean when extracted on linux.
+          COPYFILE_DISABLE: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p dist staging
+          NAME="portl-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "staging/${NAME}"
+          cp "target/${{ matrix.target }}/release/portl" "staging/${NAME}/portl"
+          (cd "staging/${NAME}" && ln -sf portl portl-agent)
+          cp LICENSE-MIT CHANGELOG.md "staging/${NAME}/"
+          # --no-mac-metadata strips any remaining com.apple.* xattrs
+          # on macos-latest runners; GNU tar on ubuntu-latest ignores
+          # the flag silently, so the invocation is portable.
+          tar_flags=(-C staging \
+              --use-compress-program='zstd -19 -T0 --long' \
+              -cf "dist/${NAME}.tar.zst" "${NAME}")
+          if tar --help 2>&1 | grep -q -- --no-mac-metadata; then
+              tar --no-mac-metadata "${tar_flags[@]}"
+          else
+              tar "${tar_flags[@]}"
+          fi
+          # Write the shasum with a path-less filename so users can
+          # `sha256sum -c ...sha256` next to the tarball without
+          # recreating a dist/ directory.
+          (cd dist && shasum -a 256 "${NAME}.tar.zst" > "${NAME}.tar.zst.sha256")
+      - uses: actions/upload-artifact@v5
+        with:
+          name: portl-${{ matrix.target }}
+          path: dist/*
+
+  release-publish:
+    name: publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [release-build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: portl ${{ github.ref_name }}
+          files: dist/*
+          body_path: CHANGELOG.md
+          fail_on_unmatched_files: true
