@@ -111,7 +111,7 @@ jobs:
       - name: Forbid unwrapped spawn_blocking in portl-agent
         run: |
           set -u
-          uv run --isolated python - <<'PY'
+          python3 - <<'PY'
           from pathlib import Path
           import sys
 
