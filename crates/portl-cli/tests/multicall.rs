@@ -175,6 +175,8 @@ fn docker_surface_subcommands_parse() {
         Command::DockerRun {
             image: "alpine:3.20".to_owned(),
             name: Some("demo".to_owned()),
+            from_binary: None,
+            watch: false,
         }
     );
 

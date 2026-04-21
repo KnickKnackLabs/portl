@@ -44,6 +44,8 @@ crossterm   = { workspace = true }
 fd-lock     = { workspace = true }
 nix         = { workspace = true }
 reqwest     = { workspace = true }
+async-trait = { workspace = true }
+bollard     = { workspace = true }
 
 [dev-dependencies]
 portl-core = { version = "0.1.0", path = "../portl-core", features = ["test-util"] }

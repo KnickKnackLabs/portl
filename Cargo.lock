@@ -3584,6 +3584,8 @@ version = "0.1.2"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "async-trait",
+ "bollard",
  "clap",
  "crossterm",
  "docker-portl",

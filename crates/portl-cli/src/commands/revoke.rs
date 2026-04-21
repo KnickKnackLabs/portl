@@ -145,6 +145,8 @@ mod tests {
                     ticket_file_path: None,
                     group_name: None,
                     base_url: None,
+                    docker_exec_id: None,
+                    docker_injected_binary_path: None,
                 },
             )
             .expect("save alias");
@@ -241,6 +243,8 @@ mod tests {
                     ticket_file_path: Some(ticket_path),
                     group_name: None,
                     base_url: None,
+                    docker_exec_id: None,
+                    docker_injected_binary_path: None,
                 },
             )
             .expect("save alias");

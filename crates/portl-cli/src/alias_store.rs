@@ -41,6 +41,10 @@ pub struct StoredSpec {
     pub ticket_file_path: Option<PathBuf>,
     pub group_name: Option<String>,
     pub base_url: Option<String>,
+    #[serde(default)]
+    pub docker_exec_id: Option<String>,
+    #[serde(default)]
+    pub docker_injected_binary_path: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -390,6 +394,8 @@ mod tests {
             ticket_file_path,
             group_name: Some("sbox".to_owned()),
             base_url: Some("http://127.0.0.1:8080".to_owned()),
+            docker_exec_id: None,
+            docker_injected_binary_path: None,
         }
     }
 
@@ -403,6 +409,8 @@ mod tests {
             ticket_file_path: None,
             group_name: None,
             base_url: None,
+            docker_exec_id: None,
+            docker_injected_binary_path: None,
         }
     }
 

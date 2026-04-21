@@ -96,9 +96,12 @@ pub enum Command {
     DockerRun {
         image: String,
         name: Option<String>,
+        from_binary: Option<PathBuf>,
+        watch: bool,
     },
     DockerAttach {
         container: String,
+        from_binary: Option<PathBuf>,
     },
     DockerDetach {
         container: String,
@@ -282,8 +285,16 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             detect,
             dry_run,
         } => commands::install::run(target, apply, yes, detect, dry_run),
-        Command::DockerRun { image, name } => commands::docker::run(&image, name.as_deref()),
-        Command::DockerAttach { container } => commands::docker::attach(&container),
+        Command::DockerRun {
+            image,
+            name,
+            from_binary,
+            watch,
+        } => commands::docker::run(&image, name.as_deref(), from_binary.as_deref(), watch),
+        Command::DockerAttach {
+            container,
+            from_binary,
+        } => commands::docker::attach(&container, from_binary.as_deref()),
         Command::DockerDetach { container } => commands::docker::detach(&container),
         Command::DockerList { json } => commands::docker::list(json),
         Command::DockerRm {
@@ -487,9 +498,15 @@ enum DockerAction {
         image: String,
         #[arg(long)]
         name: Option<String>,
+        #[arg(long = "from-binary")]
+        from_binary: Option<PathBuf>,
+        #[arg(long)]
+        watch: bool,
     },
     Attach {
         container: String,
+        #[arg(long = "from-binary")]
+        from_binary: Option<PathBuf>,
     },
     Detach {
         container: String,
@@ -623,11 +640,29 @@ impl Cli {
                 dry_run,
             },
             TopLevel::Docker {
-                action: DockerAction::Run { image, name },
-            } => Command::DockerRun { image, name },
+                action:
+                    DockerAction::Run {
+                        image,
+                        name,
+                        from_binary,
+                        watch,
+                    },
+            } => Command::DockerRun {
+                image,
+                name,
+                from_binary,
+                watch,
+            },
             TopLevel::Docker {
-                action: DockerAction::Attach { container },
-            } => Command::DockerAttach { container },
+                action:
+                    DockerAction::Attach {
+                        container,
+                        from_binary,
+                    },
+            } => Command::DockerAttach {
+                container,
+                from_binary,
+            },
             TopLevel::Docker {
                 action: DockerAction::Detach { container },
             } => Command::DockerDetach { container },

@@ -156,6 +156,8 @@ pub fn vm_add(
                 ticket_file_path: Some(ticket_path.clone()),
                 group_name: Some(group.to_owned()),
                 base_url: Some(client.original_base_url.clone()),
+                docker_exec_id: None,
+                docker_injected_binary_path: None,
             },
         )?;
 
