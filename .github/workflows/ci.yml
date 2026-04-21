@@ -15,6 +15,13 @@ env:
   # this env var. `fmt` and `deny` don't invoke rustc, so they skip
   # the action.
   SCCACHE_GHA_ENABLED: "true"
+  # Per-test-binary watchdog (see crates/portl-agent/tests/common/mod.rs).
+  # Default is 30s for local laptops; CI runs on 2-CPU shared runners
+  # under parallel test load, where UDP loopback stress tests can push
+  # past the default. 90s is well above nextest's 40s per-test slow-
+  # timeout, so the watchdog remains a true backstop rather than the
+  # primary limit.
+  PORTL_TEST_WATCHDOG_SECS: "90"
 
 # Caching strategy (see docs/specs/ for context):
 #  - `actions-rust-lang/setup-rust-toolchain` installs the toolchain
@@ -55,7 +62,16 @@ jobs:
         with:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
-      - run: cargo test --workspace --all-features
+      # cargo-nextest gives us per-test slow-timeout + terminate-after
+      # (see .config/nextest.toml profile.ci). Failures include the
+      # specific test name instead of a bare 'process aborted', and
+      # integration test binaries run in parallel instead of serially.
+      # Binary is cached by baptiste0928 action (~7 day expiry).
+      - uses: baptiste0928/cargo-install@v3
+        with:
+          crate: cargo-nextest
+          locked: true
+      - run: cargo nextest run --profile ci --workspace --all-features
 
   fmt:
     name: rustfmt
