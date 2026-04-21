@@ -3,6 +3,97 @@
 All notable changes land here. This project follows
 [Semantic Versioning](https://semver.org/) from v0.1.0 onward.
 
+## 0.2.0 — 2026-04-21
+
+Operability release. This is the first intentionally breaking
+release in the project: the CLI surface collapses, `agent.toml`
+is replaced by a fixed env-var contract, `portl docker run`
+becomes the default container workflow, and the unattended-runtime
+safety invariants from spec 140 ship together.
+
+Headline operator flow: `portl init && portl docker run <image>`.
+
+Full scope and invariants:
+[`docs/specs/140-v0.2-operability.md`](docs/specs/140-v0.2-operability.md).
+
+### Added
+
+- **`portl init` and `portl install [TARGET]`.** `init` creates an
+  identity if needed, runs `doctor`, and prints the first-mint
+  cookbook. `install` now targets `systemd`, `launchd`, `openrc`,
+  or `dockerfile`, with autodetect, dry-run, detect-only, and
+  `--apply` flows.
+- **`portl docker run` orchestrate mode.** The Docker adapter now
+  injects `portl-agent` into an existing container at runtime via
+  `docker create`/`start` + binary upload + `docker exec -d`, then
+  prints a holder-bound ticket. `attach`, `detach`, and `bake`
+  join the Docker surface.
+- **`portl-gateway` multicall entrypoint.** Gateway mode is now a
+  dedicated daemon entrypoint (`portl-gateway <upstream-url>`) and
+  a top-level `portl gateway` command.
+- **Runtime safety invariants from spec 140 §13.**
+  - Process-group teardown escalator: `SIGHUP` → 5 s → `SIGTERM`
+    → 5 s → `SIGKILL` on session drop.
+  - Async PTY drain with a 30 s force-close cap.
+  - Live-session cancellation on ticket revocation.
+  - `slow_task` watchdog around agent `spawn_blocking` call sites.
+  - `revocations.jsonl` size ceiling with fail-closed semantics.
+  - Graceful agent shutdown that stops accepting, reaps live
+    sessions, fsyncs `shell_exit`, and exits non-zero on survivors.
+
+### Changed
+
+- **CLI surface collapsed.** The supported top-level commands are
+  now: `init`, `doctor`, `status`, `shell`, `exec`, `tcp`, `udp`,
+  `mint`, `revoke`, `install`, `docker`, `slicer`, `gateway`.
+  `mint-root` became `mint`; `revocations publish` folded into
+  `revoke --publish`; `docker container ...` collapsed into
+  `docker run/list/rm/attach/detach/bake`; `slicer container ...`
+  collapsed into `slicer run/list/rm`.
+- **`portl agent *` removed.** The daemon is now invoked as the
+  multicall entrypoint `portl-agent`. The v0.2.x binary keeps a
+  one-release deprecation shim: `portl agent ...` prints a clear
+  notice and exits with status 2.
+- **`portl doctor` is strictly local.** The hard-coded relay TCP
+  probe moved out of doctor and into `portl status --relay`.
+- **Agent configuration is env-only.** `agent.toml` and
+  `PORTL_AGENT_CONFIG` are gone. The daemon reads `PORTL_HOME`,
+  `PORTL_IDENTITY_SECRET_HEX`, `PORTL_TRUST_ROOTS`,
+  `PORTL_LISTEN_ADDR`, `PORTL_DISCOVERY`, `PORTL_METRICS`,
+  `PORTL_REVOCATIONS_PATH`, `PORTL_RATE_LIMIT`,
+  `PORTL_UDP_SESSION_LINGER_SECS`, and `PORTL_MODE`.
+- **Release tarballs now ship three entrypoints** via symlinks to
+  the same ELF: `portl`, `portl-agent`, and `portl-gateway`.
+
+### Removed
+
+- **`agent.toml` / TOML parsing.** The `toml` crate leaves the
+  workspace.
+- **Old CLI namespaces and commands:** `id new/show/export/import`,
+  `mint-root`, `docker image generate`, `docker image build`,
+  `docker container rebuild`, `docker container logs`, and the
+  `portl agent` subcommand tree.
+
+### Infrastructure
+
+- **Release and CI gating continue through the consolidated
+  `ci.yml` flow.** `release-build` remains gated on the full test /
+  clippy / fmt / deny / docker-smoke matrix before publishing.
+- **Docker asset resolution now supports `--from-release <tag>`.**
+  Foreign-arch orchestrate flows can download the correct release
+  tarball, verify the `.sha256` sidecar, and inject the matching
+  `portl-agent` binary.
+
+### Notes
+
+- The full internal extraction of gateway code out of
+  `portl-agent` into its own crate was intentionally deferred to a
+  follow-up release. The user-visible `portl-gateway` surface
+  ships in v0.2.0; the binary-size / direct-dep cleanup is tracked
+  separately.
+- v0.2.0 is still ticket-schema v1 / ALPN v1. Existing v0.1
+  tickets and identities remain valid.
+
 ## 0.1.2 — 2026-04-21
 
 Alias-isolation patch release. Non-breaking at the CLI / config /
