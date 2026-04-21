@@ -483,9 +483,13 @@ mod tests {
 
     #[test]
     fn install_systemd_emits_valid_unit_file() {
-        let unit = render_systemd_unit(Path::new("/usr/local/bin/portl-agent"), true, None)
-            .expect("render systemd unit");
-        assert!(unit.contains("ExecStart=/usr/local/bin/portl-agent"));
+        let dir = tempdir().expect("tempdir");
+        let binary = dir.path().join("portl-agent");
+        std::fs::write(&binary, b"#!/bin/sh\nexit 0\n").expect("write fake binary");
+        set_mode_0755(&binary).expect("chmod fake binary");
+
+        let unit = render_systemd_unit(&binary, true, None).expect("render systemd unit");
+        assert!(unit.contains(&format!("ExecStart={}", binary.display())));
         assert!(unit.contains("EnvironmentFile=-/etc/portl/agent.env"));
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("StartLimitBurst=5"));
@@ -493,7 +497,6 @@ mod tests {
         if Path::new("/usr/bin/systemd-analyze").exists()
             || Path::new("/bin/systemd-analyze").exists()
         {
-            let dir = tempdir().expect("tempdir");
             let path = dir.path().join("portl-agent.service");
             std::fs::write(&path, unit).expect("write unit");
             validate_install_target(InstallTarget::Systemd, &path).expect("verify unit");
