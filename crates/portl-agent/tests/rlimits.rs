@@ -5,6 +5,9 @@
 
 #![cfg(unix)]
 
+#[allow(dead_code)]
+mod common;
+
 use portl_agent::shell_handler::run_exec_capture;
 
 #[tokio::test]

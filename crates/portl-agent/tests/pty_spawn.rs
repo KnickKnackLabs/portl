@@ -4,6 +4,9 @@
 
 #![cfg(unix)]
 
+#[allow(dead_code)]
+mod common;
+
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::{AsRawFd, OwnedFd};

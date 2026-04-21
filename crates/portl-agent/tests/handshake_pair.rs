@@ -1,3 +1,6 @@
+#[allow(dead_code)]
+mod common;
+
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;

@@ -1,11 +1,55 @@
 //! Shared helpers for the portl-agent integration tests.
 //!
 //! Only used by tests under `crates/portl-agent/tests/*`.
+//!
+//! # Per-binary watchdog
+//!
+//! When this module is linked into a test binary (any
+//! `tests/*.rs` with `mod common;`), the `install_test_watchdog`
+//! constructor spawns a background thread that aborts the process
+//! after `PORTL_TEST_WATCHDOG_SECS` (default 30s). This prevents a
+//! single hung integration test — most often an `iroh` endpoint
+//! waiting on the public n0 relay infrastructure — from wedging
+//! `cargo test --workspace` for minutes at a time. Set
+//! `PORTL_TEST_WATCHDOG_SECS=0` to disable for local debugging.
 
 #![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+/// Per-test-binary timeout. After this many seconds from process
+/// start, the watchdog thread calls [`std::process::abort`] so a
+/// hung test can't wedge `cargo test`. Override with
+/// `PORTL_TEST_WATCHDOG_SECS`; `0` disables the watchdog.
+const DEFAULT_WATCHDOG_SECS: u64 = 30;
+
+fn watchdog_seconds() -> u64 {
+    match std::env::var("PORTL_TEST_WATCHDOG_SECS") {
+        Ok(s) => s.parse().unwrap_or(DEFAULT_WATCHDOG_SECS),
+        Err(_) => DEFAULT_WATCHDOG_SECS,
+    }
+}
+
+#[ctor::ctor]
+fn install_test_watchdog() {
+    let secs = watchdog_seconds();
+    if secs == 0 {
+        return;
+    }
+    // Named thread so stack traces / `ps` output make the source obvious.
+    let _ = std::thread::Builder::new()
+        .name("portl-test-watchdog".into())
+        .spawn(move || {
+            std::thread::sleep(Duration::from_secs(secs));
+            eprintln!(
+                "\n[portl-test-watchdog] test binary exceeded {secs}s; aborting. \
+                 Set PORTL_TEST_WATCHDOG_SECS to override (0 disables)."
+            );
+            std::process::abort();
+        });
+}
 
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};

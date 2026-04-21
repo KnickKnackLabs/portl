@@ -1,3 +1,6 @@
+#[allow(dead_code)]
+mod common;
+
 use anyhow::Result;
 use portl_agent::gateway::inject_authorization_header;
 use portl_agent::{AgentConfig, AgentMode, DiscoveryConfig, run_task};

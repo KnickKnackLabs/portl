@@ -1,3 +1,6 @@
+#[allow(dead_code)]
+mod common;
+
 use std::process::Command;
 use std::time::Duration;
 

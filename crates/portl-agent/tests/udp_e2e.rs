@@ -1,3 +1,6 @@
+#[allow(dead_code)]
+mod common;
+
 use std::collections::HashMap;
 use std::net::UdpSocket as StdUdpSocket;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
