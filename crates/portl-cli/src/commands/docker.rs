@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, ExitCode};
+use std::process::{Command as ProcessCommand, ExitCode, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -23,6 +25,7 @@ use portl_core::bootstrap::{Bootstrapper, Handle, TargetStatus};
 use portl_core::id::{Identity, store};
 use portl_core::ticket::hash::ticket_id;
 use portl_core::ticket::mint::mint_root;
+use serde::Deserialize;
 
 use crate::alias_store::{AliasRecord, AliasStore, StoredSpec, now_unix_secs};
 use crate::commands::mint_root::{parse_caps, parse_ttl};
@@ -83,13 +86,15 @@ pub fn detach(container: &str) -> Result<ExitCode> {
 }
 
 pub fn bake(
-    _base_image: &str,
-    _output: Option<&Path>,
-    _tag: Option<&str>,
-    _push: bool,
-    _init_shim: bool,
+    base_image: &str,
+    output: Option<&Path>,
+    tag: Option<&str>,
+    push: bool,
+    init_shim: bool,
 ) -> Result<ExitCode> {
-    anyhow::bail!("`portl docker bake` is implemented in Task 3.3")
+    let ops = RealBakeOps;
+    bake_with(&ops, base_image, output, tag, push, init_shim)?;
+    Ok(ExitCode::SUCCESS)
 }
 
 pub fn list(json_output: bool) -> Result<ExitCode> {
@@ -674,6 +679,219 @@ async fn wait_for_agent_start<D: DockerOps>(docker: &D, exec_id: &str) -> Result
     }
 }
 
+trait BakeOps {
+    fn current_exe(&self) -> Result<PathBuf>;
+    fn inspect_image(&self, image: &str) -> Result<ImageMetadata>;
+    fn build_image(&self, context_dir: &Path, tag: &str) -> Result<()>;
+    fn push_image(&self, tag: &str) -> Result<()>;
+}
+
+struct RealBakeOps;
+
+impl BakeOps for RealBakeOps {
+    fn current_exe(&self) -> Result<PathBuf> {
+        std::env::current_exe().context("resolve current executable")
+    }
+
+    fn inspect_image(&self, image: &str) -> Result<ImageMetadata> {
+        let output = ProcessCommand::new("docker")
+            .args(["image", "inspect", image])
+            .output()
+            .context("run docker image inspect")?;
+        if !output.status.success() {
+            bail!(
+                "docker image inspect {image} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let inspected: Vec<DockerImageInspect> =
+            serde_json::from_slice(&output.stdout).context("decode docker image inspect")?;
+        let inspected = inspected
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("docker image inspect returned no rows for {image}"))?;
+        Ok(ImageMetadata {
+            entrypoint: inspected.config.entrypoint,
+            cmd: inspected.config.cmd,
+        })
+    }
+
+    fn build_image(&self, context_dir: &Path, tag: &str) -> Result<()> {
+        let status = ProcessCommand::new("docker")
+            .args(["build", "-t", tag])
+            .arg(context_dir)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .context("run docker build")?;
+        if status.success() {
+            Ok(())
+        } else {
+            bail!("docker build failed for tag {tag}")
+        }
+    }
+
+    fn push_image(&self, tag: &str) -> Result<()> {
+        let status = ProcessCommand::new("docker")
+            .args(["push", tag])
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .context("run docker push")?;
+        if status.success() {
+            Ok(())
+        } else {
+            bail!("docker push failed for tag {tag}")
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImageMetadata {
+    entrypoint: Vec<String>,
+    cmd: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct DockerImageInspect {
+    #[serde(rename = "Config")]
+    config: DockerImageConfig,
+}
+
+#[derive(Deserialize)]
+struct DockerImageConfig {
+    #[serde(rename = "Entrypoint", default)]
+    entrypoint: Vec<String>,
+    #[serde(rename = "Cmd", default)]
+    cmd: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BakeContext {
+    dockerfile: String,
+    wrapper: Option<String>,
+}
+
+fn bake_with<O: BakeOps>(
+    ops: &O,
+    base_image: &str,
+    output: Option<&Path>,
+    tag: Option<&str>,
+    push: bool,
+    init_shim: bool,
+) -> Result<()> {
+    if push && tag.is_none() {
+        bail!("`--push` requires `--tag <image>`");
+    }
+    if output.is_none() && tag.is_none() {
+        bail!("choose either `--output DIR` or `--tag <image>` for `portl docker bake`");
+    }
+
+    let metadata = init_shim
+        .then(|| ops.inspect_image(base_image))
+        .transpose()?;
+    let context = render_bake_context(base_image, metadata.as_ref(), init_shim)?;
+
+    let owned_output;
+    let context_dir = if let Some(output) = output {
+        output.to_path_buf()
+    } else {
+        owned_output = temp_bake_dir()?;
+        owned_output
+    };
+    write_bake_context(&context_dir, &context, &ops.current_exe()?)?;
+
+    if let Some(tag) = tag {
+        ops.build_image(&context_dir, tag)?;
+        if push {
+            ops.push_image(tag)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn render_bake_context(
+    base_image: &str,
+    metadata: Option<&ImageMetadata>,
+    init_shim: bool,
+) -> Result<BakeContext> {
+    if !init_shim {
+        return Ok(BakeContext {
+            dockerfile: format!(
+                "FROM {base_image}\nCOPY portl-agent /usr/local/bin/portl-agent\nRUN chmod +x /usr/local/bin/portl-agent\n"
+            ),
+            wrapper: None,
+        });
+    }
+
+    let metadata = metadata.ok_or_else(|| anyhow!("init shim requires image metadata"))?;
+    let wrapper = render_init_shim(metadata);
+    let mut dockerfile = format!(
+        "FROM {base_image}\nCOPY portl-agent /usr/local/bin/portl-agent\nCOPY portl-init-shim /usr/local/bin/portl-init-shim\nRUN chmod +x /usr/local/bin/portl-agent /usr/local/bin/portl-init-shim\nENTRYPOINT [\"/usr/local/bin/portl-init-shim\"]\n"
+    );
+    if !metadata.cmd.is_empty() {
+        writeln!(dockerfile, "CMD {}", serde_json::to_string(&metadata.cmd)?)
+            .expect("writing to String cannot fail");
+    }
+
+    Ok(BakeContext {
+        dockerfile,
+        wrapper: Some(wrapper),
+    })
+}
+
+fn render_init_shim(metadata: &ImageMetadata) -> String {
+    let target = if metadata.entrypoint.is_empty() {
+        "exec \"$@\"".to_owned()
+    } else {
+        let quoted = metadata
+            .entrypoint
+            .iter()
+            .map(|part| shell_quote(part))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("exec {quoted} \"$@\"")
+    };
+    format!("#!/bin/sh\n/usr/local/bin/portl-agent & {target}\n")
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn write_bake_context(context_dir: &Path, context: &BakeContext, binary: &Path) -> Result<()> {
+    fs::create_dir_all(context_dir)
+        .with_context(|| format!("create bake context {}", context_dir.display()))?;
+    fs::write(context_dir.join("Dockerfile"), &context.dockerfile)
+        .with_context(|| format!("write Dockerfile in {}", context_dir.display()))?;
+    fs::copy(binary, context_dir.join("portl-agent")).with_context(|| {
+        format!(
+            "copy {} into {}",
+            binary.display(),
+            context_dir.join("portl-agent").display()
+        )
+    })?;
+    if let Some(wrapper) = &context.wrapper {
+        fs::write(context_dir.join("portl-init-shim"), wrapper)
+            .with_context(|| format!("write {}", context_dir.join("portl-init-shim").display()))?;
+    }
+    Ok(())
+}
+
+fn temp_bake_dir() -> Result<PathBuf> {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("portl-docker-bake-{unique}"));
+    fs::create_dir_all(&path)
+        .with_context(|| format!("create temp bake dir {}", path.display()))?;
+    Ok(path)
+}
+
 async fn container_snapshot(
     docker: &Docker,
     inspect: ContainerInspectResponse,
@@ -839,7 +1057,7 @@ fn normalize_image(image: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::{fs, sync::Mutex};
     use tempfile::tempdir;
 
     #[derive(Default)]
@@ -890,6 +1108,39 @@ mod tests {
                 .lock()
                 .expect("lock")
                 .push((container_pid, path.to_path_buf()));
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct MockBakeOps {
+        current_exe: PathBuf,
+        metadata: Option<ImageMetadata>,
+        builds: Mutex<Vec<(PathBuf, String)>>,
+        pushes: Mutex<Vec<String>>,
+    }
+
+    impl BakeOps for MockBakeOps {
+        fn current_exe(&self) -> Result<PathBuf> {
+            Ok(self.current_exe.clone())
+        }
+
+        fn inspect_image(&self, _image: &str) -> Result<ImageMetadata> {
+            self.metadata
+                .clone()
+                .ok_or_else(|| anyhow!("missing image metadata"))
+        }
+
+        fn build_image(&self, context_dir: &Path, tag: &str) -> Result<()> {
+            self.builds
+                .lock()
+                .expect("lock")
+                .push((context_dir.to_path_buf(), tag.to_owned()));
+            Ok(())
+        }
+
+        fn push_image(&self, tag: &str) -> Result<()> {
+            self.pushes.lock().expect("lock").push(tag.to_owned());
             Ok(())
         }
     }
@@ -1060,7 +1311,7 @@ mod tests {
     async fn orchestrate_injects_agent_into_running_container() {
         let dir = tempdir().expect("tempdir");
         let binary = dir.path().join("portl");
-        std::fs::write(&binary, b"portl").expect("write binary");
+        fs::write(&binary, b"portl").expect("write binary");
         let host = MockHostOps::with_current_exe(binary);
         let docker = MockDockerOps::new(running_container());
 
@@ -1106,7 +1357,7 @@ mod tests {
     async fn install_path_fallback_order() {
         let dir = tempdir().expect("tempdir");
         let binary = dir.path().join("portl");
-        std::fs::write(&binary, b"portl").expect("write binary");
+        fs::write(&binary, b"portl").expect("write binary");
         let docker = MockDockerOps::new(running_container()).with_copy_failures([
             (INJECTION_PATHS[0], "read-only root"),
             (INJECTION_PATHS[1], "tmp unavailable"),
@@ -1132,7 +1383,7 @@ mod tests {
     fn foreign_arch_refusal_without_release_binary() {
         let dir = tempdir().expect("tempdir");
         let binary = dir.path().join("portl");
-        std::fs::write(&binary, b"portl").expect("write binary");
+        fs::write(&binary, b"portl").expect("write binary");
         let host = MockHostOps::with_current_exe(binary);
         let foreign = ContainerSnapshot {
             target_arch: Some(if normalize_arch(std::env::consts::ARCH) == "amd64" {
@@ -1152,7 +1403,7 @@ mod tests {
     async fn attach_on_stopped_container_errors() {
         let dir = tempdir().expect("tempdir");
         let binary = dir.path().join("portl");
-        std::fs::write(&binary, b"portl").expect("write binary");
+        fs::write(&binary, b"portl").expect("write binary");
         let host = MockHostOps::with_current_exe(binary);
         let stopped = ContainerSnapshot {
             running: false,
@@ -1217,13 +1468,81 @@ mod tests {
     }
 
     #[test]
+    fn bake_emits_valid_dockerfile_inheriting_entrypoint() {
+        let dir = tempdir().expect("tempdir");
+        let output = dir.path().join("bake");
+        let binary = dir.path().join("portl");
+        fs::write(&binary, b"portl").expect("write binary");
+        let ops = MockBakeOps {
+            current_exe: binary,
+            ..MockBakeOps::default()
+        };
+
+        bake_with(&ops, "alpine:3.20", Some(&output), None, false, false).expect("bake output");
+
+        let dockerfile = fs::read_to_string(output.join("Dockerfile")).expect("read Dockerfile");
+        assert!(dockerfile.contains("FROM alpine:3.20"));
+        assert!(dockerfile.contains("COPY portl-agent /usr/local/bin/portl-agent"));
+        assert!(!dockerfile.contains("ENTRYPOINT"));
+        assert!(!dockerfile.contains("CMD ["));
+        assert!(output.join("portl-agent").exists());
+    }
+
+    #[test]
+    fn bake_init_shim_mode_produces_two_line_entrypoint() {
+        let dir = tempdir().expect("tempdir");
+        let output = dir.path().join("bake");
+        let binary = dir.path().join("portl");
+        fs::write(&binary, b"portl").expect("write binary");
+        let ops = MockBakeOps {
+            current_exe: binary,
+            metadata: Some(ImageMetadata {
+                entrypoint: vec!["/usr/local/bin/app".to_owned(), "--serve".to_owned()],
+                cmd: vec!["8080".to_owned()],
+            }),
+            ..MockBakeOps::default()
+        };
+
+        bake_with(&ops, "alpine:3.20", Some(&output), None, false, true).expect("bake init shim");
+
+        let dockerfile = fs::read_to_string(output.join("Dockerfile")).expect("read Dockerfile");
+        let wrapper = fs::read_to_string(output.join("portl-init-shim")).expect("read wrapper");
+        assert!(dockerfile.contains("ENTRYPOINT [\"/usr/local/bin/portl-init-shim\"]"));
+        assert!(dockerfile.contains("CMD [\"8080\"]"));
+        assert_eq!(wrapper.lines().count(), 2);
+        assert!(
+            wrapper.contains(
+                "/usr/local/bin/portl-agent & exec '/usr/local/bin/app' '--serve' \"$@\""
+            )
+        );
+    }
+
+    #[test]
+    fn bake_tag_mode_invokes_docker_build() {
+        let dir = tempdir().expect("tempdir");
+        let binary = dir.path().join("portl");
+        fs::write(&binary, b"portl").expect("write binary");
+        let ops = MockBakeOps {
+            current_exe: binary,
+            ..MockBakeOps::default()
+        };
+
+        bake_with(&ops, "alpine:3.20", None, Some("demo:portl"), false, false)
+            .expect("bake tag mode");
+
+        let builds = ops.builds.lock().expect("lock");
+        assert_eq!(builds.len(), 1);
+        assert_eq!(builds[0].1, "demo:portl");
+    }
+
+    #[test]
     fn rm_force_revokes_ticket() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("revocations.jsonl");
 
         revoke_ticket([0x11; 16], Some(99), &path).expect("write revocation");
 
-        let contents = std::fs::read_to_string(path).expect("read revocations");
+        let contents = fs::read_to_string(path).expect("read revocations");
         assert!(contents.contains(&hex::encode([0x11; 16])));
         assert!(contents.contains("docker_rm"));
         assert!(contents.contains("99"));
