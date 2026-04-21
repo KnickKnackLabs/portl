@@ -4,7 +4,10 @@
 //! records intentionally include only `argv[0]` because later arguments may
 //! carry secrets.
 
-use std::sync::OnceLock;
+use std::fs::{File, OpenOptions};
+use std::io::Write as _;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use tracing::Level;
 use tracing_subscriber::prelude::*;
@@ -12,9 +15,11 @@ use tracing_subscriber::prelude::*;
 use crate::session::Session;
 
 static AUDIT_INIT: OnceLock<()> = OnceLock::new();
+static SHELL_EXIT_AUDIT_FILE: OnceLock<Option<Mutex<File>>> = OnceLock::new();
 
 pub(crate) fn init() {
     let () = *AUDIT_INIT.get_or_init(|| {
+        let _ = SHELL_EXIT_AUDIT_FILE.get_or_init(init_shell_exit_audit_file);
         #[cfg(target_os = "linux")]
         {
             if let Ok(layer) = tracing_journald::layer() {
@@ -92,6 +97,47 @@ pub(crate) fn shell_exit_raw(
         exit_code,
         duration_ms,
     );
+
+    if let Some(file) = SHELL_EXIT_AUDIT_FILE
+        .get_or_init(init_shell_exit_audit_file)
+        .as_ref()
+    {
+        let mut file = file.lock().expect("shell exit audit file mutex");
+        let _ = writeln!(
+            file,
+            "{{\"event\":\"audit.shell_exit\",\"caller_endpoint_id\":\"{}\",\"ticket_id\":\"{}\",\"session_id\":\"{}\",\"pid\":{},\"exit_code\":{},\"duration_ms\":{}}}",
+            hex::encode(caller_endpoint_id),
+            hex::encode(ticket_id),
+            session_id,
+            pid,
+            exit_code,
+            duration_ms,
+        );
+        let _ = file.flush();
+    }
+}
+
+pub(crate) fn sync_shell_exit_records() {
+    if let Some(file) = SHELL_EXIT_AUDIT_FILE
+        .get_or_init(init_shell_exit_audit_file)
+        .as_ref()
+    {
+        let file = file.lock().expect("shell exit audit file mutex");
+        let _ = file.sync_all();
+    }
+}
+
+fn init_shell_exit_audit_file() -> Option<Mutex<File>> {
+    let path = std::env::var_os("PORTL_AUDIT_SHELL_EXIT_PATH").map(PathBuf::from)?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()?;
+    Some(Mutex::new(file))
 }
 
 pub(crate) fn tcp_connect(session: &Session, host: &str, port: u16) {

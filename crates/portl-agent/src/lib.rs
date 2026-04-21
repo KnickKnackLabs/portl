@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::Result;
@@ -99,7 +100,8 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
         endpoint::bind(&cfg, &identity).await?
     };
 
-    let signal_tasks = install_signal_tasks(&shutdown)?;
+    let signal_shutdown = Arc::new(AtomicBool::new(false));
+    let signal_tasks = install_signal_tasks(&shutdown, &signal_shutdown)?;
     let udp_gc = spawn_udp_gc_task(Arc::clone(&state), shutdown.clone());
     let revocation_gc = spawn_revocation_gc_task(Arc::clone(&state), shutdown.clone());
     let metrics_task = spawn_metrics_server(&state, shutdown.clone(), &cfg);
@@ -140,11 +142,21 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
     if shutdown.is_cancelled() {
         graceful_close_endpoint(&endpoint).await;
     }
+    let all_sessions_reaped = if signal_shutdown.load(Ordering::SeqCst) {
+        graceful_shutdown_shell_sessions(&state).await
+    } else {
+        true
+    };
+    audit::sync_shell_exit_records();
     signal_tasks.abort();
     udp_gc.abort();
     revocation_gc.abort();
     if let Some(metrics) = metrics_task {
         metrics.abort();
+    }
+
+    if signal_shutdown.load(Ordering::SeqCst) && !all_sessions_reaped {
+        anyhow::bail!("graceful shutdown left live shell sessions unreaped");
     }
 
     Ok(())
@@ -240,7 +252,46 @@ async fn graceful_close_endpoint(endpoint: &iroh::Endpoint) {
     }
 }
 
-fn install_signal_tasks(shutdown: &CancellationToken) -> Result<SignalTasks> {
+async fn graceful_shutdown_shell_sessions(state: &AgentState) -> bool {
+    let processes = state
+        .shell_registry
+        .iter()
+        .map(|entry| Arc::clone(entry.value()))
+        .collect::<Vec<_>>();
+    if processes.is_empty() {
+        return true;
+    }
+
+    let mut joins = tokio::task::JoinSet::new();
+    for process in processes {
+        joins.spawn(async move {
+            shell_handler::begin_session_shutdown(process.as_ref(), true)
+                .reap()
+                .await
+        });
+    }
+
+    (tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut all_reaped = true;
+        while let Some(result) = joins.join_next().await {
+            match result {
+                Ok(reaped) => all_reaped &= reaped,
+                Err(err) => {
+                    warn!(?err, "shell session shutdown task panicked");
+                    all_reaped = false;
+                }
+            }
+        }
+        all_reaped
+    })
+    .await)
+        .unwrap_or_default()
+}
+
+fn install_signal_tasks(
+    shutdown: &CancellationToken,
+    signal_shutdown: &Arc<AtomicBool>,
+) -> Result<SignalTasks> {
     #[cfg(unix)]
     {
         use nix::errno::Errno;
@@ -253,10 +304,17 @@ fn install_signal_tasks(shutdown: &CancellationToken) -> Result<SignalTasks> {
         let mut sigterm = signal(SignalKind::terminate())?;
         let mut sigint = signal(SignalKind::interrupt())?;
         let shutdown_for_signals = shutdown.clone();
+        let signal_shutdown = Arc::clone(signal_shutdown);
         handles.push(tokio::spawn(async move {
             tokio::select! {
-                _ = sigterm.recv() => shutdown_for_signals.cancel(),
-                _ = sigint.recv() => shutdown_for_signals.cancel(),
+                _ = sigterm.recv() => {
+                    signal_shutdown.store(true, Ordering::SeqCst);
+                    shutdown_for_signals.cancel();
+                }
+                _ = sigint.recv() => {
+                    signal_shutdown.store(true, Ordering::SeqCst);
+                    shutdown_for_signals.cancel();
+                }
                 () = shutdown_for_signals.cancelled() => {}
             }
         }));
@@ -293,7 +351,7 @@ fn install_signal_tasks(shutdown: &CancellationToken) -> Result<SignalTasks> {
 
     #[cfg(not(unix))]
     {
-        let _ = shutdown;
+        let _ = (shutdown, signal_shutdown);
         Ok(SignalTasks::default())
     }
 }

@@ -76,8 +76,7 @@ impl Drop for ShellSessionGuard<'_> {
             revocations.deregister_live_session(self.session_id, &self.ticket_chain_ids);
         }
         if let Some((_, process)) = self.registry.remove(&self.session_id) {
-            request_pty_close(process.pty_tx.as_ref(), false);
-            SessionReaper::from_process(process.as_ref()).spawn();
+            begin_session_shutdown(process.as_ref(), false).spawn();
         }
     }
 }
@@ -114,22 +113,22 @@ impl SessionReaper {
 
     pub(crate) fn spawn(self) {
         tokio::spawn(async move {
-            self.reap().await;
+            let _ = self.reap().await;
         });
     }
 
-    pub(crate) async fn reap(mut self) {
+    pub(crate) async fn reap(mut self) -> bool {
         let Some(pgid) = self.pgid else {
-            return;
+            return true;
         };
         if self.is_reaped() {
-            return;
+            return true;
         }
 
         for signal in [Signal::SIGHUP, Signal::SIGTERM] {
             match killpg(pgid, signal) {
                 Ok(()) => {}
-                Err(nix::errno::Errno::ESRCH) => return,
+                Err(nix::errno::Errno::ESRCH) => return true,
                 Err(err) => {
                     warn!(
                         ?err,
@@ -137,20 +136,29 @@ impl SessionReaper {
                         ?signal,
                         "session reaper failed to signal process group"
                     );
-                    return;
+                    return false;
                 }
             }
             if self.wait_for_reap().await {
-                return;
+                return true;
             }
         }
 
         match killpg(pgid, Signal::SIGKILL) {
-            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Ok(()) => {}
+            Err(nix::errno::Errno::ESRCH) => return true,
             Err(err) => {
                 warn!(?err, pgid = pgid.as_raw(), signal = ?Signal::SIGKILL, "session reaper failed to signal process group");
+                return false;
             }
         }
+
+        if std::env::var_os("PORTL_TEST_REAPER_SKIP_OBSERVATION").is_some() {
+            return false;
+        }
+
+        self.wait_for_reap_with_timeout(Duration::from_millis(100))
+            .await
     }
 
     fn is_reaped(&self) -> bool {
@@ -158,12 +166,16 @@ impl SessionReaper {
     }
 
     async fn wait_for_reap(&mut self) -> bool {
+        self.wait_for_reap_with_timeout(self.grace).await
+    }
+
+    async fn wait_for_reap_with_timeout(&mut self, timeout: Duration) -> bool {
         if self.is_reaped() {
             return true;
         }
         tokio::select! {
             changed = self.exit_rx.changed() => changed.is_ok() && self.is_reaped(),
-            () = tokio::time::sleep(self.grace) => self.is_reaped(),
+            () = tokio::time::sleep(timeout) => self.is_reaped(),
         }
     }
 }
@@ -1322,6 +1334,11 @@ fn request_pty_close(pty_tx: Option<&mpsc::UnboundedSender<PtyCommand>>, force: 
     if let Some(pty_tx) = pty_tx {
         let _ = pty_tx.send(PtyCommand::Close { force });
     }
+}
+
+pub(crate) fn begin_session_shutdown(process: &ShellProcess, force_close: bool) -> SessionReaper {
+    request_pty_close(process.pty_tx.as_ref(), force_close);
+    SessionReaper::from_process(process)
 }
 
 fn process_group_signal_target_from_pid(pid: u32) -> std::result::Result<i32, SpawnReject> {
