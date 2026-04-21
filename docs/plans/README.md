@@ -21,9 +21,9 @@ subproject it implements, not the spec number.
 
 | # | File | Implements | Status |
 | --- | --- | --- | --- |
-| 010 | `010-v0.1.1-safety-net.md` | `specs/150-v0.1.1-safety-net.md` | pending |
-| 020 | `020-v0.1.2-alias-isolation.md` | `specs/160-v0.1.2-alias-isolation.md` | pending |
-| 030 | `030-v0.2-operability.md` *(deferred)* | `specs/140-v0.2-operability.md` | written after v0.1.1 + v0.1.2 land |
+| 010 | `010-v0.1.1-safety-net.md` | `specs/150-v0.1.1-safety-net.md` | shipped in `v0.1.1` |
+| 020 | `020-v0.1.2-alias-isolation.md` | `specs/160-v0.1.2-alias-isolation.md` | shipped in `v0.1.2` |
+| 030 | `030-v0.2-operability.md` | `specs/140-v0.2-operability.md` | shipped in `v0.2.0` |
 
 ## Structure of a plan
 

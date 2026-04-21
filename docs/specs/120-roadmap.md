@@ -84,9 +84,9 @@ Exit:
 - Workspace compiles (`cargo check --workspace`).
 - All crates (`portl-core`, `portl-proto`, `portl-cli`,
   `slicer-portl`, `manual-portl`) have `fn main`/`pub fn` stubs.
-- `portl-cli` builds as a single multicall binary; `portl agent run`
-  dispatches into the agent subtree, and argv[0] == `portl-agent`
-  prepends `agent` before clap parsing.
+- `portl-cli` builds as a single multicall binary; the shipped v0.1
+  shape routed `portl agent run` into the agent subtree, and
+  argv[0] == `portl-agent` prepended `agent` before clap parsing.
 - `portl-core::endpoint` is a thin newtype over `iroh::Endpoint`.
 - `portl-core::test_util::pair()` returns two wired-in-process Endpoints
   (replaces the pre-review `portl-overlay-loopback` crate).
@@ -100,7 +100,7 @@ Non-goals: no real functionality yet.
 
 Exit:
 
-- `portl id new/show/export/import` works.
+- the v0.1 identity-management surface (`portl id new/show/export/import`) works.
 - Ticket codec roundtrip: `mint → encode (postcard + base32) → decode → verify`.
 - Chain carrying tested: a 3-hop delegation encodes via separate
   `Bytes` blobs in `TicketOffer.chain`, not embedded in the URI.
@@ -161,9 +161,10 @@ Exit:
 
 - `adapters/docker-portl/` crate implements the `Bootstrapper` trait
   against `dockerd` via `bollard`.
-- `portl docker container add <name>` provisions, registers, mints a
-  root ticket, and prints the URI. See `060-docker.md`.
-- `portl docker container {list,rm,rebuild,logs}` all work.
+- the v0.1 Docker UX (`portl docker container add <name>`) provisions,
+  registers, mints a root ticket, and prints the URI. See
+  `060-docker.md`.
+- the v0.1 `portl docker container {list,rm,rebuild,logs}` surface all works.
 - Reference `Dockerfile` at `adapters/docker-portl/images/` builds
   a <80 MiB image containing the multicall binary.
 - GH Actions `ci-e2e.yml` workflow brings up two ephemeral
@@ -191,8 +192,8 @@ Tag, but no release. At this point the quickstart is:
 
 ```
 brew install portl          # or apt / direct download
-portl id new
-portl docker container add demo-1
+portl init
+portl docker run demo-image --name demo-1
 portl shell demo-1
 ```
 
@@ -220,8 +221,9 @@ Exit:
 - `portl slicer vm add sbox` creates + registers + prints ticket.
 - `portl shell <vm>` uses the per-VM ticket, bypasses slicer daemon.
 - `portl slicer vm delete <vm>` revokes + deprovisions.
-- `portl agent run --mode gateway` implemented; master-ticket
-  bearer injection against the slicer HTTP API works.
+- the gateway-mode path that later became `portl-gateway` is
+  implemented; master-ticket bearer injection against the slicer
+  HTTP API works.
 - Published `ghcr.io/knickknacklabs/portl-agent:<version>` image
   (shared with docker-portl).
 

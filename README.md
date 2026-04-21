@@ -96,8 +96,7 @@ curl --unix-socket $PORTL_HOME/metrics.sock http://metrics/
 ```
 
 Counters cover ticket accept/reject rates (with reason labels)
-and stream opens per ALPN. Byte-counter series are scheduled for
-v0.2.
+and stream opens per ALPN.
 
 `portl doctor` runs a local diagnostic sweep: wall-clock sanity,
 identity file + permissions, UDP ephemeral bind, and ticket-expiry
@@ -133,7 +132,7 @@ Tarballs are `zstd -19` compressed (~7 MiB each). Any `tar` built on
 top of GNU tar 1.31+ or bsdtar with libarchive can extract them; if
 you see `unrecognized option --zstd`, install the `zstd` package.
 
-Use `portl install dockerfile --output ./portl-image --apply --yes`
+Use `portl install dockerfile --output ./portl-image`
 to emit a service Dockerfile and matching `portl-agent` binary for
 container-only deployments.
 

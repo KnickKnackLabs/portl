@@ -32,15 +32,15 @@
  Step 5. B: `portl shell A` works.
 
   A                                     B
-  │ portl id new                        │ portl id new
-  │ portl-agent run &                   │ portl-agent run &
+  │ portl init                          │ portl init
+  │ portl-agent &                       │ portl-agent &
   │                                     │
   │──────── exchange pubkeys ───────────│
   │                                     │
   │ # trust.roots on A includes Kb       │
   │ # trust.roots on B includes Ka       │
   │                                     │
-  │ portl mint-root \
+  │ portl mint \
   │   --node $(cat B.pub) \
   │   --caps shell,tcp:22 \
   │   --ttl 30d \

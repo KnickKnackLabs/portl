@@ -156,8 +156,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/portl agent run --config /etc/portl/agent.toml
-Restart=always
+ExecStart=/usr/local/bin/portl-agent
+EnvironmentFile=-/etc/portl/agent.env
+Restart=on-failure
 RestartSec=2
 DynamicUser=no
 User=root

@@ -125,12 +125,12 @@ and protocol suite on top of iroh without adding a control plane.
 
 The project is useful when:
 
-1. Two laptops running `portl agent run` can shell and port-forward to
+1. Two laptops running `portl-agent` can shell and port-forward to
    each other across the public internet using only a ticket exchanged
    via any out-of-band channel.
-2. `portl docker container add demo-1` provisions a container on any
-   dev laptop or CI runner and the operator can `portl shell demo-1`
-   from their own machine with no port-forwarding. (M4)
+2. `portl docker run <image> --name demo-1` provisions a container on
+   any dev laptop or CI runner and the operator can `portl shell
+   demo-1` from their own machine with no port-forwarding. (M4)
 3. `portl slicer vm add sbox` provisions a VM such that the operator's
    laptop can `portl shell <vm>` directly, without the slicer daemon
    being in the hot path. (M5)

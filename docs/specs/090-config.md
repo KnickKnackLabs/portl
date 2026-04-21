@@ -305,11 +305,11 @@ is post-v1.
 ```
 operator identity key
   │
-  │   portl id new                (or generated implicitly on first use)
+  │   portl init                  (or generated implicitly on first use)
   ▼
 ~/.config/portl/identity.key
   │
-  │   portl id export             (backup, age-encrypted)
+  │   copy identity.bin           (manual backup in v0.2)
   ▼
 encrypted tarball
 
@@ -348,9 +348,9 @@ agent secret
 Moving from one laptop to another:
 
 ```
-portl id export ~/backup/portl-identity.tar.age
+cp "$PORTL_HOME/identity.bin" ~/backup/portl-identity.bin
 rsync -a ~/.config/portl/ new-laptop:~/.config/portl/
 # on new laptop:
-portl id import ~/portl-identity.tar.age
+cp ~/backup/portl-identity.bin "$PORTL_HOME/identity.bin"
 # everything else is already copied
 ```

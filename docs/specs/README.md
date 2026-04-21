@@ -10,7 +10,7 @@
 ```
  ┌────────── operator machine(s) ──────────┐        ┌───────── target host ─────────┐
  │                                         │        │                               │
- │  identity.key  (ed25519)                │        │  portl agent run              │
+│  identity.key  (ed25519)                │        │  portl-agent                  │
  │  ~/.config/portl/tickets/*.ticket       │        │    secret /var/lib/portl/key  │
  │                                         │        │    policy /etc/portl/agent.* │
  │  ┌────────────┐                         │        │    (same binary as client)    │

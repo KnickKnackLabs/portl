@@ -418,10 +418,10 @@ The agent's `trust.roots` contains the operator's public key `Ka`.
 chain ultimately roots in a `Ka` signature.
 
 ```
-portl id new                                 # creates Ka in ~/.config/portl/identity.key
-# in agent config: trust.roots = [Ka.pub]
-portl mint-root --endpoint <endpoint_id> \
-                --caps all --ttl 1y          # signs with Ka; this IS a root ticket
+portl init                                   # creates Ka locally
+# in agent env / deployment: PORTL_TRUST_ROOTS includes Ka.pub
+portl mint --endpoint <endpoint_id> \
+           --caps all --ttl 1y               # signs with Ka; this IS a root ticket
 ```
 
 The resulting body has `issuer: Some(Ka_pub)` (not elided, because
@@ -596,7 +596,7 @@ All numbers below are after the v0.1 compression wins (§12): iroh's
 `Capabilities` uses a presence bitmap, `alpns_extra` is empty for
 the routine ALPNs.
 
-### 10.1 Minimal root — `portl mint-root --caps shell --ttl 24h`
+### 10.1 Minimal root — `portl mint --caps shell --ttl 24h`
 
 Postcard byte-by-byte for a self-signed agent root:
 
