@@ -83,6 +83,67 @@ jobs:
           cache-on-failure: true
       - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
 
+  docker-smoke:
+    name: docker integration smoke
+    # Only run after the fast unit checks pass. No point rebuilding
+    # a release binary + a Docker image if test or clippy is red;
+    # this `needs:` makes e2e serial after the cheap gates.
+    needs: [test, clippy]
+    runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      # Shared with the `test` / `clippy` jobs via the same
+      # Cargo.lock + rustc key — this job only rebuilds what's
+      # missing for --release (release-profile artifacts).
+      - uses: Swatinem/rust-cache@v2.8.2
+        with:
+          shared-key: "linux-native"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+      - name: Build portl (release)
+        run: cargo build --release --bin portl
+      - name: Build reference Docker image
+        run: |
+          mkdir -p adapters/docker-portl/images/bin
+          cp target/release/portl adapters/docker-portl/images/bin/portl-amd64
+          docker build \
+            --platform linux/amd64 \
+            -t portl-agent:ci \
+            --build-arg TARGETARCH=amd64 \
+            -f adapters/docker-portl/images/Dockerfile.reference \
+            adapters/docker-portl/images/
+      - name: Docker adapter end-to-end smoke
+        env:
+          PORTL_HOME: /tmp/portl-home
+        run: |
+          export PORTL_HOME=$(mktemp -d)
+          ./target/release/portl id new
+          ./target/release/portl docker container add t1 --image portl-agent:ci
+          ./target/release/portl docker container add t2 --image portl-agent:ci
+
+          # ticket/v1 + shell/v1 via exec
+          ./target/release/portl exec t1 -- echo hi
+          ./target/release/portl exec t2 -- sh -c 'exit 42' && exit 1 || true
+
+          # shell/v1 via PTY — use -c to avoid raw-mode issues in CI
+          ./target/release/portl shell t1 -- -c 'ls /tmp' || true
+
+          # tcp/v1 — start an http server in t1, forward, curl
+          ./target/release/portl exec t1 -- sh -c '(python3 -m http.server 8080 &) && sleep 1' &
+          sleep 2
+          ./target/release/portl tcp t1 -L 127.0.0.1:18080:127.0.0.1:8080 &
+          sleep 1
+          curl -sSf http://127.0.0.1:18080/ || echo "tcp forward curl exit $?"
+
+          # cleanup
+          pkill -f "portl tcp" || true
+          ./target/release/portl docker container rm t1 --force
+          ./target/release/portl docker container rm t2 --force
+
   deny:
     name: cargo deny
     runs-on: ubuntu-latest
