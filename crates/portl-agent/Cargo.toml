@@ -21,9 +21,10 @@ workspace = true
 [dependencies]
 portl-core  = { version = "0.1.0", path = "../portl-core" }
 portl-proto = { version = "0.1.0", path = "../portl-proto" }
-anyhow      = { workspace = true }
-serde       = { workspace = true }
-serde_json  = { workspace = true }
+ anyhow      = { workspace = true }
+ thiserror   = { workspace = true }
+ serde       = { workspace = true }
+ serde_json  = { workspace = true }
 postcard    = { workspace = true }
 hex         = { workspace = true }
 tracing     = { workspace = true }

@@ -15,6 +15,7 @@ pub enum ErrorKind {
     CapDenied,
     NotFound,
     RateLimited,
+    ResourceExhausted,
     Overloaded,
     VersionMismatch,
     InternalError,

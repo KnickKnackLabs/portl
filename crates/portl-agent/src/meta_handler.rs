@@ -64,7 +64,7 @@ pub(crate) async fn serve_stream(
             }
         }
         portl_proto::meta_v1::MetaReq::PublishRevocations { items } => {
-            publish_revocations(&state, &session, items).await
+            publish_revocations(&state, &session, items)
         }
     };
 
@@ -84,7 +84,7 @@ fn meta_caps(session: &Session) -> Option<&portl_core::ticket::schema::MetaCaps>
 /// `PublishRevocations` request may carry.
 const MAX_PUBLISH_ITEMS: usize = 1000;
 
-async fn publish_revocations(
+fn publish_revocations(
     state: &Arc<AgentState>,
     session: &Session,
     items: Vec<Vec<u8>>,
@@ -124,63 +124,48 @@ async fn publish_revocations(
     let mut rejected: Vec<(Vec<u8>, String)> = Vec::new();
     let caller_hex = hex::encode(session.caller_endpoint_id);
 
-    // Build the new records under the write lock, release the lock,
-    // then fsync off the runtime.
-    let (to_persist, persist_path) = {
-        let Ok(mut revocations) = state.revocations.write() else {
-            return portl_proto::meta_v1::MetaResp::Error(portl_proto::error::Error {
-                kind: portl_proto::error::ErrorKind::InternalError,
-                message: "revocations lock poisoned".to_owned(),
-                retry_after_ms: None,
-            });
-        };
-        for raw in items {
-            let Ok(id) = <[u8; 16]>::try_from(raw.as_slice()) else {
-                rejected.push((raw, "ticket_id must be 16 bytes".to_owned()));
-                continue;
-            };
-            if revocations.contains(&id) {
-                accepted += 1;
-                continue;
-            }
-            revocations.insert_record(crate::revocations::RevocationRecord::new(
-                id,
-                format!("meta_publish_from_{caller_hex}"),
-                now,
-                None,
-            ));
-            accepted += 1;
-        }
-        (
-            revocations.snapshot(),
-            revocations.file_path().to_path_buf(),
-        )
+    let Ok(mut revocations) = state.revocations.write() else {
+        return portl_proto::meta_v1::MetaResp::Error(portl_proto::error::Error {
+            kind: portl_proto::error::ErrorKind::InternalError,
+            message: "revocations lock poisoned".to_owned(),
+            retry_after_ms: None,
+        });
     };
-
-    // Persist off the async task so a slow fsync doesn't stall the
-    // ticket acceptance pipeline (which reads the same RwLock).
-    #[rustfmt::skip]
-    let persist_result = portl_core::runtime::slow_task("meta_publish_revocations_persist", tokio::task::spawn_blocking(move || {
-        crate::revocations::write_jsonl(&persist_path, &to_persist)
-    }))
-    .await;
-    match persist_result {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
-            tracing::warn!(?err, "persist revocations after publish");
-            return portl_proto::meta_v1::MetaResp::Error(portl_proto::error::Error {
-                kind: portl_proto::error::ErrorKind::InternalError,
-                message: format!("persist revocations: {err}"),
-                retry_after_ms: None,
-            });
-        }
-        Err(join_err) => {
-            tracing::warn!(?join_err, "persist revocations task panicked");
-            return portl_proto::meta_v1::MetaResp::Error(portl_proto::error::Error {
-                kind: portl_proto::error::ErrorKind::InternalError,
-                message: "persist revocations task panicked".to_owned(),
-                retry_after_ms: None,
-            });
+    for raw in items {
+        let Ok(id) = <[u8; 16]>::try_from(raw.as_slice()) else {
+            rejected.push((raw, "ticket_id must be 16 bytes".to_owned()));
+            continue;
+        };
+        match revocations.append(crate::revocations::RevocationRecord::new(
+            id,
+            format!("meta_publish_from_{caller_hex}"),
+            now,
+            None,
+        )) {
+            Ok(_) => {
+                accepted += 1;
+            }
+            Err(crate::revocations::AppendError::SizeCeilingExceeded {
+                max_bytes,
+                current_bytes,
+                append_bytes,
+            }) => {
+                return portl_proto::meta_v1::MetaResp::Error(portl_proto::error::Error {
+                    kind: portl_proto::error::ErrorKind::ResourceExhausted,
+                    message: format!(
+                        "revocations.jsonl ceiling exceeded: current={current_bytes} append={append_bytes} max={max_bytes}"
+                    ),
+                    retry_after_ms: None,
+                });
+            }
+            Err(err) => {
+                tracing::warn!(?err, "append revocations after publish");
+                return portl_proto::meta_v1::MetaResp::Error(portl_proto::error::Error {
+                    kind: portl_proto::error::ErrorKind::InternalError,
+                    message: format!("append revocations: {err}"),
+                    retry_after_ms: None,
+                });
+            }
         }
     }
 

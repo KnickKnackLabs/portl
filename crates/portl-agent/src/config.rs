@@ -20,6 +20,7 @@ const AGENT_ENV_VARS: &[&str] = &[
     "PORTL_DISCOVERY",
     "PORTL_METRICS",
     "PORTL_REVOCATIONS_PATH",
+    "PORTL_REVOCATIONS_MAX_BYTES",
     "PORTL_RATE_LIMIT",
     "PORTL_UDP_SESSION_LINGER_SECS",
     "PORTL_MODE",
@@ -34,6 +35,7 @@ pub struct AgentConfig {
     pub discovery: DiscoveryConfig,
     pub trust_roots: Vec<[u8; 32]>,
     pub revocations_path: Option<PathBuf>,
+    pub revocations_max_bytes: Option<u64>,
     pub rate_limit: RateLimitConfig,
     pub mode: AgentMode,
     #[doc(hidden)]
@@ -88,6 +90,14 @@ impl AgentConfig {
             .map(|value| parse_rate_limit(&value))
             .transpose()?
             .unwrap_or_default();
+        let revocations_max_bytes = env_string("PORTL_REVOCATIONS_MAX_BYTES")?
+            .map(|value| {
+                value.parse::<u64>().with_context(|| {
+                    format!("parse PORTL_REVOCATIONS_MAX_BYTES as an integer: {value}")
+                })
+            })
+            .transpose()?
+            .unwrap_or(crate::revocations::DEFAULT_REVOCATIONS_MAX_BYTES);
         let udp_session_linger_secs = env_string("PORTL_UDP_SESSION_LINGER_SECS")?
             .map(|value| {
                 value.parse::<u64>().with_context(|| {
@@ -112,6 +122,7 @@ impl AgentConfig {
             discovery,
             trust_roots,
             revocations_path: Some(revocations_path),
+            revocations_max_bytes: Some(revocations_max_bytes),
             rate_limit,
             mode,
             endpoint: None,
@@ -348,6 +359,10 @@ mod tests {
             assert_eq!(
                 config.revocations_path,
                 Some(home.join("revocations.jsonl"))
+            );
+            assert_eq!(
+                config.revocations_max_bytes,
+                Some(crate::revocations::DEFAULT_REVOCATIONS_MAX_BYTES)
             );
             assert_eq!(config.rate_limit, RateLimitConfig::default());
             assert_eq!(config.mode, AgentMode::Listener);

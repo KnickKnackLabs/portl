@@ -108,9 +108,47 @@ async fn revocation_of_parent_ticket_cancels_delegated_session() -> Result<()> {
     shutdown(connection, client, server, agent).await
 }
 
+#[tokio::test]
+async fn publish_revocations_replies_resource_exhausted_on_ceiling() -> Result<()> {
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent_with_max_bytes(server.clone(), &operator, 1).await?;
+    let ticket = root_ticket(&operator, server.addr(), shell_and_meta_caps());
+
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let response = publish_revocations(
+        &connection,
+        session.peer_token,
+        vec![ticket_id(&ticket.sig).to_vec()],
+    )
+    .await?;
+
+    match response {
+        MetaResp::Error(err) => {
+            assert_eq!(err.kind, portl_proto::error::ErrorKind::ResourceExhausted);
+        }
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+
+    shutdown(connection, client, server, agent).await
+}
+
 async fn start_agent(
     server: portl_core::endpoint::Endpoint,
     operator: &Identity,
+) -> Result<tokio::task::JoinHandle<Result<()>>> {
+    start_agent_with_max_bytes(
+        server,
+        operator,
+        portl_agent::revocations::DEFAULT_REVOCATIONS_MAX_BYTES,
+    )
+    .await
+}
+
+async fn start_agent_with_max_bytes(
+    server: portl_core::endpoint::Endpoint,
+    operator: &Identity,
+    revocations_max_bytes: u64,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
     let revocations_path = std::env::temp_dir().join(format!(
         "portl-agent-live-revocations-{}.json",
@@ -120,6 +158,7 @@ async fn start_agent(
         discovery: DiscoveryConfig::in_process(),
         trust_roots: vec![operator.verifying_key()],
         revocations_path: Some(revocations_path),
+        revocations_max_bytes: Some(revocations_max_bytes),
         endpoint: Some(server),
         ..AgentConfig::default()
     })

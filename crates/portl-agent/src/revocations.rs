@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 pub const REVOCATION_LINGER_SECS: u64 = 7 * 86_400;
+pub const DEFAULT_REVOCATIONS_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RevocationRecord {
@@ -56,10 +57,15 @@ pub struct RevocationSet {
     ids: HashSet<[u8; 16]>,
     records: Vec<RevocationRecord>,
     live_sessions: HashMap<[u8; 16], HashMap<[u8; 16], CancellationToken>>,
+    max_bytes: u64,
 }
 
 impl RevocationSet {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        Self::load_with_max_bytes(path, DEFAULT_REVOCATIONS_MAX_BYTES)
+    }
+
+    pub fn load_with_max_bytes(path: impl AsRef<Path>, max_bytes: u64) -> Result<Self> {
         let requested = path.as_ref().to_path_buf();
         let now = unix_now_secs()?;
         let file = migrate_legacy_json_if_needed(&requested, now)?;
@@ -80,6 +86,7 @@ impl RevocationSet {
             ids,
             records,
             live_sessions: HashMap::new(),
+            max_bytes,
         };
         if set.gc(now) > 0 {
             set.persist()?;
@@ -106,8 +113,26 @@ impl RevocationSet {
         true
     }
 
-    /// Append a fully-formed `RevocationRecord` if its `ticket_id` is not
-    /// already present. Returns `true` when a new entry was recorded.
+    /// Append a fully-formed `RevocationRecord` to disk if its `ticket_id`
+    /// is not already present. Returns `true` when a new entry was recorded.
+    pub fn append(&mut self, record: RevocationRecord) -> std::result::Result<bool, AppendError> {
+        let id = record
+            .ticket_id_bytes()
+            .map_err(|err| AppendError::InvalidRecord {
+                message: err.to_string(),
+            })?;
+        if self.ids.contains(&id) {
+            return Ok(false);
+        }
+        append_record_limited(&self.file, &record, self.max_bytes)?;
+        self.ids.insert(id);
+        self.records.push(record);
+        self.cancel_live_sessions(id);
+        Ok(true)
+    }
+
+    /// Insert a fully-formed `RevocationRecord` into memory only.
+    /// Used when rebuilding state from disk or restoring snapshots in tests.
     pub fn insert_record(&mut self, record: RevocationRecord) -> bool {
         let Ok(id) = record.ticket_id_bytes() else {
             return false;
@@ -218,22 +243,60 @@ pub fn write_jsonl(path: &Path, records: &[RevocationRecord]) -> Result<()> {
 }
 
 pub fn append_record(path: impl AsRef<Path>, record: &RevocationRecord) -> Result<()> {
+    append_record_limited(path, record, DEFAULT_REVOCATIONS_MAX_BYTES).map_err(anyhow::Error::from)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AppendError {
+    #[error(
+        "revocations.jsonl would exceed ceiling: current={current_bytes} append={append_bytes} max={max_bytes}"
+    )]
+    SizeCeilingExceeded {
+        current_bytes: u64,
+        append_bytes: u64,
+        max_bytes: u64,
+    },
+    #[error("invalid revocation record: {message}")]
+    InvalidRecord { message: String },
+    #[error(transparent)]
+    Io(#[from] anyhow::Error),
+}
+
+pub fn append_record_limited(
+    path: impl AsRef<Path>,
+    record: &RevocationRecord,
+    max_bytes: u64,
+) -> std::result::Result<(), AppendError> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create {}", parent.display()))
+            .map_err(AppendError::Io)?;
+    }
+    let encoded = format!(
+        "{}\n",
+        serde_json::to_string(record)
+            .with_context(|| format!("encode revocation {}", record.ticket_id))
+            .map_err(AppendError::Io)?
+    );
+    let current_bytes = fs::metadata(path).map_or(0, |metadata| metadata.len());
+    let append_bytes = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
+    if current_bytes.saturating_add(append_bytes) > max_bytes {
+        return Err(AppendError::SizeCeilingExceeded {
+            current_bytes,
+            append_bytes,
+            max_bytes,
+        });
     }
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-        .with_context(|| format!("open revocations file {}", path.display()))?;
-    writeln!(
-        file,
-        "{}",
-        serde_json::to_string(record)
-            .with_context(|| format!("encode revocation {}", record.ticket_id))?
-    )
-    .with_context(|| format!("append revocation record to {}", path.display()))
+        .with_context(|| format!("open revocations file {}", path.display()))
+        .map_err(AppendError::Io)?;
+    file.write_all(encoded.as_bytes())
+        .with_context(|| format!("append revocation record to {}", path.display()))
+        .map_err(AppendError::Io)
 }
 
 fn migrate_legacy_json_if_needed(path: &Path, now: u64) -> Result<PathBuf> {
@@ -327,7 +390,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        REVOCATION_LINGER_SECS, RevocationRecord, RevocationSet, append_record,
+        AppendError, REVOCATION_LINGER_SECS, RevocationRecord, RevocationSet, append_record,
         migrate_legacy_json_if_needed, unix_now_secs,
     };
 
@@ -364,6 +427,18 @@ mod tests {
     }
 
     #[test]
+    fn append_at_ceiling_returns_size_exceeded_error() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("revocations.jsonl");
+        let mut set = RevocationSet::load_with_max_bytes(&path, 1).expect("load revocations set");
+
+        let err = set
+            .append(RevocationRecord::new([0x11; 16], "manual", 7, None))
+            .expect_err("append should hit size ceiling");
+        assert!(matches!(err, AppendError::SizeCeilingExceeded { .. }));
+    }
+
+    #[test]
     fn gc_removes_expired_revocations() {
         // Matches 070-security §4.12: drop when BOTH the linger window
         // past revocation has expired AND the ticket itself is no
@@ -382,6 +457,7 @@ mod tests {
                 Some(revoked_at),
             )],
             live_sessions: std::collections::HashMap::new(),
+            max_bytes: super::DEFAULT_REVOCATIONS_MAX_BYTES,
         };
 
         let removed = set.gc(now);
@@ -406,6 +482,7 @@ mod tests {
                 Some(now - 1),
             )],
             live_sessions: std::collections::HashMap::new(),
+            max_bytes: super::DEFAULT_REVOCATIONS_MAX_BYTES,
         };
 
         let removed = set.gc(now);
@@ -431,6 +508,7 @@ mod tests {
                 None,
             )],
             live_sessions: std::collections::HashMap::new(),
+            max_bytes: super::DEFAULT_REVOCATIONS_MAX_BYTES,
         };
 
         let removed = set.gc(now);

@@ -16,6 +16,17 @@ entangled with `AgentState`, `Session`, `caps_enforce`,
 §4 CLI collapse + §5 docker orchestrate + §13 runtime safety
 multiplies regression risk.
 
-User-observable §10 behaviour (the `portl-gateway` multicall
-entrypoint) ships in v0.2.0 via the small-scope Task 1.2. The
-binary-size / build-time wins are deferred by one release.
+ User-observable §10 behaviour (the `portl-gateway` multicall
+ entrypoint) ships in v0.2.0 via the small-scope Task 1.2. The
+ binary-size / build-time wins are deferred by one release.
+
+## v0.2.1 — `portl revoke --compact`
+
+Add a maintenance subcommand that compacts expired-and-revoked
+entries out of `revocations.jsonl` once they are past both the
+underlying ticket expiry and the linger window.
+
+Deferred from v0.2.0 Task 2.5 because the runtime-safety contract
+needed the size ceiling + fail-closed `ResourceExhausted` behavior
+first, and a correct compactor would have pushed the task beyond the
+smallest-correct scope for this phase.

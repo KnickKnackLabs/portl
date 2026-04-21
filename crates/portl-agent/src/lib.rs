@@ -73,7 +73,11 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
 
     let state = Arc::new(AgentState {
         trust_roots: TrustRoots(cfg.trust_roots.iter().copied().collect::<HashSet<_>>()),
-        revocations: std::sync::RwLock::new(RevocationSet::load(revocations_path(&cfg))?),
+        revocations: std::sync::RwLock::new(RevocationSet::load_with_max_bytes(
+            revocations_path(&cfg),
+            cfg.revocations_max_bytes
+                .unwrap_or(revocations::DEFAULT_REVOCATIONS_MAX_BYTES),
+        )?),
         rate_limit: OfferRateLimiter::new(&cfg.rate_limit)?,
         started_at: Instant::now(),
         shell_registry: shell_registry::ShellRegistry::default(),
