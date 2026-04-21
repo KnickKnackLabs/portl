@@ -75,7 +75,7 @@ rand        = "0.8"
 rand_core   = "0.6"
 uuid        = { version = "1", features = ["v4"] }
 humantime   = "2"
-nix         = { version = "0.30", features = ["fs", "poll", "process", "signal", "term", "user"] }
+nix         = { version = "0.30", features = ["fs", "poll", "process", "resource", "signal", "term", "user"] }
 async-trait = "0.1"
 bollard     = "0.17"
 rusqlite    = { version = "0.32", features = ["bundled"] }
