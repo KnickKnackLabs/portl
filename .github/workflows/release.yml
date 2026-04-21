@@ -52,13 +52,13 @@ jobs:
         with:
           version: 0.13.0
       - name: Install cargo-zigbuild (linux only)
-        # baptiste0928/cargo-install caches the compiled binary under
-        # ~/.cargo-install so subsequent release runs skip the ~1min
-        # `cargo install --locked cargo-zigbuild` compile.
+        # taiki-e/install-action downloads the prebuilt cargo-zigbuild
+        # binary from its GitHub releases — ~5 s vs ~1 min for a cold
+        # source build, and decoupled from our pinned 1.89 toolchain.
         if: matrix.linux
-        uses: baptiste0928/cargo-install@v3
+        uses: taiki-e/install-action@v2
         with:
-          crate: cargo-zigbuild
+          tool: cargo-zigbuild
       - name: Build (linux musl via zigbuild)
         if: matrix.linux
         run: cargo zigbuild --release --target ${{ matrix.target }} --bin portl
