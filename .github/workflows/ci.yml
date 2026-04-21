@@ -67,9 +67,14 @@ jobs:
       # specific test name instead of a bare 'process aborted', and
       # integration test binaries run in parallel instead of serially.
       # Binary is cached by baptiste0928 action (~7 day expiry).
+      #
+      # Pinned to 0.9.128 — the last release supporting rustc 1.89.
+      # nextest 0.9.133+ requires rustc 1.91. When we bump
+      # rust-toolchain.toml past 1.89, drop this version pin.
       - uses: baptiste0928/cargo-install@v3
         with:
           crate: cargo-nextest
+          version: "0.9.128"
           locked: true
       - run: cargo nextest run --profile ci --workspace --all-features
 
