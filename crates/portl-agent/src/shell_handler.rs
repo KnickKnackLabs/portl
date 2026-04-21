@@ -792,27 +792,26 @@ pub fn spawn_pty_for_test(
 ///   is per-process and cannot contain a fork bomb at the uid level)
 #[cfg(unix)]
 fn apply_rlimits() -> std::io::Result<()> {
-    fn set(resource: nix::libc::c_int, value: u64) -> std::io::Result<()> {
-        let rl = nix::libc::rlimit {
-            rlim_cur: value as nix::libc::rlim_t,
-            rlim_max: value as nix::libc::rlim_t,
-        };
-        // SAFETY(unsafe_code): setrlimit with a valid &rlimit is a
-        // standard libc call; it cannot escape memory or aliasing rules.
-        #[allow(unsafe_code)]
-        let rc = unsafe { nix::libc::setrlimit(resource, &raw const rl) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
+    // Use nix::sys::resource::setrlimit so nix's Resource enum handles
+    // the platform-specific resource-id integer type. On Linux glibc,
+    // libc::RLIMIT_* are `u32` and setrlimit takes `__rlimit_resource_t`;
+    // on Darwin/BSD they're `i32` / `c_int`. A hand-rolled libc wrapper
+    // using `c_int` compiles on macOS but fails on linux-musl/glibc
+    // (E0308: expected i32, found u32). The `nix` shim abstracts that
+    // away and is still async-signal-safe (thin wrapper over libc::
+    // setrlimit, which POSIX lists as AS-safe).
+    use nix::sys::resource::{setrlimit, Resource};
+
+    fn set(resource: Resource, value: u64) -> std::io::Result<()> {
+        setrlimit(resource, value, value).map_err(std::io::Error::from)
     }
 
-    set(nix::libc::RLIMIT_NOFILE, 4096)?;
-    set(nix::libc::RLIMIT_CORE, 0)?;
-    set(nix::libc::RLIMIT_CPU, 86_400)?;
-    set(nix::libc::RLIMIT_FSIZE, 10 * 1024 * 1024 * 1024)?;
+    set(Resource::RLIMIT_NOFILE, 4096)?;
+    set(Resource::RLIMIT_CORE, 0)?;
+    set(Resource::RLIMIT_CPU, 86_400)?;
+    set(Resource::RLIMIT_FSIZE, 10 * 1024 * 1024 * 1024)?;
     #[cfg(target_os = "linux")]
-    set(nix::libc::RLIMIT_NPROC, 512)?;
+    set(Resource::RLIMIT_NPROC, 512)?;
     Ok(())
 }
 
