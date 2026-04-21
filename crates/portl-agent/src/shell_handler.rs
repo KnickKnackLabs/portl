@@ -718,6 +718,14 @@ fn spawn_pty_blocking(
     // fork(2) and execve(2). The closure only invokes async-signal-safe
     // syscalls (setsid, ioctl TIOCSCTTY, dup2, close) and returns an
     // io::Result, matching the documented contract.
+    //
+    // SAFETY(signal): every libc call below is on POSIX.1-2017's
+    // async-signal-safe (AS-safe) list: setrlimit (via
+    // `apply_rlimits`), setsid, ioctl, dup2, close. The only Rust
+    // stdlib call is `std::io::Error::last_os_error()`, which in
+    // practice just wraps a pre-initialised errno read and does not
+    // allocate on the error path (Err(io::Error::from_raw_os_error)),
+    // making it AS-safe enough for the narrow post-fork window.
     #[allow(unsafe_code)]
     unsafe {
         command.pre_exec(move || {
@@ -817,6 +825,12 @@ fn install_exec_rlimits_pre_exec(command: &mut StdCommand) {
     // SAFETY(unsafe_code): pre_exec runs post-fork, pre-exec. The
     // closure calls `apply_rlimits()` which only invokes
     // async-signal-safe syscalls (setrlimit) and returns an io::Result.
+    //
+    // SAFETY(signal): `apply_rlimits` calls only setrlimit (AS-safe
+    // per POSIX.1-2017). Error paths construct
+    // `std::io::Error::last_os_error()` which is a pre-initialised
+    // errno read with no allocation on the Err(OsError) branch, AS-safe
+    // in practice for the post-fork window.
     #[allow(unsafe_code)]
     unsafe {
         command.pre_exec(apply_rlimits);
