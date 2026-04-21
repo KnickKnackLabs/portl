@@ -872,7 +872,7 @@ fn injected_agent_env(identity: &Identity, operator: &Identity) -> Vec<String> {
             "PORTL_TRUST_ROOTS={}",
             hex::encode(operator.verifying_key())
         ),
-        "PORTL_DISCOVERY=pkarr,local".to_owned(),
+        "PORTL_DISCOVERY=dns,pkarr,local,relay".to_owned(),
         "PORTL_METRICS=0".to_owned(),
     ]
 }
