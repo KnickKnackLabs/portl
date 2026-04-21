@@ -68,6 +68,7 @@ n0-future  = "0.3"
 # identity + age
 age         = { version = "0.11", default-features = false, features = ["armor"] }
 directories = "5"
+fd-lock     = "4"
 hex         = "0.4"
 rpassword   = "7"
 qrcode      = "0.14"
