@@ -82,6 +82,7 @@ bollard     = "0.17"
 reqwest     = { version = "0.13", default-features = false, features = ["rustls", "json", "query", "blocking"] }
 tar         = "0.4"
 zstd        = "0.13"
+url         = "2"
 wiremock    = "0.6"
 
 [workspace.lints.rust]

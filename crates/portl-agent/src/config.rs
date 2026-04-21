@@ -194,7 +194,7 @@ impl Default for RateLimitConfig {
 
 pub fn parse_gateway_mode(url: &str) -> Result<AgentMode> {
     let parsed =
-        reqwest::Url::parse(url).with_context(|| format!("parse gateway upstream URL {url}"))?;
+        url::Url::parse(url).with_context(|| format!("parse gateway upstream URL {url}"))?;
     let host = parsed
         .host_str()
         .map(ToOwned::to_owned)

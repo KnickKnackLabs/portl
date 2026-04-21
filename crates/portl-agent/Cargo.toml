@@ -40,7 +40,7 @@ nix         = { workspace = true }
 tracing-subscriber = { workspace = true }
 bytes       = { workspace = true }
 sha2        = { workspace = true }
-reqwest     = { workspace = true }
+url         = { workspace = true }
 prometheus-client = { workspace = true }
 directories = { workspace = true }
 uuid        = { workspace = true }
@@ -54,7 +54,6 @@ iroh-base = { workspace = true }
 tokio      = { workspace = true }
 tokio-util = { workspace = true }
 n0-future  = { workspace = true }
-wiremock   = { workspace = true }
 # Pre-main hook used by `tests/common/mod.rs` to install a per-test-binary
 # watchdog that aborts the process after `PORTL_TEST_WATCHDOG_SECS` (default
 # 30s). Prevents a single hung integration test (e.g. iroh relay stalls)
