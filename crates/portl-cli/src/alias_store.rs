@@ -1,16 +1,19 @@
+use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::result::Result as StdResult;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use fd_lock::RwLock;
 use portl_core::id::store;
 use portl_core::ticket::schema::Capabilities;
-use rusqlite::{Connection, OptionalExtension, params};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-const DB_FILE: &str = "aliases.sqlite";
-const BUSY_TIMEOUT_MS: u64 = 5_000;
-static DB_INIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const DB_FILE: &str = "aliases.json";
+const LOCK_FILE: &str = "aliases.json.lock";
+const CURRENT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AliasRecord {
@@ -27,16 +30,31 @@ pub struct AliasRecord {
 pub struct StoredSpec {
     pub caps: Capabilities,
     pub ttl_secs: u64,
+    #[serde(with = "hex_opt_32", default)]
     pub to: Option<[u8; 32]>,
     pub labels: Vec<(String, String)>,
+    #[serde(with = "hex_opt_16", default)]
     pub root_ticket_id: Option<[u8; 16]>,
     pub ticket_file_path: Option<PathBuf>,
     pub group_name: Option<String>,
     pub base_url: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Default)]
+struct Root {
+    version: u32,
+    aliases: BTreeMap<String, Entry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Entry {
+    record: AliasRecord,
+    spec: StoredSpec,
+}
+
 pub struct AliasStore {
-    db_path: PathBuf,
+    path: PathBuf,
+    lock_path: PathBuf,
 }
 
 impl Default for AliasStore {
@@ -47,160 +65,117 @@ impl Default for AliasStore {
 
 impl AliasStore {
     pub fn new(db_path: PathBuf) -> Self {
-        Self { db_path }
+        let lock_path = db_path.with_file_name(LOCK_FILE);
+        Self {
+            path: db_path,
+            lock_path,
+        }
     }
 
     pub fn save(&self, alias: &AliasRecord, spec: &StoredSpec) -> Result<()> {
-        let mut conn = self.open()?;
-        let tx = conn.transaction().context("begin alias save transaction")?;
-        tx.execute(
-            "INSERT OR REPLACE INTO aliases (
-                name, adapter, container_id, endpoint_id, image, network, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                alias.name,
-                alias.adapter,
-                alias.container_id,
-                alias.endpoint_id,
-                alias.image,
-                alias.network,
-                alias.created_at,
-            ],
-        )
-        .context("upsert alias row")?;
-        tx.execute(
-            "INSERT OR REPLACE INTO alias_specs (
-                name, caps_json, ttl_secs, to_hex, labels_json, root_ticket_id_hex,
-                ticket_file_path, group_name, base_url
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                alias.name,
-                serde_json::to_string(&spec.caps).context("encode caps json")?,
-                i64::try_from(spec.ttl_secs).context("ttl exceeds sqlite integer range")?,
-                spec.to.map(hex::encode),
-                serde_json::to_string(&spec.labels).context("encode labels json")?,
-                spec.root_ticket_id.map(hex::encode),
-                spec.ticket_file_path
-                    .as_ref()
-                    .map(|path| path.to_string_lossy().into_owned()),
-                spec.group_name,
-                spec.base_url,
-            ],
-        )
-        .context("upsert alias spec row")?;
-        tx.commit().context("commit alias save transaction")?;
-        Ok(())
+        self.with_write_lock(|root| {
+            root.version = CURRENT_VERSION;
+            root.aliases.insert(
+                alias.name.clone(),
+                Entry {
+                    record: alias.clone(),
+                    spec: spec.clone(),
+                },
+            );
+            Ok(())
+        })
     }
 
     pub fn get(&self, name: &str) -> Result<Option<AliasRecord>> {
-        let conn = self.open()?;
-        conn.query_row(
-            "SELECT name, adapter, container_id, endpoint_id, image, network, created_at
-             FROM aliases WHERE name = ?1",
-            params![name],
-            |row| {
-                Ok(AliasRecord {
-                    name: row.get(0)?,
-                    adapter: row.get(1)?,
-                    container_id: row.get(2)?,
-                    endpoint_id: row.get(3)?,
-                    image: row.get(4)?,
-                    network: row.get(5)?,
-                    created_at: row.get(6)?,
-                })
-            },
-        )
-        .optional()
-        .context("query alias by name")
+        let mut root = self.read()?;
+        Ok(root.aliases.remove(name).map(|entry| entry.record))
     }
 
     pub fn get_spec(&self, name: &str) -> Result<Option<StoredSpec>> {
-        let conn = self.open()?;
-        conn.query_row(
-            "SELECT caps_json, ttl_secs, to_hex, labels_json, root_ticket_id_hex,
-                    ticket_file_path, group_name, base_url
-             FROM alias_specs WHERE name = ?1",
-            params![name],
-            |row| {
-                let caps_json: String = row.get(0)?;
-                let ttl_secs: i64 = row.get(1)?;
-                let to_hex: Option<String> = row.get(2)?;
-                let labels_json: String = row.get(3)?;
-                let root_ticket_id_hex: Option<String> = row.get(4)?;
-                let ticket_file_path: Option<String> = row.get(5)?;
-                let group_name: Option<String> = row.get(6)?;
-                let base_url: Option<String> = row.get(7)?;
-                Ok(StoredSpec {
-                    caps: serde_json::from_str(&caps_json).map_err(json_error_to_sqlite)?,
-                    ttl_secs: u64::try_from(ttl_secs).map_err(int_error_to_sqlite)?,
-                    to: to_hex
-                        .map(|value| parse_optional_hex32(&value))
-                        .transpose()
-                        .map_err(json_error_to_sqlite)?,
-                    labels: serde_json::from_str(&labels_json).map_err(json_error_to_sqlite)?,
-                    root_ticket_id: root_ticket_id_hex
-                        .map(|value| parse_optional_hex16(&value))
-                        .transpose()
-                        .map_err(json_error_to_sqlite)?,
-                    ticket_file_path: ticket_file_path.map(PathBuf::from),
-                    group_name,
-                    base_url,
-                })
-            },
-        )
-        .optional()
-        .context("query alias spec by name")
+        let mut root = self.read()?;
+        Ok(root.aliases.remove(name).map(|entry| entry.spec))
     }
 
     pub fn list(&self) -> Result<Vec<AliasRecord>> {
-        let conn = self.open()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT name, adapter, container_id, endpoint_id, image, network, created_at
-                 FROM aliases ORDER BY name ASC",
-            )
-            .context("prepare alias list query")?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(AliasRecord {
-                    name: row.get(0)?,
-                    adapter: row.get(1)?,
-                    container_id: row.get(2)?,
-                    endpoint_id: row.get(3)?,
-                    image: row.get(4)?,
-                    network: row.get(5)?,
-                    created_at: row.get(6)?,
-                })
-            })
-            .context("query alias list")?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .context("collect alias rows")
+        Ok(self
+            .read()?
+            .aliases
+            .into_values()
+            .map(|entry| entry.record)
+            .collect())
     }
 
     pub fn remove(&self, name: &str) -> Result<()> {
-        let conn = self.open()?;
-        conn.execute("DELETE FROM alias_specs WHERE name = ?1", params![name])
-            .context("delete alias spec row")?;
-        conn.execute("DELETE FROM aliases WHERE name = ?1", params![name])
-            .context("delete alias row")?;
-        Ok(())
+        self.with_write_lock(|root| {
+            root.version = CURRENT_VERSION;
+            root.aliases.remove(name);
+            Ok(())
+        })
     }
 
-    fn open(&self) -> Result<Connection> {
-        if let Some(parent) = self.db_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create alias db directory {}", parent.display()))?;
+    fn read(&self) -> Result<Root> {
+        let file = match File::open(&self.path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Root::default());
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("open alias store {}", self.path.display()));
+            }
+        };
+        let lock = RwLock::new(file);
+        let guard = lock.read().context("acquire alias store read lock")?;
+        let mut file = &*guard;
+        let mut json = String::new();
+        file.read_to_string(&mut json).context("read alias store")?;
+        if json.trim().is_empty() {
+            return Ok(Root::default());
         }
-        let conn = Connection::open(&self.db_path)
-            .with_context(|| format!("open alias db {}", self.db_path.display()))?;
-        let _guard = DB_INIT_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .map_err(|_| anyhow::anyhow!("alias db init lock poisoned"))?;
-        configure_connection(&conn)?;
-        init_schema(&conn)?;
-        migrate_schema(&conn)?;
-        Ok(conn)
+        serde_json::from_str(&json).context("parse alias store JSON")
+    }
+
+    fn with_write_lock<F>(&self, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut Root) -> Result<()>,
+    {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create alias store directory {}", parent.display()))?;
+        }
+
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.lock_path)
+            .with_context(|| format!("open alias store lock {}", self.lock_path.display()))?;
+        let mut lock = RwLock::new(lock_file);
+        let _guard = lock.write().context("acquire alias store write lock")?;
+
+        let mut root = self.read()?;
+        root.version = CURRENT_VERSION;
+        f(&mut root)?;
+        self.write_root(&root)
+    }
+
+    fn write_root(&self, root: &Root) -> Result<()> {
+        let tmp_path = self.path.with_extension("json.tmp");
+        let mut file = File::create(&tmp_path)
+            .with_context(|| format!("create alias store tmp {}", tmp_path.display()))?;
+        serde_json::to_writer_pretty(&mut file, root).context("encode alias store JSON")?;
+        file.write_all(b"\n")
+            .context("write alias store trailing newline")?;
+        file.sync_all().context("fsync alias store tmp")?;
+        fs::rename(&tmp_path, &self.path).with_context(|| {
+            format!(
+                "rename alias store tmp {} into place {}",
+                tmp_path.display(),
+                self.path.display()
+            )
+        })?;
+        Ok(())
     }
 }
 
@@ -219,120 +194,79 @@ pub fn now_unix_secs() -> Result<i64> {
     )?)
 }
 
-fn configure_connection(conn: &Connection) -> Result<()> {
-    conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))
-        .context("set alias db busy timeout")?;
-    conn.execute_batch(
-        "PRAGMA foreign_keys = ON;\
-         PRAGMA journal_mode = WAL;",
-    )
-    .context("configure alias db pragmas")
+#[allow(clippy::ref_option)]
+fn serialize_hex_opt<const N: usize, S>(
+    value: &Option<[u8; N]>,
+    serializer: S,
+) -> StdResult<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    Option::<String>::serialize(&value.as_ref().map(hex::encode), serializer)
 }
 
-fn init_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "BEGIN;
-         CREATE TABLE IF NOT EXISTS aliases (
-             name TEXT PRIMARY KEY,
-             adapter TEXT NOT NULL,
-             container_id TEXT NOT NULL,
-             endpoint_id TEXT NOT NULL,
-             image TEXT NOT NULL,
-             network TEXT NOT NULL,
-             created_at INTEGER NOT NULL
-         );
-         CREATE UNIQUE INDEX IF NOT EXISTS idx_aliases_endpoint_id
-             ON aliases(endpoint_id);
-         CREATE TABLE IF NOT EXISTS alias_specs (
-             name TEXT PRIMARY KEY,
-             caps_json TEXT NOT NULL,
-             ttl_secs INTEGER NOT NULL,
-             to_hex TEXT,
-             labels_json TEXT NOT NULL,
-             root_ticket_id_hex TEXT,
-             ticket_file_path TEXT,
-             group_name TEXT,
-             base_url TEXT,
-             FOREIGN KEY(name) REFERENCES aliases(name) ON DELETE CASCADE
-         );
-         COMMIT;",
-    )
-    .context("initialize alias db schema")
-}
-
-fn migrate_schema(conn: &Connection) -> Result<()> {
-    if !table_has_column(conn, "alias_specs", "root_ticket_id_hex")? {
-        conn.execute(
-            "ALTER TABLE alias_specs ADD COLUMN root_ticket_id_hex TEXT",
-            [],
-        )
-        .context("add root_ticket_id_hex column to alias_specs")?;
-    }
-    if !table_has_column(conn, "alias_specs", "ticket_file_path")? {
-        conn.execute(
-            "ALTER TABLE alias_specs ADD COLUMN ticket_file_path TEXT",
-            [],
-        )
-        .context("add ticket_file_path column to alias_specs")?;
-    }
-    if !table_has_column(conn, "alias_specs", "group_name")? {
-        conn.execute("ALTER TABLE alias_specs ADD COLUMN group_name TEXT", [])
-            .context("add group_name column to alias_specs")?;
-    }
-    if !table_has_column(conn, "alias_specs", "base_url")? {
-        conn.execute("ALTER TABLE alias_specs ADD COLUMN base_url TEXT", [])
-            .context("add base_url column to alias_specs")?;
-    }
-    Ok(())
-}
-
-fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
-    let mut stmt = conn
-        .prepare(&format!("PRAGMA table_info({table})"))
-        .with_context(|| format!("prepare table_info for {table}"))?;
-    let mut rows = stmt
-        .query([])
-        .with_context(|| format!("query table_info for {table}"))?;
-    while let Some(row) = rows.next().context("step table_info rows")? {
-        let name: String = row.get(1).context("read table_info column name")?;
-        if name == column {
-            return Ok(true);
+fn deserialize_hex_opt<'de, const N: usize, D>(
+    deserializer: D,
+) -> StdResult<Option<[u8; N]>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(value) if value.is_empty() => Ok(None),
+        Some(value) => {
+            let bytes = hex::decode(&value).map_err(serde::de::Error::custom)?;
+            let bytes: [u8; N] = bytes.try_into().map_err(|_| {
+                serde::de::Error::custom(format!("expected exactly {N} bytes of hex"))
+            })?;
+            Ok(Some(bytes))
         }
     }
-    Ok(false)
 }
 
-fn parse_optional_hex32(value: &str) -> Result<[u8; 32]> {
-    let bytes = hex::decode(value).with_context(|| format!("invalid 32-byte hex: {value}"))?;
-    bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("expected exactly 32 bytes of hex: {value}"))
+mod hex_opt_32 {
+    use super::{Deserializer, Serializer, StdResult, deserialize_hex_opt, serialize_hex_opt};
+
+    #[allow(clippy::ref_option)]
+    pub fn serialize<S>(value: &Option<[u8; 32]>, serializer: S) -> StdResult<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serialize_hex_opt(value, serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> StdResult<Option<[u8; 32]>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_hex_opt(deserializer)
+    }
 }
 
-fn parse_optional_hex16(value: &str) -> Result<[u8; 16]> {
-    let bytes = hex::decode(value).with_context(|| format!("invalid 16-byte hex: {value}"))?;
-    bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("expected exactly 16 bytes of hex: {value}"))
-}
+mod hex_opt_16 {
+    use super::{Deserializer, Serializer, StdResult, deserialize_hex_opt, serialize_hex_opt};
 
-fn json_error_to_sqlite(err: impl std::fmt::Display) -> rusqlite::Error {
-    rusqlite::Error::FromSqlConversionFailure(
-        0,
-        rusqlite::types::Type::Text,
-        Box::new(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            err.to_string(),
-        )),
-    )
-}
+    #[allow(clippy::ref_option)]
+    pub fn serialize<S>(value: &Option<[u8; 16]>, serializer: S) -> StdResult<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serialize_hex_opt(value, serializer)
+    }
 
-fn int_error_to_sqlite(err: impl std::fmt::Display) -> rusqlite::Error {
-    json_error_to_sqlite(err)
+    pub fn deserialize<'de, D>(deserializer: D) -> StdResult<Option<[u8; 16]>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_hex_opt(deserializer)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::{Arc, Barrier};
 
     use tempfile::tempdir;
@@ -352,29 +286,55 @@ mod tests {
         }
     }
 
-    #[test]
-    fn alias_store_round_trips_alias_and_spec() {
-        let dir = tempdir().expect("tempdir");
-        let store = AliasStore::new(dir.path().join("aliases.sqlite"));
-        let alias = AliasRecord {
-            name: "demo".to_owned(),
+    fn alias(
+        name: impl Into<String>,
+        endpoint_id: impl Into<String>,
+        created_at: i64,
+    ) -> AliasRecord {
+        let name = name.into();
+        AliasRecord {
+            container_id: format!("cid-{name}"),
+            endpoint_id: endpoint_id.into(),
+            name,
             adapter: "docker-portl".to_owned(),
-            container_id: "cid".to_owned(),
-            endpoint_id: "eid".to_owned(),
             image: "img".to_owned(),
             network: "bridge".to_owned(),
-            created_at: 7,
-        };
-        let spec = StoredSpec {
+            created_at,
+        }
+    }
+
+    fn spec(ticket_file_path: Option<PathBuf>) -> StoredSpec {
+        StoredSpec {
             caps: empty_caps(),
             ttl_secs: 60,
             to: Some([9; 32]),
             labels: vec![("a".to_owned(), "b".to_owned())],
             root_ticket_id: Some([4; 16]),
-            ticket_file_path: Some(dir.path().join("demo.ticket")),
+            ticket_file_path,
             group_name: Some("sbox".to_owned()),
             base_url: Some("http://127.0.0.1:8080".to_owned()),
-        };
+        }
+    }
+
+    fn minimal_spec() -> StoredSpec {
+        StoredSpec {
+            caps: empty_caps(),
+            ttl_secs: 60,
+            to: None,
+            labels: vec![],
+            root_ticket_id: None,
+            ticket_file_path: None,
+            group_name: None,
+            base_url: None,
+        }
+    }
+
+    #[test]
+    fn alias_store_round_trips_alias_and_spec() {
+        let dir = tempdir().expect("tempdir");
+        let store = AliasStore::new(dir.path().join("aliases.json"));
+        let alias = alias("demo", "eid", 7);
+        let spec = spec(Some(dir.path().join("demo.ticket")));
 
         store.save(&alias, &spec).expect("save alias");
         assert_eq!(store.get("demo").expect("get alias"), Some(alias));
@@ -384,7 +344,7 @@ mod tests {
     #[test]
     fn concurrent_saves_serialize_without_corruption() {
         let dir = tempdir().expect("tempdir");
-        let db_path = dir.path().join("aliases.sqlite");
+        let db_path = dir.path().join("aliases.json");
         let barrier = Arc::new(Barrier::new(3));
 
         let worker = |name: &'static str, endpoint_id: &'static str| {
@@ -392,25 +352,8 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
                 let store = AliasStore::new(db_path);
-                let alias = AliasRecord {
-                    name: name.to_owned(),
-                    adapter: "docker-portl".to_owned(),
-                    container_id: format!("cid-{name}"),
-                    endpoint_id: endpoint_id.to_owned(),
-                    image: "img".to_owned(),
-                    network: "bridge".to_owned(),
-                    created_at: 1,
-                };
-                let spec = StoredSpec {
-                    caps: empty_caps(),
-                    ttl_secs: 60,
-                    to: None,
-                    labels: vec![],
-                    root_ticket_id: None,
-                    ticket_file_path: None,
-                    group_name: None,
-                    base_url: None,
-                };
+                let alias = alias(name, endpoint_id, 1);
+                let spec = minimal_spec();
                 barrier.wait();
                 store.save(&alias, &spec).expect("concurrent save");
             })
@@ -427,5 +370,51 @@ mod tests {
         assert_eq!(aliases.len(), 2);
         assert!(store.get_spec("demo-1").expect("spec 1").is_some());
         assert!(store.get_spec("demo-2").expect("spec 2").is_some());
+    }
+
+    #[test]
+    fn stale_sqlite_file_is_ignored() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("aliases.sqlite"), b"SQLite format 3\0junk")
+            .expect("write stale file");
+        let store = AliasStore::new(dir.path().join("aliases.json"));
+
+        assert!(store.list().expect("list").is_empty());
+
+        let alias = alias("demo", "endpoint-1", 1);
+        let spec = minimal_spec();
+        store.save(&alias, &spec).expect("save");
+
+        assert!(dir.path().join("aliases.sqlite").exists());
+        assert!(dir.path().join("aliases.json").exists());
+    }
+
+    #[test]
+    fn many_writers_converge_to_full_set() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("aliases.json");
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let store = AliasStore::new(path);
+                    for j in 0..250_u32 {
+                        let alias = alias(
+                            format!("t{i}-{j}"),
+                            format!("endpoint-{i}-{j}"),
+                            i64::from(j),
+                        );
+                        store.save(&alias, &minimal_spec()).expect("save");
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("thread");
+        }
+
+        let store = AliasStore::new(path);
+        assert_eq!(store.list().expect("list").len(), 1_000);
     }
 }

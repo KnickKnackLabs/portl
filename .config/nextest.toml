@@ -57,5 +57,14 @@ failure-output = "immediate-final"
 filter = 'test(=udp_src_tag_lru_eviction)'
 slow-timeout = { period = "30s", terminate-after = 3 }
 
+# `many_writers_converge_to_full_set` performs 1,000 persisted
+# save() calls, and each save intentionally fsyncs a temp file before
+# atomic rename to validate the alias-store durability contract.
+# That makes it much slower than the rest of the unit suite in debug
+# builds, especially on APFS and on shared CI runners.
+[[profile.ci.overrides]]
+filter = 'test(=alias_store::tests::many_writers_converge_to_full_set)'
+slow-timeout = { period = "90s", terminate-after = 3 }
+
 [profile.ci.junit]
 path = "junit.xml"
