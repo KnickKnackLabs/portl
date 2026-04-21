@@ -42,7 +42,6 @@ humantime   = { workspace = true }
 n0-future   = { workspace = true }
 crossterm   = { workspace = true }
 fd-lock     = { workspace = true }
-rusqlite    = { workspace = true }
 nix         = { workspace = true }
 reqwest     = { workspace = true }
 

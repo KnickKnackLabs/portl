@@ -80,7 +80,6 @@ humantime   = "2"
 nix         = { version = "0.30", features = ["fs", "poll", "process", "resource", "signal", "term", "user"] }
 async-trait = "0.1"
 bollard     = "0.17"
-rusqlite    = { version = "0.32", features = ["bundled"] }
 reqwest     = { version = "0.13", default-features = false, features = ["rustls", "json", "query"] }
 wiremock    = "0.6"
 
