@@ -176,7 +176,12 @@ fn docker_surface_subcommands_parse() {
             image: "alpine:3.20".to_owned(),
             name: Some("demo".to_owned()),
             from_binary: None,
+            from_release: None,
             watch: false,
+            env: vec![],
+            volume: vec![],
+            network: None,
+            user: None,
         }
     );
 
@@ -199,6 +204,8 @@ fn docker_surface_subcommands_parse() {
             tag: Some("demo:portl".to_owned()),
             push: true,
             init_shim: true,
+            from_binary: None,
+            from_release: None,
         }
     );
 }

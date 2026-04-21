@@ -105,7 +105,7 @@ impl Bootstrapper for DockerBootstrapper {
             Err(err) if is_conflict_docker(&err) => {
                 cleanup.best_effort();
                 bail!(
-                    "container '{}' already exists; remove it first with `portl docker container rm {}` or pass --rm-existing",
+                    "container '{}' already exists; remove it first with `portl docker rm {}` or pass --rm-existing",
                     spec.name,
                     spec.name
                 );

@@ -198,16 +198,16 @@ jobs:
           PORTL_HOME: /tmp/portl-home
         run: |
           export PORTL_HOME=$(mktemp -d)
-          ./target/release/portl id new
-          ./target/release/portl docker container add t1 --image portl-agent:ci
-          ./target/release/portl docker container add t2 --image portl-agent:ci
+          ./target/release/portl init
+          ./target/release/portl docker run portl-agent:ci --name t1
+          ./target/release/portl docker run portl-agent:ci --name t2
 
           # ticket/v1 + shell/v1 via exec
           ./target/release/portl exec t1 -- echo hi
           ./target/release/portl exec t2 -- sh -c 'exit 42' && exit 1 || true
 
-          # shell/v1 via PTY — use -c to avoid raw-mode issues in CI
-          ./target/release/portl shell t1 -- -c 'ls /tmp' || true
+          # shell/v1 smoke via a simple non-PTY exec in CI
+          ./target/release/portl exec t1 -- sh -lc 'ls /tmp' || true
 
           # tcp/v1 — start an http server in t1, forward, curl
           ./target/release/portl exec t1 -- sh -c '(python3 -m http.server 8080 &) && sleep 1' &
@@ -218,8 +218,8 @@ jobs:
 
           # cleanup
           pkill -f "portl tcp" || true
-          ./target/release/portl docker container rm t1 --force
-          ./target/release/portl docker container rm t2 --force
+          ./target/release/portl docker rm t1 --force
+          ./target/release/portl docker rm t2 --force
 
   # ─────────────────────────── Release jobs ───────────────────────────
   # Fire only on tag pushes (v*). Gated on every CI job above being

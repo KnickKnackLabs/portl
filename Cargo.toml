@@ -79,7 +79,9 @@ humantime   = "2"
 nix         = { version = "0.30", features = ["fs", "poll", "process", "resource", "signal", "term", "user"] }
 async-trait = "0.1"
 bollard     = "0.17"
-reqwest     = { version = "0.13", default-features = false, features = ["rustls", "json", "query"] }
+reqwest     = { version = "0.13", default-features = false, features = ["rustls", "json", "query", "blocking"] }
+tar         = "0.4"
+zstd        = "0.13"
 wiremock    = "0.6"
 
 [workspace.lints.rust]

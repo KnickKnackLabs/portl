@@ -10,12 +10,15 @@ use async_trait::async_trait;
 use bollard::Docker;
 use bollard::container::{
     Config, CreateContainerOptions, InspectContainerOptions, StartContainerOptions,
+    UploadToContainerOptions,
 };
-use bollard::exec::{CreateExecOptions, StartExecOptions};
+use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
 use bollard::models::ContainerInspectResponse;
+use bollard::system::EventsOptions;
+use bytes::Bytes;
 use docker_portl::{ADAPTER_NAME, DockerBootstrapper};
-use futures_util::stream::TryStreamExt;
+use futures_util::stream::{BoxStream, StreamExt, TryStreamExt};
 use iroh_tickets::Ticket;
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
@@ -29,46 +32,80 @@ use serde::Deserialize;
 
 use crate::alias_store::{AliasRecord, AliasStore, StoredSpec, now_unix_secs};
 use crate::commands::mint_root::{parse_caps, parse_ttl};
+use crate::release_binary;
 
 const DEFAULT_NETWORK: &str = "bridge";
 const DEFAULT_AGENT_CAPS: &str = "all";
 const DEFAULT_TTL: &str = "30d";
+const READY_LOG_TOKEN: &str = "portl-agent listening";
 const INJECTION_PATHS: [&str; 3] = [
     "/usr/local/bin/portl-agent",
     "/tmp/portl-agent",
     "/dev/shm/portl-agent",
 ];
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     image: &str,
     name: Option<&str>,
     from_binary: Option<&Path>,
+    from_release: Option<&str>,
     watch: bool,
+    env: &[String],
+    volume: &[String],
+    network: Option<&str>,
+    user: Option<&str>,
 ) -> Result<ExitCode> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
         let operator = store::load(&store::default_path()).context("load operator identity")?;
         let docker = RealDockerOps::connect()?;
         let host = RealHostOps;
-        let outcome = orchestrate_run(&docker, &host, image, name, from_binary, &operator).await?;
+        let binary_source = resolve_binary_source(from_binary, from_release)?;
+        let runtime = RunRuntimeSpec {
+            env: env.to_vec(),
+            volume: volume.to_vec(),
+            network: network.map(str::to_owned),
+            user: user.map(str::to_owned),
+        };
+        let outcome = orchestrate_run(
+            &docker,
+            &host,
+            image,
+            name,
+            &binary_source,
+            &runtime,
+            &operator,
+        )
+        .await?;
         save_injected_alias(&outcome)?;
-        if watch {
-            eprintln!(
-                "warning: `portl docker run --watch` is not implemented yet; continuing without a watch loop"
-            );
-        }
         println!("{}", outcome.plan.ticket.serialize());
+        if watch {
+            watch_container_restarts(
+                &docker,
+                &host,
+                &outcome.container.id,
+                &binary_source,
+                &operator,
+            )
+            .await?;
+        }
         Ok(ExitCode::SUCCESS)
     })
 }
 
-pub fn attach(container: &str, from_binary: Option<&Path>) -> Result<ExitCode> {
+pub fn attach(
+    container: &str,
+    from_binary: Option<&Path>,
+    from_release: Option<&str>,
+) -> Result<ExitCode> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
         let operator = store::load(&store::default_path()).context("load operator identity")?;
         let docker = RealDockerOps::connect()?;
         let host = RealHostOps;
-        let outcome = attach_existing(&docker, &host, container, from_binary, &operator).await?;
+        let binary_source = resolve_binary_source(from_binary, from_release)?;
+        let outcome = attach_existing(&docker, &host, container, &binary_source, &operator).await?;
         save_injected_alias(&outcome)?;
         println!("{}", outcome.plan.ticket.serialize());
         Ok(ExitCode::SUCCESS)
@@ -91,9 +128,20 @@ pub fn bake(
     tag: Option<&str>,
     push: bool,
     init_shim: bool,
+    from_binary: Option<&Path>,
+    from_release: Option<&str>,
 ) -> Result<ExitCode> {
     let ops = RealBakeOps;
-    bake_with(&ops, base_image, output, tag, push, init_shim)?;
+    let binary_source = resolve_binary_source(from_binary, from_release)?;
+    bake_with(
+        &ops,
+        base_image,
+        output,
+        tag,
+        push,
+        init_shim,
+        &binary_source,
+    )?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -230,6 +278,26 @@ struct ExecSnapshot {
     exit_code: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BinarySource {
+    CurrentExecutable,
+    ExplicitPath(PathBuf),
+    ReleaseTag(String),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RunRuntimeSpec {
+    env: Vec<String>,
+    volume: Vec<String>,
+    network: Option<String>,
+    user: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContainerEvent {
+    action: String,
+}
+
 trait HostOps {
     fn current_exe(&self) -> Result<PathBuf>;
     fn host_os(&self) -> &'static str;
@@ -289,6 +357,7 @@ trait DockerOps {
         image: &str,
         name: Option<&str>,
         labels: &HashMap<String, String>,
+        runtime: &RunRuntimeSpec,
     ) -> Result<String>;
     async fn start_container(&self, container: &str) -> Result<()>;
     async fn inspect_container(&self, container: &str) -> Result<ContainerSnapshot>;
@@ -299,8 +368,12 @@ trait DockerOps {
         cmd: Vec<String>,
         env: Vec<String>,
     ) -> Result<String>;
-    async fn start_exec_detached(&self, exec_id: &str) -> Result<()>;
+    async fn start_exec_with_logs(
+        &self,
+        exec_id: &str,
+    ) -> Result<BoxStream<'static, Result<String>>>;
     async fn inspect_exec(&self, exec_id: &str) -> Result<ExecSnapshot>;
+    fn container_events(&self, container: &str) -> BoxStream<'static, Result<ContainerEvent>>;
 }
 
 struct RealDockerOps {
@@ -338,10 +411,21 @@ impl DockerOps for RealDockerOps {
         image: &str,
         name: Option<&str>,
         labels: &HashMap<String, String>,
+        runtime: &RunRuntimeSpec,
     ) -> Result<String> {
+        let host_config = (!runtime.volume.is_empty() || runtime.network.is_some()).then(|| {
+            bollard::models::HostConfig {
+                binds: (!runtime.volume.is_empty()).then_some(runtime.volume.clone()),
+                network_mode: runtime.network.clone(),
+                ..bollard::models::HostConfig::default()
+            }
+        });
         let config = Config::<String> {
             image: Some(image.to_owned()),
             labels: Some(labels.clone()),
+            env: (!runtime.env.is_empty()).then_some(runtime.env.clone()),
+            user: runtime.user.clone(),
+            host_config,
             ..Config::default()
         };
         let options = name.map(|name| CreateContainerOptions {
@@ -372,24 +456,47 @@ impl DockerOps for RealDockerOps {
     }
 
     async fn copy_file(&self, source: &Path, container: &str, dest: &Path) -> Result<()> {
-        let source = source
-            .to_str()
-            .ok_or_else(|| anyhow!("binary path is not valid UTF-8: {}", source.display()))?;
-        let dest = dest
-            .to_str()
-            .ok_or_else(|| anyhow!("container path is not valid UTF-8: {}", dest.display()))?;
-        let output = ProcessCommand::new("docker")
-            .args(["cp", source, &format!("{container}:{dest}")])
-            .output()
-            .context("run docker cp")?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            bail!(
-                "docker cp to {dest} failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )
+        let bytes = fs::read(source).with_context(|| format!("read {}", source.display()))?;
+        let metadata =
+            fs::metadata(source).with_context(|| format!("stat {}", source.display()))?;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            header.set_mode(metadata.permissions().mode());
         }
+        #[cfg(not(unix))]
+        {
+            header.set_mode(0o755);
+        }
+        header.set_cksum();
+        let parent = dest.parent().unwrap_or_else(|| Path::new("/"));
+        let entry_name = dest.file_name().ok_or_else(|| {
+            anyhow!(
+                "container path must include a file name: {}",
+                dest.display()
+            )
+        })?;
+        let mut tarball = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tarball);
+            builder
+                .append_data(&mut header, entry_name, bytes.as_slice())
+                .with_context(|| format!("build tar entry for {}", dest.display()))?;
+            builder.finish().context("finish upload tarball")?;
+        }
+        self.docker
+            .upload_to_container(
+                container,
+                Some(UploadToContainerOptions {
+                    path: parent.display().to_string(),
+                    ..UploadToContainerOptions::default()
+                }),
+                Bytes::from(tarball),
+            )
+            .await
+            .with_context(|| format!("upload {} into {}", source.display(), dest.display()))
     }
 
     async fn create_exec(
@@ -402,8 +509,8 @@ impl DockerOps for RealDockerOps {
             .create_exec(
                 container,
                 CreateExecOptions {
-                    attach_stdout: Some(false),
-                    attach_stderr: Some(false),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
                     env: Some(env),
                     cmd: Some(cmd),
                     ..CreateExecOptions::default()
@@ -414,19 +521,31 @@ impl DockerOps for RealDockerOps {
             .map(|created| created.id)
     }
 
-    async fn start_exec_detached(&self, exec_id: &str) -> Result<()> {
-        self.docker
+    async fn start_exec_with_logs(
+        &self,
+        exec_id: &str,
+    ) -> Result<BoxStream<'static, Result<String>>> {
+        let output = self
+            .docker
             .start_exec(
                 exec_id,
                 Some(StartExecOptions {
-                    detach: true,
+                    detach: false,
                     tty: false,
                     output_capacity: None,
                 }),
             )
             .await
             .with_context(|| format!("start injected exec {exec_id}"))?;
-        Ok(())
+        match output {
+            StartExecResults::Attached { output, .. } => Ok(Box::pin(output.map(|item| {
+                item.map(|line| line.to_string())
+                    .map_err(anyhow::Error::from)
+            }))),
+            StartExecResults::Detached => {
+                bail!("docker returned detached exec output for {exec_id}")
+            }
+        }
     }
 
     async fn inspect_exec(&self, exec_id: &str) -> Result<ExecSnapshot> {
@@ -441,6 +560,31 @@ impl DockerOps for RealDockerOps {
             exit_code: inspect.exit_code,
         })
     }
+
+    fn container_events(&self, container: &str) -> BoxStream<'static, Result<ContainerEvent>> {
+        let mut filters = HashMap::new();
+        filters.insert("type".to_owned(), vec!["container".to_owned()]);
+        filters.insert("container".to_owned(), vec![container.to_owned()]);
+        filters.insert(
+            "event".to_owned(),
+            vec!["die".to_owned(), "start".to_owned()],
+        );
+        let docker = self.docker.clone();
+        Box::pin(
+            docker
+                .events(Some(EventsOptions::<String> {
+                    since: None,
+                    until: None,
+                    filters,
+                }))
+                .map(|event| {
+                    let event = event.context("stream docker events")?;
+                    Ok(ContainerEvent {
+                        action: event.action.unwrap_or_default(),
+                    })
+                }),
+        )
+    }
 }
 
 async fn orchestrate_run<D: DockerOps, H: HostOps>(
@@ -448,7 +592,8 @@ async fn orchestrate_run<D: DockerOps, H: HostOps>(
     host: &H,
     image: &str,
     name: Option<&str>,
-    from_binary: Option<&Path>,
+    binary_source: &BinarySource,
+    runtime: &RunRuntimeSpec,
     operator: &Identity,
 ) -> Result<InjectionOutcome> {
     let plan = prepare_injection_plan(operator)?;
@@ -457,17 +602,19 @@ async fn orchestrate_run<D: DockerOps, H: HostOps>(
         ("portl.endpoint_id".to_owned(), plan.endpoint_id_hex.clone()),
     ]);
     docker.ensure_image(image).await?;
-    let container_id = docker.create_container(image, name, &labels).await?;
+    let container_id = docker
+        .create_container(image, name, &labels, runtime)
+        .await?;
     docker.start_container(&container_id).await?;
     let container = docker.inspect_container(&container_id).await?;
-    inject_container(docker, host, container, from_binary, operator, plan).await
+    inject_container(docker, host, container, binary_source, operator, plan).await
 }
 
 async fn attach_existing<D: DockerOps, H: HostOps>(
     docker: &D,
     host: &H,
     container: &str,
-    from_binary: Option<&Path>,
+    binary_source: &BinarySource,
     operator: &Identity,
 ) -> Result<InjectionOutcome> {
     let snapshot = docker.inspect_container(container).await?;
@@ -478,14 +625,14 @@ async fn attach_existing<D: DockerOps, H: HostOps>(
         );
     }
     let plan = prepare_injection_plan(operator)?;
-    inject_container(docker, host, snapshot, from_binary, operator, plan).await
+    inject_container(docker, host, snapshot, binary_source, operator, plan).await
 }
 
 async fn inject_container<D: DockerOps, H: HostOps>(
     docker: &D,
     host: &H,
     container: ContainerSnapshot,
-    from_binary: Option<&Path>,
+    binary_source: &BinarySource,
     operator: &Identity,
     plan: InjectionPlan,
 ) -> Result<InjectionOutcome> {
@@ -495,7 +642,7 @@ async fn inject_container<D: DockerOps, H: HostOps>(
             container.name
         );
     }
-    let binary = resolve_binary_source(host, from_binary, &container)?;
+    let binary = resolve_binary_path(host, binary_source, &container)?;
     let binary_path = copy_binary_with_fallback(docker, &binary, &container.id).await?;
     let exec_env = injected_agent_env(&plan.identity, operator);
     let exec_id = docker
@@ -505,8 +652,8 @@ async fn inject_container<D: DockerOps, H: HostOps>(
             exec_env,
         )
         .await?;
-    docker.start_exec_detached(&exec_id).await?;
-    wait_for_agent_start(docker, &exec_id).await?;
+    let logs = docker.start_exec_with_logs(&exec_id).await?;
+    wait_for_agent_start(docker, &exec_id, logs).await?;
     Ok(InjectionOutcome {
         container,
         binary_path,
@@ -533,6 +680,10 @@ async fn detach_saved_container<D: DockerOps, H: HostOps>(
             alias.name
         )
     })?;
+
+    if host.host_os() != "linux" {
+        bail!("detaching injected docker agents is currently supported on Linux hosts only");
+    }
 
     if let Ok(exec) = docker.inspect_exec(exec_id).await
         && exec.running
@@ -581,25 +732,42 @@ fn prepare_injection_plan(operator: &Identity) -> Result<InjectionPlan> {
     })
 }
 
-fn resolve_binary_source<H: HostOps>(
-    host: &H,
+fn resolve_binary_source(
     from_binary: Option<&Path>,
+    from_release: Option<&str>,
+) -> Result<BinarySource> {
+    match (from_binary, from_release) {
+        (Some(path), None) => Ok(BinarySource::ExplicitPath(path.to_path_buf())),
+        (None, Some(tag)) => Ok(BinarySource::ReleaseTag(tag.to_owned())),
+        (None, None) => Ok(BinarySource::CurrentExecutable),
+        (Some(_), Some(_)) => bail!("choose only one of --from-binary or --from-release"),
+    }
+}
+
+fn resolve_binary_path<H: HostOps>(
+    host: &H,
+    source: &BinarySource,
     container: &ContainerSnapshot,
 ) -> Result<PathBuf> {
-    if from_binary.is_none() && !platform_matches(host.host_os(), host.host_arch(), container) {
-        let target_os = container.target_os.as_deref().unwrap_or("unknown");
-        let target_arch = container.target_arch.as_deref().unwrap_or("unknown");
-        bail!(
-            "container '{}' targets {target_os}/{target_arch}, but the running CLI is {}/{}; pass --from-binary <linux-portl-agent> or use `portl docker bake`",
-            container.name,
-            host.host_os(),
-            host.host_arch()
-        );
+    let target_os = container.target_os.as_deref().unwrap_or("unknown");
+    let target_arch = container.target_arch.as_deref().unwrap_or("unknown");
+    match source {
+        BinarySource::ExplicitPath(path) => Ok(path.clone()),
+        BinarySource::ReleaseTag(tag) => {
+            release_binary::download_release_binary(tag, target_os, target_arch)
+        }
+        BinarySource::CurrentExecutable => {
+            if !platform_matches(host.host_os(), host.host_arch(), container) {
+                bail!(
+                    "container '{}' targets {target_os}/{target_arch}, but the running CLI is {}/{}; pass --from-release <tag>, --from-binary <linux-portl-agent>, or use `portl docker bake`",
+                    container.name,
+                    host.host_os(),
+                    host.host_arch()
+                );
+            }
+            host.current_exe()
+        }
     }
-
-    from_binary
-        .map(Path::to_path_buf)
-        .map_or_else(|| host.current_exe(), Ok)
 }
 
 fn platform_matches(host_os: &str, host_arch: &str, container: &ContainerSnapshot) -> bool {
@@ -662,20 +830,81 @@ fn injected_agent_env(identity: &Identity, operator: &Identity) -> Vec<String> {
     ]
 }
 
-async fn wait_for_agent_start<D: DockerOps>(docker: &D, exec_id: &str) -> Result<()> {
+async fn wait_for_agent_start<D: DockerOps>(
+    docker: &D,
+    exec_id: &str,
+    mut logs: BoxStream<'static, Result<String>>,
+) -> Result<()> {
+    let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        while let Some(line) = logs.next().await {
+            match line {
+                Ok(line) if line.contains(READY_LOG_TOKEN) => {
+                    let _ = ready_tx.send(true);
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    });
+
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let exec = docker.inspect_exec(exec_id).await?;
-        if exec.running {
-            return Ok(());
+        tokio::select! {
+            changed = ready_rx.changed() => {
+                if changed.is_ok() && *ready_rx.borrow() {
+                    return Ok(());
+                }
+            }
+            () = tokio::time::sleep(Duration::from_millis(200)) => {
+                let exec = docker.inspect_exec(exec_id).await?;
+                if let Some(code) = exec.exit_code {
+                    bail!("injected agent exited before becoming ready (exit code {code})");
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    bail!("injected agent did not report readiness within 5s");
+                }
+            }
         }
-        if let Some(code) = exec.exit_code {
-            bail!("injected agent exited before becoming ready (exit code {code})");
+    }
+}
+
+async fn watch_container_restarts<D: DockerOps, H: HostOps>(
+    docker: &D,
+    host: &H,
+    container: &str,
+    binary_source: &BinarySource,
+    operator: &Identity,
+) -> Result<()> {
+    let mut events = docker.container_events(container);
+    let mut needs_reinject = false;
+    loop {
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                signal.context("wait for ctrl-c")?;
+                return Ok(());
+            }
+            event = events.next() => match event {
+                Some(Ok(ContainerEvent { action })) => match action.as_str() {
+                    "die" => needs_reinject = true,
+                    "start" if needs_reinject => {
+                        match attach_existing(docker, host, container, binary_source, operator).await {
+                            Ok(outcome) => {
+                                save_injected_alias(&outcome)?;
+                                println!("{}", outcome.plan.ticket.serialize());
+                                needs_reinject = false;
+                            }
+                            Err(err) => {
+                                eprintln!("warning: failed to re-inject after container restart: {err:#}");
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                Some(Err(err)) => return Err(err),
+                None => return Ok(()),
+            }
         }
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -713,6 +942,8 @@ impl BakeOps for RealBakeOps {
         Ok(ImageMetadata {
             entrypoint: inspected.config.entrypoint,
             cmd: inspected.config.cmd,
+            os: inspected.os,
+            architecture: inspected.architecture,
         })
     }
 
@@ -752,12 +983,18 @@ impl BakeOps for RealBakeOps {
 struct ImageMetadata {
     entrypoint: Vec<String>,
     cmd: Vec<String>,
+    os: Option<String>,
+    architecture: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct DockerImageInspect {
+    #[serde(rename = "Architecture")]
+    architecture: Option<String>,
     #[serde(rename = "Config")]
     config: DockerImageConfig,
+    #[serde(rename = "Os")]
+    os: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -781,6 +1018,7 @@ fn bake_with<O: BakeOps>(
     tag: Option<&str>,
     push: bool,
     init_shim: bool,
+    binary_source: &BinarySource,
 ) -> Result<()> {
     if push && tag.is_none() {
         bail!("`--push` requires `--tag <image>`");
@@ -789,10 +1027,9 @@ fn bake_with<O: BakeOps>(
         bail!("choose either `--output DIR` or `--tag <image>` for `portl docker bake`");
     }
 
-    let metadata = init_shim
-        .then(|| ops.inspect_image(base_image))
-        .transpose()?;
-    let context = render_bake_context(base_image, metadata.as_ref(), init_shim)?;
+    let metadata = ops.inspect_image(base_image)?;
+    let binary = resolve_bake_binary(ops, binary_source, &metadata, base_image)?;
+    let context = render_bake_context(base_image, Some(&metadata), init_shim)?;
 
     let owned_output;
     let context_dir = if let Some(output) = output {
@@ -801,7 +1038,7 @@ fn bake_with<O: BakeOps>(
         owned_output = temp_bake_dir()?;
         owned_output
     };
-    write_bake_context(&context_dir, &context, &ops.current_exe()?)?;
+    write_bake_context(&context_dir, &context, &binary)?;
 
     if let Some(tag) = tag {
         ops.build_image(&context_dir, tag)?;
@@ -860,6 +1097,45 @@ fn render_init_shim(metadata: &ImageMetadata) -> String {
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn resolve_bake_binary<O: BakeOps>(
+    ops: &O,
+    source: &BinarySource,
+    metadata: &ImageMetadata,
+    base_image: &str,
+) -> Result<PathBuf> {
+    let target = ContainerSnapshot {
+        id: String::new(),
+        name: base_image.to_owned(),
+        image: base_image.to_owned(),
+        network: DEFAULT_NETWORK.to_owned(),
+        running: false,
+        pid: None,
+        target_os: metadata.os.clone(),
+        target_arch: metadata.architecture.clone(),
+    };
+    match source {
+        BinarySource::ExplicitPath(path) => Ok(path.clone()),
+        BinarySource::ReleaseTag(tag) => release_binary::download_release_binary(
+            tag,
+            target.target_os.as_deref().unwrap_or("unknown"),
+            target.target_arch.as_deref().unwrap_or("unknown"),
+        ),
+        BinarySource::CurrentExecutable => {
+            if !platform_matches(std::env::consts::OS, std::env::consts::ARCH, &target) {
+                bail!(
+                    "image '{}' targets {}/{}, but the running CLI is {}/{}; pass --from-release <tag> or --from-binary <path>",
+                    base_image,
+                    target.target_os.as_deref().unwrap_or("unknown"),
+                    target.target_arch.as_deref().unwrap_or("unknown"),
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                );
+            }
+            ops.current_exe()
+        }
+    }
 }
 
 fn write_bake_context(context_dir: &Path, context: &BakeContext, binary: &Path) -> Result<()> {
@@ -1126,9 +1402,12 @@ mod tests {
         }
 
         fn inspect_image(&self, _image: &str) -> Result<ImageMetadata> {
-            self.metadata
-                .clone()
-                .ok_or_else(|| anyhow!("missing image metadata"))
+            Ok(self.metadata.clone().unwrap_or(ImageMetadata {
+                entrypoint: Vec::new(),
+                cmd: Vec::new(),
+                os: Some(normalize_os(std::env::consts::OS).to_owned()),
+                architecture: Some(normalize_arch(std::env::consts::ARCH).to_owned()),
+            }))
         }
 
         fn build_image(&self, context_dir: &Path, tag: &str) -> Result<()> {
@@ -1153,6 +1432,9 @@ mod tests {
         exec_id: String,
         recorded_exec_cmd: Mutex<Option<Vec<String>>>,
         recorded_exec_env: Mutex<Option<Vec<String>>>,
+        recorded_runtime: Mutex<Option<RunRuntimeSpec>>,
+        start_logs: Mutex<Vec<String>>,
+        events: Mutex<Vec<ContainerEvent>>,
     }
 
     impl MockDockerOps {
@@ -1175,6 +1457,9 @@ mod tests {
                 exec_id: "exec-1".to_owned(),
                 recorded_exec_cmd: Mutex::new(None),
                 recorded_exec_env: Mutex::new(None),
+                recorded_runtime: Mutex::new(None),
+                start_logs: Mutex::new(vec![READY_LOG_TOKEN.to_owned()]),
+                events: Mutex::new(Vec::new()),
             }
         }
 
@@ -1208,11 +1493,13 @@ mod tests {
             image: &str,
             name: Option<&str>,
             _labels: &HashMap<String, String>,
+            runtime: &RunRuntimeSpec,
         ) -> Result<String> {
             self.actions
                 .lock()
                 .expect("lock")
                 .push(format!("create:{image}:{}", name.unwrap_or("<auto>")));
+            *self.recorded_runtime.lock().expect("lock") = Some(runtime.clone());
             Ok("demo-id".to_owned())
         }
 
@@ -1268,12 +1555,18 @@ mod tests {
             Ok(self.exec_id.clone())
         }
 
-        async fn start_exec_detached(&self, exec_id: &str) -> Result<()> {
+        async fn start_exec_with_logs(
+            &self,
+            exec_id: &str,
+        ) -> Result<BoxStream<'static, Result<String>>> {
             self.actions
                 .lock()
                 .expect("lock")
                 .push(format!("start-exec:{exec_id}"));
-            Ok(())
+            let logs = self.start_logs.lock().expect("lock").clone();
+            Ok(Box::pin(futures_util::stream::iter(
+                logs.into_iter().map(Ok::<_, anyhow::Error>),
+            )))
         }
 
         async fn inspect_exec(&self, exec_id: &str) -> Result<ExecSnapshot> {
@@ -1287,6 +1580,13 @@ mod tests {
                 .get(exec_id)
                 .cloned()
                 .ok_or_else(|| anyhow!("missing exec {exec_id}"))
+        }
+
+        fn container_events(&self, _container: &str) -> BoxStream<'static, Result<ContainerEvent>> {
+            let events = self.events.lock().expect("lock").clone();
+            Box::pin(futures_util::stream::iter(
+                events.into_iter().map(Ok::<_, anyhow::Error>),
+            ))
         }
     }
 
@@ -1320,7 +1620,8 @@ mod tests {
             &host,
             "alpine:3.20",
             Some("demo"),
-            None,
+            &BinarySource::CurrentExecutable,
+            &RunRuntimeSpec::default(),
             &operator(),
         )
         .await
@@ -1351,6 +1652,60 @@ mod tests {
                 .iter()
                 .any(|entry| entry.starts_with("PORTL_TRUST_ROOTS="))
         );
+    }
+
+    #[tokio::test]
+    async fn docker_run_threads_passthrough_runtime_settings() {
+        let dir = tempdir().expect("tempdir");
+        let binary = dir.path().join("portl");
+        fs::write(&binary, b"portl").expect("write binary");
+        let host = MockHostOps::with_current_exe(binary);
+        let docker = MockDockerOps::new(running_container());
+        let runtime = RunRuntimeSpec {
+            env: vec!["FOO=bar".to_owned()],
+            volume: vec!["/host:/container:ro".to_owned()],
+            network: Some("demo-net".to_owned()),
+            user: Some("1000:1000".to_owned()),
+        };
+
+        orchestrate_run(
+            &docker,
+            &host,
+            "alpine:3.20",
+            Some("demo"),
+            &BinarySource::CurrentExecutable,
+            &runtime,
+            &operator(),
+        )
+        .await
+        .expect("orchestrate run");
+
+        assert_eq!(
+            docker.recorded_runtime.lock().expect("lock").clone(),
+            Some(runtime)
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_agent_start_waits_for_readiness_log() {
+        let docker = MockDockerOps::new(running_container());
+        let started = tokio::time::Instant::now();
+        let logs = Box::pin(futures_util::stream::unfold(0_u8, |state| async move {
+            match state {
+                0 => Some((Ok::<_, anyhow::Error>("booting".to_owned()), 1)),
+                1 => {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    Some((Ok::<_, anyhow::Error>(READY_LOG_TOKEN.to_owned()), 2))
+                }
+                _ => None,
+            }
+        }));
+
+        wait_for_agent_start(&docker, "exec-1", logs)
+            .await
+            .expect("wait for readiness");
+
+        assert!(started.elapsed() >= Duration::from_millis(200));
     }
 
     #[tokio::test]
@@ -1394,8 +1749,10 @@ mod tests {
             ..running_container()
         };
 
-        let err = resolve_binary_source(&host, None, &foreign).expect_err("foreign arch must fail");
+        let err = resolve_binary_path(&host, &BinarySource::CurrentExecutable, &foreign)
+            .expect_err("foreign arch must fail");
         assert!(err.to_string().contains("--from-binary"));
+        assert!(err.to_string().contains("--from-release"));
         assert!(err.to_string().contains("portl docker bake"));
     }
 
@@ -1416,10 +1773,16 @@ mod tests {
             .expect("lock")
             .insert(stopped.name.clone(), stopped.clone());
 
-        let err = attach_existing(&docker, &host, &stopped.name, None, &operator())
-            .await
-            .err()
-            .expect("stopped container must fail");
+        let err = attach_existing(
+            &docker,
+            &host,
+            &stopped.name,
+            &BinarySource::CurrentExecutable,
+            &operator(),
+        )
+        .await
+        .err()
+        .expect("stopped container must fail");
         assert!(err.to_string().contains("is not running"));
     }
 
@@ -1454,7 +1817,11 @@ mod tests {
             .expect("save alias");
 
         let docker = MockDockerOps::new(running_container());
-        let host = MockHostOps::default();
+        let host = MockHostOps {
+            host_os: "linux",
+            host_arch: std::env::consts::ARCH,
+            ..MockHostOps::default()
+        };
         detach_saved_container(&docker, &host, &store, "demo")
             .await
             .expect("detach container");
@@ -1465,6 +1832,49 @@ mod tests {
             vec![(99, PathBuf::from(INJECTION_PATHS[1]))]
         );
         assert!(store.get("demo").expect("read alias").is_none());
+    }
+
+    #[tokio::test]
+    async fn detach_refuses_non_linux_hosts_before_touching_exec_pid() {
+        let dir = tempdir().expect("tempdir");
+        let store = AliasStore::new(dir.path().join("aliases.json"));
+        store
+            .save(
+                &AliasRecord {
+                    name: "demo".to_owned(),
+                    adapter: ADAPTER_NAME.to_owned(),
+                    container_id: "demo-id".to_owned(),
+                    endpoint_id: "endpoint".to_owned(),
+                    image: "alpine:3.20".to_owned(),
+                    network: "bridge".to_owned(),
+                    created_at: 1,
+                },
+                &StoredSpec {
+                    caps: parse_caps(DEFAULT_AGENT_CAPS).expect("caps"),
+                    ttl_secs: parse_ttl(DEFAULT_TTL).expect("ttl"),
+                    to: None,
+                    labels: vec![],
+                    root_ticket_id: None,
+                    ticket_file_path: None,
+                    group_name: None,
+                    base_url: None,
+                    docker_exec_id: Some("exec-1".to_owned()),
+                    docker_injected_binary_path: Some(PathBuf::from(INJECTION_PATHS[1])),
+                },
+            )
+            .expect("save alias");
+
+        let docker = MockDockerOps::new(running_container());
+        let host = MockHostOps {
+            host_os: "macos",
+            host_arch: std::env::consts::ARCH,
+            ..MockHostOps::default()
+        };
+        let err = detach_saved_container(&docker, &host, &store, "demo")
+            .await
+            .expect_err("non-linux host must be refused");
+        assert!(err.to_string().contains("Linux hosts only"));
+        assert!(host.killed_pids.lock().expect("lock").is_empty());
     }
 
     #[test]
@@ -1478,7 +1888,16 @@ mod tests {
             ..MockBakeOps::default()
         };
 
-        bake_with(&ops, "alpine:3.20", Some(&output), None, false, false).expect("bake output");
+        bake_with(
+            &ops,
+            "alpine:3.20",
+            Some(&output),
+            None,
+            false,
+            false,
+            &BinarySource::CurrentExecutable,
+        )
+        .expect("bake output");
 
         let dockerfile = fs::read_to_string(output.join("Dockerfile")).expect("read Dockerfile");
         assert!(dockerfile.contains("FROM alpine:3.20"));
@@ -1499,11 +1918,22 @@ mod tests {
             metadata: Some(ImageMetadata {
                 entrypoint: vec!["/usr/local/bin/app".to_owned(), "--serve".to_owned()],
                 cmd: vec!["8080".to_owned()],
+                os: Some(normalize_os(std::env::consts::OS).to_owned()),
+                architecture: Some(normalize_arch(std::env::consts::ARCH).to_owned()),
             }),
             ..MockBakeOps::default()
         };
 
-        bake_with(&ops, "alpine:3.20", Some(&output), None, false, true).expect("bake init shim");
+        bake_with(
+            &ops,
+            "alpine:3.20",
+            Some(&output),
+            None,
+            false,
+            true,
+            &BinarySource::CurrentExecutable,
+        )
+        .expect("bake init shim");
 
         let dockerfile = fs::read_to_string(output.join("Dockerfile")).expect("read Dockerfile");
         let wrapper = fs::read_to_string(output.join("portl-init-shim")).expect("read wrapper");
@@ -1527,8 +1957,16 @@ mod tests {
             ..MockBakeOps::default()
         };
 
-        bake_with(&ops, "alpine:3.20", None, Some("demo:portl"), false, false)
-            .expect("bake tag mode");
+        bake_with(
+            &ops,
+            "alpine:3.20",
+            None,
+            Some("demo:portl"),
+            false,
+            false,
+            &BinarySource::CurrentExecutable,
+        )
+        .expect("bake tag mode");
 
         let builds = ops.builds.lock().expect("lock");
         assert_eq!(builds.len(), 1);

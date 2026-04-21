@@ -2,7 +2,6 @@ pub mod agent;
 pub mod docker;
 pub mod doctor;
 pub mod exec;
-pub mod id;
 pub mod init;
 pub mod install;
 pub mod mint_root;

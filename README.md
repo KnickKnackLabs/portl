@@ -11,11 +11,10 @@ and (opt-in) Mainline DHT services.
 
 ## Status
 
-**v0.1.0** — first end-to-end release. Ticket-based authentication,
-shell/tcp/udp forwarding, reference adapters for Docker and Slicer, a
-local `portl doctor`, and on-socket Prometheus metrics are all in
-place. The quickstart below works on macOS (with OrbStack or Docker
-Desktop) and Linux.
+**v0.2.0** — operability release. The operator flow is now `portl init`
+followed by `portl docker run <image>` or `portl slicer run <image>`.
+Runtime orchestration, install targets, local revocation propagation,
+and the collapsed CLI surface are all in place.
 
 ## Quickstart (Docker adapter)
 
@@ -26,10 +25,10 @@ cd portl
 cargo install --path crates/portl-cli
 
 # One-time setup:
-portl id new
+portl init
 
 # Spin up an ephemeral container + mint a ticket:
-portl docker container add demo
+portl docker run alpine:3.20 --name demo
 
 # Open a shell:
 portl exec demo -- echo "it works"
@@ -44,17 +43,17 @@ portl udp demo -L 60000:127.0.0.1:60000
 portl doctor
 
 # Tear down:
-portl docker container rm demo --force
+portl docker rm demo --force
 ```
 
-From `portl docker container add` to a working shell is typically
-under 3 seconds on a warm image; 10 seconds on first pull.
+From `portl docker run` to a working shell is typically under 3
+seconds on a warm image; 10 seconds on first pull.
 
 ## Ticket model
 
 Every remote session is gated by a postcard-encoded
 `portl` ticket (see
-[`docs/design/030-tickets.md`](docs/design/030-tickets.md)). Tickets
+[`docs/specs/030-tickets.md`](docs/specs/030-tickets.md)). Tickets
 are ed25519-signed, narrow-by-construction, and support up to 8 hops
 of delegation. The in-session pipeline does postcard canonical-form
 enforcement, strict `verify_strict` signature check, re-encode
@@ -74,18 +73,18 @@ for 30 days; delegate variants narrow further.
   roaming-aware apps like mosh.
 
 Full wire spec at
-[`docs/design/040-protocols.md`](docs/design/040-protocols.md).
+[`docs/specs/040-protocols.md`](docs/specs/040-protocols.md).
 
 ## Adapters
 
 - **`docker-portl`** — provisions an ephemeral container with the
   `portl` multicall binary and an injected per-container ed25519
   secret. Works against `dockerd` or OrbStack. See
-  [`docs/design/060-docker.md`](docs/design/060-docker.md).
+  [`docs/specs/140-v0.2-operability.md`](docs/specs/140-v0.2-operability.md).
 - **`slicer-portl`** — provisions a Slicer VM with a systemd
   `portl-agent.service`, plus a gateway mode for bridging the Slicer
   HTTP API via master tickets. See
-  [`docs/design/065-slicer.md`](docs/design/065-slicer.md).
+  [`docs/specs/065-slicer.md`](docs/specs/065-slicer.md).
 
 ## Metrics + diagnostics
 
@@ -121,7 +120,7 @@ macOS builds link only against always-present system frameworks.
 Install from a tag:
 
 ```sh
-VER=v0.1.1
+VER=v0.2.0
 TARGET=x86_64-unknown-linux-musl      # pick your target
 curl -L -o portl.tar.zst \
   https://github.com/KnickKnackLabs/portl/releases/download/$VER/portl-$VER-$TARGET.tar.zst
@@ -134,14 +133,14 @@ Tarballs are `zstd -19` compressed (~7 MiB each). Any `tar` built on
 top of GNU tar 1.31+ or bsdtar with libarchive can extract them; if
 you see `unrecognized option --zstd`, install the `zstd` package.
 
-See [`docs/design/060-docker.md §13`](docs/design/060-docker.md) for
-the reference Dockerfile — with a musl binary you can FROM
-`gcr.io/distroless/static-debian12` or even `scratch`.
+Use `portl install dockerfile --output ./portl-image --apply --yes`
+to emit a service Dockerfile and matching `portl-agent` binary for
+container-only deployments.
 
 ## Design docs
 
-Everything under [`docs/design/`](docs/design/). Start with
-[`docs/design/README.md`](docs/design/README.md) for the full reading
+Everything under [`docs/specs/`](docs/specs/). Start with
+[`docs/specs/README.md`](docs/specs/README.md) for the full reading
 order; the numbered prefixes (`010`, `020`, `030`, ...) encode the
 intended traversal.
 

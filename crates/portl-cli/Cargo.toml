@@ -31,11 +31,15 @@ postcard    = { workspace = true }
 tracing     = { workspace = true }
 tracing-subscriber = { workspace = true }
 futures-util = { workspace = true }
+bytes       = { workspace = true }
 iroh-base   = { workspace = true }
 iroh        = { workspace = true }
 iroh-tickets = { workspace = true }
 rpassword   = { workspace = true }
 hex         = { workspace = true }
+sha2        = { workspace = true }
+tar         = { workspace = true }
+zstd        = { workspace = true }
 qrcode      = { workspace = true }
 zeroize     = { workspace = true }
 humantime   = { workspace = true }

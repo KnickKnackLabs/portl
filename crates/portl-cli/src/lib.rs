@@ -9,6 +9,7 @@
 
 mod alias_store;
 mod commands;
+mod release_binary;
 
 pub use commands::init::InitRole;
 pub use commands::install::InstallTarget;
@@ -30,20 +31,6 @@ pub enum Command {
     AgentRun {
         mode: Option<AgentModeArg>,
         upstream_url: Option<String>,
-    },
-    /// Hidden compatibility path for the pre-v0.2 `id` namespace.
-    IdNew {
-        force: bool,
-    },
-    IdShow,
-    IdExport {
-        out: PathBuf,
-        passphrase_cmd: Option<String>,
-    },
-    IdImport {
-        from: PathBuf,
-        force: bool,
-        passphrase_cmd: Option<String>,
     },
     Init {
         force: bool,
@@ -92,16 +79,23 @@ pub enum Command {
         yes: bool,
         detect: bool,
         dry_run: bool,
+        output: Option<PathBuf>,
     },
     DockerRun {
         image: String,
         name: Option<String>,
         from_binary: Option<PathBuf>,
+        from_release: Option<String>,
         watch: bool,
+        env: Vec<String>,
+        volume: Vec<String>,
+        network: Option<String>,
+        user: Option<String>,
     },
     DockerAttach {
         container: String,
         from_binary: Option<PathBuf>,
+        from_release: Option<String>,
     },
     DockerDetach {
         container: String,
@@ -120,6 +114,8 @@ pub enum Command {
         tag: Option<String>,
         push: bool,
         init_shim: bool,
+        from_binary: Option<PathBuf>,
+        from_release: Option<String>,
     },
     SlicerRun {
         image: String,
@@ -136,9 +132,6 @@ pub enum Command {
     SlicerRm {
         name: String,
         base_url: Option<String>,
-    },
-    SlicerBake {
-        base_image: String,
     },
     Gateway {
         upstream_url: String,
@@ -270,17 +263,6 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
         Command::AgentRun { mode, upstream_url } => {
             commands::agent::run::run(mode, upstream_url.as_deref())
         }
-        Command::IdNew { force } => commands::id::new::run(force),
-        Command::IdShow => commands::id::show::run(),
-        Command::IdExport {
-            out,
-            passphrase_cmd,
-        } => commands::id::export::run(&out, passphrase_cmd.as_deref()),
-        Command::IdImport {
-            from,
-            force,
-            passphrase_cmd,
-        } => commands::id::import::run(&from, force, passphrase_cmd.as_deref()),
         Command::Init { force, role } => commands::init::run(force, role),
         Command::Doctor => Ok(commands::doctor::run()),
         Command::Status { peer, relay } => commands::status::run(&peer, relay),
@@ -319,17 +301,34 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             yes,
             detect,
             dry_run,
-        } => commands::install::run(target, apply, yes, detect, dry_run),
+            output,
+        } => commands::install::run(target, apply, yes, detect, dry_run, output.as_deref()),
         Command::DockerRun {
             image,
             name,
             from_binary,
+            from_release,
             watch,
-        } => commands::docker::run(&image, name.as_deref(), from_binary.as_deref(), watch),
+            env,
+            volume,
+            network,
+            user,
+        } => commands::docker::run(
+            &image,
+            name.as_deref(),
+            from_binary.as_deref(),
+            from_release.as_deref(),
+            watch,
+            &env,
+            &volume,
+            network.as_deref(),
+            user.as_deref(),
+        ),
         Command::DockerAttach {
             container,
             from_binary,
-        } => commands::docker::attach(&container, from_binary.as_deref()),
+            from_release,
+        } => commands::docker::attach(&container, from_binary.as_deref(), from_release.as_deref()),
         Command::DockerDetach { container } => commands::docker::detach(&container),
         Command::DockerList { json } => commands::docker::list(json),
         Command::DockerRm {
@@ -343,12 +342,16 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             tag,
             push,
             init_shim,
+            from_binary,
+            from_release,
         } => commands::docker::bake(
             &base_image,
             output.as_deref(),
             tag.as_deref(),
             push,
             init_shim,
+            from_binary.as_deref(),
+            from_release.as_deref(),
         ),
         Command::SlicerRun {
             image,
@@ -367,7 +370,6 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
         ),
         Command::SlicerList { base_url, json } => commands::slicer::list(base_url.as_deref(), json),
         Command::SlicerRm { name, base_url } => commands::slicer::rm(&name, base_url.as_deref()),
-        Command::SlicerBake { base_image } => commands::slicer::bake(&base_image),
         Command::Gateway { upstream_url } => {
             commands::agent::run::run(Some(AgentModeArg::Gateway), Some(&upstream_url))
         }
@@ -385,6 +387,12 @@ fn removed_invocation_exit(argv: &[OsString]) -> Option<ExitCode> {
                 "portl: `portl agent *` was removed in v0.2.0. Use `portl-agent` instead.\n      See https://github.com/KnickKnackLabs/portl/blob/v0.2.0/docs/specs/140-v0.2-operability.md#12-multicall-only-daemon"
             );
             Some(ExitCode::from(2))
+        }
+        Some("id") => {
+            eprintln!(
+                "portl: `portl id *` was removed in v0.2.0. Use `portl init`, `portl doctor`, and direct file copies of identity.bin instead."
+            );
+            Some(ExitCode::FAILURE)
         }
         _ => None,
     }
@@ -504,6 +512,8 @@ enum TopLevel {
         detect: bool,
         #[arg(long = "dry-run")]
         dry_run: bool,
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
     /// Docker target management.
     Docker {
@@ -517,11 +527,6 @@ enum TopLevel {
     },
     /// Run the slicer HTTP bridge against an upstream API.
     Gateway { upstream_url: String },
-    #[command(hide = true)]
-    Id {
-        #[command(subcommand)]
-        action: IdAction,
-    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -530,15 +535,27 @@ enum DockerAction {
         image: String,
         #[arg(long)]
         name: Option<String>,
-        #[arg(long = "from-binary")]
+        #[arg(long = "from-binary", conflicts_with = "from_release")]
         from_binary: Option<PathBuf>,
+        #[arg(long = "from-release", conflicts_with = "from_binary")]
+        from_release: Option<String>,
         #[arg(long)]
         watch: bool,
+        #[arg(long = "env")]
+        env: Vec<String>,
+        #[arg(long = "volume")]
+        volume: Vec<String>,
+        #[arg(long)]
+        network: Option<String>,
+        #[arg(long)]
+        user: Option<String>,
     },
     Attach {
         container: String,
-        #[arg(long = "from-binary")]
+        #[arg(long = "from-binary", conflicts_with = "from_release")]
         from_binary: Option<PathBuf>,
+        #[arg(long = "from-release", conflicts_with = "from_binary")]
+        from_release: Option<String>,
     },
     Detach {
         container: String,
@@ -564,6 +581,10 @@ enum DockerAction {
         push: bool,
         #[arg(long = "init-shim")]
         init_shim: bool,
+        #[arg(long = "from-binary", conflicts_with = "from_release")]
+        from_binary: Option<PathBuf>,
+        #[arg(long = "from-release", conflicts_with = "from_binary")]
+        from_release: Option<String>,
     },
 }
 
@@ -592,32 +613,6 @@ enum SlicerAction {
         name: String,
         #[arg(long, hide = true)]
         base_url: Option<String>,
-    },
-    Bake {
-        base_image: String,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum IdAction {
-    New {
-        #[arg(long)]
-        force: bool,
-    },
-    Show,
-    Export {
-        #[arg(long)]
-        out: PathBuf,
-        #[arg(long = "passphrase-cmd")]
-        passphrase_cmd: Option<String>,
-    },
-    Import {
-        #[arg(long)]
-        from: PathBuf,
-        #[arg(long)]
-        force: bool,
-        #[arg(long = "passphrase-cmd")]
-        passphrase_cmd: Option<String>,
     },
 }
 
@@ -664,12 +659,14 @@ impl Cli {
                 yes,
                 detect,
                 dry_run,
+                output,
             } => Command::Install {
                 target,
                 apply,
                 yes,
                 detect,
                 dry_run,
+                output,
             },
             TopLevel::Docker {
                 action:
@@ -677,23 +674,35 @@ impl Cli {
                         image,
                         name,
                         from_binary,
+                        from_release,
                         watch,
+                        env,
+                        volume,
+                        network,
+                        user,
                     },
             } => Command::DockerRun {
                 image,
                 name,
                 from_binary,
+                from_release,
                 watch,
+                env,
+                volume,
+                network,
+                user,
             },
             TopLevel::Docker {
                 action:
                     DockerAction::Attach {
                         container,
                         from_binary,
+                        from_release,
                     },
             } => Command::DockerAttach {
                 container,
                 from_binary,
+                from_release,
             },
             TopLevel::Docker {
                 action: DockerAction::Detach { container },
@@ -721,6 +730,8 @@ impl Cli {
                         tag,
                         push,
                         init_shim,
+                        from_binary,
+                        from_release,
                     },
             } => Command::DockerBake {
                 base_image,
@@ -728,6 +739,8 @@ impl Cli {
                 tag,
                 push,
                 init_shim,
+                from_binary,
+                from_release,
             },
             TopLevel::Slicer {
                 action:
@@ -753,38 +766,7 @@ impl Cli {
             TopLevel::Slicer {
                 action: SlicerAction::Rm { name, base_url },
             } => Command::SlicerRm { name, base_url },
-            TopLevel::Slicer {
-                action: SlicerAction::Bake { base_image },
-            } => Command::SlicerBake { base_image },
             TopLevel::Gateway { upstream_url } => Command::Gateway { upstream_url },
-            TopLevel::Id {
-                action: IdAction::New { force },
-            } => Command::IdNew { force },
-            TopLevel::Id {
-                action: IdAction::Show,
-            } => Command::IdShow,
-            TopLevel::Id {
-                action:
-                    IdAction::Export {
-                        out,
-                        passphrase_cmd,
-                    },
-            } => Command::IdExport {
-                out,
-                passphrase_cmd,
-            },
-            TopLevel::Id {
-                action:
-                    IdAction::Import {
-                        from,
-                        force,
-                        passphrase_cmd,
-                    },
-            } => Command::IdImport {
-                from,
-                force,
-                passphrase_cmd,
-            },
         }
     }
 }

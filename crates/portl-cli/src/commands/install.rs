@@ -112,6 +112,7 @@ pub fn run(
     yes: bool,
     detect: bool,
     dry_run: bool,
+    output: Option<&Path>,
 ) -> Result<ExitCode> {
     let detect_result = detect_host();
     if detect {
@@ -120,11 +121,25 @@ pub fn run(
     }
 
     let target = resolve_target(target, &detect_result)?;
-    let binary_path =
-        install_binary_path(target, detect_result.root, detect_result.home.as_deref())?;
-    let service_path =
-        install_service_path(target, detect_result.root, detect_result.home.as_deref())?;
-    let rendered = render_target(target, &binary_path, detect_result.root);
+    let output = resolve_output_dir(target, output)?;
+    let binary_path = install_binary_path(
+        target,
+        detect_result.root,
+        detect_result.home.as_deref(),
+        output.as_deref(),
+    )?;
+    let service_path = install_service_path(
+        target,
+        detect_result.root,
+        detect_result.home.as_deref(),
+        output.as_deref(),
+    )?;
+    let rendered = render_target(
+        target,
+        &binary_path,
+        detect_result.root,
+        detect_result.home.as_deref(),
+    )?;
 
     if dry_run || !apply {
         print!("{rendered}");
@@ -154,7 +169,14 @@ pub fn run(
     })?;
     std::fs::write(&service_path, &rendered)
         .with_context(|| format!("write {}", service_path.display()))?;
+    if matches!(target, InstallTarget::Dockerfile | InstallTarget::Openrc) {
+        set_mode_0755(&binary_path)?;
+    }
+    if matches!(target, InstallTarget::Openrc) {
+        set_mode_0755(&service_path)?;
+    }
     validate_install_target(target, &service_path)?;
+    apply_install_target(target, detect_result.root, &service_path)?;
     println!("installed {}", service_path.display());
     Ok(ExitCode::SUCCESS)
 }
@@ -171,7 +193,19 @@ fn resolve_target(target: Option<InstallTarget>, detect: &DetectResult) -> Resul
     detect.matched.ok_or_else(|| anyhow!("{}", detect.reason))
 }
 
-fn install_binary_path(target: InstallTarget, root: bool, home: Option<&Path>) -> Result<PathBuf> {
+fn resolve_output_dir(target: InstallTarget, output: Option<&Path>) -> Result<Option<PathBuf>> {
+    if !matches!(target, InstallTarget::Dockerfile) && output.is_some() {
+        bail!("`--output DIR` is only supported for `portl install dockerfile`");
+    }
+    Ok(output.map(Path::to_path_buf))
+}
+
+fn install_binary_path(
+    target: InstallTarget,
+    root: bool,
+    home: Option<&Path>,
+    output: Option<&Path>,
+) -> Result<PathBuf> {
     match target {
         InstallTarget::Systemd if !root => Ok(home
             .ok_or_else(|| anyhow!("HOME is required for user-level systemd installs"))?
@@ -179,12 +213,19 @@ fn install_binary_path(target: InstallTarget, root: bool, home: Option<&Path>) -
         InstallTarget::Launchd if !root => Ok(home
             .ok_or_else(|| anyhow!("HOME is required for launchd installs"))?
             .join(".local/bin/portl-agent")),
-        InstallTarget::Dockerfile => Ok(PathBuf::from("portl-agent")),
+        InstallTarget::Dockerfile => {
+            Ok(output.unwrap_or_else(|| Path::new(".")).join("portl-agent"))
+        }
         _ => Ok(PathBuf::from("/usr/local/bin/portl-agent")),
     }
 }
 
-fn install_service_path(target: InstallTarget, root: bool, home: Option<&Path>) -> Result<PathBuf> {
+fn install_service_path(
+    target: InstallTarget,
+    root: bool,
+    home: Option<&Path>,
+    output: Option<&Path>,
+) -> Result<PathBuf> {
     match target {
         InstallTarget::Systemd if root => {
             Ok(PathBuf::from("/etc/systemd/system/portl-agent.service"))
@@ -198,31 +239,45 @@ fn install_service_path(target: InstallTarget, root: bool, home: Option<&Path>) 
         InstallTarget::Launchd => Ok(home
             .ok_or_else(|| anyhow!("HOME is required for launchd installs"))?
             .join("Library/LaunchAgents/com.portl.agent.plist")),
-        InstallTarget::Dockerfile => Ok(PathBuf::from("Dockerfile")),
+        InstallTarget::Dockerfile => {
+            Ok(output.unwrap_or_else(|| Path::new(".")).join("Dockerfile"))
+        }
         InstallTarget::Openrc => Ok(PathBuf::from("/etc/init.d/portl-agent")),
     }
 }
 
-fn render_target(target: InstallTarget, binary_path: &Path, root: bool) -> String {
+fn render_target(
+    target: InstallTarget,
+    binary_path: &Path,
+    root: bool,
+    home: Option<&Path>,
+) -> Result<String> {
     match target {
-        InstallTarget::Systemd => render_systemd_unit(binary_path, root),
-        InstallTarget::Launchd => render_launchd_plist(binary_path),
-        InstallTarget::Dockerfile => render_service_dockerfile(),
-        InstallTarget::Openrc => render_openrc_script(binary_path),
+        InstallTarget::Systemd => render_systemd_unit(binary_path, root, home),
+        InstallTarget::Launchd => Ok(render_launchd_plist(binary_path)),
+        InstallTarget::Dockerfile => Ok(render_service_dockerfile()),
+        InstallTarget::Openrc => Ok(render_openrc_script(binary_path)),
     }
 }
 
-fn render_systemd_unit(binary_path: &Path, root: bool) -> String {
+fn render_systemd_unit(binary_path: &Path, root: bool, home: Option<&Path>) -> Result<String> {
     let wanted_by = if root {
         "multi-user.target"
     } else {
         "default.target"
     };
-    format!(
-        "[Unit]\nDescription=portl agent\nAfter=network-online.target\nWants=network-online.target\nStartLimitBurst=5\nStartLimitIntervalSec=60s\n\n[Service]\nExecStart={}\nEnvironmentFile=-/etc/portl/agent.env\nRestart=on-failure\nRestartSec=5s\n\n[Install]\nWantedBy={}\n",
+    let env_file = if root {
+        PathBuf::from("/etc/portl/agent.env")
+    } else {
+        home.ok_or_else(|| anyhow!("HOME is required for user-level systemd installs"))?
+            .join(".config/portl/agent.env")
+    };
+    Ok(format!(
+        "[Unit]\nDescription=portl agent\nAfter=network-online.target\nWants=network-online.target\nStartLimitBurst=5\nStartLimitIntervalSec=60s\n\n[Service]\nExecStart={}\nEnvironmentFile=-{}\nRestart=on-failure\nRestartSec=5s\n\n[Install]\nWantedBy={}\n",
         binary_path.display(),
+        env_file.display(),
         wanted_by
-    )
+    ))
 }
 
 fn render_launchd_plist(binary_path: &Path) -> String {
@@ -238,7 +293,10 @@ fn render_launchd_plist(binary_path: &Path) -> String {
             "  <array>\n",
             "    <string>{}</string>\n",
             "  </array>\n",
-            "  <key>KeepAlive</key><true/>\n",
+            "  <key>KeepAlive</key>\n",
+            "  <dict>\n",
+            "    <key>SuccessfulExit</key><false/>\n",
+            "  </dict>\n",
             "  <key>RunAtLoad</key><true/>\n",
             "</dict>\n",
             "</plist>\n"
@@ -263,6 +321,103 @@ fn render_openrc_script(binary_path: &Path) -> String {
 
 fn render_service_dockerfile() -> String {
     "FROM debian:stable-slim\nCOPY portl-agent /usr/local/bin/portl-agent\nRUN chmod +x /usr/local/bin/portl-agent\nENTRYPOINT [\"/usr/local/bin/portl-agent\"]\n".to_owned()
+}
+
+fn apply_install_target(target: InstallTarget, root: bool, path: &Path) -> Result<()> {
+    match target {
+        InstallTarget::Systemd => apply_systemd(root, path),
+        InstallTarget::Launchd => apply_launchd(root, path),
+        InstallTarget::Dockerfile => {
+            println!(
+                "dockerfile target is write-only; `--apply` writes {} and does not start a service",
+                path.display()
+            );
+            Ok(())
+        }
+        InstallTarget::Openrc => apply_openrc(path),
+    }
+}
+
+fn apply_systemd(root: bool, _path: &Path) -> Result<()> {
+    let args = user_scoped_systemd_args(root);
+    run_checked("systemctl", &append_args(args, &["daemon-reload"]))?;
+    run_checked(
+        "systemctl",
+        &append_args(args, &["enable", "--now", "portl-agent.service"]),
+    )?;
+    run_checked(
+        "systemctl",
+        &append_args(args, &["status", "--no-pager", "portl-agent.service"]),
+    )?;
+    let journal_args = if root {
+        vec!["-u", "portl-agent.service", "-n", "20", "--no-pager"]
+    } else {
+        vec![
+            "--user",
+            "-u",
+            "portl-agent.service",
+            "-n",
+            "20",
+            "--no-pager",
+        ]
+    };
+    run_checked("journalctl", &journal_args)
+}
+
+fn apply_launchd(root: bool, path: &Path) -> Result<()> {
+    let domain = if root {
+        "system".to_owned()
+    } else {
+        format!("gui/{}", Uid::effective().as_raw())
+    };
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| anyhow!("launchd path is not valid UTF-8: {}", path.display()))?;
+    let _ = run_checked("launchctl", &["bootout", &domain, path_str]);
+    run_checked("launchctl", &["bootstrap", &domain, path_str])?;
+    run_checked(
+        "launchctl",
+        &["kickstart", "-k", &format!("{domain}/com.portl.agent")],
+    )?;
+    run_checked(
+        "launchctl",
+        &["print", &format!("{domain}/com.portl.agent")],
+    )
+}
+
+fn apply_openrc(_path: &Path) -> Result<()> {
+    run_checked("rc-update", &["add", "portl-agent", "default"])?;
+    run_checked("rc-service", &["portl-agent", "start"])?;
+    run_checked("rc-service", &["portl-agent", "status"])
+}
+
+fn user_scoped_systemd_args(root: bool) -> &'static [&'static str] {
+    if root { &[] } else { &["--user"] }
+}
+
+fn append_args<'a>(prefix: &'a [&'a str], suffix: &'a [&'a str]) -> Vec<&'a str> {
+    prefix
+        .iter()
+        .copied()
+        .chain(suffix.iter().copied())
+        .collect()
+}
+
+fn run_checked(program: &str, args: &[&str]) -> Result<()> {
+    let status = ProcessCommand::new(program)
+        .args(args)
+        .status()
+        .with_context(|| format!("run {} {}", program, args.join(" ")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!(
+            "{} {} failed with status {}",
+            program,
+            args.join(" "),
+            status
+        )
+    }
 }
 
 fn validate_install_target(target: InstallTarget, path: &Path) -> Result<()> {
@@ -298,6 +453,22 @@ fn validate_install_target(target: InstallTarget, path: &Path) -> Result<()> {
     }
 }
 
+fn set_mode_0755(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let perms = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(path, perms)
+            .with_context(|| format!("chmod 0755 {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
 fn inside_docker() -> bool {
     Path::new("/.dockerenv").exists()
         || std::fs::read_to_string("/proc/1/cgroup")
@@ -312,7 +483,8 @@ mod tests {
 
     #[test]
     fn install_systemd_emits_valid_unit_file() {
-        let unit = render_systemd_unit(Path::new("/usr/local/bin/portl-agent"), true);
+        let unit = render_systemd_unit(Path::new("/usr/local/bin/portl-agent"), true, None)
+            .expect("render systemd unit");
         assert!(unit.contains("ExecStart=/usr/local/bin/portl-agent"));
         assert!(unit.contains("EnvironmentFile=-/etc/portl/agent.env"));
         assert!(unit.contains("Restart=on-failure"));
@@ -332,7 +504,7 @@ mod tests {
     fn install_launchd_emits_valid_plist() {
         let plist = render_launchd_plist(Path::new("/usr/local/bin/portl-agent"));
         assert!(plist.contains("<string>/usr/local/bin/portl-agent</string>"));
-        assert!(plist.contains("<key>KeepAlive</key><true/>"));
+        assert!(plist.contains("<key>SuccessfulExit</key><false/>"));
 
         if Path::new("/usr/bin/plutil").exists() {
             let dir = tempdir().expect("tempdir");
@@ -371,5 +543,31 @@ mod tests {
         });
         assert_eq!(detect.matched, Some(InstallTarget::Systemd));
         assert!(!detect.root);
+    }
+
+    #[test]
+    fn user_systemd_uses_user_env_file() {
+        let unit = render_systemd_unit(
+            Path::new("/tmp/home/.local/bin/portl-agent"),
+            false,
+            Some(Path::new("/tmp/home")),
+        )
+        .expect("render user unit");
+        assert!(unit.contains("EnvironmentFile=-/tmp/home/.config/portl/agent.env"));
+    }
+
+    #[test]
+    fn dockerfile_output_paths_use_requested_directory() {
+        let output = Path::new("/tmp/portl-image");
+        assert_eq!(
+            install_binary_path(InstallTarget::Dockerfile, false, None, Some(output))
+                .expect("binary path"),
+            output.join("portl-agent")
+        );
+        assert_eq!(
+            install_service_path(InstallTarget::Dockerfile, false, None, Some(output))
+                .expect("service path"),
+            output.join("Dockerfile")
+        );
     }
 }

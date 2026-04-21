@@ -206,11 +206,12 @@ Arguments:
   [TARGET]  [possible values: systemd, launchd, dockerfile, openrc]
 
 Options:
-      --apply    
-      --yes      
-      --detect   
-      --dry-run  
-  -h, --help     Print help
+      --apply            
+      --yes              
+      --detect           
+      --dry-run          
+      --output <OUTPUT>  
+  -h, --help             Print help
 "#,
         ),
         (
@@ -242,7 +243,6 @@ Commands:
   run   
   list  
   rm    
-  bake  
   help  Print this message or the help of the given subcommand(s)
 
 Options:
@@ -285,5 +285,23 @@ fn portl_mint_root_exits_nonzero_with_clear_error() {
     assert_eq!(
         String::from_utf8(output.stderr).expect("utf8 stderr"),
         "portl: `portl mint-root` was removed in v0.2.0. Use `portl mint` instead.\n"
+    );
+}
+
+#[test]
+fn portl_id_exits_nonzero_with_clear_error() {
+    let output = Command::cargo_bin("portl")
+        .expect("cargo bin")
+        .args(["id", "new"])
+        .output()
+        .expect("run removed id command");
+
+    assert!(
+        !output.status.success(),
+        "removed id command unexpectedly succeeded"
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("utf8 stderr"),
+        "portl: `portl id *` was removed in v0.2.0. Use `portl init`, `portl doctor`, and direct file copies of identity.bin instead.\n"
     );
 }

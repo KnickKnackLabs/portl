@@ -100,6 +100,8 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
         endpoint::bind(&cfg, &identity).await?
     };
 
+    tracing::info!("portl-agent listening");
+
     let signal_shutdown = Arc::new(AtomicBool::new(false));
     let signal_tasks = install_signal_tasks(&shutdown, &signal_shutdown)?;
     let udp_gc = spawn_udp_gc_task(Arc::clone(&state), shutdown.clone());

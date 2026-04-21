@@ -49,10 +49,6 @@ pub fn rm(name: &str, base_url: Option<&str>) -> Result<ExitCode> {
     vm_delete(name, base_url)
 }
 
-pub fn bake(_base_image: &str) -> Result<ExitCode> {
-    anyhow::bail!("`portl slicer bake` is not yet implemented")
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct SlicerLoginRecord {
     ticket_file_path: PathBuf,
