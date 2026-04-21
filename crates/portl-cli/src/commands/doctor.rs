@@ -111,7 +111,7 @@ fn check_identity() -> CheckResult {
             name: "identity",
             status: Status::Fail,
             detail: format!(
-                "cannot load identity at {}: {err}; run `portl id new`",
+                "cannot load identity at {}: {err}; run `portl init`",
                 path.display()
             ),
         },

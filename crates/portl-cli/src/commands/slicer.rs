@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -27,6 +29,29 @@ const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8080";
 const DEFAULT_TICKET_TTL: &str = "30d";
 const DEFAULT_AGENT_CAPS: &str = "all";
 const LOGIN_RECORD_FILE: &str = "slicer-login.json";
+
+pub fn run(
+    image: &str,
+    base_url: Option<&str>,
+    cpus: Option<u8>,
+    ram_gb: Option<u16>,
+    tags: &[String],
+    ticket_out: Option<&Path>,
+) -> Result<ExitCode> {
+    vm_add(image, base_url, cpus, ram_gb, tags, ticket_out)
+}
+
+pub fn list(base_url: Option<&str>, json_output: bool) -> Result<ExitCode> {
+    vm_list(base_url, json_output)
+}
+
+pub fn rm(name: &str, base_url: Option<&str>) -> Result<ExitCode> {
+    vm_delete(name, base_url)
+}
+
+pub fn bake(_base_image: &str) -> Result<ExitCode> {
+    anyhow::bail!("`portl slicer bake` is not yet implemented")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct SlicerLoginRecord {

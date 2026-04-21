@@ -292,36 +292,27 @@ fn id_export_then_import_roundtrip() {
 }
 
 #[test]
-fn mint_root_requires_endpoint_arg() {
+fn mint_requires_caps_arg() {
     let home = tempdir().unwrap();
     init_identity(&home);
 
     Command::cargo_bin("portl")
         .unwrap()
         .env("PORTL_HOME", home.path())
-        .args(["mint-root", "--caps", "shell", "--ttl", "24h"])
+        .args(["mint"])
         .assert()
         .failure();
 }
 
 #[test]
-fn mint_root_emits_portl_prefix_ticket() {
+fn mint_emits_portl_prefix_ticket() {
     let home = tempdir().unwrap();
     let operator = init_identity(&home);
-    let endpoint = hex::encode(operator);
 
     let stdout = Command::cargo_bin("portl")
         .unwrap()
         .env("PORTL_HOME", home.path())
-        .args([
-            "mint-root",
-            "--endpoint",
-            endpoint.as_str(),
-            "--caps",
-            "shell",
-            "--ttl",
-            "24h",
-        ])
+        .args(["mint", "shell", "--ttl", "24h"])
         .assert()
         .success()
         .get_output()
@@ -337,26 +328,19 @@ fn mint_root_emits_portl_prefix_ticket() {
     let parsed = PortlTicket::deserialize(ticket.trim()).unwrap();
     assert_eq!(parsed.body.caps, shell_caps());
     assert_eq!(parsed.body.issuer, None);
+    assert_eq!(*parsed.addr.id.as_bytes(), operator);
+    assert_eq!(parsed.body.target, operator);
 }
 
 #[test]
-fn mint_root_with_tcp_rule() {
+fn mint_with_tcp_rule() {
     let home = tempdir().unwrap();
-    let operator = init_identity(&home);
-    let endpoint = hex::encode(operator);
+    init_identity(&home);
 
     let stdout = Command::cargo_bin("portl")
         .unwrap()
         .env("PORTL_HOME", home.path())
-        .args([
-            "mint-root",
-            "--endpoint",
-            endpoint.as_str(),
-            "--caps",
-            "tcp:127.0.0.1:22-22",
-            "--ttl",
-            "1h",
-        ])
+        .args(["mint", "tcp:127.0.0.1:22-22", "--ttl", "1h"])
         .assert()
         .success()
         .get_output()
@@ -377,23 +361,14 @@ fn mint_root_with_tcp_rule() {
 }
 
 #[test]
-fn mint_root_accepts_all_caps_keyword() {
+fn mint_accepts_all_caps_keyword() {
     let home = tempdir().unwrap();
-    let operator = init_identity(&home);
-    let endpoint = hex::encode(operator);
+    init_identity(&home);
 
     let stdout = Command::cargo_bin("portl")
         .unwrap()
         .env("PORTL_HOME", home.path())
-        .args([
-            "mint-root",
-            "--endpoint",
-            endpoint.as_str(),
-            "--caps",
-            "all",
-            "--ttl",
-            "1h",
-        ])
+        .args(["mint", "all", "--ttl", "1h"])
         .assert()
         .success()
         .get_output()
@@ -439,23 +414,14 @@ fn mint_root_accepts_all_caps_keyword() {
 }
 
 #[test]
-fn mint_root_accepts_y_ttl_up_to_365d() {
+fn mint_accepts_y_ttl_up_to_365d() {
     let home = tempdir().unwrap();
-    let operator = init_identity(&home);
-    let endpoint = hex::encode(operator);
+    init_identity(&home);
 
     let stdout = Command::cargo_bin("portl")
         .unwrap()
         .env("PORTL_HOME", home.path())
-        .args([
-            "mint-root",
-            "--endpoint",
-            endpoint.as_str(),
-            "--caps",
-            "shell",
-            "--ttl",
-            "1y",
-        ])
+        .args(["mint", "shell", "--ttl", "1y"])
         .assert()
         .success()
         .get_output()
@@ -471,27 +437,16 @@ fn mint_root_accepts_y_ttl_up_to_365d() {
 }
 
 #[test]
-fn mint_root_sets_to_field_from_flag() {
+fn mint_sets_to_field_from_flag() {
     let home = tempdir().unwrap();
-    let operator = init_identity(&home);
-    let endpoint = hex::encode(operator);
+    init_identity(&home);
     let holder = endpoint_hex_from_seed(91);
     let holder_bytes: [u8; 32] = hex::decode(&holder).unwrap().try_into().unwrap();
 
     let stdout = Command::cargo_bin("portl")
         .unwrap()
         .env("PORTL_HOME", home.path())
-        .args([
-            "mint-root",
-            "--endpoint",
-            endpoint.as_str(),
-            "--caps",
-            "shell",
-            "--ttl",
-            "24h",
-            "--to",
-            holder.as_str(),
-        ])
+        .args(["mint", "shell", "--ttl", "24h", "--to", holder.as_str()])
         .assert()
         .success()
         .get_output()
@@ -504,7 +459,7 @@ fn mint_root_sets_to_field_from_flag() {
 }
 
 #[test]
-fn mint_root_targets_endpoint_when_different_from_operator() {
+fn mint_supports_hidden_endpoint_override() {
     let home = tempdir().unwrap();
     let operator = init_identity(&home);
     let endpoint = endpoint_hex_from_seed(92);
@@ -514,13 +469,12 @@ fn mint_root_targets_endpoint_when_different_from_operator() {
         .unwrap()
         .env("PORTL_HOME", home.path())
         .args([
-            "mint-root",
-            "--endpoint",
-            endpoint.as_str(),
-            "--caps",
+            "mint",
             "shell",
             "--ttl",
             "24h",
+            "--endpoint",
+            endpoint.as_str(),
         ])
         .assert()
         .success()

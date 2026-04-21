@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode, Stdio};
 
@@ -16,6 +18,28 @@ use crate::commands::mint_root::{parse_caps, parse_endpoint_bytes, parse_ttl};
 
 const DEFAULT_IMAGE: &str = "ghcr.io/knickknacklabs/portl-agent:latest";
 const DEFAULT_NETWORK: &str = "bridge";
+
+pub fn run(_image: &str, _name: Option<&str>) -> Result<ExitCode> {
+    anyhow::bail!("`portl docker run` is implemented in Task 3.2")
+}
+
+pub fn attach(_container: &str) -> Result<ExitCode> {
+    anyhow::bail!("`portl docker attach` is implemented in Task 3.2")
+}
+
+pub fn detach(_container: &str) -> Result<ExitCode> {
+    anyhow::bail!("`portl docker detach` is implemented in Task 3.2")
+}
+
+pub fn bake(
+    _base_image: &str,
+    _output: Option<&Path>,
+    _tag: Option<&str>,
+    _push: bool,
+    _init_shim: bool,
+) -> Result<ExitCode> {
+    anyhow::bail!("`portl docker bake` is implemented in Task 3.3")
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn add(
@@ -286,11 +310,11 @@ fn ensure_rm_allowed(name: &str, status: &TargetStatus, force: bool) -> Result<(
 
     match status {
         TargetStatus::Exited { .. } | TargetStatus::NotFound => Ok(()),
-        TargetStatus::Running | TargetStatus::Provisioning => bail!(
-            "container '{name}' is still running; use `portl docker container rm {name} --force`"
-        ),
+        TargetStatus::Running | TargetStatus::Provisioning => {
+            bail!("container '{name}' is still running; use `portl docker rm {name} --force`")
+        }
         TargetStatus::Unknown(other) => bail!(
-            "container '{name}' is not known to be stopped (status: {other}); use `portl docker container rm {name} --force`"
+            "container '{name}' is not known to be stopped (status: {other}); use `portl docker rm {name} --force`"
         ),
     }
 }

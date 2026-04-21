@@ -10,6 +10,8 @@
 mod alias_store;
 mod commands;
 
+pub use commands::init::InitRole;
+pub use commands::install::InstallTarget;
 pub use commands::status::run_with_identity_path as run_status_with_identity_path;
 pub use commands::status::run_with_identity_path_and_endpoint as run_status_with_identity_path_and_endpoint;
 
@@ -24,92 +26,82 @@ pub fn load_agent_config() -> anyhow::Result<portl_agent::AgentConfig> {
 /// Structured representation of a parsed invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// `portl agent run` (or its `portl-agent run` symlink form).
+    /// Hidden compatibility path for `portl-agent` until Task 3.5 lands.
     AgentRun {
         mode: Option<AgentModeArg>,
         upstream_url: Option<String>,
     },
-    /// `portl id new [--force]`
+    /// Hidden compatibility path for the pre-v0.2 `id` namespace.
     IdNew {
         force: bool,
     },
-    /// `portl id show`
     IdShow,
-    /// `portl id export --out <path> [--passphrase-cmd <cmd>]`
     IdExport {
         out: PathBuf,
         passphrase_cmd: Option<String>,
     },
-    /// `portl id import --from <path> [--force] [--passphrase-cmd <cmd>]`
     IdImport {
         from: PathBuf,
         force: bool,
         passphrase_cmd: Option<String>,
     },
-    /// `portl mint-root --endpoint ... --caps ... --ttl ...`
-    MintRoot {
-        endpoint: String,
-        caps: String,
-        ttl: String,
-        to: Option<String>,
-        depth: Option<u8>,
-        print: MintRootPrint,
+    Init {
+        force: bool,
+        role: Option<InitRole>,
     },
-    /// `portl status <peer>`
+    Doctor,
     Status {
         peer: String,
         relay: bool,
     },
-    /// `portl gateway <upstream-url>`
-    Gateway {
-        upstream_url: String,
-    },
-    /// `portl shell <peer>`
     Shell {
         peer: String,
         cwd: Option<String>,
         user: Option<String>,
     },
-    /// `portl exec <peer> -- <argv...>`
     Exec {
         peer: String,
         cwd: Option<String>,
         user: Option<String>,
         argv: Vec<String>,
     },
-    /// `portl tcp <peer> -L ...`
     Tcp {
         peer: String,
         local: Vec<String>,
     },
-    /// `portl udp <peer> -L ...`
     Udp {
         peer: String,
         local: Vec<String>,
     },
-    /// `portl revoke --alias <name>` / `portl revoke --ticket <uri>` / `portl revoke --list`
-    Revoke {
-        alias: Option<String>,
-        ticket: Option<String>,
-        list: bool,
-    },
-    /// `portl revocations publish --peer <alias_or_ticket>` or `--all-peers`
-    RevocationsPublish {
-        peer: Option<String>,
-        all_peers: bool,
-    },
-    /// `portl doctor`
-    Doctor,
-    /// `portl docker container add ...`
-    DockerAdd {
-        name: String,
-        image: Option<String>,
-        network: Option<String>,
-        agent_caps: String,
+    Mint {
+        caps: String,
         ttl: String,
         to: Option<String>,
-        labels: Vec<String>,
-        rm_existing: bool,
+        from: Option<String>,
+        print: MintRootPrint,
+        endpoint: Option<String>,
+    },
+    Revoke {
+        id: Option<String>,
+        list: bool,
+        publish: bool,
+    },
+    Install {
+        target: Option<InstallTarget>,
+        apply: bool,
+        yes: bool,
+        detect: bool,
+        dry_run: bool,
+    },
+    DockerRun {
+        image: String,
+        name: Option<String>,
+    },
+    DockerAttach {
+        container: String,
+    },
+    DockerDetach {
+        container: String,
     },
     DockerList {
         json: bool,
@@ -119,42 +111,34 @@ pub enum Command {
         force: bool,
         keep_tickets: bool,
     },
-    DockerRebuild {
-        name: String,
+    DockerBake {
+        base_image: String,
+        output: Option<PathBuf>,
+        tag: Option<String>,
+        push: bool,
+        init_shim: bool,
     },
-    DockerLogs {
-        name: String,
-        follow: bool,
-        tail: Option<String>,
-        deprecated_container_alias: bool,
-    },
-    SlicerLogin {
-        master_ticket: String,
-        base_url: Option<String>,
-    },
-    SlicerVmAdd {
-        group: String,
+    SlicerRun {
+        image: String,
         base_url: Option<String>,
         cpus: Option<u8>,
         ram_gb: Option<u16>,
         tags: Vec<String>,
         ticket_out: Option<PathBuf>,
     },
-    SlicerVmList {
+    SlicerList {
         base_url: Option<String>,
         json: bool,
     },
-    SlicerVmDelete {
+    SlicerRm {
         name: String,
         base_url: Option<String>,
     },
-    SlicerVmLogs {
-        name: String,
-        base_url: Option<String>,
-        tail: usize,
+    SlicerBake {
+        base_image: String,
     },
-    SlicerVmShell {
-        name: String,
+    Gateway {
+        upstream_url: String,
     },
 }
 
@@ -197,22 +181,46 @@ pub fn parse(argv: Vec<OsString>) -> Result<Command, ParseError> {
     Ok(cli.into_command())
 }
 
-/// Library entry point wrapping [`parse`] + dispatch.
+/// Library entry point wrapping parsing + dispatch.
+fn clap_exit_code(err: &clap::Error) -> ExitCode {
+    match err.kind() {
+        clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
+            ExitCode::SUCCESS
+        }
+        _ => ExitCode::FAILURE,
+    }
+}
+
 pub fn run(argv: Vec<OsString>) -> ExitCode {
-    match parse(argv) {
-        Ok(cmd) => match dispatch(cmd) {
-            Ok(code) => code,
-            Err(err) => {
-                eprintln!("{err:#}");
-                ExitCode::FAILURE
-            }
-        },
+    let argv = match rewrite_multicall(argv) {
+        Ok(argv) => argv,
         Err(ParseError::EmptyArgv) => {
             eprintln!("portl: argv is empty");
-            ExitCode::FAILURE
+            return ExitCode::FAILURE;
         }
         Err(ParseError::Clap(err)) => {
             let _ = err.print();
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if let Some(code) = removed_invocation_exit(&argv) {
+        return code;
+    }
+
+    let cli = match Cli::try_parse_from(argv) {
+        Ok(cli) => cli,
+        Err(err) => {
+            let code = clap_exit_code(&err);
+            let _ = err.print();
+            return code;
+        }
+    };
+
+    match dispatch(cli.into_command()) {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("{err:#}");
             ExitCode::FAILURE
         }
     }
@@ -235,18 +243,9 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             force,
             passphrase_cmd,
         } => commands::id::import::run(&from, force, passphrase_cmd.as_deref()),
-        Command::MintRoot {
-            endpoint,
-            caps,
-            ttl,
-            to,
-            depth,
-            print,
-        } => commands::mint_root::run(&endpoint, &caps, &ttl, to.as_deref(), depth, print),
+        Command::Init { force, role } => commands::init::run(force, role),
+        Command::Doctor => Ok(commands::doctor::run()),
         Command::Status { peer, relay } => commands::status::run(&peer, relay),
-        Command::Gateway { upstream_url } => {
-            commands::agent::run::run(Some(AgentModeArg::Gateway), Some(&upstream_url))
-        }
         Command::Shell { peer, cwd, user } => {
             commands::shell::run(&peer, cwd.as_deref(), user.as_deref())
         }
@@ -258,78 +257,84 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
         } => commands::exec::run(&peer, cwd.as_deref(), user.as_deref(), &argv),
         Command::Tcp { peer, local } => commands::tcp::run(&peer, &local),
         Command::Udp { peer, local } => commands::udp::run(&peer, &local),
-        Command::Revoke {
-            alias,
-            ticket,
-            list,
-        } => commands::revoke::run(alias.as_deref(), ticket.as_deref(), list),
-        Command::RevocationsPublish { peer, all_peers } => {
-            commands::revocations::publish(peer.as_deref(), all_peers)
-        }
-        Command::Doctor => Ok(commands::doctor::run()),
-        Command::DockerAdd {
-            name,
-            image,
-            network,
-            agent_caps,
+        Command::Mint {
+            caps,
             ttl,
             to,
-            labels,
-            rm_existing,
-        } => commands::docker::add(
-            &name,
-            image.as_deref(),
-            network.as_deref(),
-            &agent_caps,
+            from,
+            print,
+            endpoint,
+        } => commands::mint_root::run(
+            &caps,
             &ttl,
             to.as_deref(),
-            &labels,
-            rm_existing,
+            from.as_deref(),
+            print,
+            endpoint.as_deref(),
         ),
+        Command::Revoke { id, list, publish } => {
+            commands::revoke::run(id.as_deref(), list, publish)
+        }
+        Command::Install {
+            target,
+            apply,
+            yes,
+            detect,
+            dry_run,
+        } => commands::install::run(target, apply, yes, detect, dry_run),
+        Command::DockerRun { image, name } => commands::docker::run(&image, name.as_deref()),
+        Command::DockerAttach { container } => commands::docker::attach(&container),
+        Command::DockerDetach { container } => commands::docker::detach(&container),
         Command::DockerList { json } => commands::docker::list(json),
         Command::DockerRm {
             name,
             force,
             keep_tickets,
         } => commands::docker::rm(&name, force, keep_tickets),
-        Command::DockerRebuild { name } => commands::docker::rebuild(&name),
-        Command::DockerLogs {
-            name,
-            follow,
-            tail,
-            deprecated_container_alias,
-        } => commands::docker::logs(&name, follow, tail.as_deref(), deprecated_container_alias),
-        Command::SlicerLogin {
-            master_ticket,
-            base_url,
-        } => commands::slicer::login(&master_ticket, base_url.as_deref()),
-        Command::SlicerVmAdd {
-            group,
+        Command::DockerBake {
+            base_image,
+            output,
+            tag,
+            push,
+            init_shim,
+        } => commands::docker::bake(
+            &base_image,
+            output.as_deref(),
+            tag.as_deref(),
+            push,
+            init_shim,
+        ),
+        Command::SlicerRun {
+            image,
             base_url,
             cpus,
             ram_gb,
             tags,
             ticket_out,
-        } => commands::slicer::vm_add(
-            &group,
+        } => commands::slicer::run(
+            &image,
             base_url.as_deref(),
             cpus,
             ram_gb,
             &tags,
             ticket_out.as_deref(),
         ),
-        Command::SlicerVmList { base_url, json } => {
-            commands::slicer::vm_list(base_url.as_deref(), json)
+        Command::SlicerList { base_url, json } => commands::slicer::list(base_url.as_deref(), json),
+        Command::SlicerRm { name, base_url } => commands::slicer::rm(&name, base_url.as_deref()),
+        Command::SlicerBake { base_image } => commands::slicer::bake(&base_image),
+        Command::Gateway { upstream_url } => {
+            commands::agent::run::run(Some(AgentModeArg::Gateway), Some(&upstream_url))
         }
-        Command::SlicerVmDelete { name, base_url } => {
-            commands::slicer::vm_delete(&name, base_url.as_deref())
+    }
+}
+
+fn removed_invocation_exit(argv: &[OsString]) -> Option<ExitCode> {
+    match argv.get(1).and_then(|arg| arg.to_str()) {
+        Some("mint-root") => {
+            eprintln!("portl: `portl mint-root` was removed in v0.2.0. Use `portl mint` instead.");
+            Some(ExitCode::FAILURE)
         }
-        Command::SlicerVmLogs {
-            name,
-            base_url,
-            tail,
-        } => commands::slicer::vm_logs(&name, base_url.as_deref(), tail),
-        Command::SlicerVmShell { name } => commands::slicer::vm_shell(&name),
+        _ => None,
     }
 }
 
@@ -362,31 +367,15 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum TopLevel {
-    /// Target-side agent subcommands (run, enroll, identity, ...).
-    Agent {
-        #[command(subcommand)]
-        action: AgentAction,
+    /// Create identity, run doctor, and print next steps.
+    Init {
+        #[arg(long)]
+        force: bool,
+        #[arg(long, value_enum)]
+        role: Option<InitRole>,
     },
-    /// Local operator identity management.
-    Id {
-        #[command(subcommand)]
-        action: IdAction,
-    },
-    /// Mint a root ticket with the local operator identity.
-    MintRoot {
-        #[arg(long, alias = "node")]
-        endpoint: String,
-        #[arg(long)]
-        caps: String,
-        #[arg(long)]
-        ttl: String,
-        #[arg(long)]
-        to: Option<String>,
-        #[arg(long)]
-        depth: Option<u8>,
-        #[arg(short = 'o', long = "print", value_enum, default_value = "string")]
-        print: MintRootPrint,
-    },
+    /// Print strictly local diagnostics (clock, identity, listener bind, discovery config, ticket expiry).
+    Doctor,
     /// Query peer reachability and metadata.
     Status {
         peer: String,
@@ -394,8 +383,6 @@ enum TopLevel {
         #[arg(long)]
         relay: bool,
     },
-    /// Run the slicer HTTP bridge against an upstream API.
-    Gateway { upstream_url: String },
     /// Open an interactive remote PTY shell.
     Shell {
         peer: String,
@@ -416,32 +403,50 @@ enum TopLevel {
     },
     /// Set up one or more local TCP forwards.
     Tcp {
-        peer: String,
         #[arg(short = 'L', required = true)]
         local: Vec<String>,
+        peer: String,
     },
     /// Set up one or more local UDP forwards.
     Udp {
-        peer: String,
         #[arg(short = 'L', required = true)]
         local: Vec<String>,
+        peer: String,
     },
-    /// Append a local ticket revocation or list the current revocation log.
+    /// Mint a ticket with the local identity.
+    Mint {
+        caps: String,
+        #[arg(long, default_value = "30d")]
+        ttl: String,
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long = "from")]
+        from: Option<String>,
+        #[arg(short = 'o', long = "print", value_enum, default_value = "string")]
+        print: MintRootPrint,
+        #[arg(long, hide = true, alias = "node")]
+        endpoint: Option<String>,
+    },
+    /// Append a local ticket revocation, optionally publish it, or list the current revocation log.
     Revoke {
-        #[arg(long, conflicts_with_all = ["ticket", "list"])]
-        alias: Option<String>,
-        #[arg(long, conflicts_with_all = ["alias", "list"])]
-        ticket: Option<String>,
-        #[arg(long, conflicts_with_all = ["alias", "ticket"])]
+        id: Option<String>,
+        #[arg(long, conflicts_with = "id")]
         list: bool,
+        #[arg(long, requires = "id")]
+        publish: bool,
     },
-    /// Distribute local revocations to peer agents via `meta/v1 PublishRevocations`.
-    Revocations {
-        #[command(subcommand)]
-        action: RevocationsAction,
+    /// Install the daemon for a supported target.
+    Install {
+        target: Option<InstallTarget>,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        detect: bool,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
-    /// Print strictly local diagnostics (clock, identity, listener bind, discovery config, ticket expiry).
-    Doctor,
     /// Docker target management.
     Docker {
         #[command(subcommand)]
@@ -452,11 +457,22 @@ enum TopLevel {
         #[command(subcommand)]
         action: SlicerAction,
     },
+    /// Run the slicer HTTP bridge against an upstream API.
+    Gateway { upstream_url: String },
+    #[command(hide = true)]
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
+    #[command(hide = true)]
+    Id {
+        #[command(subcommand)]
+        action: IdAction,
+    },
 }
 
 #[derive(Subcommand, Debug)]
 enum AgentAction {
-    /// Start the long-running agent service.
     Run {
         #[arg(long, value_enum)]
         mode: Option<AgentModeArg>,
@@ -466,90 +482,46 @@ enum AgentAction {
 }
 
 #[derive(Subcommand, Debug)]
-enum RevocationsAction {
-    /// Push local revocations to one peer or every alias in the alias store.
-    Publish {
-        #[arg(long, conflicts_with = "all_peers")]
-        peer: Option<String>,
-        #[arg(long, conflicts_with = "peer")]
-        all_peers: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
 enum DockerAction {
-    Container {
-        #[command(subcommand)]
-        action: DockerContainerAction,
+    Run {
+        image: String,
+        #[arg(long)]
+        name: Option<String>,
     },
-    Logs {
-        name: String,
-        #[arg(long)]
-        follow: bool,
-        #[arg(long)]
-        tail: Option<String>,
+    Attach {
+        container: String,
     },
-}
-
-#[derive(Subcommand, Debug)]
-enum DockerContainerAction {
-    Add {
-        name: String,
-        #[arg(long)]
-        image: Option<String>,
-        #[arg(long)]
-        network: Option<String>,
-        #[arg(long = "agent-caps", default_value = "shell")]
-        agent_caps: String,
-        #[arg(long, default_value = "30d")]
-        ttl: String,
-        #[arg(long)]
-        to: Option<String>,
-        #[arg(long = "label")]
-        labels: Vec<String>,
-        #[arg(long = "rm-existing")]
-        rm_existing: bool,
+    Detach {
+        container: String,
     },
     List {
-        #[arg(long)]
+        #[arg(long, hide = true)]
         json: bool,
     },
     Rm {
         name: String,
-        #[arg(long)]
+        #[arg(long, hide = true)]
         force: bool,
-        #[arg(long = "keep-tickets")]
+        #[arg(long = "keep-tickets", hide = true)]
         keep_tickets: bool,
     },
-    Rebuild {
-        name: String,
-    },
-    Logs {
-        name: String,
+    Bake {
+        base_image: String,
         #[arg(long)]
-        follow: bool,
+        output: Option<PathBuf>,
         #[arg(long)]
-        tail: Option<String>,
+        tag: Option<String>,
+        #[arg(long)]
+        push: bool,
+        #[arg(long = "init-shim")]
+        init_shim: bool,
     },
 }
 
 #[derive(Subcommand, Debug)]
 enum SlicerAction {
-    Login {
-        master_ticket: String,
-        #[arg(long)]
-        base_url: Option<String>,
-    },
-    Vm {
-        #[command(subcommand)]
-        action: SlicerVmAction,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum SlicerVmAction {
-    Add {
-        group: String,
+    Run {
+        image: String,
         #[arg(long)]
         base_url: Option<String>,
         #[arg(long)]
@@ -562,45 +534,34 @@ enum SlicerVmAction {
         ticket_out: Option<PathBuf>,
     },
     List {
-        #[arg(long)]
+        #[arg(long, hide = true)]
         base_url: Option<String>,
-        #[arg(long)]
+        #[arg(long, hide = true)]
         json: bool,
     },
-    Delete {
+    Rm {
         name: String,
-        #[arg(long)]
+        #[arg(long, hide = true)]
         base_url: Option<String>,
     },
-    Logs {
-        name: String,
-        #[arg(long)]
-        base_url: Option<String>,
-        #[arg(long, default_value_t = 100)]
-        tail: usize,
-    },
-    Shell {
-        name: String,
+    Bake {
+        base_image: String,
     },
 }
 
 #[derive(Subcommand, Debug)]
 enum IdAction {
-    /// Generate a new local identity.
     New {
         #[arg(long)]
         force: bool,
     },
-    /// Show the current identity.
     Show,
-    /// Export the current identity.
     Export {
         #[arg(long)]
         out: PathBuf,
         #[arg(long = "passphrase-cmd")]
         passphrase_cmd: Option<String>,
     },
-    /// Import an encrypted identity export.
     Import {
         #[arg(long)]
         from: PathBuf,
@@ -615,6 +576,120 @@ impl Cli {
     #[allow(clippy::too_many_lines)]
     fn into_command(self) -> Command {
         match self.command {
+            TopLevel::Init { force, role } => Command::Init { force, role },
+            TopLevel::Doctor => Command::Doctor,
+            TopLevel::Status { peer, relay } => Command::Status { peer, relay },
+            TopLevel::Shell { peer, cwd, user } => Command::Shell { peer, cwd, user },
+            TopLevel::Exec {
+                peer,
+                cwd,
+                user,
+                argv,
+            } => Command::Exec {
+                peer,
+                cwd,
+                user,
+                argv,
+            },
+            TopLevel::Tcp { local, peer } => Command::Tcp { peer, local },
+            TopLevel::Udp { local, peer } => Command::Udp { peer, local },
+            TopLevel::Mint {
+                caps,
+                ttl,
+                to,
+                from,
+                print,
+                endpoint,
+            } => Command::Mint {
+                caps,
+                ttl,
+                to,
+                from,
+                print,
+                endpoint,
+            },
+            TopLevel::Revoke { id, list, publish } => Command::Revoke { id, list, publish },
+            TopLevel::Install {
+                target,
+                apply,
+                yes,
+                detect,
+                dry_run,
+            } => Command::Install {
+                target,
+                apply,
+                yes,
+                detect,
+                dry_run,
+            },
+            TopLevel::Docker {
+                action: DockerAction::Run { image, name },
+            } => Command::DockerRun { image, name },
+            TopLevel::Docker {
+                action: DockerAction::Attach { container },
+            } => Command::DockerAttach { container },
+            TopLevel::Docker {
+                action: DockerAction::Detach { container },
+            } => Command::DockerDetach { container },
+            TopLevel::Docker {
+                action: DockerAction::List { json },
+            } => Command::DockerList { json },
+            TopLevel::Docker {
+                action:
+                    DockerAction::Rm {
+                        name,
+                        force,
+                        keep_tickets,
+                    },
+            } => Command::DockerRm {
+                name,
+                force,
+                keep_tickets,
+            },
+            TopLevel::Docker {
+                action:
+                    DockerAction::Bake {
+                        base_image,
+                        output,
+                        tag,
+                        push,
+                        init_shim,
+                    },
+            } => Command::DockerBake {
+                base_image,
+                output,
+                tag,
+                push,
+                init_shim,
+            },
+            TopLevel::Slicer {
+                action:
+                    SlicerAction::Run {
+                        image,
+                        base_url,
+                        cpus,
+                        ram_gb,
+                        tags,
+                        ticket_out,
+                    },
+            } => Command::SlicerRun {
+                image,
+                base_url,
+                cpus,
+                ram_gb,
+                tags,
+                ticket_out,
+            },
+            TopLevel::Slicer {
+                action: SlicerAction::List { base_url, json },
+            } => Command::SlicerList { base_url, json },
+            TopLevel::Slicer {
+                action: SlicerAction::Rm { name, base_url },
+            } => Command::SlicerRm { name, base_url },
+            TopLevel::Slicer {
+                action: SlicerAction::Bake { base_image },
+            } => Command::SlicerBake { base_image },
+            TopLevel::Gateway { upstream_url } => Command::Gateway { upstream_url },
             TopLevel::Agent {
                 action: AgentAction::Run { mode, upstream_url },
             } => Command::AgentRun { mode, upstream_url },
@@ -646,185 +721,6 @@ impl Cli {
                 force,
                 passphrase_cmd,
             },
-            TopLevel::MintRoot {
-                endpoint,
-                caps,
-                ttl,
-                to,
-                depth,
-                print,
-            } => Command::MintRoot {
-                endpoint,
-                caps,
-                ttl,
-                to,
-                depth,
-                print,
-            },
-            TopLevel::Status { peer, relay } => Command::Status { peer, relay },
-            TopLevel::Gateway { upstream_url } => Command::Gateway { upstream_url },
-            TopLevel::Shell { peer, cwd, user } => Command::Shell { peer, cwd, user },
-            TopLevel::Exec {
-                peer,
-                cwd,
-                user,
-                argv,
-            } => Command::Exec {
-                peer,
-                cwd,
-                user,
-                argv,
-            },
-            TopLevel::Tcp { peer, local } => Command::Tcp { peer, local },
-            TopLevel::Udp { peer, local } => Command::Udp { peer, local },
-            TopLevel::Revoke {
-                alias,
-                ticket,
-                list,
-            } => Command::Revoke {
-                alias,
-                ticket,
-                list,
-            },
-            TopLevel::Revocations {
-                action: RevocationsAction::Publish { peer, all_peers },
-            } => Command::RevocationsPublish { peer, all_peers },
-            TopLevel::Doctor => Command::Doctor,
-            TopLevel::Docker {
-                action:
-                    DockerAction::Container {
-                        action:
-                            DockerContainerAction::Add {
-                                name,
-                                image,
-                                network,
-                                agent_caps,
-                                ttl,
-                                to,
-                                labels,
-                                rm_existing,
-                            },
-                    },
-            } => Command::DockerAdd {
-                name,
-                image,
-                network,
-                agent_caps,
-                ttl,
-                to,
-                labels,
-                rm_existing,
-            },
-            TopLevel::Docker {
-                action:
-                    DockerAction::Container {
-                        action: DockerContainerAction::List { json },
-                    },
-            } => Command::DockerList { json },
-            TopLevel::Docker {
-                action:
-                    DockerAction::Container {
-                        action:
-                            DockerContainerAction::Rm {
-                                name,
-                                force,
-                                keep_tickets,
-                            },
-                    },
-            } => Command::DockerRm {
-                name,
-                force,
-                keep_tickets,
-            },
-            TopLevel::Docker {
-                action:
-                    DockerAction::Container {
-                        action: DockerContainerAction::Rebuild { name },
-                    },
-            } => Command::DockerRebuild { name },
-            TopLevel::Docker {
-                action: DockerAction::Logs { name, follow, tail },
-            } => Command::DockerLogs {
-                name,
-                follow,
-                tail,
-                deprecated_container_alias: false,
-            },
-            TopLevel::Docker {
-                action:
-                    DockerAction::Container {
-                        action: DockerContainerAction::Logs { name, follow, tail },
-                    },
-            } => Command::DockerLogs {
-                name,
-                follow,
-                tail,
-                deprecated_container_alias: true,
-            },
-            TopLevel::Slicer {
-                action:
-                    SlicerAction::Login {
-                        master_ticket,
-                        base_url,
-                    },
-            } => Command::SlicerLogin {
-                master_ticket,
-                base_url,
-            },
-            TopLevel::Slicer {
-                action:
-                    SlicerAction::Vm {
-                        action:
-                            SlicerVmAction::Add {
-                                group,
-                                base_url,
-                                cpus,
-                                ram_gb,
-                                tags,
-                                ticket_out,
-                            },
-                    },
-            } => Command::SlicerVmAdd {
-                group,
-                base_url,
-                cpus,
-                ram_gb,
-                tags,
-                ticket_out,
-            },
-            TopLevel::Slicer {
-                action:
-                    SlicerAction::Vm {
-                        action: SlicerVmAction::List { base_url, json },
-                    },
-            } => Command::SlicerVmList { base_url, json },
-            TopLevel::Slicer {
-                action:
-                    SlicerAction::Vm {
-                        action: SlicerVmAction::Delete { name, base_url },
-                    },
-            } => Command::SlicerVmDelete { name, base_url },
-            TopLevel::Slicer {
-                action:
-                    SlicerAction::Vm {
-                        action:
-                            SlicerVmAction::Logs {
-                                name,
-                                base_url,
-                                tail,
-                            },
-                    },
-            } => Command::SlicerVmLogs {
-                name,
-                base_url,
-                tail,
-            },
-            TopLevel::Slicer {
-                action:
-                    SlicerAction::Vm {
-                        action: SlicerVmAction::Shell { name },
-                    },
-            } => Command::SlicerVmShell { name },
         }
     }
 }

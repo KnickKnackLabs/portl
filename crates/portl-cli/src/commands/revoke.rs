@@ -10,22 +10,26 @@ use portl_core::id::store;
 use portl_core::ticket::hash::ticket_id;
 use portl_core::ticket::schema::PortlTicket;
 
-use crate::alias_store::AliasStore;
+use crate::{alias_store::AliasStore, commands::revocations};
 
-pub fn run(alias: Option<&str>, ticket: Option<&str>, list: bool) -> Result<ExitCode> {
+pub fn run(id_or_target: Option<&str>, list: bool, publish: bool) -> Result<ExitCode> {
     let path = local_revocations_path();
     if list {
         print!("{}", render_list(&path)?);
         return Ok(ExitCode::SUCCESS);
     }
 
-    let id = match (alias, ticket) {
-        (Some(name), None) => revoke_alias(name, &AliasStore::default(), &path)?,
-        (None, Some(uri)) => revoke_ticket_uri(uri, &path)?,
-        _ => bail!("exactly one of --alias, --ticket, or --list is required"),
+    let target = id_or_target.ok_or_else(|| anyhow!("either <id> or --list is required"))?;
+    let id = if AliasStore::default().get(target)?.is_some() {
+        revoke_alias(target, &AliasStore::default(), &path)?
+    } else {
+        revoke_ticket_uri(target, &path)?
     };
 
     println!("revoked {}", hex::encode(id));
+    if publish {
+        return revocations::publish(Some(target), false);
+    }
     Ok(ExitCode::SUCCESS)
 }
 

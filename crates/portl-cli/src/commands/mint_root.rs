@@ -1,11 +1,11 @@
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use iroh_base::{EndpointAddr, EndpointId};
 use iroh_tickets::Ticket;
-use portl_core::id::store;
-use portl_core::ticket::mint::mint_root;
+use portl_core::id::{Identity, store};
+use portl_core::ticket::mint::{mint_delegated, mint_root};
 use portl_core::ticket::schema::{Capabilities, EnvPolicy, MetaCaps, PortRule, ShellCaps};
 use qrcode::QrCode;
 use qrcode::render::unicode;
@@ -16,15 +16,14 @@ const TICKET_EXPLORER_URL: &str = "https://ticket.iroh.computer/#";
 const ONE_YEAR_SECONDS: u64 = 365 * 24 * 60 * 60;
 
 pub fn run(
-    endpoint: &str,
     caps: &str,
     ttl: &str,
     to: Option<&str>,
-    depth: Option<u8>,
+    from: Option<&str>,
     print: MintRootPrint,
+    endpoint: Option<&str>,
 ) -> Result<ExitCode> {
     let identity = store::load(&store::default_path())?;
-    let addr = parse_endpoint_addr(endpoint)?;
     let caps = parse_caps(caps)?;
     let ttl_secs = parse_ttl(ttl)?;
     let to = to.map(parse_endpoint_bytes).transpose()?;
@@ -34,11 +33,16 @@ pub fn run(
         .as_secs();
     let not_after = now.checked_add(ttl_secs).context("ttl overflows u64")?;
 
-    if let Some(depth) = depth {
-        eprintln!("warning: ignoring --depth={depth} for root tickets in M1");
-    }
-
-    let ticket = mint_root(identity.signing_key(), addr, caps, now, not_after, to)?;
+    let ticket = if let Some(parent) = from {
+        let parent = parse_ticket(parent)?;
+        mint_delegated(identity.signing_key(), &parent, caps, now, not_after, to)?
+    } else {
+        let addr = endpoint
+            .map(parse_endpoint_addr)
+            .transpose()?
+            .unwrap_or_else(|| local_endpoint_addr(&identity));
+        mint_root(identity.signing_key(), addr, caps, now, not_after, to)?
+    };
     let ticket_uri = ticket.serialize();
 
     match print {
@@ -202,6 +206,18 @@ pub(crate) fn parse_ttl(spec: &str) -> Result<u64> {
         _ => bail!("ttl unit must be one of s, m, h, d, y"),
     };
     value.checked_mul(multiplier).context("ttl overflows u64")
+}
+
+fn parse_ticket(spec: &str) -> Result<portl_core::ticket::schema::PortlTicket> {
+    <portl_core::ticket::schema::PortlTicket as Ticket>::deserialize(spec)
+        .map_err(|err| anyhow!("parse parent ticket: {err}"))
+}
+
+fn local_endpoint_addr(identity: &Identity) -> EndpointAddr {
+    EndpointAddr::new(
+        EndpointId::from_bytes(&identity.verifying_key())
+            .expect("identity pubkey is a valid endpoint id"),
+    )
 }
 
 fn parse_endpoint_addr(spec: &str) -> Result<EndpointAddr> {
