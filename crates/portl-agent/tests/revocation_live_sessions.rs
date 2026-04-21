@@ -62,13 +62,15 @@ async fn revocation_of_parent_ticket_cancels_delegated_session() -> Result<()> {
     let operator = Identity::new();
     let agent = start_agent(server.clone(), &operator).await?;
     let parent = root_ticket(&operator, server.addr(), shell_and_meta_caps());
-    let now = unix_now_secs();
+    // Mint the delegated child strictly inside the parent's window so
+    // the test doesn't race the wall-clock second boundary between the
+    // two `unix_now_secs()` calls.
     let delegated = mint_delegated(
         operator.signing_key(),
         &parent,
         shell_and_meta_caps(),
-        now,
-        now + 300,
+        parent.body.not_before,
+        parent.body.not_after,
         None,
     )
     .expect("mint delegated ticket");

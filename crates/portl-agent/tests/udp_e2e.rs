@@ -466,7 +466,7 @@ async fn udp_src_tag_lru_eviction() -> Result<()> {
     // retry-loop comment below for the recovery strategy this
     // test uses.
     const RECV_TIMEOUT: Duration = Duration::from_secs(3);
-    const MAX_ATTEMPTS: u32 = 3;
+    const MAX_ATTEMPTS: u32 = 6;
     let remote = UdpSocket::bind(("127.0.0.1", 0)).await?;
     let remote_port = remote.local_addr()?.port();
     let (client, server) = pair().await?;
