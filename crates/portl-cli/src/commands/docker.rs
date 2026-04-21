@@ -25,6 +25,7 @@ use portl_core::bootstrap::{Bootstrapper, Handle, TargetStatus};
 use portl_core::id::{Identity, store};
 use portl_core::ticket::hash::ticket_id;
 use portl_core::ticket::mint::mint_root;
+use portl_core::ticket::schema::PortlTicket;
 use serde::Deserialize;
 
 use crate::alias_store::{AliasRecord, AliasStore, StoredSpec, now_unix_secs};
@@ -239,7 +240,7 @@ pub fn rm(name: &str, force: bool, keep_tickets: bool) -> Result<ExitCode> {
 #[derive(Clone)]
 struct InjectionPlan {
     identity: Identity,
-    ticket: portl_core::ticket::schema::PortlTicket,
+    ticket: PortlTicket,
     caps: portl_core::ticket::schema::Capabilities,
     ttl_secs: u64,
     endpoint_id_hex: String,
@@ -1243,6 +1244,8 @@ async fn container_snapshot(
 }
 
 fn save_injected_alias(outcome: &InjectionOutcome) -> Result<()> {
+    let ticket_path = local_ticket_path(&outcome.container.name);
+    write_ticket(&ticket_path, &outcome.plan.ticket)?;
     AliasStore::default().save(
         &AliasRecord {
             name: outcome.container.name.clone(),
@@ -1259,7 +1262,7 @@ fn save_injected_alias(outcome: &InjectionOutcome) -> Result<()> {
             to: Some(outcome.plan.holder),
             labels: vec![],
             root_ticket_id: Some(outcome.plan.root_ticket_id),
-            ticket_file_path: None,
+            ticket_file_path: Some(ticket_path),
             group_name: None,
             base_url: None,
             docker_exec_id: Some(outcome.exec_id.clone()),
@@ -1300,6 +1303,20 @@ fn local_revocations_path() -> PathBuf {
         || PathBuf::from("revocations.jsonl"),
         |parent| parent.join("revocations.jsonl"),
     )
+}
+
+fn local_ticket_path(name: &str) -> PathBuf {
+    store::default_path().parent().map_or_else(
+        || PathBuf::from(format!("{name}.ticket")),
+        |parent| parent.join("tickets").join(format!("{name}.ticket")),
+    )
+}
+
+fn write_ticket(path: &Path, ticket: &PortlTicket) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    fs::write(path, ticket.serialize()).with_context(|| format!("write ticket {}", path.display()))
 }
 
 fn ticket_not_after(created_at: i64, ttl_secs: u64) -> Option<u64> {
