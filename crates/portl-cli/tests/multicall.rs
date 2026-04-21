@@ -9,6 +9,10 @@
 //!    for systemd-unit compat), the argument vector is rewritten
 //!    so that `agent` is prepended before clap parsing. This
 //!    makes `portl-agent run` equivalent to `portl agent run`.
+//! 3. When argv[0] is `portl-gateway`, the argument vector is
+//!    rewritten so that `gateway` is prepended before clap
+//!    parsing. This makes `portl-gateway <upstream>` equivalent
+//!    to `portl gateway <upstream>`.
 //!
 //! The tests drive `portl_cli::parse` which returns a structured
 //! `Command` value — no process spawning, no stdout capture.
@@ -68,6 +72,18 @@ fn portl_agent_symlink_respects_full_path() {
             }
         ),
         "basename dispatch must see past absolute path"
+    );
+}
+
+#[test]
+fn rewrite_multicall_dispatches_portl_gateway_to_gateway_subcommand() {
+    let cmd = parse(argv(&["portl-gateway", "https://upstream.example:443"]))
+        .expect("parse should succeed");
+    assert_eq!(
+        cmd,
+        Command::Gateway {
+            upstream_url: "https://upstream.example:443".to_owned(),
+        }
     );
 }
 

@@ -285,7 +285,13 @@ jobs:
           NAME="portl-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir -p "staging/${NAME}"
           cp "target/${{ matrix.target }}/release/portl" "staging/${NAME}/portl"
-          (cd "staging/${NAME}" && ln -sf portl portl-agent)
+          (
+            cd "staging/${NAME}"
+            ln -sf portl portl-agent
+            ln -sf portl portl-gateway
+            test -L portl-agent
+            test -L portl-gateway
+          )
           cp LICENSE-MIT CHANGELOG.md "staging/${NAME}/"
           # --no-mac-metadata strips any remaining com.apple.* xattrs
           # on macos-latest runners; GNU tar on ubuntu-latest ignores

@@ -93,6 +93,24 @@ fn agent_run_rejects_invalid_trust_root_hex() {
     );
 }
 
+#[test]
+fn agent_run_rejects_gateway_mode_env_with_portl_gateway_hint() {
+    let err = with_env(
+        &[("PORTL_MODE", Some(OsString::from("gateway")))],
+        portl_cli::load_agent_config,
+    )
+    .expect_err("PORTL_MODE=gateway should be rejected");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("PORTL_MODE=gateway has been removed"),
+        "unexpected error: {rendered}"
+    );
+    assert!(
+        rendered.contains("portl-gateway"),
+        "unexpected error: {rendered}"
+    );
+}
+
 #[allow(unsafe_code)]
 fn with_env<T>(vars: &[(&str, Option<OsString>)], f: impl FnOnce() -> T) -> T {
     let _guard = ENV_LOCK.lock().expect("env lock");

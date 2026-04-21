@@ -59,6 +59,10 @@ pub enum Command {
     Status {
         peer: String,
     },
+    /// `portl gateway <upstream-url>`
+    Gateway {
+        upstream_url: String,
+    },
     /// `portl shell <peer>`
     Shell {
         peer: String,
@@ -182,9 +186,10 @@ pub enum ParseError {
 ///
 /// Handles multicall dispatch: if argv[0]'s basename is
 /// `portl-agent`, the argument vector is rewritten to
-/// `["portl", "agent", ...rest]` before clap parses it. This
-/// keeps the symlink + systemd-unit pathway working without a
-/// second binary.
+/// `["portl", "agent", ...rest]`; if it is `portl-gateway`,
+/// the vector is rewritten to `["portl", "gateway", ...rest]`.
+/// This keeps the symlink + systemd-unit pathway working
+/// without a second binary.
 pub fn parse(argv: Vec<OsString>) -> Result<Command, ParseError> {
     let argv = rewrite_multicall(argv)?;
     let cli = Cli::try_parse_from(argv)?;
@@ -238,6 +243,9 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             print,
         } => commands::mint_root::run(&endpoint, &caps, &ttl, to.as_deref(), depth, print),
         Command::Status { peer } => commands::status::run(&peer),
+        Command::Gateway { upstream_url } => {
+            commands::agent::run::run(Some(AgentModeArg::Gateway), Some(&upstream_url))
+        }
         Command::Shell { peer, cwd, user } => {
             commands::shell::run(&peer, cwd.as_deref(), user.as_deref())
         }
@@ -330,9 +338,16 @@ fn rewrite_multicall(mut argv: Vec<OsString>) -> Result<Vec<OsString>, ParseErro
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or_default();
-    if basename == "portl-agent" {
-        argv[0] = OsString::from("portl");
-        argv.insert(1, OsString::from("agent"));
+    match basename {
+        "portl-agent" => {
+            argv[0] = OsString::from("portl");
+            argv.insert(1, OsString::from("agent"));
+        }
+        "portl-gateway" => {
+            argv[0] = OsString::from("portl");
+            argv.insert(1, OsString::from("gateway"));
+        }
+        _ => {}
     }
     Ok(argv)
 }
@@ -373,6 +388,8 @@ enum TopLevel {
     },
     /// Query peer reachability and metadata.
     Status { peer: String },
+    /// Run the slicer HTTP bridge against an upstream API.
+    Gateway { upstream_url: String },
     /// Open an interactive remote PTY shell.
     Shell {
         peer: String,
@@ -639,6 +656,7 @@ impl Cli {
                 print,
             },
             TopLevel::Status { peer } => Command::Status { peer },
+            TopLevel::Gateway { upstream_url } => Command::Gateway { upstream_url },
             TopLevel::Shell { peer, cwd, user } => Command::Shell { peer, cwd, user },
             TopLevel::Exec {
                 peer,
