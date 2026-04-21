@@ -1,7 +1,13 @@
 # 10 — End-to-end walkthroughs
-
-Each walkthrough is a self-contained story with diagrams. Read them in
-order — later ones build on earlier concepts.
++
++> **Historical walkthrough note.** These flows were written against
++> the v0.1 command surface. Read `portl id new` as `portl init`,
++> `portl mint-root` as `portl mint`, and `portl agent run` as the
++> `portl-agent` entrypoint when mapping them onto the shipped v0.2.0
++> surface.
++
++Each walkthrough is a self-contained story with diagrams. Read them in
++order — later ones build on earlier concepts.
 
 ## 1. Peer-to-peer: two laptops, no orchestrator
 

@@ -1,4 +1,9 @@
 # 03 — Tickets
++
++> **Ticket schema is still live; CLI examples are partly historical.**
++> The wire format in this document remains valid in v0.2.0. Where
++> examples use `portl id new` or `portl mint-root`, read those as
++> the modern `portl init` and `portl mint` commands.
 
 Tickets are the **only** multi-party object in portl. Everything that
 crosses a trust boundary is a ticket.

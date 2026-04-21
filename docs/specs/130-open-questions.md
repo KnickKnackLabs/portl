@@ -1,7 +1,11 @@
 # 13 — Open questions / decisions needed
-
-These are the places where this doc deliberately stops short and asks for
-explicit confirmation before code shape locks in.
++
++> **Historical decision log.** Most items in this file are resolved
++> by the shipped v0.1.x / v0.2.0 work. Keep reading it as design
++> provenance, not as a live unresolved-questions queue.
++
++These are the places where this doc deliberately stops short and asks for
++explicit confirmation before code shape locks in.
 
 Each item lists: the choice, the options, the current lean, and the cost
 of getting it wrong.

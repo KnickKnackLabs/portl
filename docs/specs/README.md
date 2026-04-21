@@ -36,10 +36,11 @@
 
 ## What this document set is
 
-A complete design doc for `portl` before any code is written. Each file is
-self-contained and cross-references the others. The intent is to settle
-enough architecture that scaffolding the workspace is a mechanical
-translation of what's written here.
+A mix of **live specs** and **historical design records**. The v0.1
+canon docs (`010`–`130`) capture the project as originally designed;
+`140`, `150`, and `160` record the shipped post-v0.1 release work.
+Where a v0.1 doc's user-facing surface is now stale, it is preserved as
+history and should be read together with the newer superseding spec.
 
 ## Terminology note: `node_id` vs `endpoint_id`
 
@@ -63,13 +64,13 @@ prose still use `node_id`. Treat them as synonymous.
 | 060 | `060-docker.md` | The Docker adapter (M4 reference implementation). |
 | 065 | `065-slicer.md` | The slicer adapter end-to-end (M5). |
 | 070 | `070-security.md` | Threat model, trust, key custody, failure modes. |
-| 080 | `080-cli.md` | Exhaustive CLI reference: `portl` (operator), `portl agent` (target-side), adapters. |
-| 090 | `090-config.md` | Config file formats, on-disk layout, directories, keys. |
-| 100 | `100-walkthroughs.md` | End-to-end example flows with diagrams. |
-| 110 | `110-workspace.md` | Cargo workspace layout, crate boundaries, dependencies. |
-| 120 | `120-roadmap.md` | Milestones M0–M10 with exit criteria (M4 docker, M5 slicer). |
-| 130 | `130-open-questions.md` | Decisions the author wants confirmed before scaffolding. |
-| 140 | `140-v0.2-operability.md` | **v0.2.0 design spec.** Shape cleanup + session-lifecycle hardening; supersedes parts of 060/080/090 on ship. |
+| 080 | `080-cli.md` | **Historical v0.1 CLI reference.** Superseded for shipped behavior by `140-v0.2-operability.md §4` and the current `--help` output. |
+| 090 | `090-config.md` | **Historical v0.1 config/layout doc.** Superseded for shipped behavior by `140-v0.2-operability.md §8-§9`. |
+| 100 | `100-walkthroughs.md` | End-to-end example flows with diagrams. Early walkthroughs use v0.1 command names; read with `140` for the shipped v0.2 surface. |
+| 110 | `110-workspace.md` | Workspace layout and repo structure. Some command-tree examples are historical v0.1; the live CLI surface is in `140`. |
+| 120 | `120-roadmap.md` | Historical milestone plan and release sequence record. Read as shipped history, not forward roadmap. |
+| 130 | `130-open-questions.md` | Historical design questions. Many are resolved; use as decision provenance rather than an active to-do list. |
+| 140 | `140-v0.2-operability.md` | **v0.2.0 design spec.** Live reference for the shipped CLI/config/runtime surface; supersedes parts of 060/080/090 on ship. |
 | 150 | `150-v0.1.1-safety-net.md` | **v0.1.1 design spec.** Three non-breaking runtime-stability items shipped ahead of v0.2. |
 | 160 | `160-v0.1.2-alias-isolation.md` | **v0.1.2 design spec.** Forensic experiment: isolate rusqlite removal to test the macOS release-mode crash hypothesis. |
 
@@ -143,12 +144,10 @@ are adapters"). That temptation trades one renumbering crisis
 - **Bootstrap is pluggable.** Docker is the M4 reference
   `Bootstrapper`; slicer lands at M5. Others (cloud-init, nixos,
   k8s, manual) follow the same pattern.
-- **One binary.** `portl` is a single multicall binary that serves
-  both operator and target roles: `portl shell foo` on your laptop,
-  `portl agent run` on the target. Packagers ship a
-  `/usr/bin/portl-agent` symlink so argv[0] dispatch preserves
-  legacy systemd units. `--mode gateway` covers the earlier
-  "portl-gw" role. Everything else is libraries.
+- **One multicall ELF, three entrypoints.** `portl` is the operator
+  CLI; `portl-agent` is the daemon entrypoint; `portl-gateway` is
+  the gateway daemon entrypoint. The v0.2.x binary still accepts
+  `portl agent ...` only as a deprecation shim.
 
 ## Reading order
 

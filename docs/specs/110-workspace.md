@@ -1,7 +1,12 @@
 # 11 — Workspace layout
-
-Single Cargo workspace, single repo, all in one place until v0.1 ships
-and stable APIs freeze.
++
++> **Historical workspace note.** This file still captures the real
++> repo/crate layout, but many command-tree comments and examples are
++> v0.1-era. For the live v0.2.0 CLI/config/runtime surface, read it
++> together with [`140-v0.2-operability.md`](140-v0.2-operability.md).
++
++Single Cargo workspace, single repo, all in one place until v0.1 ships
++and stable APIs freeze.
 
 ## 1. Filesystem layout
 

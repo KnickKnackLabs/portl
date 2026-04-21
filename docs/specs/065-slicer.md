@@ -1,13 +1,13 @@
 # 06a — Slicer adapter
-
-> **Scheduled for M5.** The slicer adapter ships one milestone after
-> the Docker adapter (M4). Docker is the canonical reference
-> `Bootstrapper` implementation for v0.1; slicer-portl exercises
-> additional surfaces (systemd installs, gateway-mode for wrapping
-> the slicer HTTP API, master tickets). The two adapters validate
-> different parts of the design and both ship in v0.1.
->
-> See `060-docker.md` for the M4 adapter.
++
++> **Historical rollout note.** This doc was written when slicer was
++> still “scheduled for M5”. Both adapters have shipped. The live
++> v0.2.0 surface is `portl slicer run|list|rm`; `portl-gateway`
++> is now a dedicated entrypoint rather than a mode on `portl agent`.
++>
++> See `060-docker.md` for the Docker reference adapter and
++> [`140-v0.2-operability.md`](140-v0.2-operability.md) for the
++> shipped CLI surface.
 
 ## 1. Shape
 

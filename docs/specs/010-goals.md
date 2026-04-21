@@ -1,4 +1,11 @@
 # 01 — Goals, Non-Goals, Positioning
++
++> **Historical design note.** This document captures the original
++> v0.1-era shape. The project shipped v0.2.0 with `portl-agent`
++> / `portl-gateway` entrypoints, `portl init`, `portl mint`, and an
++> env-only daemon config surface. Treat old command names here as
++> design-history unless they are explicitly reaffirmed in
++> [`140-v0.2-operability.md`](140-v0.2-operability.md).
 
 ## 1. What portl is
 
@@ -7,11 +14,10 @@ capability tickets**. Ships as:
 
 - A Rust library (`portl-core`) plus a combined protocol crate
   (`portl-proto`).
-- One multicall binary: `portl`. The same executable serves the
-  operator side (`portl shell …`) and the target side (`portl agent
-  run …`), with an installed `portl-agent` symlink for argv[0]
-  dispatch so legacy systemd units keep working. Opt-in `--mode
-  gateway` replaces the earlier "portl-gw" sketch.
+- One multicall binary family: `portl` for the operator CLI,
+  `portl-agent` for the target daemon, and `portl-gateway` for the
+  gateway daemon. The old `portl agent ...` form survives only as a
+  v0.2.x deprecation shim.
 - A growing set of adapter crates that plug arbitrary orchestrators into
   the bootstrap pipeline.
 

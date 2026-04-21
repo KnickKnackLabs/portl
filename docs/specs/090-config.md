@@ -6,6 +6,11 @@
 > [`140-v0.2-operability.md §8-§9`](140-v0.2-operability.md#8-environment-and-configuration).
 
 ## 1. Client (operator) layout
++
++> **Historical layout warning.** The tree below is the v0.1 shape.
++> Shipped v0.2.0 replaces `agent.toml` with env-only config and
++> `aliases.sqlite` with `aliases.json`. Keep this section for
++> provenance, not as the current deployment recipe.
 
 ```
 ~/.config/portl/

@@ -1,4 +1,13 @@
 # 02 — Architecture
++
++> **Historical architecture note.** This document preserves the
++> original v0.1 architecture vocabulary and diagrams. The shipped
++> v0.2.0 user-facing surface differs in three important ways:
++> `portl-agent` replaces `portl agent run`, `portl-gateway`
++> replaces gateway mode on the main CLI, and `agent.toml` is
++> replaced by env-only configuration. See
++> [`140-v0.2-operability.md`](140-v0.2-operability.md) for the live
++> surface.
 
 ## 1. Component inventory
 

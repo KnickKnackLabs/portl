@@ -1,4 +1,9 @@
 # 12 — Roadmap
++
++> **Historical roadmap record.** This file is now best read as the
++> shipped path to v0.1 and the setup for the v0.1.1 / v0.1.2 /
++> v0.2.0 sequence. It is not the active forward roadmap after the
++> v0.2.0 release.
 
 ## 1. Milestones
 

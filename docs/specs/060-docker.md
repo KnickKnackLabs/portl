@@ -1,10 +1,10 @@
 # 06 — Docker adapter (M4 reference)
 
 > **Note:** this document describes the v0.1 "bake the image first"
-> flow. v0.2 defaults to runtime orchestration (inject portl into
-> the user's unmodified image via `docker cp` + `docker exec`) and
-> keeps bake as an opt-in. See
-> [`140-v0.2-operability.md §5-§6`](140-v0.2-operability.md#5-portl-docker-orchestrate).
++> flow. v0.2 defaults to runtime orchestration (inject portl into
++> the user's unmodified image via Docker API upload + `docker exec`)
++> and keeps bake as an opt-in. See
++> [`140-v0.2-operability.md §5-§6`](140-v0.2-operability.md#5-portl-docker-orchestrate).
 
 The `docker-portl` adapter is the canonical `Bootstrapper` reference
 implementation for v0.1. It provisions a container, installs the

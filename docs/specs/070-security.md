@@ -1,4 +1,10 @@
 # 07 — Security model
++
++> **Security invariants are live; some command examples are historical.**
++> Read `portl agent status`, `portl id export`, and similar v0.1
++> command references here as historical UI examples. The shipped
++> v0.2.0 surface uses `portl-agent`, `portl init`, `portl install`,
++> and `portl status`.
 
 ## 1. Trust hierarchy
 
