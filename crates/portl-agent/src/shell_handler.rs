@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 use std::process::{Command as StdCommand, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::{Connection, SendStream};
 #[cfg(unix)]
-use nix::sys::signal::{Signal, kill};
+use nix::sys::signal::{Signal, kill, killpg};
 #[cfg(unix)]
 use nix::unistd::{Gid, Pid, Uid, User, geteuid};
 #[cfg(unix)]
@@ -27,6 +27,7 @@ const MAX_CONTROL_BYTES: usize = 64 * 1024;
 const MAX_SIGNAL_BYTES: usize = 1024;
 const MAX_RESIZE_BYTES: usize = 1024;
 const IO_CHUNK: usize = 16 * 1024;
+const SESSION_REAPER_GRACE: Duration = Duration::from_secs(5);
 
 pub(crate) async fn serve_stream(
     connection: Connection,
@@ -68,8 +69,109 @@ struct ShellSessionGuard<'a> {
 impl Drop for ShellSessionGuard<'_> {
     fn drop(&mut self) {
         if let Some((_, process)) = self.registry.remove(&self.session_id) {
-            terminate_process(process.signal_target);
+            SessionReaper::from_process(process.as_ref()).spawn();
         }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct SessionReaper {
+    pgid: Option<Pid>,
+    exit_rx: watch::Receiver<Option<i32>>,
+    grace: Duration,
+}
+
+#[cfg(unix)]
+impl SessionReaper {
+    pub(crate) fn from_process(process: &ShellProcess) -> Self {
+        Self {
+            pgid: process
+                .signal_target
+                .and_then(i32::checked_abs)
+                .map(Pid::from_raw),
+            exit_rx: process.exit_rx(),
+            grace: SESSION_REAPER_GRACE,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_test(pgid: Pid, exit_rx: watch::Receiver<Option<i32>>, grace: Duration) -> Self {
+        Self {
+            pgid: Some(pgid),
+            exit_rx,
+            grace,
+        }
+    }
+
+    pub(crate) fn spawn(self) {
+        tokio::spawn(async move {
+            self.reap().await;
+        });
+    }
+
+    pub(crate) async fn reap(mut self) {
+        let Some(pgid) = self.pgid else {
+            return;
+        };
+        if self.is_reaped() {
+            return;
+        }
+
+        for signal in [Signal::SIGHUP, Signal::SIGTERM] {
+            match killpg(pgid, signal) {
+                Ok(()) => {}
+                Err(nix::errno::Errno::ESRCH) => return,
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        pgid = pgid.as_raw(),
+                        ?signal,
+                        "session reaper failed to signal process group"
+                    );
+                    return;
+                }
+            }
+            if self.wait_for_reap().await {
+                return;
+            }
+        }
+
+        match killpg(pgid, Signal::SIGKILL) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(err) => {
+                warn!(?err, pgid = pgid.as_raw(), signal = ?Signal::SIGKILL, "session reaper failed to signal process group");
+            }
+        }
+    }
+
+    fn is_reaped(&self) -> bool {
+        self.exit_rx.borrow().is_some()
+    }
+
+    async fn wait_for_reap(&mut self) -> bool {
+        if self.is_reaped() {
+            return true;
+        }
+        tokio::select! {
+            changed = self.exit_rx.changed() => changed.is_ok() && self.is_reaped(),
+            () = tokio::time::sleep(self.grace) => self.is_reaped(),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub(crate) struct SessionReaper;
+
+#[cfg(not(unix))]
+impl SessionReaper {
+    pub(crate) fn from_process(_process: &ShellProcess) -> Self {
+        Self
+    }
+
+    pub(crate) fn spawn(self) {
+        let _ = self;
     }
 }
 
@@ -432,7 +534,7 @@ fn spawn_exec_process(
         effective_env(session.caps.shell.as_ref(), req, requested_user),
     );
     #[cfg(unix)]
-    install_exec_rlimits_pre_exec(&mut command);
+    install_exec_session_pre_exec(&mut command);
     #[cfg(unix)]
     if let Some(user) = requested_user {
         install_exec_user_switch(&mut command, user);
@@ -523,7 +625,7 @@ fn spawn_exec_process(
         stderr_rx: tokio::sync::Mutex::new(Some(stderr_rx)),
         exit_code,
         exit_tx,
-        signal_target: Some(signal_target_from_pid(pid)?),
+        signal_target: Some(process_group_signal_target_from_pid(pid)?),
         pty_master: None,
         started_at,
     }))
@@ -833,24 +935,21 @@ fn apply_rlimits() -> std::io::Result<()> {
     Ok(())
 }
 
-/// Install a `pre_exec` hook that applies the v0.1.1 rlimits. This
-/// is the first closure registered on the exec path so it runs
-/// before the optional user-switch hook.
+/// Install a `pre_exec` hook that applies the v0.1.1 rlimits and moves
+/// the child into its own process group so teardown can signal the
+/// session tree without touching the agent's process group.
 #[cfg(unix)]
-fn install_exec_rlimits_pre_exec(command: &mut StdCommand) {
+fn install_exec_session_pre_exec(command: &mut StdCommand) {
     use std::os::unix::process::CommandExt;
     // SAFETY(unsafe_code): pre_exec runs post-fork, pre-exec. The
-    // closure calls `apply_rlimits()` which only invokes
-    // async-signal-safe syscalls (setrlimit) and returns an io::Result.
-    //
-    // SAFETY(signal): `apply_rlimits` calls only setrlimit (AS-safe
-    // per POSIX.1-2017). Error paths construct
-    // `std::io::Error::last_os_error()` which is a pre-initialised
-    // errno read with no allocation on the Err(OsError) branch, AS-safe
-    // in practice for the post-fork window.
+    // closure calls `apply_rlimits()` and `setpgid(0, 0)`, both of
+    // which are async-signal-safe syscalls, and returns an io::Result.
     #[allow(unsafe_code)]
     unsafe {
-        command.pre_exec(apply_rlimits);
+        command.pre_exec(|| {
+            apply_rlimits()?;
+            nix::unistd::setpgid(Pid::from_raw(0), Pid::from_raw(0)).map_err(std::io::Error::from)
+        });
     }
 }
 
@@ -883,7 +982,7 @@ pub async fn run_exec_capture(
     }
     // Inherit a minimal PATH so `/bin/sh` can resolve builtins.
     command.env("PATH", "/usr/local/bin:/usr/bin:/bin");
-    install_exec_rlimits_pre_exec(&mut command);
+    install_exec_session_pre_exec(&mut command);
     let output = TokioCommand::from(command).output().await?;
     Ok(ExecCapture {
         status: output.status,
@@ -1122,22 +1221,11 @@ fn send_signal(target: Option<i32>, sig: u8) {
 #[cfg(not(unix))]
 fn send_signal(_target: Option<i32>, _sig: u8) {}
 
-fn terminate_process(target: Option<i32>) {
-    #[cfg(unix)]
-    {
-        if let Some(target) = target {
-            let _ = kill(Pid::from_raw(target), Signal::SIGHUP);
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = target;
-    }
-}
-
-fn signal_target_from_pid(pid: u32) -> std::result::Result<i32, SpawnReject> {
-    i32::try_from(pid).map_err(|_| SpawnReject::path_probe_failed("child pid out of range"))
+fn process_group_signal_target_from_pid(pid: u32) -> std::result::Result<i32, SpawnReject> {
+    let pid =
+        i32::try_from(pid).map_err(|_| SpawnReject::path_probe_failed("child pid out of range"))?;
+    pid.checked_neg()
+        .ok_or_else(|| SpawnReject::path_probe_failed("child pid out of range"))
 }
 
 #[cfg(all(
@@ -1227,17 +1315,29 @@ fn fresh_session_id() -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use super::{RequestedUser, install_exec_user_switch};
+    use super::{RequestedUser, SessionReaper, install_exec_user_switch};
     use super::{ShellProcess, ShellSessionGuard};
     use crate::shell_registry::ShellRegistry;
     #[cfg(unix)]
-    use nix::unistd::{Gid, Uid};
+    use nix::errno::Errno;
+    #[cfg(unix)]
+    use nix::sys::signal::{Signal, kill};
+    #[cfg(unix)]
+    use nix::unistd::{Gid, Pid, Uid};
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt as _;
+    #[cfg(unix)]
+    use std::path::PathBuf;
     #[cfg(unix)]
     use std::process::Command as StdCommand;
+    #[cfg(unix)]
+    use std::time::Duration;
     use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 
-    #[test]
-    fn shell_registry_is_empty_after_control_stream_error() {
+    #[tokio::test]
+    async fn shell_registry_is_empty_after_control_stream_error() {
         let registry = ShellRegistry::default();
         let session_id = [9; 16];
         let (stdin_tx, _stdin_rx) = mpsc::channel(1);
@@ -1290,5 +1390,293 @@ mod tests {
         let mut target_user = base_user;
         target_user.switch_required = true;
         assert!(install_exec_user_switch(&mut switched, &target_user));
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "watchos",
+            target_os = "visionos"
+        ))
+    ))]
+    #[tokio::test]
+    async fn session_reaper_kills_interactive_shell_on_hup() {
+        let (_master, pid, exit_rx, wait_task) = spawn_pty_reaper_target(&["-i"]);
+
+        SessionReaper::new_for_test(pid, exit_rx, Duration::from_millis(100))
+            .reap()
+            .await;
+
+        let status = wait_task
+            .await
+            .expect("wait task join")
+            .expect("wait status");
+        assert_eq!(status.signal(), Some(Signal::SIGHUP as i32));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_reaper_escalates_to_term_on_hup_ignored() {
+        let (pid, exit_rx, wait_task) = spawn_exec_reaper_target("trap '' HUP; exec sleep 1000");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        SessionReaper::new_for_test(pid, exit_rx, Duration::from_millis(100))
+            .reap()
+            .await;
+
+        let status = wait_task
+            .await
+            .expect("wait task join")
+            .expect("wait status");
+        assert_eq!(status.signal(), Some(Signal::SIGTERM as i32));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_reaper_escalates_to_kill_on_term_ignored() {
+        let (pid, exit_rx, wait_task) =
+            spawn_exec_reaper_target("trap '' HUP TERM; exec sleep 1000");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        SessionReaper::new_for_test(pid, exit_rx, Duration::from_millis(100))
+            .reap()
+            .await;
+
+        let status = wait_task
+            .await
+            .expect("wait task join")
+            .expect("wait status");
+        assert_eq!(status.signal(), Some(Signal::SIGKILL as i32));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_jobs_in_pgroup_are_terminated() {
+        let pid_file = temp_pid_file("session-reaper-background");
+        let script = format!("sleep 1000 & echo $! > {}; wait", pid_file.display());
+        let (pid, exit_rx, wait_task) = spawn_exec_reaper_target(&script);
+
+        let background_pid = wait_for_pid_file(&pid_file).await;
+        SessionReaper::new_for_test(pid, exit_rx, Duration::from_millis(100))
+            .reap()
+            .await;
+        let _ = wait_task
+            .await
+            .expect("wait task join")
+            .expect("wait status");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_process_gone(background_pid);
+        let _ = fs::remove_file(pid_file);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn double_forked_daemons_survive_teardown() {
+        let pid_file = temp_pid_file("session-reaper-daemon");
+        let (pid, exit_rx, wait_task) = spawn_helper_reaper_target("double-fork-daemon", &pid_file);
+
+        let daemon_pid = wait_for_pid_file(&pid_file).await;
+        SessionReaper::new_for_test(pid, exit_rx, Duration::from_millis(100))
+            .reap()
+            .await;
+        let _ = wait_task
+            .await
+            .expect("wait task join")
+            .expect("wait status");
+
+        assert!(
+            process_exists(daemon_pid),
+            "double-forked daemon should survive session teardown"
+        );
+        let _ = kill(Pid::from_raw(daemon_pid), Signal::SIGKILL);
+        let _ = fs::remove_file(pid_file);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_reaper_helper_entrypoint() {
+        let Ok(mode) = std::env::var("PORTL_SESSION_REAPER_HELPER") else {
+            return;
+        };
+        let pid_file =
+            PathBuf::from(std::env::var("PORTL_SESSION_REAPER_PID_FILE").expect("pid file"));
+        match mode.as_str() {
+            "double-fork-daemon" => run_double_fork_daemon_helper(&pid_file),
+            other => panic!("unknown session reaper helper mode {other}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn spawn_exec_reaper_target(
+        script: &str,
+    ) -> (
+        Pid,
+        watch::Receiver<Option<i32>>,
+        tokio::task::JoinHandle<std::io::Result<std::process::ExitStatus>>,
+    ) {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.arg("-c").arg(script);
+        spawn_reaper_target(command)
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "watchos",
+            target_os = "visionos"
+        ))
+    ))]
+    fn spawn_pty_reaper_target(
+        argv: &[&str],
+    ) -> (
+        std::os::fd::OwnedFd,
+        Pid,
+        watch::Receiver<Option<i32>>,
+        tokio::task::JoinHandle<std::io::Result<std::process::ExitStatus>>,
+    ) {
+        let (master, mut child) =
+            super::spawn_pty_for_test("/bin/sh", argv).expect("spawn pty reaper target");
+        let pid =
+            Pid::from_raw(i32::try_from(child.id().expect("child pid")).expect("pid fits in i32"));
+        let (exit_tx, exit_rx) = watch::channel(None);
+        let wait_task = tokio::spawn(async move {
+            let status = child.wait().await?;
+            let _ = exit_tx.send(Some(exit_marker(status)));
+            Ok(status)
+        });
+        (master, pid, exit_rx, wait_task)
+    }
+
+    #[cfg(unix)]
+    fn spawn_helper_reaper_target(
+        mode: &str,
+        pid_file: &PathBuf,
+    ) -> (
+        Pid,
+        watch::Receiver<Option<i32>>,
+        tokio::task::JoinHandle<std::io::Result<std::process::ExitStatus>>,
+    ) {
+        let helper_name = "shell_handler::tests::session_reaper_helper_entrypoint";
+        let mut command =
+            tokio::process::Command::new(std::env::current_exe().expect("current exe"));
+        command
+            .env("PORTL_SESSION_REAPER_HELPER", mode)
+            .env("PORTL_SESSION_REAPER_PID_FILE", pid_file)
+            .arg("--exact")
+            .arg(helper_name)
+            .arg("--nocapture")
+            .arg("--test-threads=1");
+        spawn_reaper_target(command)
+    }
+
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn spawn_reaper_target(
+        mut command: tokio::process::Command,
+    ) -> (
+        Pid,
+        watch::Receiver<Option<i32>>,
+        tokio::task::JoinHandle<std::io::Result<std::process::ExitStatus>>,
+    ) {
+        // SAFETY: post-fork hook only calls setpgid, which is async-signal-safe.
+        unsafe {
+            command.pre_exec(|| {
+                nix::unistd::setpgid(Pid::from_raw(0), Pid::from_raw(0))
+                    .map_err(std::io::Error::from)
+            });
+        }
+        let mut child = command.spawn().expect("spawn reaper target");
+        let pid =
+            Pid::from_raw(i32::try_from(child.id().expect("child pid")).expect("pid fits in i32"));
+        let (exit_tx, exit_rx) = watch::channel(None);
+        let wait_task = tokio::spawn(async move {
+            let status = child.wait().await?;
+            let _ = exit_tx.send(Some(exit_marker(status)));
+            Ok(status)
+        });
+        (pid, exit_rx, wait_task)
+    }
+
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn run_double_fork_daemon_helper(pid_file: &PathBuf) {
+        use nix::sys::wait::{WaitPidFlag, waitpid};
+        use nix::unistd::{ForkResult, fork, setsid};
+        use std::thread;
+
+        // SAFETY: test-only helper process; each fork path either exits quickly
+        // or enters a simple sleep loop, and no shared Rust state is touched
+        // after the fork beyond process exit.
+        match unsafe { fork() }.expect("first fork") {
+            ForkResult::Parent { child } => {
+                let _ = waitpid(child, Some(WaitPidFlag::empty()));
+                loop {
+                    thread::sleep(Duration::from_secs(60));
+                }
+            }
+            ForkResult::Child => {
+                setsid().expect("setsid");
+                match unsafe { fork() }.expect("second fork") {
+                    ForkResult::Parent { .. } => std::process::exit(0),
+                    ForkResult::Child => {
+                        fs::write(pid_file, std::process::id().to_string())
+                            .expect("write daemon pid file");
+                        loop {
+                            thread::sleep(Duration::from_secs(60));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn temp_pid_file(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{label}-{}-{}.pid",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_pid_file(path: &PathBuf) -> i32 {
+        for _ in 0..100 {
+            if let Ok(raw) = fs::read_to_string(path)
+                && let Ok(pid) = raw.trim().parse::<i32>()
+            {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("timed out waiting for pid file {}", path.display());
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: i32) -> bool {
+        match kill(Pid::from_raw(pid), None) {
+            Ok(()) | Err(Errno::EPERM) => true,
+            Err(Errno::ESRCH) => false,
+            Err(err) => panic!("unexpected kill(0) error for pid {pid}: {err}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_process_gone(pid: i32) {
+        assert!(!process_exists(pid), "pid {pid} should not be alive");
+    }
+
+    #[cfg(unix)]
+    fn exit_marker(status: std::process::ExitStatus) -> i32 {
+        status
+            .code()
+            .unwrap_or_else(|| status.signal().unwrap_or(1))
     }
 }
