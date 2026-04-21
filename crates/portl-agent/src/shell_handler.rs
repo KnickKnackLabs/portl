@@ -738,8 +738,26 @@ fn spawn_pty_blocking(
                 return Err(std::io::Error::last_os_error());
             }
             // Make the slave the controlling tty for this session.
-            #[allow(clippy::cast_lossless)]
-            let req = nix::libc::TIOCSCTTY as nix::libc::c_ulong;
+            // The `ioctl` request argument type varies by target:
+            // `c_ulong` on glibc and darwin, `c_int` on musl, which
+            // means a direct `as c_ulong` breaks the musl release
+            // build. `try_into().expect(...)` adapts across all
+            // three because `TIOCSCTTY` (0x540E on Linux, 0x2000_7461
+            // on darwin) fits comfortably in every integer type
+            // `ioctl`'s second parameter might be on a supported
+            // platform.
+            // Clippy sees this as `useless_conversion` on glibc-linux
+            // and `unnecessary_fallible_conversions` on darwin
+            // because on both platforms `libc::TIOCSCTTY` and the
+            // `ioctl` request parameter are `c_ulong`. On musl the
+            // request parameter is `c_int`, so `.into()` won't
+            // compile; `.try_into()` is the only form that works
+            // everywhere. Both allows are needed because clippy
+            // picks a different lint on each host.
+            #[allow(clippy::useless_conversion, clippy::unnecessary_fallible_conversions)]
+            let req = nix::libc::TIOCSCTTY
+                .try_into()
+                .expect("TIOCSCTTY fits in ioctl request type");
             if nix::libc::ioctl(slave_fd, req, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
