@@ -1,0 +1,22 @@
+# Workspace-wide cargo configuration.
+#
+# Only cache-safe knobs here (aliases, job limits, net settings) — nothing
+# that changes rustc flags, linker flags, profiles, or `RUSTC_WRAPPER`, since
+# those invalidate the entire `target/` fingerprint on first use.
+#
+# For cache-invalidating optimizations (sccache, alternate linkers, profile
+# tweaks, the `pair()` preset fix), see `scratch/rust-perf-notes.md`.
+
+[alias]
+# Hot-loop shortcuts. `nt` is the default everyday runner.
+nt          = "nextest run --workspace --no-fail-fast"
+nt-unit     = "nextest run --workspace --lib --bins --no-fail-fast"
+nt-int      = "nextest run --workspace --test '*' --no-fail-fast"
+check-all   = "check --workspace --all-targets"
+clippy-all  = "clippy --workspace --all-targets"
+
+[env]
+# Keep the per-test-binary watchdog default visible to agents/CI even when
+# invoking `cargo test` directly (the Rust code also defaults to 30s).
+# Overridable per-invocation via the shell environment.
+PORTL_TEST_WATCHDOG_SECS = { value = "30", force = false }

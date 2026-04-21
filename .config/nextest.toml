@@ -1,0 +1,44 @@
+# nextest config. See https://nexte.st/docs/configuration/
+#
+# The goals here are defense-in-depth alongside the per-test-binary
+# watchdog in `crates/portl-agent/tests/common/mod.rs`:
+#   - Catch individual hung tests at a finer granularity than the
+#     30s process-abort watchdog.
+#   - Fail fast on leaked subprocesses/threads after test completion.
+#   - Run integration test binaries in parallel (nextest's default),
+#     which `cargo test --workspace` does not.
+
+[profile.default]
+# If a single test runs longer than `period` with no output, emit a
+# warning. After `terminate-after` periods, nextest SIGKILLs it. This
+# fires BEFORE the 30s binary-level watchdog, so you get a specific
+# test name in the failure output instead of a bare "process aborted".
+slow-timeout = { period = "10s", terminate-after = 2, grace-period = "2s" }
+
+# If a test finishes but leaves background tasks / child processes
+# alive past this window, fail it. Catches iroh endpoints / spawned
+# PTYs that outlive the test body.
+leak-timeout = "2s"
+
+# Fail the run quickly once something breaks, but still surface every
+# failing test (default is 1 — we want the full picture).
+fail-fast = false
+
+# Show output inline from failed tests; keep successful tests quiet.
+failure-output = "immediate-final"
+success-output = "never"
+
+# Retry flaky tests once. Most iroh-dependent tests are deterministic
+# in-process; a single retry covers transient port-bind / mDNS races.
+retries = { backoff = "fixed", count = 1, delay = "1s" }
+
+[profile.ci]
+# CI uses a stricter profile: no retries, JUnit output, longer slow
+# timeout because CI machines are sometimes slower than laptops.
+slow-timeout = { period = "20s", terminate-after = 2 }
+retries = 0
+fail-fast = false
+failure-output = "immediate-final"
+
+[profile.ci.junit]
+path = "junit.xml"
