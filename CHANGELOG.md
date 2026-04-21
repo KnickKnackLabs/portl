@@ -3,6 +3,55 @@
 All notable changes land here. This project follows
 [Semantic Versioning](https://semver.org/) from v0.1.0 onward.
 
+## 0.2.2 — 2026-04-21
+
+Post-v0.2 cleanup release. No new user-facing features; pure
+simplification, dead-code removal, and retirement of v0.2.0
+transition scaffolding.
+
+### Removed
+
+- **`portl agent *`, `portl id *`, and `portl mint-root` helpful-error
+  shims.** These printed a migration pointer to the v0.2.0 spec and
+  exited non-zero. After v0.2.1, they are gone; users hitting those
+  paths get clap's default unrecognized-subcommand error. Scripts
+  that still pipe through them will fail with a different error
+  message but the same non-zero exit.
+- **v0.1 `revocations.json` migration path.** The agent no longer
+  converts a bare-JSON-array `revocations.json` to `revocations.jsonl`
+  at startup. Any site still on v0.1 on-disk state must run a v0.2.0
+  agent once (which performs the migration) before upgrading here.
+- **`portl-agent` `reqwest` direct dep.** Already trimmed in v0.2.1
+  but the `.github/workflows` and `autoresearch.ideas.md` still
+  referenced it; updated to reflect the shipped A+B gateway isolation.
+
+### Changed
+
+- **`commands/docker.rs` split into submodules.** 2145-line file
+  becomes `commands/docker/{mod,types,host_ops,docker_ops,run,bake,aliases}.rs`.
+  No behavior change; public surface identical.
+- **`commands/install.rs` split into submodules.** 576-line file
+  becomes `commands/install/{mod,detect,resolve,render,apply}.rs`.
+  No behavior change; public surface identical.
+- **`src/shell_handler.rs` split into submodules.** 1955-line file
+  becomes `src/shell_handler/{mod,pumps,reject,spawn,exec_capture,pty_master,env,user,shutdown}.rs`.
+  No behavior change; public surface identical.
+- **Agent-mode error message.** The pty `--user` rejection no
+  longer says "in v0.1"; it just describes the current behavior.
+- **Retired v0.1.1 / v0.1.2 / v0.2.0 implementation plans.** Per
+  the stated `docs/plans/README.md` policy, these task-level
+  recipes are removed now that their features shipped. The
+  shipped contracts live in the specs and CHANGELOG.
+
+### Internal
+
+- Dropped unused `#[allow(dead_code)]` on `AgentState`; every
+  field is referenced.
+- Fixed two alias-store test fixtures that still named the
+  on-disk file `aliases.sqlite` instead of `aliases.json`.
+- Refreshed predictive doc comments ("v0.2 may add PAM env")
+  that never actually shipped.
+
 ## 0.2.1 — 2026-04-21
 
 Gateway-isolation and dependency-hygiene patch release. No user-facing
