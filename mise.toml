@@ -1,2 +1,6 @@
 [tools]
 "cargo:cargo-nextest" = "latest"
+# sccache: compiler-output caching wrapper. Activated workspace-wide via
+# RUSTC_WRAPPER in .cargo/config.toml; biggest wins are on fresh target
+# dirs, branch switches, and CI runners.
+"cargo:sccache" = "latest"

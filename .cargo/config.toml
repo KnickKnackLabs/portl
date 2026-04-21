@@ -1,11 +1,12 @@
 # Workspace-wide cargo configuration.
 #
-# Only cache-safe knobs here (aliases, job limits, net settings) — nothing
-# that changes rustc flags, linker flags, profiles, or `RUSTC_WRAPPER`, since
-# those invalidate the entire `target/` fingerprint on first use.
+# Contains a mix of cache-safe knobs (aliases, env passthroughs) and
+# cache-invalidating ones (`RUSTC_WRAPPER`, `[profile.*]` overrides). The
+# latter trigger a one-time full rebuild on first use, with compounding
+# wins on every subsequent fresh target / branch switch / CI job.
 #
-# For cache-invalidating optimizations (sccache, alternate linkers, profile
-# tweaks, the `pair()` preset fix), see `scratch/rust-perf-notes.md`.
+# Cache-invalidating knobs deliberately live in this file so the rebuild
+# happens once at commit time, not silently on contributor machines.
 
 [alias]
 # Hot-loop shortcuts. `nt` is the default everyday runner.
@@ -14,6 +15,25 @@ nt-unit     = "nextest run --workspace --lib --bins --no-fail-fast"
 nt-int      = "nextest run --workspace --test '*' --no-fail-fast"
 check-all   = "check --workspace --all-targets"
 clippy-all  = "clippy --workspace --all-targets"
+
+[build]
+# Compiler-output caching. Hits recycle rustc output across fresh
+# target dirs, CI runners, and branch switches. Cache misses add
+# ~50–100ms per crate; hits save whole rustc invocations. sccache is
+# pinned via mise.toml; set SCCACHE_DIR / SCCACHE_CACHE_SIZE in the
+# shell environment to tune location and footprint (defaults:
+# ~/Library/Caches/Mozilla.sccache, 10G).
+rustc-wrapper = "sccache"
+
+[profile.dev.package."*"]
+# Cut debuginfo fidelity for every crate (workspace + deps) from the
+# dev-profile default of "full" to line tables only. Keeps file/line
+# numbers in backtraces, drops variable/type info that lldb `p`/`v`
+# commands need — a trade most devs won't notice day to day, and one
+# that substantially shrinks dSYM generation and link time on macOS.
+# Override locally with `CARGO_PROFILE_DEV_PACKAGE_*_DEBUG=full` when
+# debugging with lldb.
+debug = "line-tables-only"
 
 [env]
 # Keep the per-test-binary watchdog default visible to agents/CI even when
