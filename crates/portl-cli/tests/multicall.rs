@@ -9,8 +9,8 @@ fn argv(parts: &[&str]) -> Vec<OsString> {
 }
 
 #[test]
-fn portl_agent_symlink_prepends_agent() {
-    let cmd = parse(argv(&["portl-agent", "run"])).expect("parse should succeed");
+fn portl_agent_symlink_enters_daemon_mode() {
+    let cmd = parse(argv(&["portl-agent"])).expect("parse should succeed");
     assert!(
         matches!(
             cmd,
@@ -25,8 +25,8 @@ fn portl_agent_symlink_prepends_agent() {
 
 #[test]
 fn portl_agent_symlink_respects_full_path() {
-    let cmd = parse(argv(&["/usr/local/bin/portl-agent", "run"]))
-        .expect("parse with absolute path argv[0]");
+    let cmd =
+        parse(argv(&["/usr/local/bin/portl-agent"])).expect("parse with absolute path argv[0]");
     assert!(
         matches!(
             cmd,

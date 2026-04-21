@@ -172,13 +172,17 @@ pub enum ParseError {
 
 /// Parse an argv vector into a structured [`Command`].
 ///
-/// Handles multicall dispatch: if argv[0]'s basename is
-/// `portl-agent`, the argument vector is rewritten to
-/// `["portl", "agent", ...rest]`; if it is `portl-gateway`,
-/// the vector is rewritten to `["portl", "gateway", ...rest]`.
-/// This keeps the symlink + systemd-unit pathway working
-/// without a second binary.
+/// Handles multicall dispatch: `portl-agent` maps directly to the
+/// daemon entrypoint, while `portl-gateway` rewrites to the top-level
+/// `gateway` subcommand.
 pub fn parse(argv: Vec<OsString>) -> Result<Command, ParseError> {
+    if is_portl_agent_invocation(&argv)? {
+        let _ = AgentCli::try_parse_from(argv)?;
+        return Ok(Command::AgentRun {
+            mode: None,
+            upstream_url: None,
+        });
+    }
     let argv = rewrite_multicall(argv)?;
     let cli = Cli::try_parse_from(argv)?;
     Ok(cli.into_command())
@@ -195,6 +199,37 @@ fn clap_exit_code(err: &clap::Error) -> ExitCode {
 }
 
 pub fn run(argv: Vec<OsString>) -> ExitCode {
+    match is_portl_agent_invocation(&argv) {
+        Ok(true) => {
+            return match AgentCli::try_parse_from(argv) {
+                Ok(_) => match dispatch(Command::AgentRun {
+                    mode: None,
+                    upstream_url: None,
+                }) {
+                    Ok(code) => code,
+                    Err(err) => {
+                        eprintln!("{err:#}");
+                        ExitCode::FAILURE
+                    }
+                },
+                Err(err) => {
+                    let code = clap_exit_code(&err);
+                    let _ = err.print();
+                    code
+                }
+            };
+        }
+        Ok(false) => {}
+        Err(ParseError::EmptyArgv) => {
+            eprintln!("portl: argv is empty");
+            return ExitCode::FAILURE;
+        }
+        Err(ParseError::Clap(err)) => {
+            let _ = err.print();
+            return ExitCode::FAILURE;
+        }
+    }
+
     let argv = match rewrite_multicall(argv) {
         Ok(argv) => argv,
         Err(ParseError::EmptyArgv) => {
@@ -345,8 +380,23 @@ fn removed_invocation_exit(argv: &[OsString]) -> Option<ExitCode> {
             eprintln!("portl: `portl mint-root` was removed in v0.2.0. Use `portl mint` instead.");
             Some(ExitCode::FAILURE)
         }
+        Some("agent") => {
+            eprintln!(
+                "portl: `portl agent *` was removed in v0.2.0. Use `portl-agent` instead.\n      See https://github.com/KnickKnackLabs/portl/blob/v0.2.0/docs/specs/140-v0.2-operability.md#12-multicall-only-daemon"
+            );
+            Some(ExitCode::from(2))
+        }
         _ => None,
     }
+}
+
+fn is_portl_agent_invocation(argv: &[OsString]) -> Result<bool, ParseError> {
+    let first = argv.first().ok_or(ParseError::EmptyArgv)?;
+    let basename = Path::new(first)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    Ok(basename == "portl-agent")
 }
 
 fn rewrite_multicall(mut argv: Vec<OsString>) -> Result<Vec<OsString>, ParseError> {
@@ -355,16 +405,9 @@ fn rewrite_multicall(mut argv: Vec<OsString>) -> Result<Vec<OsString>, ParseErro
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or_default();
-    match basename {
-        "portl-agent" => {
-            argv[0] = OsString::from("portl");
-            argv.insert(1, OsString::from("agent"));
-        }
-        "portl-gateway" => {
-            argv[0] = OsString::from("portl");
-            argv.insert(1, OsString::from("gateway"));
-        }
-        _ => {}
+    if basename == "portl-gateway" {
+        argv[0] = OsString::from("portl");
+        argv.insert(1, OsString::from("gateway"));
     }
     Ok(argv)
 }
@@ -375,6 +418,10 @@ struct Cli {
     #[command(subcommand)]
     command: TopLevel,
 }
+
+#[derive(Parser, Debug)]
+#[command(name = "portl-agent", bin_name = "portl-agent", version, about = "portl daemon", long_about = None)]
+struct AgentCli {}
 
 #[derive(Subcommand, Debug)]
 enum TopLevel {
@@ -471,24 +518,9 @@ enum TopLevel {
     /// Run the slicer HTTP bridge against an upstream API.
     Gateway { upstream_url: String },
     #[command(hide = true)]
-    Agent {
-        #[command(subcommand)]
-        action: AgentAction,
-    },
-    #[command(hide = true)]
     Id {
         #[command(subcommand)]
         action: IdAction,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum AgentAction {
-    Run {
-        #[arg(long, value_enum)]
-        mode: Option<AgentModeArg>,
-        #[arg(long)]
-        upstream_url: Option<String>,
     },
 }
 
@@ -725,9 +757,6 @@ impl Cli {
                 action: SlicerAction::Bake { base_image },
             } => Command::SlicerBake { base_image },
             TopLevel::Gateway { upstream_url } => Command::Gateway { upstream_url },
-            TopLevel::Agent {
-                action: AgentAction::Run { mode, upstream_url },
-            } => Command::AgentRun { mode, upstream_url },
             TopLevel::Id {
                 action: IdAction::New { force },
             } => Command::IdNew { force },
