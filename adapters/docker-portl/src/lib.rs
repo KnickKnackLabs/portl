@@ -23,8 +23,8 @@ use tracing::warn;
 
 pub const ADAPTER_NAME: &str = "docker-portl";
 pub const DEFAULT_NETWORK: &str = "bridge";
-pub const SECRET_MOUNT_PATH: &str = "/var/lib/portl/secret";
-pub const CONFIG_MOUNT_PATH: &str = "/etc/portl/agent.toml";
+pub const PORTL_HOME_IN_CONTAINER: &str = "/var/lib/portl";
+pub const SECRET_MOUNT_PATH: &str = "/var/lib/portl/identity.bin";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct DockerProvisionParams {
@@ -67,15 +67,11 @@ impl Bootstrapper for DockerBootstrapper {
         let identity = Identity::new();
         let endpoint_id = hex::encode(identity.endpoint_id().as_bytes());
         let secret_path = temp_artifact_path("portl-secret", &endpoint_id);
-        let config_path = temp_artifact_path("portl-agent", &endpoint_id);
         store::save(&identity, &secret_path)
             .with_context(|| format!("write secret to {}", secret_path.display()))?;
-        fs::write(&config_path, render_agent_config(&self.trust_roots)?)
-            .with_context(|| format!("write config to {}", config_path.display()))?;
 
         let cleanup = CleanupPaths {
             secret_path: secret_path.clone(),
-            config_path: config_path.clone(),
         };
 
         if let Err(err) = self.pull_image(&params.image).await {
@@ -84,8 +80,8 @@ impl Bootstrapper for DockerBootstrapper {
         }
 
         let labels = docker_labels(spec, &endpoint_id);
-        let binds = docker_binds(&secret_path, &config_path);
-        let config = build_container_config(&params, labels, binds);
+        let binds = docker_binds(&secret_path);
+        let config = build_container_config(&params, labels, binds, &self.trust_roots)?;
 
         let options = Some(CreateContainerOptions {
             name: spec.name.clone(),
@@ -150,7 +146,6 @@ impl Bootstrapper for DockerBootstrapper {
                 image: params.image.clone(),
                 network: params.network.clone(),
                 name: spec.name.clone(),
-                config_path,
             }),
         })
     }
@@ -188,11 +183,6 @@ impl Bootstrapper for DockerBootstrapper {
         {
             return Err(err);
         }
-        if let Err(err) = fs::remove_file(&inner.config_path)
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            warn!(?err, path = %inner.config_path.display(), "failed to remove docker adapter config file");
-        }
         Ok(())
     }
 }
@@ -204,7 +194,6 @@ pub struct DockerHandle {
     pub image: String,
     pub network: String,
     pub name: String,
-    pub config_path: PathBuf,
 }
 
 impl DockerHandle {
@@ -331,7 +320,6 @@ impl DockerBootstrapper {
                 image,
                 network,
                 name,
-                config_path: PathBuf::new(),
             });
         }
         Ok(handles)
@@ -387,30 +375,12 @@ fn exit_code_to_i32(code: i64) -> i32 {
     })
 }
 
-fn render_agent_config(trust_roots: &[[u8; 32]]) -> Result<String> {
-    if trust_roots.is_empty() {
-        bail!("docker bootstrapper requires at least one trust root");
-    }
-    let trust_roots = trust_roots
-        .iter()
-        .map(hex::encode)
-        .collect::<Vec<_>>()
-        .join(", ");
-    Ok(format!(
-        "identity_path = \"{SECRET_MOUNT_PATH}\"\nrevocations_path = \"/var/lib/portl/revocations.jsonl\"\nbind_addr = \"0.0.0.0:0\"\ndiscovery = {{ dns = false, pkarr = true, local = true }}\ntrust_roots = [{}]\n",
-        trust_roots
-            .split(", ")
-            .map(|value| format!("\"{value}\""))
-            .collect::<Vec<_>>()
-            .join(", "),
-    ))
-}
-
 fn build_container_config(
     params: &DockerProvisionParams,
     labels: HashMap<String, String>,
     binds: Vec<String>,
-) -> Config<String> {
+    trust_roots: &[[u8; 32]],
+) -> Result<Config<String>> {
     let host_config = HostConfig {
         binds: Some(binds),
         network_mode: Some(params.network.clone()),
@@ -421,7 +391,7 @@ fn build_container_config(
         ..HostConfig::default()
     };
 
-    Config {
+    Ok(Config {
         image: Some(params.image.clone()),
         labels: Some(labels),
         host_config: Some(host_config),
@@ -430,9 +400,9 @@ fn build_container_config(
             "agent".to_owned(),
             "run".to_owned(),
         ]),
-        cmd: Some(vec!["--config".to_owned(), CONFIG_MOUNT_PATH.to_owned()]),
+        env: Some(agent_env(trust_roots)?),
         ..Config::default()
-    }
+    })
 }
 
 fn docker_labels(spec: &ProvisionSpec, endpoint_id: &str) -> HashMap<String, String> {
@@ -446,11 +416,26 @@ fn docker_labels(spec: &ProvisionSpec, endpoint_id: &str) -> HashMap<String, Str
     labels
 }
 
-fn docker_binds(secret_path: &Path, config_path: &Path) -> Vec<String> {
-    vec![
-        format!("{}:{SECRET_MOUNT_PATH}:ro", secret_path.display()),
-        format!("{}:{CONFIG_MOUNT_PATH}:ro", config_path.display()),
-    ]
+fn agent_env(trust_roots: &[[u8; 32]]) -> Result<Vec<String>> {
+    if trust_roots.is_empty() {
+        bail!("docker bootstrapper requires at least one trust root");
+    }
+    Ok(vec![
+        format!("PORTL_HOME={PORTL_HOME_IN_CONTAINER}"),
+        format!(
+            "PORTL_TRUST_ROOTS={}",
+            trust_roots
+                .iter()
+                .map(hex::encode)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        "PORTL_DISCOVERY=pkarr,local".to_owned(),
+    ])
+}
+
+fn docker_binds(secret_path: &Path) -> Vec<String> {
+    vec![format!("{}:{SECRET_MOUNT_PATH}:ro", secret_path.display())]
 }
 
 fn normalize_image(image: &str) -> String {
@@ -495,17 +480,14 @@ fn is_conflict_docker(err: &DockerError) -> bool {
 
 struct CleanupPaths {
     secret_path: PathBuf,
-    config_path: PathBuf,
 }
 
 impl CleanupPaths {
     fn best_effort(&self) {
-        for path in [&self.secret_path, &self.config_path] {
-            if let Err(err) = fs::remove_file(path)
-                && err.kind() != std::io::ErrorKind::NotFound
-            {
-                warn!(?err, path = %path.display(), "failed to clean up docker adapter temp file");
-            }
+        if let Err(err) = fs::remove_file(&self.secret_path)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(?err, path = %self.secret_path.display(), "failed to clean up docker adapter temp file");
         }
     }
 }
@@ -518,9 +500,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ADAPTER_NAME, CONFIG_MOUNT_PATH, DEFAULT_NETWORK, DockerProvisionParams, SECRET_MOUNT_PATH,
-        build_container_config, docker_binds, docker_labels, normalize_image, parse_adapter_params,
-        render_agent_config,
+        ADAPTER_NAME, DEFAULT_NETWORK, DockerProvisionParams, PORTL_HOME_IN_CONTAINER,
+        SECRET_MOUNT_PATH, agent_env, build_container_config, docker_binds, docker_labels,
+        normalize_image, parse_adapter_params,
     };
 
     #[test]
@@ -594,8 +576,10 @@ mod tests {
                 },
                 "endpoint-1",
             ),
-            docker_binds(Path::new("/tmp/secret"), Path::new("/tmp/agent.toml")),
-        );
+            docker_binds(Path::new("/tmp/secret")),
+            &[[7; 32]],
+        )
+        .expect("build container config");
 
         assert_eq!(
             config.entrypoint,
@@ -606,8 +590,12 @@ mod tests {
             ])
         );
         assert_eq!(
-            config.cmd,
-            Some(vec!["--config".to_owned(), CONFIG_MOUNT_PATH.to_owned()])
+            config.env,
+            Some(vec![
+                format!("PORTL_HOME={PORTL_HOME_IN_CONTAINER}"),
+                format!("PORTL_TRUST_ROOTS={}", hex::encode([7; 32])),
+                "PORTL_DISCOVERY=pkarr,local".to_owned(),
+            ])
         );
         assert_eq!(
             config
@@ -619,16 +607,10 @@ mod tests {
     }
 
     #[test]
-    fn bind_builder_mounts_secret_and_config_read_only() {
-        let binds = docker_binds(Path::new("/tmp/secret"), Path::new("/tmp/agent.toml"));
+    fn bind_builder_mounts_secret_read_only() {
+        let binds = docker_binds(Path::new("/tmp/secret"));
 
-        assert_eq!(
-            binds,
-            vec![
-                format!("/tmp/secret:{SECRET_MOUNT_PATH}:ro"),
-                format!("/tmp/agent.toml:{CONFIG_MOUNT_PATH}:ro"),
-            ]
-        );
+        assert_eq!(binds, vec![format!("/tmp/secret:{SECRET_MOUNT_PATH}:ro")]);
     }
 
     #[test]
@@ -642,11 +624,10 @@ mod tests {
     }
 
     #[test]
-    fn rendered_agent_config_lists_trust_roots() {
-        let config = render_agent_config(&[[7; 32]]).expect("render config");
-        assert!(config.contains("identity_path = \"/var/lib/portl/secret\""));
-        assert!(config.contains("bind_addr = \"0.0.0.0:0\""));
-        assert!(config.contains("discovery = { dns = false, pkarr = true, local = true }"));
-        assert!(config.contains(&hex::encode([7; 32])));
+    fn agent_env_lists_trust_roots() {
+        let env = agent_env(&[[7; 32]]).expect("build agent env");
+        assert!(env.contains(&format!("PORTL_HOME={PORTL_HOME_IN_CONTAINER}")));
+        assert!(env.contains(&format!("PORTL_TRUST_ROOTS={}", hex::encode([7; 32]))));
+        assert!(env.contains(&"PORTL_DISCOVERY=pkarr,local".to_owned()));
     }
 }

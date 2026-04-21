@@ -14,11 +14,11 @@ ARG TARGETARCH
 COPY bin/portl-${TARGETARCH} /usr/local/bin/portl
 RUN chmod +x /usr/local/bin/portl \
  && ln -s /usr/local/bin/portl /usr/local/bin/portl-agent \
- && mkdir -p /var/lib/portl /etc/portl \
+ && mkdir -p /var/lib/portl \
  && chmod 0700 /var/lib/portl
 
+ENV PORTL_HOME=/var/lib/portl
 ENTRYPOINT ["/usr/local/bin/portl", "agent", "run"]
-CMD ["--config", "/etc/portl/agent.toml"]
 
 LABEL org.opencontainers.image.title="portl-agent"
 LABEL org.opencontainers.image.source="https://github.com/KnickKnackLabs/portl"

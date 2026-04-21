@@ -166,52 +166,37 @@ fn check_listener_bind() -> CheckResult {
     }
 }
 
-/// Report the compiled-in default discovery stack + the agent TOML
-/// config at `PORTL_AGENT_CONFIG` if set. Doesn't actually probe DNS
-/// here; that's the relay check's job.
+/// Report the agent's effective discovery config as derived from the
+/// fixed env-var schema. Doesn't actually probe DNS here; that's the
+/// relay check's job.
 fn check_discovery_config() -> CheckResult {
-    let config_path = std::env::var_os("PORTL_AGENT_CONFIG");
-    match config_path {
-        Some(path_os) => {
-            let path = std::path::PathBuf::from(&path_os);
-            match portl_agent::AgentConfig::from_toml_path(&path) {
-                Ok(cfg) => {
-                    let discovery = &cfg.discovery;
-                    let relay = cfg
-                        .discovery
-                        .relay
-                        .as_ref()
-                        .map_or_else(|| "none".to_owned(), ToString::to_string);
-                    let detail = format!(
-                        "config={} dns={} pkarr={} local={} relay={}",
-                        path.display(),
-                        discovery.dns,
-                        discovery.pkarr,
-                        discovery.local,
-                        relay
-                    );
-                    let status = if discovery.dns || discovery.pkarr || discovery.local {
-                        Status::Ok
-                    } else {
-                        Status::Warn
-                    };
-                    CheckResult {
-                        name: "discovery",
-                        status,
-                        detail,
-                    }
-                }
-                Err(err) => CheckResult {
-                    name: "discovery",
-                    status: Status::Fail,
-                    detail: format!("cannot load {}: {err}", path.display()),
-                },
+    match portl_agent::AgentConfig::from_env() {
+        Ok(cfg) => {
+            let discovery = &cfg.discovery;
+            let relay = cfg
+                .discovery
+                .relay
+                .as_ref()
+                .map_or_else(|| "none".to_owned(), ToString::to_string);
+            let detail = format!(
+                "dns={} pkarr={} local={} relay={}",
+                discovery.dns, discovery.pkarr, discovery.local, relay
+            );
+            let status = if discovery.dns || discovery.pkarr || discovery.local {
+                Status::Ok
+            } else {
+                Status::Warn
+            };
+            CheckResult {
+                name: "discovery",
+                status,
+                detail,
             }
         }
-        None => CheckResult {
+        Err(err) => CheckResult {
             name: "discovery",
-            status: Status::Ok,
-            detail: "no PORTL_AGENT_CONFIG; defaults will resolve dns+pkarr+local+relay".to_owned(),
+            status: Status::Fail,
+            detail: format!("cannot load agent env config: {err}"),
         },
     }
 }

@@ -308,6 +308,12 @@ impl SignalTasks {
 }
 
 fn load_identity(cfg: &AgentConfig) -> Result<Identity> {
+    if let Some(secret) = cfg.identity_secret {
+        return Ok(Identity::from_signing_key(
+            ed25519_dalek::SigningKey::from_bytes(&secret),
+        ));
+    }
+
     let path = cfg
         .identity_path
         .clone()

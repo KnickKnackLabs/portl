@@ -28,7 +28,6 @@ fn portl_agent_run_parses_as_agent_run() {
         matches!(
             cmd,
             Command::AgentRun {
-                config: None,
                 mode: None,
                 upstream_url: None
             }
@@ -46,7 +45,6 @@ fn portl_agent_symlink_prepends_agent() {
         matches!(
             cmd,
             Command::AgentRun {
-                config: None,
                 mode: None,
                 upstream_url: None
             }
@@ -65,7 +63,6 @@ fn portl_agent_symlink_respects_full_path() {
         matches!(
             cmd,
             Command::AgentRun {
-                config: None,
                 mode: None,
                 upstream_url: None
             }

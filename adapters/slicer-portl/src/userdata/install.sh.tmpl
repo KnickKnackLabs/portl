@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SECRET_SRC="/run/slicer/secrets/{{SECRET_NAME}}"
-SECRET_DST="/var/lib/portl/secret"
+SECRET_DST="/var/lib/portl/identity.bin"
 
 install -d -m 0750 /var/lib/portl
 install -d -m 0755 /etc/portl
@@ -16,10 +16,8 @@ if ! command -v portl >/dev/null 2>&1; then
 fi
 ln -sf /usr/local/bin/portl /usr/local/bin/portl-agent
 
-cat > /etc/portl/agent.toml <<'TOML'
-identity_path = "/var/lib/portl/secret"
-trust_roots = ["{{OPERATOR_PUBKEY}}"]
-
-[discovery]
-{{RELAY_LINE}}
-TOML
+cat > /etc/portl/agent.env <<'ENV'
+PORTL_HOME=/var/lib/portl
+PORTL_TRUST_ROOTS={{OPERATOR_PUBKEY}}
+PORTL_DISCOVERY={{DISCOVERY}}
+ENV

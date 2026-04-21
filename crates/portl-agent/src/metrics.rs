@@ -113,13 +113,9 @@ impl Metrics {
     }
 }
 
-/// Resolve the unix socket path: `$PORTL_HOME/metrics.sock` or
-/// `$PORTL_METRICS_SOCK` if set.
+/// Resolve the unix socket path: `$PORTL_HOME/metrics.sock`.
 #[must_use]
 pub fn default_socket_path() -> PathBuf {
-    if let Some(explicit) = std::env::var_os("PORTL_METRICS_SOCK") {
-        return PathBuf::from(explicit);
-    }
     let home = if let Some(override_home) = std::env::var_os("PORTL_HOME") {
         PathBuf::from(override_home)
     } else if let Some(dirs) = directories::ProjectDirs::from("computer", "KnickKnackLabs", "portl")

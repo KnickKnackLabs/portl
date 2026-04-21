@@ -66,20 +66,9 @@ fn release_build_panics_exit_nonzero() {
     let bin = root.join("target").join("release").join("portl");
     assert!(bin.is_file(), "expected portl binary at {}", bin.display());
 
-    // Minimal config — the agent should panic before it gets this far,
-    // but the arg parser needs a valid-looking invocation.
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let cfg_path = tmp.path().join("agent.toml");
-    std::fs::write(&cfg_path, "trust_roots = []\n").expect("write cfg");
-
     let start = Instant::now();
     let mut child = Command::new(&bin)
-        .args([
-            "agent",
-            "run",
-            "--config",
-            cfg_path.to_str().expect("utf-8 cfg path"),
-        ])
+        .args(["agent", "run"])
         .env("PORTL_TEST_PANIC_AT", "startup")
         .env("RUSTUP_TOOLCHAIN", &toolchain)
         .spawn()

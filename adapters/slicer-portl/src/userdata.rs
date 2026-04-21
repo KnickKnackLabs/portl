@@ -1,8 +1,24 @@
+use std::ffi::OsString;
+use std::sync::{LazyLock, Mutex};
+
 use anyhow::{Context, Result, anyhow, bail};
 
 const TEMPLATE: &str = include_str!("userdata/install.sh.tmpl");
-const TOML_HEREDOC_START: &str = "cat > /etc/portl/agent.toml <<'TOML'\n";
-const TOML_HEREDOC_END: &str = "\nTOML";
+const ENV_HEREDOC_START: &str = "cat > /etc/portl/agent.env <<'ENV'\n";
+const ENV_HEREDOC_END: &str = "\nENV";
+static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+const AGENT_ENV_VARS: &[&str] = &[
+    "PORTL_HOME",
+    "PORTL_IDENTITY_SECRET_HEX",
+    "PORTL_TRUST_ROOTS",
+    "PORTL_LISTEN_ADDR",
+    "PORTL_DISCOVERY",
+    "PORTL_METRICS",
+    "PORTL_REVOCATIONS_PATH",
+    "PORTL_RATE_LIMIT",
+    "PORTL_UDP_SESSION_LINGER_SECS",
+    "PORTL_MODE",
+];
 
 pub struct UserdataContext<'a> {
     pub secret_name: &'a str,
@@ -26,7 +42,7 @@ pub fn render(context: &UserdataContext<'_>) -> Result<String> {
             "{{PORTL_RELEASE_URL}}",
             context.portl_release_url.to_owned(),
         ),
-        ("{{RELAY_LINE}}", relay_line(context.relay_list)),
+        ("{{DISCOVERY}}", discovery_value(context.relay_list)),
         ("{{OPERATOR_PUBKEY}}", context.operator_pubkey.to_owned()),
     ] {
         rendered = rendered.replace(needle, &replacement);
@@ -35,9 +51,8 @@ pub fn render(context: &UserdataContext<'_>) -> Result<String> {
         bail!("userdata template contains unsubstituted placeholders");
     }
 
-    let agent_toml = extract_agent_toml(&rendered)?;
-    portl_agent::AgentConfig::from_toml_str(agent_toml)
-        .context("validate rendered agent config TOML")?;
+    let agent_env = extract_agent_env(&rendered)?;
+    validate_agent_env(agent_env).context("validate rendered agent env")?;
 
     Ok(rendered)
 }
@@ -51,28 +66,79 @@ fn validate_safe(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn relay_line(relay_list: &[String]) -> String {
-    match relay_list.first() {
-        Some(relay) => format!("relay = \"{relay}\""),
-        None => String::from("# relay omitted"),
-    }
+fn discovery_value(_relay_list: &[String]) -> String {
+    "dns,pkarr,local,relay".to_owned()
 }
 
-fn extract_agent_toml(rendered: &str) -> Result<&str> {
+fn extract_agent_env(rendered: &str) -> Result<&str> {
     let start = rendered
-        .find(TOML_HEREDOC_START)
-        .map(|index| index + TOML_HEREDOC_START.len())
-        .ok_or_else(|| anyhow!("userdata template missing agent TOML heredoc start"))?;
+        .find(ENV_HEREDOC_START)
+        .map(|index| index + ENV_HEREDOC_START.len())
+        .ok_or_else(|| anyhow!("userdata template missing agent env heredoc start"))?;
     let end = rendered[start..]
-        .find(TOML_HEREDOC_END)
+        .find(ENV_HEREDOC_END)
         .map(|index| start + index)
-        .ok_or_else(|| anyhow!("userdata template missing agent TOML heredoc end"))?;
+        .ok_or_else(|| anyhow!("userdata template missing agent env heredoc end"))?;
     Ok(&rendered[start..end])
+}
+
+fn validate_agent_env(agent_env: &str) -> Result<()> {
+    config_from_agent_env(agent_env).map(|_| ())
+}
+
+fn config_from_agent_env(agent_env: &str) -> Result<portl_agent::AgentConfig> {
+    let vars = agent_env
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let (key, value) = line
+                .split_once('=')
+                .ok_or_else(|| anyhow!("invalid agent env line: {line}"))?;
+            Ok((key.to_owned(), OsString::from(value)))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    with_agent_env(&vars, portl_agent::AgentConfig::from_env)
+}
+
+#[allow(unsafe_code)]
+fn with_agent_env<T>(vars: &[(String, OsString)], f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _guard = ENV_LOCK.lock().expect("env lock");
+    let saved = AGENT_ENV_VARS
+        .iter()
+        .map(|name| (*name, std::env::var_os(name)))
+        .collect::<Vec<_>>();
+    for name in AGENT_ENV_VARS {
+        // SAFETY: the validator serializes process env mutation with ENV_LOCK.
+        unsafe { std::env::remove_var(name) };
+    }
+    for (name, value) in vars {
+        // SAFETY: the validator serializes process env mutation with ENV_LOCK.
+        unsafe { std::env::set_var(name, value) };
+    }
+
+    let result = f();
+
+    for (name, value) in saved {
+        match value {
+            Some(value) => {
+                // SAFETY: the validator serializes process env mutation with ENV_LOCK.
+                unsafe { std::env::set_var(name, value) };
+            }
+            None => {
+                // SAFETY: the validator serializes process env mutation with ENV_LOCK.
+                unsafe { std::env::remove_var(name) };
+            }
+        }
+    }
+
+    result
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{UserdataContext, extract_agent_toml, render};
+    use super::{UserdataContext, config_from_agent_env, extract_agent_env, render};
 
     #[test]
     fn render_substitutes_every_placeholder() {
@@ -86,7 +152,7 @@ mod tests {
 
         assert!(rendered.contains("/run/slicer/secrets/portl-demo"));
         assert!(rendered.contains("example.invalid/releases"));
-        assert!(rendered.contains("relay = \"https://relay.example.invalid\""));
+        assert!(rendered.contains("PORTL_DISCOVERY=dns,pkarr,local,relay"));
         assert!(rendered.contains("0123456789abcdef0123456789abcdef"));
         assert!(!rendered.contains("{{"));
     }
@@ -104,7 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_valid_agent_toml() {
+    fn renders_valid_agent_env() {
         let rendered = render(&UserdataContext {
             secret_name: "portl-demo",
             portl_release_url: "example.invalid/releases",
@@ -112,11 +178,13 @@ mod tests {
             operator_pubkey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         })
         .expect("render userdata");
-        let agent_toml = extract_agent_toml(&rendered).expect("extract agent toml");
+        let agent_env = extract_agent_env(&rendered).expect("extract agent env");
 
-        let config =
-            portl_agent::AgentConfig::from_toml_str(agent_toml).expect("parse rendered TOML");
-        assert!(!agent_toml.contains("relay = ["));
+        let config = config_from_agent_env(agent_env).expect("parse rendered env");
         assert_eq!(config.trust_roots.len(), 1);
+        assert_eq!(
+            config.identity_path.as_deref(),
+            Some(std::path::Path::new("/var/lib/portl/identity.bin"))
+        );
     }
 }

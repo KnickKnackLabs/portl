@@ -17,8 +17,8 @@ use std::{ffi::OsString, path::Path, path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-pub fn load_agent_config(config: Option<&Path>) -> anyhow::Result<portl_agent::AgentConfig> {
-    commands::agent::run::load_config(config, None, None)
+pub fn load_agent_config() -> anyhow::Result<portl_agent::AgentConfig> {
+    commands::agent::run::load_config(None, None)
 }
 
 /// Structured representation of a parsed invocation.
@@ -26,7 +26,6 @@ pub fn load_agent_config(config: Option<&Path>) -> anyhow::Result<portl_agent::A
 pub enum Command {
     /// `portl agent run` (or its `portl-agent run` symlink form).
     AgentRun {
-        config: Option<PathBuf>,
         mode: Option<AgentModeArg>,
         upstream_url: Option<String>,
     },
@@ -216,11 +215,9 @@ pub fn run(argv: Vec<OsString>) -> ExitCode {
 #[allow(clippy::too_many_lines)]
 fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
     match cmd {
-        Command::AgentRun {
-            config,
-            mode,
-            upstream_url,
-        } => commands::agent::run::run(config.as_deref(), mode, upstream_url.as_deref()),
+        Command::AgentRun { mode, upstream_url } => {
+            commands::agent::run::run(mode, upstream_url.as_deref())
+        }
         Command::IdNew { force } => commands::id::new::run(force),
         Command::IdShow => commands::id::show::run(),
         Command::IdExport {
@@ -438,8 +435,6 @@ enum TopLevel {
 enum AgentAction {
     /// Start the long-running agent service.
     Run {
-        #[arg(long)]
-        config: Option<PathBuf>,
         #[arg(long, value_enum)]
         mode: Option<AgentModeArg>,
         #[arg(long)]
@@ -598,17 +593,8 @@ impl Cli {
     fn into_command(self) -> Command {
         match self.command {
             TopLevel::Agent {
-                action:
-                    AgentAction::Run {
-                        config,
-                        mode,
-                        upstream_url,
-                    },
-            } => Command::AgentRun {
-                config,
-                mode,
-                upstream_url,
-            },
+                action: AgentAction::Run { mode, upstream_url },
+            } => Command::AgentRun { mode, upstream_url },
             TopLevel::Id {
                 action: IdAction::New { force },
             } => Command::IdNew { force },

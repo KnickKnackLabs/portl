@@ -1,7 +1,6 @@
 use std::num::NonZeroU32;
-use std::time::Duration;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use governor::Quota;
 use governor::RateLimiter;
 use governor::clock::DefaultClock;
@@ -17,11 +16,9 @@ pub struct OfferRateLimiter {
 
 impl OfferRateLimiter {
     pub fn new(config: &RateLimitConfig) -> Result<Self> {
-        ensure!(config.replenish_secs > 0, "replenish_secs must be > 0");
+        let rps = NonZeroU32::new(config.rps).context("rps must be > 0")?;
         let burst = NonZeroU32::new(config.burst).context("burst must be > 0")?;
-        let quota = Quota::with_period(Duration::from_secs(config.replenish_secs))
-            .context("invalid replenish period")?
-            .allow_burst(burst);
+        let quota = Quota::per_second(rps).allow_burst(burst);
         Ok(Self {
             inner: RateLimiter::keyed(quota),
         })
