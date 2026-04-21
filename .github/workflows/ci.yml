@@ -17,16 +17,20 @@ env:
   SCCACHE_GHA_ENABLED: "true"
 
 # Caching strategy (see docs/specs/ for context):
-#  - Swatinem/rust-cache caches ~/.cargo + target/ as bulk blobs, keyed
-#    by Cargo.lock + rustc version. Fast restore on same lockfile.
-#  - sccache caches per-rustc-invocation output via the GHA cache
-#    backend. Survives lockfile churn; hits individual crates even
-#    when the tree drifts.
-#  - Both together: Swatinem wins on warm branches; sccache wins
-#    on fresh lockfiles and cross-branch propagation.
-#  - `save-if: ${{ github.ref == 'refs/heads/main' }}` restricts
-#    writes to main, so PR branches only read main's cache — keeps
-#    us comfortably under the 10 GB repo budget.
+#  - `actions-rust-lang/setup-rust-toolchain` installs the toolchain
+#    pinned in rust-toolchain.toml (1.89.0) and wraps
+#    `Swatinem/rust-cache` so we get bulk dep caching (~/.cargo +
+#    target/) keyed by Cargo.lock + rustc version. Fast restore on
+#    the same lockfile.
+#  - `mozilla-actions/sccache-action` installs sccache and points its
+#    GHA backend at the Actions cache. Our `.cargo/config.toml` wires
+#    `rustc-wrapper = "sccache"`, so every rustc invocation gets per-
+#    compilation-unit caching on top of Swatinem's dep blob. sccache
+#    survives lockfile churn and hits individual crates even when
+#    the tree drifts.
+#  - `cache-save-if: refs/heads/main` restricts cache writes to main
+#    pushes; PR branches only read main's cache — keeps us under the
+#    10 GB repo budget.
 #  - `cache-on-failure: true` saves the cache even when the job
 #    fails. Safe because Swatinem's pre-save clean strips workspace
 #    crates + incremental artifacts; only successfully-compiled
@@ -45,41 +49,37 @@ jobs:
     name: cargo test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: actions/checkout@v5
       - uses: mozilla-actions/sccache-action@v0.0.9
-      - uses: Swatinem/rust-cache@v2.8.2
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
       - run: cargo test --workspace --all-features
 
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
-    # cargo fmt does not invoke rustc, so sccache is not needed and the
-    # wrapper would never be consulted.
-    env:
-      CARGO_BUILD_RUSTC_WRAPPER: ""
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: actions/checkout@v5
+      # cargo fmt does not invoke rustc; skip the cache entirely and
+      # only install rustfmt. Job finishes in ~15 s cold.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: rustfmt
+          cache: false
       - run: cargo fmt --all -- --check
 
   clippy:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: actions/checkout@v5
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy
-      - uses: mozilla-actions/sccache-action@v0.0.9
-      - uses: Swatinem/rust-cache@v2.8.2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
       - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
 
@@ -93,16 +93,15 @@ jobs:
     env:
       SCCACHE_GHA_ENABLED: "true"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: actions/checkout@v5
       - uses: mozilla-actions/sccache-action@v0.0.9
-      # Shared with the `test` / `clippy` jobs via the same
-      # Cargo.lock + rustc key — this job only rebuilds what's
-      # missing for --release (release-profile artifacts).
-      - uses: Swatinem/rust-cache@v2.8.2
+      # Shared with the `test` / `clippy` jobs via the same Cargo.lock
+      # + rustc key — this job only rebuilds what's missing for
+      # --release (release-profile artifacts).
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          shared-key: "linux-native"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-shared-key: "linux-native"
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
       - name: Build portl (release)
         run: cargo build --release --bin portl
@@ -149,18 +148,20 @@ jobs:
     runs-on: ubuntu-latest
     # cargo-deny only reads Cargo.lock / Cargo.toml, but the underlying
     # `cargo metadata` call honors rust-toolchain.toml and the
-    # rustc-wrapper from .cargo/config.toml. Avoid both headaches by
-    # running cargo-deny natively on the host runner (not in the
-    # EmbarkStudios Docker action, which ships a musl container that
-    # doesn't match our musl-targetless toolchain file). The
-    # rustc-wrapper is cleared because sccache is not installed in
-    # this job (we skip its setup for non-rustc jobs).
+    # rustc-wrapper from .cargo/config.toml. The rustc-wrapper is
+    # cleared because sccache isn't installed in this job — cargo-deny
+    # doesn't benefit from it and installing it here would waste time.
+    # `cache: false` on setup-rust-toolchain skips Swatinem since
+    # cargo-deny doesn't compile our workspace; baptiste0928/
+    # cargo-install already caches the cargo-deny binary.
     env:
       CARGO_BUILD_RUSTC_WRAPPER: ""
       RUSTC_WRAPPER: ""
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
       - uses: baptiste0928/cargo-install@v3
         with:
           crate: cargo-deny
