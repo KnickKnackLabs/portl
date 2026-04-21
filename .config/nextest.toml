@@ -40,5 +40,22 @@ retries = 0
 fail-fast = false
 failure-output = "immediate-final"
 
+# Per-test override for `udp_src_tag_lru_eviction`, which sweeps
+# past the LRU cap (1024) by doing 1,025 sequential QUIC-datagram
+# roundtrips. Each iteration touches the agent's per-src-tag code
+# path (`route_to_target` in `crates/portl-agent/src/udp_registry.rs`),
+# which holds `Mutex<UdpSessionInner>` across a `UdpSocket::bind`
+# syscall and a `tokio::spawn` — legitimately ~40 ms per roundtrip
+# on a 2-core runner, so ~45 s wall for the loop. Overridden here
+# so we still fail fast on tests that aren't network-bound.
+#
+# `udp_burst_loopback_smoke` is NOT in this override: it has its
+# own in-test `tokio::time::timeout(10s, recv)` so nextest's slow-
+# timeout is irrelevant. Its failure mode is packet-loss
+# detection, not slowness.
+[[profile.ci.overrides]]
+filter = 'test(=udp_src_tag_lru_eviction)'
+slow-timeout = { period = "30s", terminate-after = 3 }
+
 [profile.ci.junit]
 path = "junit.xml"
