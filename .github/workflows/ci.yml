@@ -214,8 +214,8 @@ jobs:
         run: |
           export PORTL_HOME=$(mktemp -d)
           ./target/release/portl init
-          ./target/release/portl docker run portl-agent:ci --name t1
-          ./target/release/portl docker run portl-agent:ci --name t2
+          ./target/release/portl docker run portl-agent:ci --name t1 --env PORTL_REFERENCE_MODE=idle
+          ./target/release/portl docker run portl-agent:ci --name t2 --env PORTL_REFERENCE_MODE=idle
 
           # ticket/v1 + shell/v1 via exec
           ./target/release/portl exec t1 -- echo hi

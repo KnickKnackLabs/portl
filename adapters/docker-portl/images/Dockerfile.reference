@@ -17,8 +17,18 @@ RUN chmod +x /usr/local/bin/portl \
  && mkdir -p /var/lib/portl \
  && chmod 0700 /var/lib/portl
 
+RUN printf '%s\n' \
+  '#!/bin/sh' \
+  'set -eu' \
+  'if [ "${PORTL_REFERENCE_MODE:-agent}" = "idle" ]; then' \
+  '  exec sleep infinity' \
+  'fi' \
+  'exec /usr/local/bin/portl-agent "$@"' \
+  > /usr/local/bin/portl-reference-entrypoint \
+ && chmod +x /usr/local/bin/portl-reference-entrypoint
+
 ENV PORTL_HOME=/var/lib/portl
-ENTRYPOINT ["/usr/local/bin/portl-agent"]
+ENTRYPOINT ["/usr/local/bin/portl-reference-entrypoint"]
 
 LABEL org.opencontainers.image.title="portl-agent"
 LABEL org.opencontainers.image.source="https://github.com/KnickKnackLabs/portl"
