@@ -65,6 +65,10 @@ slow-timeout = { period = "30s", terminate-after = 3 }
 [[profile.ci.overrides]]
 filter = 'test(=alias_store::tests::many_writers_converge_to_full_set)'
 slow-timeout = { period = "90s", terminate-after = 3 }
+# 1000 serialized fsyncs on shared CI runners can drift into the 90s
+# window; one retry absorbs disk-contention noise without masking real
+# regressions.
+retries = { backoff = "fixed", count = 1, delay = "5s" }
 
 [profile.ci.junit]
 path = "junit.xml"

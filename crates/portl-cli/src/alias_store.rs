@@ -1,15 +1,18 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use fd_lock::RwLock;
 use portl_core::id::store;
 use portl_core::ticket::schema::Capabilities;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 const DB_FILE: &str = "aliases.json";
 const LOCK_FILE: &str = "aliases.json.lock";
@@ -40,16 +43,27 @@ pub struct StoredSpec {
     pub base_url: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize)]
 struct Root {
     version: u32,
     aliases: BTreeMap<String, Entry>,
+}
+
+impl Default for Root {
+    fn default() -> Self {
+        Self {
+            version: CURRENT_VERSION,
+            aliases: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
 struct Entry {
     record: AliasRecord,
     spec: StoredSpec,
+    #[serde(flatten, default)]
+    pub(crate) extra: BTreeMap<String, serde_json::Value>,
 }
 
 pub struct AliasStore {
@@ -74,12 +88,27 @@ impl AliasStore {
 
     pub fn save(&self, alias: &AliasRecord, spec: &StoredSpec) -> Result<()> {
         self.with_write_lock(|root| {
-            root.version = CURRENT_VERSION;
+            if let Some(other_name) = root.aliases.values().find_map(|entry| {
+                (entry.record.name != alias.name && entry.record.endpoint_id == alias.endpoint_id)
+                    .then_some(entry.record.name.as_str())
+            }) {
+                bail!(
+                    "endpoint_id {} is already registered as alias {}",
+                    alias.endpoint_id,
+                    other_name
+                );
+            }
+            let extra = root
+                .aliases
+                .get(&alias.name)
+                .map(|entry| entry.extra.clone())
+                .unwrap_or_default();
             root.aliases.insert(
                 alias.name.clone(),
                 Entry {
                     record: alias.clone(),
                     spec: spec.clone(),
+                    extra,
                 },
             );
             Ok(())
@@ -107,14 +136,25 @@ impl AliasStore {
 
     pub fn remove(&self, name: &str) -> Result<()> {
         self.with_write_lock(|root| {
-            root.version = CURRENT_VERSION;
             root.aliases.remove(name);
             Ok(())
         })
     }
 
     fn read(&self) -> Result<Root> {
-        let file = match File::open(&self.path) {
+        if let Some(parent) = parent_dir(&self.lock_path) {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create alias store directory {}", parent.display()))?;
+        }
+
+        let lock_file = self.open_lock_file()?;
+        let lock = RwLock::new(lock_file);
+        let _guard = lock.read().context("acquire alias store read lock")?;
+        self.read_unlocked()
+    }
+
+    fn read_unlocked(&self) -> Result<Root> {
+        let mut file = match File::open(&self.path) {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Root::default());
@@ -124,37 +164,36 @@ impl AliasStore {
                     .with_context(|| format!("open alias store {}", self.path.display()));
             }
         };
-        let lock = RwLock::new(file);
-        let guard = lock.read().context("acquire alias store read lock")?;
-        let mut file = &*guard;
         let mut json = String::new();
         file.read_to_string(&mut json).context("read alias store")?;
         if json.trim().is_empty() {
             return Ok(Root::default());
         }
-        serde_json::from_str(&json).context("parse alias store JSON")
+        let root: Root = serde_json::from_str(&json).context("parse alias store JSON")?;
+        if root.version > CURRENT_VERSION {
+            bail!(
+                "alias store at {} was written by a newer portl (version={}); refusing to open",
+                self.path.display(),
+                root.version
+            );
+        }
+        Ok(root)
     }
 
     fn with_write_lock<F>(&self, f: F) -> Result<()>
     where
         F: FnOnce(&mut Root) -> Result<()>,
     {
-        if let Some(parent) = self.path.parent() {
+        if let Some(parent) = parent_dir(&self.path) {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create alias store directory {}", parent.display()))?;
         }
 
-        let lock_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&self.lock_path)
-            .with_context(|| format!("open alias store lock {}", self.lock_path.display()))?;
+        let lock_file = self.open_lock_file()?;
         let mut lock = RwLock::new(lock_file);
         let _guard = lock.write().context("acquire alias store write lock")?;
 
-        let mut root = self.read()?;
+        let mut root = self.read_unlocked()?;
         root.version = CURRENT_VERSION;
         f(&mut root)?;
         self.write_root(&root)
@@ -162,8 +201,7 @@ impl AliasStore {
 
     fn write_root(&self, root: &Root) -> Result<()> {
         let tmp_path = self.path.with_extension("json.tmp");
-        let mut file = File::create(&tmp_path)
-            .with_context(|| format!("create alias store tmp {}", tmp_path.display()))?;
+        let mut file = Self::create_tmp_file(&tmp_path)?;
         serde_json::to_writer_pretty(&mut file, root).context("encode alias store JSON")?;
         file.write_all(b"\n")
             .context("write alias store trailing newline")?;
@@ -175,8 +213,40 @@ impl AliasStore {
                 self.path.display()
             )
         })?;
+
+        let parent = parent_dir(&self.path).unwrap_or_else(|| Path::new("."));
+        let parent_dir = File::open(parent)
+            .with_context(|| format!("open alias store parent directory {}", parent.display()))?;
+        parent_dir
+            .sync_all()
+            .with_context(|| format!("fsync alias store parent directory {}", parent.display()))?;
         Ok(())
     }
+
+    fn open_lock_file(&self) -> Result<File> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        options.mode(0o600);
+        options
+            .open(&self.lock_path)
+            .with_context(|| format!("open alias store lock {}", self.lock_path.display()))
+    }
+
+    fn create_tmp_file(path: &Path) -> Result<File> {
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        options
+            .open(path)
+            .with_context(|| format!("create alias store tmp {}", path.display()))
+    }
+}
+
+fn parent_dir(path: &Path) -> Option<&Path> {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
 }
 
 pub fn default_db_path() -> PathBuf {
@@ -214,7 +284,9 @@ where
     let value = Option::<String>::deserialize(deserializer)?;
     match value {
         None => Ok(None),
-        Some(value) if value.is_empty() => Ok(None),
+        Some(value) if value.is_empty() => Err(serde::de::Error::custom(format!(
+            "expected exactly {N} bytes of hex, got empty string"
+        ))),
         Some(value) => {
             let bytes = hex::decode(&value).map_err(serde::de::Error::custom)?;
             let bytes: [u8; N] = bytes.try_into().map_err(|_| {
@@ -266,12 +338,17 @@ mod hex_opt_16 {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
 
+    use anyhow::Result;
+    use serde_json::json;
     use tempfile::tempdir;
 
-    use super::{AliasRecord, AliasStore, StoredSpec};
+    use super::{AliasRecord, AliasStore, CURRENT_VERSION, StoredSpec};
     use portl_core::ticket::schema::Capabilities;
 
     fn empty_caps() -> Capabilities {
@@ -416,5 +493,237 @@ mod tests {
 
         let store = AliasStore::new(path);
         assert_eq!(store.list().expect("list").len(), 1_000);
+    }
+
+    #[test]
+    fn save_rejects_duplicate_endpoint_id_for_other_alias() {
+        let dir = tempdir().expect("tempdir");
+        let store = AliasStore::new(dir.path().join("aliases.json"));
+        let spec = minimal_spec();
+
+        store
+            .save(&alias("demo-1", "endpoint-1", 1), &spec)
+            .expect("save first alias");
+
+        let err = store
+            .save(&alias("demo-2", "endpoint-1", 2), &spec)
+            .expect_err("duplicate endpoint_id should fail");
+        assert_eq!(
+            err.to_string(),
+            "endpoint_id endpoint-1 is already registered as alias demo-1"
+        );
+    }
+
+    #[test]
+    fn read_rejects_alias_store_from_newer_version() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("aliases.json");
+        fs::write(
+            &path,
+            format!(
+                "{{\n  \"version\": {},\n  \"aliases\": {{}}\n}}\n",
+                CURRENT_VERSION + 1
+            ),
+        )
+        .expect("write future alias store");
+        let store = AliasStore::new(path.clone());
+
+        let err = store
+            .list()
+            .expect_err("future alias store should fail closed");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "alias store at {} was written by a newer portl (version={}); refusing to open",
+                path.display(),
+                CURRENT_VERSION + 1
+            )
+        );
+    }
+
+    #[test]
+    fn empty_hex_strings_are_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("aliases.json");
+        fs::write(
+            &path,
+            json!({
+                "version": CURRENT_VERSION,
+                "aliases": {
+                    "demo": {
+                        "record": {
+                            "name": "demo",
+                            "adapter": "docker-portl",
+                            "container_id": "cid-demo",
+                            "endpoint_id": "endpoint-demo",
+                            "image": "img",
+                            "network": "bridge",
+                            "created_at": 7
+                        },
+                        "spec": {
+                            "caps": empty_caps(),
+                            "ttl_secs": 60,
+                            "to": "",
+                            "labels": [],
+                            "root_ticket_id": null,
+                            "ticket_file_path": null,
+                            "group_name": null,
+                            "base_url": null
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write alias store with empty hex string");
+        let store = AliasStore::new(path);
+
+        let err = store
+            .list()
+            .expect_err("empty hex string should fail closed");
+        assert!(
+            format!("{err:#}").contains("expected exactly 32 bytes of hex, got empty string"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn save_preserves_unknown_entry_fields_for_existing_alias() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("aliases.json");
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "version": CURRENT_VERSION,
+                "aliases": {
+                    "demo": {
+                        "record": {
+                            "name": "demo",
+                            "adapter": "docker-portl",
+                            "container_id": "cid-demo",
+                            "endpoint_id": "endpoint-demo",
+                            "image": "img",
+                            "network": "bridge",
+                            "created_at": 7
+                        },
+                        "spec": {
+                            "caps": empty_caps(),
+                            "ttl_secs": 60,
+                            "to": null,
+                            "labels": [],
+                            "root_ticket_id": null,
+                            "ticket_file_path": null,
+                            "group_name": null,
+                            "base_url": null
+                        },
+                        "future_field": "preserve-me"
+                    }
+                }
+            }))
+            .expect("encode alias store")
+                + "\n",
+        )
+        .expect("write alias store with future entry field");
+        let store = AliasStore::new(path.clone());
+
+        store
+            .save(&alias("demo", "endpoint-rebuilt", 8), &minimal_spec())
+            .expect("update alias");
+
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path).expect("read alias store"))
+                .expect("parse alias store");
+        assert_eq!(
+            value["aliases"]["demo"]["future_field"],
+            serde_json::Value::String("preserve-me".to_owned())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn alias_store_files_are_created_owner_only() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("aliases.json");
+        let store = AliasStore::new(path.clone());
+
+        store
+            .save(&alias("demo", "endpoint-demo", 1), &minimal_spec())
+            .expect("save alias");
+
+        let data_mode = fs::metadata(&path).expect("data metadata").mode() & 0o777;
+        let lock_mode = fs::metadata(dir.path().join("aliases.json.lock"))
+            .expect("lock metadata")
+            .mode()
+            & 0o777;
+        assert_eq!(data_mode, 0o600);
+        assert_eq!(lock_mode, 0o600);
+    }
+
+    #[test]
+    fn readers_observe_monotonic_snapshots_while_writer_updates() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("aliases.json");
+        let barrier = Arc::new(Barrier::new(4));
+        let writer_done = Arc::new(AtomicBool::new(false));
+
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                let writer_done = Arc::clone(&writer_done);
+                std::thread::spawn(move || -> Result<Vec<usize>> {
+                    let store = AliasStore::new(path);
+                    let mut counts = Vec::with_capacity(1_000);
+                    barrier.wait();
+                    for _ in 0..1_000 {
+                        counts.push(store.list()?.len());
+                        if writer_done.load(Ordering::Acquire) && counts.len() >= 200 {
+                            break;
+                        }
+                    }
+                    Ok(counts)
+                })
+            })
+            .collect();
+
+        let writer = {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            let writer_done = Arc::clone(&writer_done);
+            std::thread::spawn(move || -> Result<()> {
+                let store = AliasStore::new(path);
+                let spec = minimal_spec();
+                barrier.wait();
+                for i in 0..200_u32 {
+                    let alias = alias(format!("writer-{i}"), format!("endpoint-{i}"), i64::from(i));
+                    store.save(&alias, &spec)?;
+                }
+                writer_done.store(true, Ordering::Release);
+                Ok(())
+            })
+        };
+
+        writer
+            .join()
+            .expect("writer thread")
+            .expect("writer result");
+
+        for reader in readers {
+            let counts = reader
+                .join()
+                .expect("reader thread")
+                .expect("reader result");
+            assert!(
+                !counts.is_empty(),
+                "reader should observe at least one snapshot"
+            );
+            assert!(
+                counts.windows(2).all(|window| window[0] <= window[1]),
+                "reader counts should be monotonic: {counts:?}"
+            );
+        }
+
+        let store = AliasStore::new(path);
+        assert_eq!(store.list().expect("final list").len(), 200);
     }
 }
