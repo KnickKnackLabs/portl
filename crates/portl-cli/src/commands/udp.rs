@@ -57,7 +57,7 @@ pub fn run(peer: &str, specs: &[String]) -> Result<ExitCode> {
                         }
                     };
 
-                    let requested_session_id = forward.session_id().await;
+                    let requested_session_id = forward.session_id();
                     let control = match open_udp(
                         &connected.connection,
                         &connected.session,

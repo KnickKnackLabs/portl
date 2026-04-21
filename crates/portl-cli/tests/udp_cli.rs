@@ -95,7 +95,7 @@ async fn udp_forward_handle_reconnects_and_preserves_session() -> Result<()> {
         &ticket,
         local_port,
         remote_port,
-        forward.session_id().await,
+        forward.session_id(),
     )
     .await?;
     let first_connection = first.connection.clone();
@@ -114,7 +114,6 @@ async fn udp_forward_handle_reconnects_and_preserves_session() -> Result<()> {
     assert_eq!(&buf[..read], b"first");
     let session_id = forward
         .session_id()
-        .await
         .expect("session id after first attach");
 
     first_connection.close(0u32.into(), b"force reconnect");

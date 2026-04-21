@@ -80,6 +80,14 @@ async fn udp_echo_single_datagram() -> Result<()> {
 
 #[tokio::test]
 async fn udp_burst_loopback_smoke() -> Result<()> {
+    // Moderate-burst smoke test, deliberately scoped below any
+    // "no loss" guarantee. The transport under test is QUIC
+    // DATAGRAM frames (unreliable by design, per iroh docs). The
+    // forwarder's `upstream_loop` now decouples the socket reader
+    // from the QUIC sender via a bounded mpsc, so this burst is
+    // well within the queue depth. A true high-PPS stress test
+    // belongs behind a `--ignored` flag.
+    const BURST: u32 = 1_000;
     let echo = start_udp_echo_server().await?;
     let forward_port = reserve_udp_port()?;
     let (client, server) = pair().await?;
@@ -103,23 +111,6 @@ async fn udp_burst_loopback_smoke() -> Result<()> {
 
     let app = std::sync::Arc::new(UdpSocket::bind(("127.0.0.1", 0)).await?);
     app.connect(("127.0.0.1", forward_port)).await?;
-
-    // Moderate-burst smoke test, deliberately scoped below any
-    // "no loss" guarantee. The transport under test is QUIC
-    // DATAGRAM frames (unreliable by design, per iroh docs), and
-    // the portl forwarder's `upstream_loop` runs a single task
-    // that reads `local_socket.recv_from` and then blocks on
-    // `connection.send_datagram_wait` serially — so under QUIC
-    // congestion, the ingress UDP socket's kernel rx buffer
-    // (default ~208 KiB on Linux) can overflow and drop.
-    //
-    // 1,000 × ~140-byte encoded datagrams fit under that cap with
-    // margin, giving us a reliable assertion that the forwarder
-    // handles a burst of modest size without accidental loss. A
-    // true high-PPS stress test belongs behind a `--ignored` flag
-    // after the reader/sender decoupling tracked in the follow-up
-    // commit lands.
-    const BURST: u32 = 1_000;
 
     let sender = {
         let app = std::sync::Arc::clone(&app);
