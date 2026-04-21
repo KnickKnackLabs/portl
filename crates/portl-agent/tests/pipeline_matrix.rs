@@ -231,6 +231,63 @@ fn rejects_rate_limited_source() {
     assert_rejected(outcome, &AckReason::RateLimited);
 }
 
+#[test]
+fn listener_mode_rejects_master_ticket() {
+    let fixture = Fixture::new();
+    let ticket = fixture.master_root_ticket(b"slicer-token".to_vec());
+
+    let outcome = fixture.evaluate_in_mode(
+        &offer(&ticket, &[], None),
+        &AllowAll,
+        &portl_agent::AgentMode::Listener,
+    );
+
+    assert_rejected(
+        outcome,
+        &AckReason::InternalError {
+            detail: Some("listener mode refuses master tickets".to_owned()),
+        },
+    );
+}
+
+#[test]
+fn gateway_mode_rejects_non_master_ticket() {
+    let fixture = Fixture::new();
+    let ticket = fixture.root_ticket(meta_caps(true, true), NOW, NOW + 300, None);
+
+    let outcome = fixture.evaluate_in_mode(&offer(&ticket, &[], None), &AllowAll, &gateway_mode());
+
+    assert_rejected(
+        outcome,
+        &AckReason::InternalError {
+            detail: Some("gateway mode requires a master ticket".to_owned()),
+        },
+    );
+}
+
+#[test]
+fn gateway_mode_accepts_master_ticket() {
+    let fixture = Fixture::new();
+    let ticket = fixture.master_root_ticket(b"slicer-token".to_vec());
+
+    let outcome = fixture.evaluate_in_mode(&offer(&ticket, &[], None), &AllowAll, &gateway_mode());
+
+    match outcome {
+        AcceptanceOutcome::Accepted { bearer, .. } => {
+            assert_eq!(bearer.as_deref(), Some(b"slicer-token".as_ref()));
+        }
+        AcceptanceOutcome::Rejected { reason } => panic!("unexpected rejection: {reason:?}"),
+    }
+}
+
+fn gateway_mode() -> portl_agent::AgentMode {
+    portl_agent::AgentMode::Gateway {
+        upstream_url: "http://slicer.test:8080".to_owned(),
+        upstream_host: "slicer.test".to_owned(),
+        upstream_port: 8080,
+    }
+}
+
 fn assert_rejected(outcome: AcceptanceOutcome, expected: &AckReason) {
     match outcome {
         AcceptanceOutcome::Accepted { .. } => panic!("expected rejection"),
@@ -336,8 +393,33 @@ impl Fixture {
         revocations
     }
 
+    fn master_root_ticket(&self, bearer: Vec<u8>) -> PortlTicket {
+        let mut ticket = self.root_ticket(tcp_caps_to_upstream(), NOW, NOW + 300, None);
+        ticket.body.bearer = Some(bearer);
+        ticket.sig =
+            sign_body(self.operator.signing_key(), &ticket.body).expect("sign master root body");
+        ticket
+    }
+
     fn evaluate(&self, offer: &TicketOffer, rate_limit: &dyn RateLimitGate) -> AcceptanceOutcome {
         self.evaluate_with_revocations(offer, rate_limit, &self.revocations)
+    }
+
+    fn evaluate_in_mode(
+        &self,
+        offer: &TicketOffer,
+        rate_limit: &dyn RateLimitGate,
+        mode: &portl_agent::AgentMode,
+    ) -> AcceptanceOutcome {
+        evaluate_offer(&AcceptanceInput {
+            offer,
+            source_id: SOURCE_ID,
+            trust_roots: &self.trust_roots,
+            revocations: &self.revocations,
+            now: NOW,
+            rate_limit,
+            mode,
+        })
     }
 
     fn evaluate_with_revocations(
@@ -353,6 +435,24 @@ impl Fixture {
             revocations,
             now: NOW,
             rate_limit,
+            mode: &portl_agent::AgentMode::Listener,
         })
+    }
+}
+
+fn tcp_caps_to_upstream() -> Capabilities {
+    use portl_core::ticket::schema::PortRule;
+    Capabilities {
+        presence: 0b0000_0010,
+        shell: None,
+        tcp: Some(vec![PortRule {
+            host_glob: "slicer.test".to_owned(),
+            port_min: 8080,
+            port_max: 8080,
+        }]),
+        udp: None,
+        fs: None,
+        vpn: None,
+        meta: None,
     }
 }

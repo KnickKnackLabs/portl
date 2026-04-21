@@ -8,6 +8,7 @@ use portl_core::ticket::verify::{MAX_DELEGATION_DEPTH, TrustRoots};
 use portl_proto::ticket_v1::{AckReason, TicketOffer};
 use sha2::{Digest, Sha256};
 
+use crate::AgentMode;
 use crate::revocations::RevocationSet;
 
 const CLOCK_SKEW_SECS: u64 = 60;
@@ -24,6 +25,7 @@ pub struct AcceptanceInput<'a> {
     pub revocations: &'a RevocationSet,
     pub now: u64,
     pub rate_limit: &'a dyn RateLimitGate,
+    pub mode: &'a AgentMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +84,21 @@ pub fn evaluate_offer(input: &AcceptanceInput<'_>) -> AcceptanceOutcome {
         return reject(reason);
     }
 
+    let bearer = terminal.body.bearer;
+    match (input.mode, bearer.is_some()) {
+        (AgentMode::Listener, true) => {
+            return reject(AckReason::InternalError {
+                detail: Some("listener mode refuses master tickets".to_owned()),
+            });
+        }
+        (AgentMode::Gateway { .. }, false) => {
+            return reject(AckReason::InternalError {
+                detail: Some("gateway mode requires a master ticket".to_owned()),
+            });
+        }
+        _ => {}
+    }
+
     let terminal_ticket_id = ticket_id(&terminal.sig);
     let ticket_chain_ids = chain
         .iter()
@@ -93,7 +110,7 @@ pub fn evaluate_offer(input: &AcceptanceInput<'_>) -> AcceptanceOutcome {
         caps: Box::new(caps),
         ticket_id: terminal_ticket_id,
         ticket_chain_ids,
-        bearer: terminal.body.bearer,
+        bearer,
     }
 }
 

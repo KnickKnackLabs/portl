@@ -47,6 +47,7 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
                 revocations: &revocations,
                 now: unix_now_secs()?,
                 rate_limit: &state.rate_limit,
+                mode: &state.mode,
             })
         }
         Err(_) => AcceptanceOutcome::Rejected {
@@ -154,11 +155,16 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
                                     portl_proto::shell_v1::ALPN_SHELL_V1,
                                 ) =>
                         {
-                            state.metrics.shell_sessions_opened.inc();
-                            shell_handler::serve_stream(
-                                connection, session, state, send, recv, preamble,
-                            )
-                            .await
+                            if let Err(error) = crate::alpn_allowed_in_mode(&state.mode, value) {
+                                connection.close(0x1004u32.into(), error.as_bytes());
+                                Ok(())
+                            } else {
+                                state.metrics.shell_sessions_opened.inc();
+                                shell_handler::serve_stream(
+                                    connection, session, state, send, recv, preamble,
+                                )
+                                .await
+                            }
                         }
                         value
                             if value
@@ -184,17 +190,22 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
                             if value
                                 == String::from_utf8_lossy(portl_proto::udp_v1::ALPN_UDP_V1) =>
                         {
-                            state.metrics.udp_sessions_opened.inc();
-                            udp_handler::serve_stream(
-                                connection,
-                                session,
-                                state,
-                                send,
-                                recv,
-                                preamble,
-                                udp_context,
-                            )
-                            .await
+                            if let Err(error) = crate::alpn_allowed_in_mode(&state.mode, value) {
+                                connection.close(0x1004u32.into(), error.as_bytes());
+                                Ok(())
+                            } else {
+                                state.metrics.udp_sessions_opened.inc();
+                                udp_handler::serve_stream(
+                                    connection,
+                                    session,
+                                    state,
+                                    send,
+                                    recv,
+                                    preamble,
+                                    udp_context,
+                                )
+                                .await
+                            }
                         }
                         _ => {
                             connection.close(0x1003u32.into(), b"version mismatch");

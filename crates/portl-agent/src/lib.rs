@@ -35,6 +35,83 @@ pub use pipeline::{AcceptanceInput, AcceptanceOutcome, evaluate_offer};
 pub use rate_limit::OfferRateLimiter;
 pub use revocations::{RevocationRecord, RevocationSet};
 
+/// Gate ALPN dispatch on agent mode.
+///
+/// Listener mode serves every wire-level ALPN. Gateway mode is
+/// strictly a master-ticket-backed HTTP forwarder (see
+/// `src/gateway.rs`), so only `meta/v1` and `tcp/v1` streams are
+/// dispatched; `shell/v1` and `udp/v1` are closed at dispatch time.
+pub(crate) fn alpn_allowed_in_mode(mode: &AgentMode, alpn: &str) -> Result<(), &'static str> {
+    match mode {
+        AgentMode::Listener => Ok(()),
+        AgentMode::Gateway { .. } => {
+            let meta = String::from_utf8_lossy(portl_proto::meta_v1::ALPN_META_V1);
+            let tcp = String::from_utf8_lossy(portl_proto::tcp_v1::ALPN_TCP_V1);
+            if alpn == meta || alpn == tcp {
+                Ok(())
+            } else {
+                Err("gateway mode only serves meta/v1 and tcp/v1 streams")
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod mode_dispatch_tests {
+    use super::{AgentMode, alpn_allowed_in_mode};
+
+    fn gateway() -> AgentMode {
+        AgentMode::Gateway {
+            upstream_url: "http://slicer.test:8080".to_owned(),
+            upstream_host: "slicer.test".to_owned(),
+            upstream_port: 8080,
+        }
+    }
+
+    #[test]
+    fn listener_allows_every_alpn() {
+        for alpn in [
+            String::from_utf8_lossy(portl_proto::meta_v1::ALPN_META_V1),
+            String::from_utf8_lossy(portl_proto::shell_v1::ALPN_SHELL_V1),
+            String::from_utf8_lossy(portl_proto::tcp_v1::ALPN_TCP_V1),
+            String::from_utf8_lossy(portl_proto::udp_v1::ALPN_UDP_V1),
+        ] {
+            alpn_allowed_in_mode(&AgentMode::Listener, alpn.as_ref())
+                .unwrap_or_else(|err| panic!("listener rejected {alpn}: {err}"));
+        }
+    }
+
+    #[test]
+    fn gateway_allows_meta_and_tcp_only() {
+        alpn_allowed_in_mode(
+            &gateway(),
+            String::from_utf8_lossy(portl_proto::meta_v1::ALPN_META_V1).as_ref(),
+        )
+        .expect("meta/v1 allowed in gateway mode");
+        alpn_allowed_in_mode(
+            &gateway(),
+            String::from_utf8_lossy(portl_proto::tcp_v1::ALPN_TCP_V1).as_ref(),
+        )
+        .expect("tcp/v1 allowed in gateway mode");
+    }
+
+    #[test]
+    fn gateway_rejects_shell_and_udp() {
+        let err = alpn_allowed_in_mode(
+            &gateway(),
+            String::from_utf8_lossy(portl_proto::shell_v1::ALPN_SHELL_V1).as_ref(),
+        )
+        .expect_err("shell/v1 must be rejected in gateway mode");
+        assert!(err.contains("gateway mode only serves"));
+        let err = alpn_allowed_in_mode(
+            &gateway(),
+            String::from_utf8_lossy(portl_proto::udp_v1::ALPN_UDP_V1).as_ref(),
+        )
+        .expect_err("udp/v1 must be rejected in gateway mode");
+        assert!(err.contains("gateway mode only serves"));
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) struct AgentState {
     pub trust_roots: TrustRoots,
