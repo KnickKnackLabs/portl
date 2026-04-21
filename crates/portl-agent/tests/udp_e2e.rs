@@ -442,6 +442,11 @@ async fn udp_session_cap_enforced() -> Result<()> {
 
 #[tokio::test]
 async fn udp_src_tag_lru_eviction() -> Result<()> {
+    // QUIC DATAGRAM frames are unreliable by design. See the
+    // retry-loop comment below for the recovery strategy this
+    // test uses.
+    const RECV_TIMEOUT: Duration = Duration::from_secs(3);
+    const MAX_ATTEMPTS: u32 = 3;
     let remote = UdpSocket::bind(("127.0.0.1", 0)).await?;
     let remote_port = remote.local_addr()?.port();
     let (client, server) = pair().await?;
@@ -459,22 +464,40 @@ async fn udp_src_tag_lru_eviction() -> Result<()> {
     .await?;
     let session_id = control.session_id;
 
-    let mut buf = [0_u8; 64];
+    // To make the 1,025-iteration sweep robust against the
+    // occasional QUIC datagram drop on a shared CI runner, we:
+    //
+    //  1. Embed the src_tag in the payload as 4 BE bytes so we can
+    //     reject stragglers (retry responses for a prior src_tag).
+    //  2. Retry a given src_tag up to 3 times on timeout. Retries
+    //     are idempotent on the agent side — `route_to_target`
+    //     treats the second delivery as a refresh
+    //     (last_used update, same ephemeral socket).
+    //  3. Use `recv_until_matching_payload` to drain stale echoes
+    //     queued from previous retried iterations before concluding
+    //     the current src_tag genuinely dropped.
+    //
+    // The LRU invariant the test cares about is preserved because
+    // each successful iteration guarantees the agent processed the
+    // datagram (it echoed back to `remote`), so src_tag order in
+    // the agent's LRU matches the iteration order.
     let mut first_addr = None;
     let mut newest_addr = None;
     for src_tag in 1..=1_025_u32 {
-        send_udp_datagram(&connection, session_id, remote_port, src_tag, b"tag").await?;
-        // QUIC DATAGRAM frames are explicitly unreliable. Without this
-        // per-iteration timeout a single dropped datagram turns this
-        // test into an unbounded hang that only nextest's SIGKILL can
-        // break — which gives us a timed-out "success" instead of a
-        // real failure signal. 1 s is generous on a 2-core CI runner
-        // for a single loopback roundtrip; if we ever observe a real
-        // regression crossing that threshold, the iteration count
-        // (1,025) is the load we want to catch regressing.
-        let (_, from) = tokio::time::timeout(Duration::from_secs(1), remote.recv_from(&mut buf))
-            .await
-            .with_context(|| format!("recv_from timed out at src_tag={src_tag}"))??;
+        let payload = src_tag.to_be_bytes();
+        let mut from_addr = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            send_udp_datagram(&connection, session_id, remote_port, src_tag, &payload).await?;
+            if let Some(from) = recv_until_matching_payload(&remote, &payload, RECV_TIMEOUT).await?
+            {
+                from_addr = Some(from);
+                break;
+            }
+            if attempt == MAX_ATTEMPTS {
+                anyhow::bail!("src_tag={src_tag} echo not observed after {MAX_ATTEMPTS} attempts");
+            }
+        }
+        let from = from_addr.expect("from_addr set by successful attempt");
         if src_tag == 1 {
             first_addr = Some(from);
         }
@@ -683,6 +706,37 @@ fn udp_bind(local_port: u16, remote_port: u16) -> UdpBind {
         local_port_range: (local_port, local_port),
         target_host: "127.0.0.1".to_owned(),
         target_port_range: (remote_port, remote_port),
+    }
+}
+
+/// Read from `remote` until we see a datagram whose payload exactly
+/// matches `want`, or until `timeout` elapses.
+///
+/// Returns `Ok(Some(from))` when the match arrives, `Ok(None)` on
+/// timeout. Intermediate datagrams with non-matching payloads are
+/// drained silently — they are stragglers from a retried send of a
+/// prior iteration.
+async fn recv_until_matching_payload(
+    socket: &UdpSocket,
+    want: &[u8],
+    timeout: Duration,
+) -> Result<Option<std::net::SocketAddr>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut buf = [0_u8; 64];
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        match tokio::time::timeout(remaining, socket.recv_from(&mut buf)).await {
+            Ok(Ok((n, from))) if &buf[..n] == want => return Ok(Some(from)),
+            Ok(Ok(_)) => {
+                // Stale straggler from a previous iteration's retry.
+                // Keep draining.
+            }
+            Ok(Err(err)) => return Err(err.into()),
+            Err(_) => return Ok(None),
+        }
     }
 }
 
