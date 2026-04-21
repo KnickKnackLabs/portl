@@ -19,11 +19,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::alias_store::AliasStore;
 
-pub fn run(peer: &str) -> Result<ExitCode> {
-    run_with_identity_path(peer, None)
+pub fn run(peer: &str, relay: bool) -> Result<ExitCode> {
+    run_with_identity_path_mode(peer, None, relay)
 }
 
 pub fn run_with_identity_path(peer: &str, identity_path: Option<&Path>) -> Result<ExitCode> {
+    run_with_identity_path_mode(peer, identity_path, false)
+}
+
+fn run_with_identity_path_mode(
+    peer: &str,
+    identity_path: Option<&Path>,
+    relay: bool,
+) -> Result<ExitCode> {
     let runtime = tokio::runtime::Runtime::new()?;
     let identity_path = resolve_identity_path(identity_path);
     runtime.block_on(async move {
@@ -32,7 +40,7 @@ pub fn run_with_identity_path(peer: &str, identity_path: Option<&Path>) -> Resul
             portl_agent::endpoint::bind(&portl_agent::AgentConfig::default(), &identity)
                 .await
                 .context("bind client endpoint")?;
-        run_with_endpoint(peer, identity, raw_endpoint).await
+        run_with_endpoint(peer, identity, raw_endpoint, relay).await
     })
 }
 
@@ -45,7 +53,7 @@ pub fn run_with_identity_path_and_endpoint(
     let identity_path = resolve_identity_path(identity_path);
     runtime.block_on(async move {
         let identity = store::load(&identity_path).context("load local identity")?;
-        run_with_endpoint(peer, identity, raw_endpoint).await
+        run_with_endpoint(peer, identity, raw_endpoint, false).await
     })
 }
 
@@ -53,9 +61,10 @@ async fn run_with_endpoint(
     peer: &str,
     identity: Identity,
     raw_endpoint: iroh::Endpoint,
+    relay: bool,
 ) -> Result<ExitCode> {
     let endpoint = Endpoint::from(raw_endpoint.clone());
-    let resolved = resolve_peer(peer, &identity, &raw_endpoint).await?;
+    let resolved = resolve_peer(peer, &identity, &raw_endpoint, relay).await?;
     let (connection, session) = open_ticket_v1(&endpoint, &resolved.ticket, &[], &identity)
         .await
         .context("run ticket handshake")?;
@@ -84,6 +93,7 @@ async fn resolve_peer(
     peer: &str,
     identity: &Identity,
     endpoint: &iroh::Endpoint,
+    relay: bool,
 ) -> Result<ResolvedPeer> {
     if let Ok(ticket) = <PortlTicket as Ticket>::deserialize(peer) {
         if ticket.body.parent.is_some() {
@@ -92,7 +102,7 @@ async fn resolve_peer(
             );
         }
         return Ok(ResolvedPeer {
-            ticket,
+            ticket: maybe_force_relay_ticket(ticket, relay)?,
             discovery: "cached".to_owned(),
         });
     }
@@ -106,12 +116,12 @@ async fn resolve_peer(
             let ticket = <PortlTicket as Ticket>::deserialize(raw.trim())
                 .map_err(|err| anyhow!("parse stored ticket {}: {err}", ticket_path.display()))?;
             return Ok(ResolvedPeer {
-                ticket,
+                ticket: maybe_force_relay_ticket(ticket, relay)?,
                 discovery: "stored-ticket".to_owned(),
             });
         }
         let endpoint_id = parse_endpoint_id(&alias.endpoint_id)?;
-        let (addr, provenance) = resolve_endpoint_addr(endpoint, endpoint_id).await?;
+        let (addr, provenance) = resolve_endpoint_addr(endpoint, endpoint_id, relay).await?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .context("system clock is before unix epoch")?
@@ -133,7 +143,7 @@ async fn resolve_peer(
     }
 
     let endpoint_id = parse_endpoint_id(peer)?;
-    let (addr, provenance) = resolve_endpoint_addr(endpoint, endpoint_id).await?;
+    let (addr, provenance) = resolve_endpoint_addr(endpoint, endpoint_id, relay).await?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before unix epoch")?
@@ -157,7 +167,14 @@ async fn resolve_peer(
 async fn resolve_endpoint_addr(
     endpoint: &iroh::Endpoint,
     endpoint_id: EndpointId,
+    relay: bool,
 ) -> Result<(EndpointAddr, String)> {
+    if relay && relay_discovery_disabled() {
+        bail!(
+            "PORTL_DISCOVERY=none disables relay discovery and DNS lookups; unset it or pass a ticket with a relay address"
+        );
+    }
+
     let mut stream = endpoint
         .address_lookup()
         .context("access address lookup")?
@@ -166,10 +183,17 @@ async fn resolve_endpoint_addr(
         match item {
             Ok(Ok(item)) => {
                 let provenance = item.provenance().to_owned();
-                return Ok((item.into_endpoint_addr(), provenance));
+                let addr = item.into_endpoint_addr();
+                let addr = maybe_force_relay_addr(endpoint_id, addr, relay)?;
+                return Ok((addr, provenance));
             }
             Ok(Err(_)) => {}
             Err(AddressLookupFailed::NoServiceConfigured { .. }) => {
+                if relay {
+                    bail!(
+                        "no discovery services configured for relay probing; unset PORTL_DISCOVERY=none or pass a ticket with a relay address"
+                    );
+                }
                 bail!("no discovery services configured")
             }
             Err(AddressLookupFailed::NoResults { errors, .. }) => {
@@ -185,6 +209,35 @@ async fn resolve_endpoint_addr(
     }
 
     bail!("discovery returned no addresses")
+}
+
+fn maybe_force_relay_ticket(mut ticket: PortlTicket, relay: bool) -> Result<PortlTicket> {
+    if relay {
+        ticket.addr = relay_only_addr(ticket.addr.id, &ticket.addr)?;
+    }
+    Ok(ticket)
+}
+
+fn maybe_force_relay_addr(
+    endpoint_id: EndpointId,
+    addr: EndpointAddr,
+    relay: bool,
+) -> Result<EndpointAddr> {
+    if relay {
+        return relay_only_addr(endpoint_id, &addr);
+    }
+    Ok(addr)
+}
+
+fn relay_only_addr(endpoint_id: EndpointId, addr: &EndpointAddr) -> Result<EndpointAddr> {
+    let relay_url = addr.relay_urls().next().cloned().context(
+        "peer does not advertise a relay address; rerun without --relay or use a ticket with relay information",
+    )?;
+    Ok(EndpointAddr::new(endpoint_id).with_relay_url(relay_url))
+}
+
+fn relay_discovery_disabled() -> bool {
+    matches!(std::env::var("PORTL_DISCOVERY"), Ok(value) if value.trim() == "none")
 }
 
 fn parse_endpoint_id(spec: &str) -> Result<EndpointId> {

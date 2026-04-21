@@ -1,4 +1,4 @@
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -147,6 +147,35 @@ async fn start_agent(
         ..AgentConfig::default()
     })
     .await
+}
+
+#[test]
+fn status_relay_probe_fails_closed_on_dns_timeout() -> Result<()> {
+    let home = tempdir()?;
+    store::save(&Identity::new(), &home.path().join("identity.bin"))?;
+    let peer = hex::encode(Identity::new().verifying_key());
+
+    let output = Command::new(assert_cmd::cargo::cargo_bin("portl"))
+        .env("PORTL_HOME", home.path())
+        .env("PORTL_DISCOVERY", "none")
+        .args(["status", "--relay", &peer])
+        .output()?;
+
+    assert!(
+        !output.status.success(),
+        "relay probe unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("PORTL_DISCOVERY=none"),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("ticket with a relay address"),
+        "unexpected stderr: {stderr}"
+    );
+
+    Ok(())
 }
 
 fn meta_caps() -> Capabilities {

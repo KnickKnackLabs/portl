@@ -58,6 +58,7 @@ pub enum Command {
     /// `portl status <peer>`
     Status {
         peer: String,
+        relay: bool,
     },
     /// `portl gateway <upstream-url>`
     Gateway {
@@ -242,7 +243,7 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             depth,
             print,
         } => commands::mint_root::run(&endpoint, &caps, &ttl, to.as_deref(), depth, print),
-        Command::Status { peer } => commands::status::run(&peer),
+        Command::Status { peer, relay } => commands::status::run(&peer, relay),
         Command::Gateway { upstream_url } => {
             commands::agent::run::run(Some(AgentModeArg::Gateway), Some(&upstream_url))
         }
@@ -387,7 +388,12 @@ enum TopLevel {
         print: MintRootPrint,
     },
     /// Query peer reachability and metadata.
-    Status { peer: String },
+    Status {
+        peer: String,
+        /// Also force the handshake over the peer's relay path.
+        #[arg(long)]
+        relay: bool,
+    },
     /// Run the slicer HTTP bridge against an upstream API.
     Gateway { upstream_url: String },
     /// Open an interactive remote PTY shell.
@@ -434,7 +440,7 @@ enum TopLevel {
         #[command(subcommand)]
         action: RevocationsAction,
     },
-    /// Print local diagnostics (clock, identity, listener bind, ticket expiry).
+    /// Print strictly local diagnostics (clock, identity, listener bind, discovery config, ticket expiry).
     Doctor,
     /// Docker target management.
     Docker {
@@ -655,7 +661,7 @@ impl Cli {
                 depth,
                 print,
             },
-            TopLevel::Status { peer } => Command::Status { peer },
+            TopLevel::Status { peer, relay } => Command::Status { peer, relay },
             TopLevel::Gateway { upstream_url } => Command::Gateway { upstream_url },
             TopLevel::Shell { peer, cwd, user } => Command::Shell { peer, cwd, user },
             TopLevel::Exec {
