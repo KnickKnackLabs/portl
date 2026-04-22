@@ -64,18 +64,16 @@ test-threads = 24
 filter = 'test(=udp_src_tag_lru_eviction)'
 slow-timeout = { period = "30s", terminate-after = 3 }
 
-# `many_writers_converge_to_full_set` performs 1,000 persisted
-# save() calls, and each save intentionally fsyncs a temp file before
-# atomic rename to validate the alias-store durability contract.
-# That makes it much slower than the rest of the unit suite in debug
-# builds, especially on APFS and on shared CI runners.
+# `many_writers_converge_to_full_set` does ~80 fsync'd atomic-rename
+# save() calls across four contending writers to validate the alias-
+# store durability contract. On APFS that's a few seconds; on shared
+# CI runners under disk contention it can briefly drift past the 20 s
+# slow-timeout, so give it a bit more headroom without changing the
+# default retry policy. Retries are intentionally not set here —
+# silent retry would mask a real regression in the fsync path.
 [[profile.ci.overrides]]
 filter = 'test(=alias_store::tests::many_writers_converge_to_full_set)'
-slow-timeout = { period = "90s", terminate-after = 3 }
-# 1000 serialized fsyncs on shared CI runners can drift into the 90s
-# window; one retry absorbs disk-contention noise without masking real
-# regressions.
-retries = { backoff = "fixed", count = 1, delay = "5s" }
+slow-timeout = { period = "30s", terminate-after = 2 }
 
 [profile.ci.junit]
 path = "junit.xml"

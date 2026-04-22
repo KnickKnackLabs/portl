@@ -42,4 +42,14 @@ Thumbs.db
 ehthumbs.db
 /dist/
 /staging-test/
+# autoresearch session artefacts — the tuning infrastructure lives
+# on throwaway `autoresearch/*` branches; nothing under this prefix
+# is meant to ship on main.
 autoresearch.config.json
+autoresearch.ideas.md
+autoresearch.jsonl
+autoresearch.md
+autoresearch.sh
+autoresearch.checks.sh
+TEST_BUILD_TUNING.md
+/.autoresearch-logs/

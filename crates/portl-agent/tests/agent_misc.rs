@@ -329,7 +329,8 @@ mod rlimits {
     // exhausts the agent's uid-wide NPROC budget with 512 sleeping
     // children, which blocks every other test in the same binary that
     // needs to fork. Marked #[ignore]; run manually with:
-    //   cargo test -p portl-agent --test rlimits -- --ignored --test-threads=1
+    //   cargo test -p portl-agent --test agent_misc -- --ignored \
+    //     --test-threads=1 rlimits::fork_bomb_killed_by_nproc
     //
     // The cheaper `exec_path_applies_nproc_linux` test (above) already
     // verifies `ulimit -u` reports 512, which is the real correctness
