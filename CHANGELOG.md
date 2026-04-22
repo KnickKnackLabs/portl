@@ -3,6 +3,49 @@
 All notable changes land here. This project follows
 [Semantic Versioning](https://semver.org/) from v0.1.0 onward.
 
+## 0.2.4 — 2026-04-22
+
+Bug-fix release. Ships one critical fix for the v0.2.x line; no
+other user-visible changes.
+
+### Fixed
+
+- **`portl shell` / `portl status` / any command that opened a peer
+  handshake would SIGABRT on macOS** with
+  `malloc: *** error for object 0x…: pointer being freed was not
+  allocated` on the first TLS handshake. Root cause: `reqwest 0.13`
+  enabled its `rustls` feature with the `aws-lc-rs` crypto provider
+  by default, while every other TLS consumer in the tree (`iroh`,
+  `hickory-net`, `noq-proto`) used `ring`. Rust feature unification
+  left both C crypto libraries linked into the same binary, and on
+  macOS their internal allocator hooks collided — see
+  [`rustls/rustls#1877`](https://github.com/rustls/rustls/issues/1877).
+  The CLI (and every peer-handshake path under the CLI) would abort
+  before the first TLS exchange completed.
+
+### Changed
+
+- `reqwest` feature set switched from `rustls` to
+  `rustls-no-provider`, dropping `aws-lc-rs` / `aws-lc-sys` from the
+  workspace entirely.
+- New `portl_core::tls::install_default_crypto_provider()` helper
+  registers `ring` as the process-wide rustls crypto provider. It is
+  called once from `portl_cli::run()` (the main CLI entry) and from
+  `slicer_portl::SlicerClient::new` (the one other `reqwest::Client`
+  construction site that can be reached outside the CLI entry, e.g.
+  from integration tests).
+
+### Validation
+
+- `cargo tree -i aws-lc-sys` now reports "did not match any
+  packages" — the C crypto library is no longer linked.
+- `cargo fmt`, `cargo clippy -D warnings`, and
+  `cargo nextest run --workspace --all-features --profile ci`
+  (310 passed, 5 skipped, 0 failed) all pass.
+- Manual repro: running `portl status <ticket>` against an
+  unreachable peer now cleanly returns the handshake rejection
+  instead of aborting the process with SIGABRT.
+
 ## 0.2.3 — 2026-04-22
 
 Test-build tuning release. Pure developer-experience improvements —

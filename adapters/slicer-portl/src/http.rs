@@ -13,6 +13,7 @@ pub struct SlicerClient {
 
 impl SlicerClient {
     pub fn new(base_url: &str, auth_token: Option<String>) -> Result<Self> {
+        portl_core::tls::install_default_crypto_provider();
         Ok(Self {
             base_url: reqwest::Url::parse(base_url)
                 .with_context(|| format!("parse slicer base url {base_url}"))?,

@@ -193,6 +193,7 @@ fn clap_exit_code(err: &clap::Error) -> ExitCode {
 }
 
 pub fn run(argv: Vec<OsString>) -> ExitCode {
+    portl_core::tls::install_default_crypto_provider();
     match is_portl_agent_invocation(&argv) {
         Ok(true) => {
             return match AgentCli::try_parse_from(argv) {

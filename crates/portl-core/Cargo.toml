@@ -26,6 +26,14 @@ iroh-base     = { workspace = true }
 iroh-tickets  = { workspace = true }
 tokio         = { workspace = true }
 anyhow        = { workspace = true }
+# Direct rustls dep to let us install the `ring` crypto provider as
+# the process-wide default from a single `portl_core::tls::install_default_crypto_provider()`
+# helper. Required because `reqwest` is configured with
+# `rustls-no-provider` (to keep aws-lc-rs out of the binary);
+# without this call any reqwest TLS handshake panics with
+# `No provider set`. rustls is already in the tree transitively via
+# iroh, so this adds no link-time cost — only the one new API call.
+rustls        = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 thiserror     = { workspace = true }
 tracing       = { workspace = true }
 ed25519-dalek = { workspace = true }
@@ -48,7 +56,7 @@ socket2       = { workspace = true }
  prometheus-client = { workspace = true }
 
 [dev-dependencies]
-portl-core = { version = "0.2.3", path = ".", features = ["test-util"] }
+portl-core = { version = "0.2.4", path = ".", features = ["test-util"] }
 tokio      = { workspace = true }
 proptest   = { workspace = true }
 criterion  = { workspace = true }

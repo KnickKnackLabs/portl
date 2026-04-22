@@ -13,6 +13,7 @@ pub mod io;
 pub mod net;
 pub mod runtime;
 pub mod ticket;
+pub mod tls;
 pub mod wire;
 
 #[cfg(any(test, feature = "test-util"))]
