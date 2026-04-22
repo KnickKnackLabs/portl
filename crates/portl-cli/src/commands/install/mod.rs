@@ -163,16 +163,7 @@ pub fn run(
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
 
-    std::fs::copy(std::env::current_exe()?, &binary_path).with_context(|| {
-        format!(
-            "copy {} to {}",
-            std::env::current_exe().map_or_else(
-                |_| "current executable".to_owned(),
-                |path| path.display().to_string(),
-            ),
-            binary_path.display()
-        )
-    })?;
+    install_binary_safely(&binary_path)?;
     std::fs::write(&service_path, &rendered)
         .with_context(|| format!("write {}", service_path.display()))?;
     if matches!(target, InstallTarget::Dockerfile | InstallTarget::Openrc) {
@@ -227,6 +218,51 @@ fn seed_peer_store_self_row_with_reporting() {
              manually."
         ),
     }
+}
+
+/// Copy the current executable to `dst` safely, tolerating the case
+/// where `dst` already resolves to the same file (symlink or hardlink
+/// pointing at `current_exe`).
+///
+/// The naive [`std::fs::copy`] opens `dst` with `O_TRUNC` *before*
+/// reading `src`. When `dst` is a symlink pointing at `src`, the open
+/// follows the symlink and truncates `src` to zero bytes, and the
+/// subsequent read returns an empty file. Net result: a zero-byte
+/// binary at the install prefix. See the v0.3.1.1 postmortem for the
+/// original bug report.
+///
+/// Defense in three steps:
+///
+/// 1. Canonicalize `src` and `dst` (following symlinks). If they
+///    resolve to the same inode, the copy is a no-op; return early.
+/// 2. Otherwise, unlink `dst` first. This breaks any inode identity
+///    between `src` and `dst` *before* we open `dst` for writing.
+/// 3. Perform a regular `fs::copy`. At this point `dst` does not
+///    exist, so `fs::copy` creates a fresh file with the source
+///    content.
+fn install_binary_safely(dst: &Path) -> Result<()> {
+    let src = std::env::current_exe().context("resolve current executable")?;
+
+    if let (Ok(src_canonical), Ok(dst_canonical)) = (src.canonicalize(), dst.canonicalize())
+        && src_canonical == dst_canonical
+    {
+        // Already installed at this path (or dst is a symlink pointing
+        // back at src). Nothing to do — and critically, do NOT call
+        // fs::copy, which would truncate src.
+        return Ok(());
+    }
+
+    match std::fs::remove_file(dst) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("unlink {} before copy", dst.display()));
+        }
+    }
+
+    std::fs::copy(&src, dst)
+        .with_context(|| format!("copy {} to {}", src.display(), dst.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -343,5 +379,74 @@ mod tests {
                 .expect("service path"),
             output.join("Dockerfile")
         );
+    }
+
+    /// Regression: v0.3.1's install.sh symlinked `portl-agent → portl`,
+    /// then `portl install --apply` called `fs::copy(current_exe, dst)`
+    /// with `dst = portl-agent`. `fs::copy` opens `dst` with `O_TRUNC`
+    /// and follows the symlink, truncating `portl` to 0 bytes before
+    /// reading it. Result: 0-byte binary on disk, unusable install.
+    ///
+    /// `install_binary_safely` must detect the same-inode case and
+    /// return without touching the source.
+    #[test]
+    fn install_binary_safely_is_noop_when_dst_is_symlink_to_src() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let dir = tempdir().expect("tempdir");
+            let src = std::env::current_exe().expect("current_exe");
+            let src_len = std::fs::metadata(&src).expect("stat src").len();
+            assert!(src_len > 0, "current_exe must be non-empty for this test");
+
+            let dst = dir.path().join("portl-agent");
+            symlink(&src, &dst).expect("create symlink");
+
+            install_binary_safely(&dst).expect("install_binary_safely");
+
+            let src_len_after = std::fs::metadata(&src).expect("stat src after").len();
+            assert_eq!(
+                src_len, src_len_after,
+                "source binary was truncated! same-inode guard failed."
+            );
+        }
+    }
+
+    /// When `dst` is a regular file (not a symlink to src), copy
+    /// proceeds normally.
+    #[test]
+    fn install_binary_safely_copies_when_dst_is_distinct() {
+        let dir = tempdir().expect("tempdir");
+        let src = std::env::current_exe().expect("current_exe");
+        let src_len = std::fs::metadata(&src).expect("stat src").len();
+
+        let dst = dir.path().join("portl-agent");
+        // Pre-existing unrelated file at dst — should be overwritten.
+        std::fs::write(&dst, b"stale").expect("seed dst");
+
+        install_binary_safely(&dst).expect("install_binary_safely");
+
+        let dst_len = std::fs::metadata(&dst).expect("stat dst").len();
+        assert_eq!(
+            dst_len, src_len,
+            "copy should produce a file the same size as src"
+        );
+    }
+
+    /// When `dst` does not exist, copy proceeds normally (no spurious
+    /// errors from the pre-unlink step).
+    #[test]
+    fn install_binary_safely_copies_when_dst_is_absent() {
+        let dir = tempdir().expect("tempdir");
+        let src = std::env::current_exe().expect("current_exe");
+        let src_len = std::fs::metadata(&src).expect("stat src").len();
+
+        let dst = dir.path().join("portl-agent");
+        assert!(!dst.exists());
+
+        install_binary_safely(&dst).expect("install_binary_safely");
+
+        let dst_len = std::fs::metadata(&dst).expect("stat dst").len();
+        assert_eq!(dst_len, src_len);
     }
 }
