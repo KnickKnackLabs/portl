@@ -3,6 +3,84 @@
 All notable changes land here. This project follows
 [Semantic Versioning](https://semver.org/) from v0.1.0 onward.
 
+## 0.2.6 — 2026-04-22
+
+Quality-of-life fix for the self-host paved path: `portl install`
+now bakes the local identity's public key into the service's
+environment as `PORTL_TRUST_ROOTS`, so a fresh installation actually
+accepts tickets minted on the same machine. Before this change,
+every freshly-installed agent ran with an empty trust-roots set and
+silently rejected every handshake with `BadChain`, which was the
+root cause of the long diagnostic session behind v0.2.4 / v0.2.5.
+
+### Fixed
+
+- **Fresh `portl install` no longer produces an agent that rejects
+  every ticket.** Previously, `portl install --apply` wrote a
+  launchd plist / systemd unit with no environment configuration,
+  leaving `trust_roots` empty at runtime. Any `portl shell`,
+  `portl status`, or `portl tcp` dial — even against the same
+  machine that installed the agent — came back `BadChain`.
+
+### Added
+
+- `portl install` now reads the local identity via
+  `portl_core::id::store::load(default_path())` during `--apply`
+  and writes `PORTL_TRUST_ROOTS=<hex_endpoint_id>` into the service
+  environment:
+  - **launchd**: injected as an `EnvironmentVariables` dict in the
+    generated `com.portl.agent.plist`.
+  - **systemd**: written to the companion `agent.env` file that the
+    unit already referenced via `EnvironmentFile=-…` (path resolves
+    to `/etc/portl/agent.env` for root installs and
+    `~/.config/portl/agent.env` for user installs).
+  - **Dockerfile**: emitted as an `ENV` directive in the generated
+    image recipe.
+  - **OpenRC**: emitted as `export PORTL_TRUST_ROOTS=…` at the top
+    of the service script.
+- New internal `AgentEnv` struct and `render_env_file` /
+  `systemd_env_file_path` helpers in `install::render` so future
+  env entries (e.g. `PORTL_RATE_LIMIT`, `PORTL_REVOCATIONS_PATH`)
+  can be added in one place without touching each render target.
+- Install emits a visible `warning: no local identity found …`
+  message if run before `portl init`, naming the exact consequence
+  and the remediation.
+
+### Security
+
+- This change grants the local identity standing authority to mint
+  tickets the installed agent will honor. That's the
+  self-host-just-works contract documented since v0.1. The existing
+  `PORTL_TRUST_ROOTS` override (set before install, or in the
+  service environment after the fact) continues to take precedence
+  — v0.2.6 only fills the gap when nothing else is configured.
+- The behavior is unchanged for ephemeral-mode agents
+  (`PORTL_IDENTITY_SECRET_HEX` set); those still require explicit
+  `PORTL_TRUST_ROOTS` and bail if it isn't provided.
+
+### Validation
+
+- `cargo fmt`, `cargo clippy -D warnings`,
+  `cargo nextest run --workspace --all-features --profile ci` →
+  313 passed, 5 skipped, 0 failed. Three new tests cover: empty-env
+  launchd plist (no `EnvironmentVariables` dict emitted),
+  trust-roots-present launchd plist (lint-validates via `plutil`
+  on macOS), and systemd env-file formatting + path resolution for
+  both root and user installs.
+- Rendered launchd plist lint-validates under `plutil -lint` on
+  macOS arm64.
+- Rendered systemd unit + env file honor
+  `EnvironmentFile=-/etc/portl/agent.env` on root installs and
+  `EnvironmentFile=-$HOME/.config/portl/agent.env` on user installs.
+
+### Follow-ups
+
+- v0.3.0 (already scoped in `TODO-d49976fe`) replaces
+  `PORTL_TRUST_ROOTS`-driven trust with a first-class
+  `portl peer pair / peer accept` flow and a filesystem-backed peer
+  store, retiring the env-var surface entirely. v0.2.6 fills the
+  short-term hole until that larger rework lands.
+
 ## 0.2.5 — 2026-04-22
 
 Bug-fix release. Actually fixes the macOS TLS SIGABRT that v0.2.4
