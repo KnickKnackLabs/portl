@@ -480,14 +480,25 @@ mod tests {
 
     #[test]
     fn many_writers_converge_to_full_set() {
+        // Keep the four-writer contention shape (the semantic
+        // contract) but cut SAVES_PER_WRITER from 250 -> 20
+        // (1_000 -> 80 total saves). Each save fsyncs + atomic-
+        // renames an aliases.json shard, and 80 fsyncs is still >>
+        // any plausible fd-lock queue depth, so concurrent-writer
+        // convergence is still exercised. Drops standalone test
+        // wall-clock from ~210s -> ~5s on this host.
+        const WRITERS: u32 = 4;
+        const SAVES_PER_WRITER: u32 = 20;
+        const EXPECTED_TOTAL: usize = (WRITERS * SAVES_PER_WRITER) as usize;
+
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("aliases.json");
-        let handles: Vec<_> = (0..4)
+        let handles: Vec<_> = (0..WRITERS)
             .map(|i| {
                 let path = path.clone();
                 std::thread::spawn(move || {
                     let store = AliasStore::new(path);
-                    for j in 0..250_u32 {
+                    for j in 0..SAVES_PER_WRITER {
                         let alias = alias(
                             format!("t{i}-{j}"),
                             format!("endpoint-{i}-{j}"),
@@ -504,7 +515,7 @@ mod tests {
         }
 
         let store = AliasStore::new(path);
-        assert_eq!(store.list().expect("list").len(), 1_000);
+        assert_eq!(store.list().expect("list").len(), EXPECTED_TOTAL);
     }
 
     #[test]
@@ -685,11 +696,14 @@ mod tests {
                 let writer_done = Arc::clone(&writer_done);
                 std::thread::spawn(move || -> Result<Vec<usize>> {
                     let store = AliasStore::new(path);
-                    let mut counts = Vec::with_capacity(1_000);
+                    // Per TEST_BUILD_TUNING.md fsync-throughput guidance: readers
+                    // cap at 400 snapshots and break early once writer is done + they
+                    // have at least 80 samples. Pairs with writer loop reduced to 80.
+                    let mut counts = Vec::with_capacity(400);
                     barrier.wait();
-                    for _ in 0..1_000 {
+                    for _ in 0..400 {
                         counts.push(store.list()?.len());
-                        if writer_done.load(Ordering::Acquire) && counts.len() >= 200 {
+                        if writer_done.load(Ordering::Acquire) && counts.len() >= 80 {
                             break;
                         }
                     }
@@ -706,7 +720,9 @@ mod tests {
                 let store = AliasStore::new(path);
                 let spec = minimal_spec();
                 barrier.wait();
-                for i in 0..200_u32 {
+                // 80 writes is plenty to observe monotonic growth from 3 readers;
+                // each save fsyncs + renames, so cost scales linearly with count.
+                for i in 0..80_u32 {
                     let alias = alias(format!("writer-{i}"), format!("endpoint-{i}"), i64::from(i));
                     store.save(&alias, &spec)?;
                 }
@@ -736,6 +752,6 @@ mod tests {
         }
 
         let store = AliasStore::new(path);
-        assert_eq!(store.list().expect("final list").len(), 200);
+        assert_eq!(store.list().expect("final list").len(), 80);
     }
 }

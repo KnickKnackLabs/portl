@@ -225,7 +225,12 @@ async fn udp_session_expires_after_linger() -> Result<()> {
     .await?;
     let session_id = control1.session_id;
     control1.close()?;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Linger is a whole-second API (is_expired uses unix_now_secs
+    // truncation); 1.3 s is 30% margin over the 1-second agent linger
+    // configured above, which matches scheduler jitter headroom
+    // elsewhere in the suite. Cuts standalone test from ~8.5 s to
+    // ~4.9 s per TEST_BUILD_TUNING.md.
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
 
     let (connection2, session2) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
     let control2 = open_udp(

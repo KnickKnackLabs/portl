@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version      = "0.2.2"
+version      = "0.2.3"
 edition      = "2024"
 license      = "MIT"
 repository   = "https://github.com/KnickKnackLabs/portl"
@@ -44,7 +44,16 @@ base64           = "0.22"
 serde_json       = "1"
 
 # CLI
-clap      = { version = "4", features = ["derive", "env", "wrap_help"] }
+# clap default features pruned: portl-cli uses #[derive(Parser)] but
+# no #[arg(env = …)] and never uses the `unicode` or `cargo` features,
+# so the corresponding defaults are dropped. `wrap_help` is retained
+# because portl-cli/tests/help_cli.rs snapshots wrapped help output.
+# Trimming the unused defaults shaved ~0.9 s off the dominant compile
+# unit (portl-cli lib) in the v0.2.2-tuning autoresearch session.
+clap      = { version = "4", default-features = false, features = [
+    "std", "derive", "help", "usage", "error-context",
+    "suggestions", "color", "wrap_help",
+] }
 anyhow    = "1"
 thiserror = "2"
 crossterm = "0.29"

@@ -39,6 +39,13 @@ slow-timeout = { period = "20s", terminate-after = 2 }
 retries = 0
 fail-fast = false
 failure-output = "immediate-final"
+# Oversubscribe nextest threads to 24 (1.5× logical cpu count on this
+# host). Many iroh-handshake tests spend ~4.5 s blocked on QUIC IO;
+# more threads than cores lets short CPU-bound tests squeeze between
+# the network waits. Upper bound on this host: ≥28 races
+# `m3_cli::exec_exits_promptly_when_child_exits_with_stdin_idle`
+# which is legitimately CPU-timing-sensitive.
+test-threads = 24
 
 # Per-test override for `udp_src_tag_lru_eviction`, which sweeps
 # past the LRU cap (1024) by doing 1,025 sequential QUIC-datagram

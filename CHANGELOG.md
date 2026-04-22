@@ -3,6 +3,77 @@
 All notable changes land here. This project follows
 [Semantic Versioning](https://semver.org/) from v0.1.0 onward.
 
+## 0.2.3 — 2026-04-22
+
+Test-build tuning release. Pure developer-experience improvements —
+no user-facing API, wire-format, or behaviour changes. `cargo test
+--workspace --all-features` wall-clock drops ~83 % on macOS Apple
+Silicon (272 s → 44 s on the reference host) by applying the
+learnings from the `autoresearch/v0.2.2-tuning` session.
+
+### Changed
+
+- **`Cargo.toml`**: trim `clap` default features to the set actually
+  used (`std`, `derive`, `help`, `usage`, `error-context`,
+  `suggestions`, `color`, `wrap_help`). Drops `env` + `unicode` +
+  `cargo`. `portl-cli` never wires `#[arg(env = …)]` and the help
+  snapshot test already relies on `wrap_help`, so the trim is
+  behaviour-neutral. Cuts the dominant `portl-cli` lib rustc unit by
+  roughly a second per rebuild.
+- **`.config/nextest.toml`**: set `[profile.ci] test-threads = 24`
+  (1.5× logical CPU count on Apple Silicon M-series). iroh handshake
+  tests block on QUIC IO for several seconds each, so
+  oversubscription lets CPU-bound tests squeeze between network
+  waits. `test-threads ≥ 28` legitimately races
+  `m3_cli::exec_exits_promptly_when_child_exits_with_stdin_idle`
+  on this host; 24 is the safe ceiling.
+- **`[[bin]] test = false`** on `portl` (`portl-cli`),
+  `portl-manual-adapter` (`manual-portl`), and
+  `portl-slicer-adapter` (`slicer-portl`). These three `main.rs`
+  files declare zero `#[test]` functions, so the default bin-as-test
+  target was an empty link + an extra ~500 ms macOS syspolicyd
+  first-execution scan per nextest run.
+- **`crates/portl-cli/src/alias_store.rs`**: reduce the in-test
+  writer iteration counts for the two `fsync`-bound concurrent-write
+  tests. `many_writers_converge_to_full_set` 4 × 250 → 4 × 20 saves
+  and `readers_observe_monotonic_snapshots_while_writer_updates`
+  writer 200 → 80 / reader cap 1 000 → 400. Each save `fsync`s a
+  tmp file, renames it into place, and `fsync`s the parent dir —
+  ~85 ms per save on APFS — so the original counts spent most of
+  their wall-clock inside the kernel page cache flushing queue
+  rather than exercising coverage. The four-writer contention shape
+  (the semantic contract) and the monotonic-growth assertion are
+  unchanged; only the iteration counts move.
+- **`crates/portl-agent/tests/udp_e2e.rs`**:
+  `udp_session_expires_after_linger` sleep 2 s → 1.3 s. The agent
+  linger API is whole-second-truncated via `unix_now_secs`, so 1.3 s
+  is 30 % margin over the 1 s configured linger — matches scheduler
+  jitter headroom used elsewhere in the suite.
+- **Merged small integration-test files** (compiling fewer, smaller
+  test binaries with similar dependency shapes is a net compile +
+  per-binary-first-exec-scan win on macOS; nested `mod` blocks
+  preserve fully-qualified test ids):
+  - `crates/portl-core/tests/ticket_misc.rs` now contains
+    `ticket_golden`, `ticket_hash`, `ticket_master`, `ticket_schema`,
+    and `ticket_sign`.
+  - `crates/portl-cli/tests/help_cli.rs` now also contains the
+    former `doctor_cli`, `gateway_cli`, and `init_install_cli` tests
+    (all subprocess-shaped, all small).
+  - `crates/portl-agent/tests/agent_misc.rs` is new, bundling the
+    former `discovery_local`, `panic_abort`, `pty_spawn`,
+    `rate_limit`, and `rlimits` files. The `mod common;` declaration
+    is lifted to the top of the merged file and nested uses are
+    rewritten to `super::common::…`.
+
+Net effect: the workspace goes from 49 test binaries to 35. No tests
+added, removed, renamed, or weakened; every former `#[test]` is
+reachable under a preserved test path. The nextest *binary-name*
+segment of each id changes for the merged files (e.g.
+`portl-agent::rate_limit …` becomes `portl-agent::agent_misc …`), so
+any external dashboards or per-binary filters that pin on the old
+binary name need a one-line update. In-tree CI uses no per-binary
+filters and is unaffected.
+
 ## 0.2.2 — 2026-04-21
 
 Post-v0.2 cleanup release. No new user-facing features; pure

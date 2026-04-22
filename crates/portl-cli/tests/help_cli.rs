@@ -269,3 +269,83 @@ Options:
         assert_eq!(actual, expected, "help snapshot mismatch for {args:?}");
     }
 }
+
+// ---- merged small CLI test files (per TEST_BUILD_TUNING.md) ----
+
+mod doctor_cli {
+    use anyhow::Result;
+    use assert_cmd::Command;
+    use portl_core::id::{Identity, store};
+    use tempfile::tempdir;
+
+    #[test]
+    fn doctor_is_offline_safe() -> Result<()> {
+        let home = tempdir()?;
+        store::save(&Identity::new(), &home.path().join("identity.bin"))?;
+
+        Command::cargo_bin("portl")?
+            .env("PORTL_HOME", home.path())
+            .env("PORTL_DISCOVERY", "none")
+            .arg("doctor")
+            .assert()
+            .success();
+
+        Ok(())
+    }
+}
+
+mod gateway_cli {
+    use std::process::Command;
+
+    use anyhow::Result;
+    use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn portl_gateway_help_matches_top_level_gateway_help() -> Result<()> {
+        let portl = assert_cmd::cargo::cargo_bin("portl");
+
+        let direct = Command::new(&portl).args(["gateway", "--help"]).output()?;
+
+        let temp = tempdir()?;
+        let gateway = temp.path().join("portl-gateway");
+        std::os::unix::fs::symlink(&portl, &gateway)?;
+
+        let multicall = Command::new(&gateway).arg("--help").output()?;
+        assert_eq!(multicall.status.code(), direct.status.code());
+        assert_eq!(multicall.stdout, direct.stdout);
+        assert_eq!(multicall.stderr, direct.stderr);
+
+        Ok(())
+    }
+}
+
+mod init_install_cli {
+    use assert_cmd::cargo::CommandCargoExt;
+    use portl_core::id::store::default_path_with_home;
+    use std::process::Command;
+    use tempfile::tempdir;
+
+    #[test]
+    fn init_generates_identity_and_runs_doctor() {
+        let home = tempdir().expect("tempdir");
+        let identity_path = default_path_with_home(Some(home.path()));
+
+        let output = Command::cargo_bin("portl")
+            .expect("cargo bin")
+            .env("PORTL_HOME", home.path())
+            .args(["init"])
+            .output()
+            .expect("run init");
+
+        assert!(output.status.success(), "init failed: {:?}", output.status);
+        assert!(identity_path.exists(), "identity was not created");
+
+        let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+        assert!(
+            stdout.contains("created identity:") || stdout.contains("using existing identity:")
+        );
+        assert!(stdout.contains("[ok  ]") || stdout.contains("[warn]"));
+        assert!(stdout.contains("cookbook: portl docker run <image>"));
+    }
+}

@@ -14,7 +14,10 @@ workspace = true
 [[bin]]
 name = "portl-manual-adapter"
 path = "src/main.rs"
+# bin/main.rs has no #[test] functions; skip the empty test target
+# (~500 ms macOS syspolicyd first-exec scan per nextest run).
+test = false
 
 [dependencies]
-portl-core = { version = "0.2.2", path = "../../crates/portl-core" }
+portl-core = { version = "0.2.3", path = "../../crates/portl-core" }
 anyhow     = { workspace = true }
