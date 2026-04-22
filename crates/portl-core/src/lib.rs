@@ -11,8 +11,11 @@ pub mod error;
 pub mod id;
 pub mod io;
 pub mod net;
+pub mod peer_store;
 pub mod runtime;
+pub mod store_index;
 pub mod ticket;
+pub mod ticket_store;
 pub mod tls;
 pub mod wire;
 

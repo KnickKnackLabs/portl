@@ -23,14 +23,21 @@ fn help_output(args: &[&str]) -> String {
 fn cli_help_lists_expected_top_level_commands() {
     let help = help_output(&["--help"]);
     for command in [
-        "init", "doctor", "status", "shell", "exec", "tcp", "udp", "mint", "revoke", "install",
-        "docker", "slicer", "gateway",
+        "init", "doctor", "status", "shell", "exec", "tcp", "udp", "peer", "ticket", "whoami",
+        "install", "docker", "slicer", "gateway",
     ] {
         assert!(
             help.contains(command),
             "missing top-level command {command}\n{help}"
         );
     }
+    // v0.3.0: top-level `mint` and `revoke` were removed. `mint`
+    // moved to `ticket issue`, `revoke` to `ticket revoke`. The
+    // old `mint-root` alias from v0.1.x has been gone since v0.2.0.
+    assert!(
+        !help.contains("Mint a ticket with the local identity"),
+        "removed top-level `mint` command still shown\n{help}"
+    );
     assert!(
         !help.contains("mint-root"),
         "removed mint-root still shown\n{help}"
@@ -55,9 +62,9 @@ Commands:
   exec     Run a remote command without a PTY
   tcp      Set up one or more local TCP forwards
   udp      Set up one or more local UDP forwards
-  mint     Mint a ticket with the local identity
-  revoke   Append a local ticket revocation, optionally publish it, or list the current revocation
-           log
+  peer     Manage peer trust (the filesystem-backed `peers.json` store)
+  ticket   Manage saved tickets (outbound credentials)
+  whoami   Print the local identity's `endpoint_id` and peer-store label
   install  Install the daemon for a supported target
   docker   Docker target management
   slicer   Slicer target management
@@ -165,10 +172,48 @@ Options:
 "#,
         ),
         (
-            &["mint", "--help"][..],
-            r#"Mint a ticket with the local identity
+            &["peer", "--help"][..],
+            r#"Manage peer trust (the filesystem-backed `peers.json` store)
 
-Usage: portl mint [OPTIONS] <CAPS>
+Usage: portl peer <COMMAND>
+
+Commands:
+  ls              List stored peers
+  unlink          Remove a peer by label
+  add-unsafe-raw  Add a peer by raw `endpoint_id` without a pairing handshake. Requires the user to
+                  retype the `endpoint_id` at a confirmation prompt to guard against blind
+                  paste-ins; pick exactly one of --mutual / --inbound / --outbound to set
+                  relationship
+  help            Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+"#,
+        ),
+        (
+            &["ticket", "--help"][..],
+            r#"Manage saved tickets (outbound credentials)
+
+Usage: portl ticket <COMMAND>
+
+Commands:
+  issue   Mint a new ticket signed by the local identity
+  save    Save a ticket string under a local label
+  ls      List saved tickets
+  rm      Remove a saved ticket
+  prune   Bulk-remove expired tickets
+  revoke  Append a local ticket revocation, publish, or list revocations
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+"#,
+        ),
+        (
+            &["ticket", "issue", "--help"][..],
+            r#"Mint a new ticket signed by the local identity
+
+Usage: portl ticket issue [OPTIONS] <CAPS>
 
 Arguments:
   <CAPS>  
@@ -182,10 +227,10 @@ Options:
 "#,
         ),
         (
-            &["revoke", "--help"][..],
-            r#"Append a local ticket revocation, optionally publish it, or list the current revocation log
+            &["ticket", "revoke", "--help"][..],
+            r#"Append a local ticket revocation, publish, or list revocations
 
-Usage: portl revoke [OPTIONS] [ID]
+Usage: portl ticket revoke [OPTIONS] [ID]
 
 Arguments:
   [ID]  
@@ -194,6 +239,16 @@ Options:
       --list     
       --publish  
   -h, --help     Print help
+"#,
+        ),
+        (
+            &["whoami", "--help"][..],
+            r#"Print the local identity's `endpoint_id` and peer-store label
+
+Usage: portl whoami
+
+Options:
+  -h, --help  Print help
 "#,
         ),
         (

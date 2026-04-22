@@ -8,7 +8,7 @@ use portl_core::ticket::schema::{Capabilities, PortRule};
 use portl_proto::udp_v1::UdpBind;
 use tokio::sync::watch;
 
-use crate::commands::peer::{
+use crate::commands::peer_resolve::{
     bind_client_endpoint, connect_peer_with_endpoint, resolve_identity_path,
 };
 

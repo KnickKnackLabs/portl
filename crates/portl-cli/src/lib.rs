@@ -61,7 +61,20 @@ pub enum Command {
         peer: String,
         local: Vec<String>,
     },
-    Mint {
+    // v0.3.0: peer / ticket / whoami replace top-level mint + revoke.
+    PeerLs,
+    PeerUnlink {
+        label: String,
+    },
+    PeerAddUnsafeRaw {
+        endpoint: String,
+        label: Option<String>,
+        mutual: bool,
+        inbound: bool,
+        outbound: bool,
+        yes: bool,
+    },
+    TicketIssue {
         caps: String,
         ttl: String,
         to: Option<String>,
@@ -69,11 +82,21 @@ pub enum Command {
         print: MintRootPrint,
         endpoint: Option<String>,
     },
-    Revoke {
+    TicketSave {
+        label: String,
+        ticket: String,
+    },
+    TicketLs,
+    TicketRm {
+        label: String,
+    },
+    TicketPrune,
+    TicketRevoke {
         id: Option<String>,
         list: bool,
         publish: bool,
     },
+    Whoami,
     Install {
         target: Option<InstallTarget>,
         apply: bool,
@@ -275,14 +298,24 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
         } => commands::exec::run(&peer, cwd.as_deref(), user.as_deref(), &argv),
         Command::Tcp { peer, local } => commands::tcp::run(&peer, &local),
         Command::Udp { peer, local } => commands::udp::run(&peer, &local),
-        Command::Mint {
+        Command::PeerLs => commands::peer::ls::run(),
+        Command::PeerUnlink { label } => commands::peer::unlink::run(&label),
+        Command::PeerAddUnsafeRaw {
+            endpoint,
+            label,
+            mutual,
+            inbound,
+            outbound,
+            yes,
+        } => commands::peer::add_unsafe_raw::run(&endpoint, label, mutual, inbound, outbound, yes),
+        Command::TicketIssue {
             caps,
             ttl,
             to,
             from,
             print,
             endpoint,
-        } => commands::mint_root::run(
+        } => commands::ticket::issue::run(
             &caps,
             &ttl,
             to.as_deref(),
@@ -290,9 +323,14 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             print,
             endpoint.as_deref(),
         ),
-        Command::Revoke { id, list, publish } => {
-            commands::revoke::run(id.as_deref(), list, publish)
+        Command::TicketSave { label, ticket } => commands::ticket::save::run(&label, &ticket),
+        Command::TicketLs => commands::ticket::ls::run(),
+        Command::TicketRm { label } => commands::ticket::rm::run(&label),
+        Command::TicketPrune => commands::ticket::prune::run(),
+        Command::TicketRevoke { id, list, publish } => {
+            commands::ticket::revoke::run(id.as_deref(), list, publish)
         }
+        Command::Whoami => commands::whoami::run(),
         Command::Install {
             target,
             apply,
@@ -458,28 +496,18 @@ enum TopLevel {
         local: Vec<String>,
         peer: String,
     },
-    /// Mint a ticket with the local identity.
-    Mint {
-        caps: String,
-        #[arg(long, default_value = "30d")]
-        ttl: String,
-        #[arg(long)]
-        to: Option<String>,
-        #[arg(long = "from")]
-        from: Option<String>,
-        #[arg(short = 'o', long = "print", value_enum, default_value = "string")]
-        print: MintRootPrint,
-        #[arg(long, hide = true, alias = "node")]
-        endpoint: Option<String>,
+    /// Manage peer trust (the filesystem-backed `peers.json` store).
+    Peer {
+        #[command(subcommand)]
+        action: PeerAction,
     },
-    /// Append a local ticket revocation, optionally publish it, or list the current revocation log.
-    Revoke {
-        id: Option<String>,
-        #[arg(long, conflicts_with = "id")]
-        list: bool,
-        #[arg(long, requires = "id")]
-        publish: bool,
+    /// Manage saved tickets (outbound credentials).
+    Ticket {
+        #[command(subcommand)]
+        action: TicketAction,
     },
+    /// Print the local identity's `endpoint_id` and peer-store label.
+    Whoami,
     /// Install the daemon for a supported target.
     Install {
         target: Option<InstallTarget>,
@@ -506,6 +534,70 @@ enum TopLevel {
     },
     /// Run the slicer HTTP bridge against an upstream API.
     Gateway { upstream_url: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum PeerAction {
+    /// List stored peers.
+    Ls,
+    /// Remove a peer by label.
+    Unlink { label: String },
+    /// Add a peer by raw `endpoint_id` without a pairing handshake.
+    /// Requires the user to retype the `endpoint_id` at a confirmation
+    /// prompt to guard against blind paste-ins; pick exactly one of
+    /// --mutual / --inbound / --outbound to set relationship.
+    AddUnsafeRaw {
+        /// 64-char hex `endpoint_id`.
+        endpoint: String,
+        #[arg(long)]
+        label: Option<String>,
+        /// Mutual trust (both sides accept each other's tickets).
+        #[arg(long, conflicts_with_all = ["inbound", "outbound"])]
+        mutual: bool,
+        /// We accept their tickets; they do not accept ours.
+        #[arg(long, conflicts_with = "outbound")]
+        inbound: bool,
+        /// They accept our tickets; we do not accept theirs.
+        #[arg(long)]
+        outbound: bool,
+        /// Skip the retype-to-confirm prompt. Useful in scripts.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TicketAction {
+    /// Mint a new ticket signed by the local identity.
+    Issue {
+        caps: String,
+        #[arg(long, default_value = "30d")]
+        ttl: String,
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long = "from")]
+        from: Option<String>,
+        #[arg(short = 'o', long = "print", value_enum, default_value = "string")]
+        print: MintRootPrint,
+        #[arg(long, hide = true, alias = "node")]
+        endpoint: Option<String>,
+    },
+    /// Save a ticket string under a local label.
+    Save { label: String, ticket: String },
+    /// List saved tickets.
+    Ls,
+    /// Remove a saved ticket.
+    Rm { label: String },
+    /// Bulk-remove expired tickets.
+    Prune,
+    /// Append a local ticket revocation, publish, or list revocations.
+    Revoke {
+        id: Option<String>,
+        #[arg(long, conflicts_with = "id")]
+        list: bool,
+        #[arg(long, requires = "id")]
+        publish: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -616,14 +708,41 @@ impl Cli {
             },
             TopLevel::Tcp { local, peer } => Command::Tcp { peer, local },
             TopLevel::Udp { local, peer } => Command::Udp { peer, local },
-            TopLevel::Mint {
-                caps,
-                ttl,
-                to,
-                from,
-                print,
+            TopLevel::Peer {
+                action: PeerAction::Ls,
+            } => Command::PeerLs,
+            TopLevel::Peer {
+                action: PeerAction::Unlink { label },
+            } => Command::PeerUnlink { label },
+            TopLevel::Peer {
+                action:
+                    PeerAction::AddUnsafeRaw {
+                        endpoint,
+                        label,
+                        mutual,
+                        inbound,
+                        outbound,
+                        yes,
+                    },
+            } => Command::PeerAddUnsafeRaw {
                 endpoint,
-            } => Command::Mint {
+                label,
+                mutual,
+                inbound,
+                outbound,
+                yes,
+            },
+            TopLevel::Ticket {
+                action:
+                    TicketAction::Issue {
+                        caps,
+                        ttl,
+                        to,
+                        from,
+                        print,
+                        endpoint,
+                    },
+            } => Command::TicketIssue {
                 caps,
                 ttl,
                 to,
@@ -631,7 +750,22 @@ impl Cli {
                 print,
                 endpoint,
             },
-            TopLevel::Revoke { id, list, publish } => Command::Revoke { id, list, publish },
+            TopLevel::Ticket {
+                action: TicketAction::Save { label, ticket },
+            } => Command::TicketSave { label, ticket },
+            TopLevel::Ticket {
+                action: TicketAction::Ls,
+            } => Command::TicketLs,
+            TopLevel::Ticket {
+                action: TicketAction::Rm { label },
+            } => Command::TicketRm { label },
+            TopLevel::Ticket {
+                action: TicketAction::Prune,
+            } => Command::TicketPrune,
+            TopLevel::Ticket {
+                action: TicketAction::Revoke { id, list, publish },
+            } => Command::TicketRevoke { id, list, publish },
+            TopLevel::Whoami => Command::Whoami,
             TopLevel::Install {
                 target,
                 apply,

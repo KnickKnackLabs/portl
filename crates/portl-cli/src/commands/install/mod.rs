@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use portl_core::peer_store::{PeerEntry, PeerOrigin, PeerStore};
 use serde::Serialize;
 
 mod apply;
@@ -11,7 +13,7 @@ mod resolve;
 
 use self::apply::{apply_install_target, set_mode_0755, validate_install_target};
 use self::detect::{DetectionContext, detect_host_with};
-use self::render::{AgentEnv, render_env_file, render_target, systemd_env_file_path};
+use self::render::render_target;
 use self::resolve::{
     install_binary_path, install_service_path, resolve_output_dir, resolve_target,
 };
@@ -72,13 +74,11 @@ pub fn run(
         detect_result.home.as_deref(),
         output.as_deref(),
     )?;
-    let agent_env = load_agent_env();
     let rendered = render_target(
         target,
         &binary_path,
         detect_result.root,
         detect_result.home.as_deref(),
-        &agent_env,
     )?;
 
     if dry_run || !apply {
@@ -109,19 +109,6 @@ pub fn run(
     })?;
     std::fs::write(&service_path, &rendered)
         .with_context(|| format!("write {}", service_path.display()))?;
-    // systemd reads env from a sidecar file referenced via
-    // `EnvironmentFile=-…`. Write it alongside the unit so that the
-    // installed agent picks up `PORTL_TRUST_ROOTS` without the
-    // operator needing to edit anything by hand.
-    if matches!(target, InstallTarget::Systemd) && !agent_env.is_empty() {
-        let env_path = systemd_env_file_path(detect_result.root, detect_result.home.as_deref())?;
-        if let Some(parent) = env_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
-        }
-        std::fs::write(&env_path, render_env_file(&agent_env))
-            .with_context(|| format!("write {}", env_path.display()))?;
-    }
     if matches!(target, InstallTarget::Dockerfile | InstallTarget::Openrc) {
         set_mode_0755(&binary_path)?;
     }
@@ -129,32 +116,76 @@ pub fn run(
         set_mode_0755(&service_path)?;
     }
     validate_install_target(target, &service_path)?;
+
+    // Seed the peer store so the local agent accepts tickets minted
+    // by this machine (the "paved path" self-host contract). v0.3.0
+    // replaces v0.2.6's env-var injection with a filesystem entry
+    // that the agent reloads live.
+    seed_peer_store_self_row_with_reporting();
+
     apply_install_target(target, detect_result.root, &service_path)?;
     println!("installed {}", service_path.display());
     Ok(ExitCode::SUCCESS)
 }
 
-/// Load the local identity and surface its `endpoint_id` as
-/// `PORTL_TRUST_ROOTS`. Missing identity (e.g. `portl install` run
-/// before `portl init`) produces an empty env set plus a warning —
-/// we'd rather let install proceed with an explicit "you will need
-/// to configure trust roots manually" message than fail here.
-fn load_agent_env() -> AgentEnv {
-    use portl_core::id::store;
-    match store::load(&store::default_path()) {
-        Ok(identity) => AgentEnv {
-            trust_roots_hex: Some(hex::encode(identity.verifying_key())),
-        },
-        Err(err) => {
-            eprintln!(
-                "warning: no local identity found ({err}); installing without \
-                 PORTL_TRUST_ROOTS. The agent will reject every ticket until \
-                 you run `portl init` and reinstall, or set PORTL_TRUST_ROOTS \
-                 manually in the service environment."
-            );
-            AgentEnv::default()
-        }
+/// Write the local identity to `peers.json` as `label="self"`,
+/// `is_self=true`, `mutual` relationship. Returns `Ok(Some(hex))`
+/// if a row was created or updated, `Ok(None)` if no identity
+/// exists yet (install running before `portl init`), `Err` on I/O
+/// failures.
+///
+/// Idempotent: running install twice against the same identity
+/// leaves the row unchanged. Running install after `portl init`
+/// creates a new identity will overwrite the self-row with the new
+/// `endpoint_id` (correct behavior — you can only have one self).
+/// Wrapper that translates the outcome of
+/// [`seed_peer_store_self_row`] into user-facing messaging.
+/// Extracted so that the `--apply` flow's match expression stays
+/// short enough to keep clippy happy (it flagged the inline one as
+/// a `let...else` candidate).
+fn seed_peer_store_self_row_with_reporting() {
+    match seed_peer_store_self_row() {
+        Ok(Some(eid_hex)) => println!(
+            "seeded peer store with self-row: {eid_short}…",
+            eid_short = &eid_hex[..16]
+        ),
+        Ok(None) => {}
+        Err(err) => eprintln!(
+            "warning: failed to seed peer store self-row ({err:#}); \
+             run `portl init` and re-run install, or add the self-row \
+             with `portl peer add-unsafe-raw <your_eid> --label self --mutual` \
+             manually."
+        ),
     }
+}
+
+fn seed_peer_store_self_row() -> Result<Option<String>> {
+    use portl_core::id::store;
+    let Ok(identity) = store::load(&store::default_path()) else {
+        return Ok(None);
+    };
+    let eid = identity.verifying_key();
+    let eid_hex = hex::encode(eid);
+    let path = PeerStore::default_path();
+    let mut peers = PeerStore::load(&path).context("load peer store")?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock before unix epoch")?
+        .as_secs();
+    peers
+        .insert_or_update(PeerEntry {
+            label: "self".to_owned(),
+            endpoint_id_hex: eid_hex.clone(),
+            accepts_from_them: true,
+            they_accept_from_me: true,
+            since: now,
+            origin: PeerOrigin::Zelf,
+            last_hold_at: None,
+            is_self: true,
+        })
+        .context("insert self-row in peer store")?;
+    peers.save(&path).context("save peer store")?;
+    Ok(Some(eid_hex))
 }
 
 #[cfg(test)]
@@ -185,16 +216,15 @@ mod tests {
     }
 
     #[test]
-    fn install_launchd_emits_valid_plist() {
-        let plist = render_launchd_plist(
-            Path::new("/usr/local/bin/portl-agent"),
-            &AgentEnv::default(),
-        );
+    fn install_launchd_plist_is_minimal_without_env() {
+        // v0.3.0 removed env-var injection; plist should contain
+        // neither `EnvironmentVariables` nor `PORTL_TRUST_ROOTS`.
+        // Trust is now peer-store-backed.
+        let plist = render_launchd_plist(Path::new("/usr/local/bin/portl-agent"));
         assert!(plist.contains("<string>/usr/local/bin/portl-agent</string>"));
         assert!(plist.contains("<key>SuccessfulExit</key><false/>"));
-        // Empty env → no EnvironmentVariables dict emitted; the
-        // plist stays minimal when we have nothing to set.
         assert!(!plist.contains("EnvironmentVariables"));
+        assert!(!plist.contains("PORTL_TRUST_ROOTS"));
 
         if Path::new("/usr/bin/plutil").exists() {
             let dir = tempdir().expect("tempdir");
@@ -204,54 +234,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn launchd_plist_carries_trust_roots_when_set() {
-        // Well-formed 32-byte hex stands in for a real endpoint_id.
-        let env = AgentEnv {
-            trust_roots_hex: Some("a".repeat(64)),
-        };
-        let plist = render_launchd_plist(Path::new("/usr/local/bin/portl-agent"), &env);
-        assert!(plist.contains("<key>EnvironmentVariables</key>"));
-        assert!(plist.contains("<key>PORTL_TRUST_ROOTS</key>"));
-        assert!(plist.contains(&format!("<string>{}</string>", "a".repeat(64))));
-
-        // Lint via plutil where available; gates this test in local
-        // macOS dev, skipped on Linux CI jobs.
-        if Path::new("/usr/bin/plutil").exists() {
-            let dir = tempdir().expect("tempdir");
-            let path = dir.path().join("com.portl.agent.plist");
-            std::fs::write(&path, plist).expect("write plist");
-            validate_install_target(InstallTarget::Launchd, &path)
-                .expect("plutil -lint must accept the plist with env vars");
-        }
-    }
-
-    #[test]
-    fn systemd_env_file_renders_as_key_value_pairs() {
-        let env = AgentEnv {
-            trust_roots_hex: Some("b".repeat(64)),
-        };
-        let contents = render_env_file(&env);
-        assert_eq!(contents, format!("PORTL_TRUST_ROOTS={}\n", "b".repeat(64)));
-
-        // Root install targets /etc/portl/agent.env.
-        let path = systemd_env_file_path(true, None).expect("root env path");
-        assert_eq!(path, PathBuf::from("/etc/portl/agent.env"));
-
-        // User install targets ~/.config/portl/agent.env.
-        let user =
-            systemd_env_file_path(false, Some(Path::new("/tmp/home"))).expect("user env path");
-        assert_eq!(user, PathBuf::from("/tmp/home/.config/portl/agent.env"));
-    }
-
-    #[test]
-    fn empty_env_produces_empty_env_file() {
-        // Nothing to write when there's no identity yet; prevents us
-        // from creating a misleading empty agent.env that might later
-        // look populated.
-        assert!(render_env_file(&AgentEnv::default()).is_empty());
-        assert!(AgentEnv::default().is_empty());
-    }
+    // NOTE: The full end-to-end test for `seed_peer_store_self_row`
+    // requires mutating `PORTL_HOME`, which the workspace forbids in
+    // safe code (unsafe_code = deny). Peer store seeding is covered
+    // indirectly by the store's unit tests (`peer_store::tests`) +
+    // a manual smoke via `cargo run -- install launchd && cat
+    // ~/Library/Application\ Support/computer.KnickKnackLabs.portl/\
+    // peers.json`. If we ever want first-class coverage, expose a
+    // `seed_peer_store_self_row_at(path: &Path)` variant and drive
+    // that from a tempdir test.
 
     #[test]
     fn install_refuses_to_target_systemd_inside_docker() {
@@ -286,6 +277,9 @@ mod tests {
 
     #[test]
     fn user_systemd_uses_user_env_file() {
+        // Sidecar file path is preserved so operators can drop in
+        // knobs for rate_limit / metrics / etc. even though install
+        // itself no longer writes it.
         let unit = render_systemd_unit(
             Path::new("/tmp/home/.local/bin/portl-agent"),
             false,

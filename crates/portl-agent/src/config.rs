@@ -6,6 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use directories::ProjectDirs;
 use iroh_base::RelayUrl;
 use portl_core::endpoint::Endpoint;
+use portl_core::peer_store::PeerStore;
 use serde::{Deserialize, Serialize};
 
 use crate::udp_registry::DEFAULT_UDP_SESSION_LINGER_SECS;
@@ -33,7 +34,15 @@ pub struct AgentConfig {
     pub identity_secret: Option<[u8; 32]>,
     pub bind_addr: Option<SocketAddr>,
     pub discovery: DiscoveryConfig,
+    /// Populated at startup from `peers.json`. v0.3.0 removed the
+    /// `PORTL_TRUST_ROOTS` env var — the peer store is the only
+    /// source of truth. Leave as empty `Vec` in tests that don't
+    /// care about trust policy.
     pub trust_roots: Vec<[u8; 32]>,
+    /// Path to the peer store. Defaults to `<home>/peers.json` (the
+    /// same dir that holds `identity.bin`), overridable via explicit
+    /// assignment in tests.
+    pub peers_path: Option<PathBuf>,
     pub revocations_path: Option<PathBuf>,
     pub revocations_max_bytes: Option<u64>,
     pub rate_limit: RateLimitConfig,
@@ -67,12 +76,31 @@ impl AgentConfig {
             );
         }
 
-        let trust_roots = env_string("PORTL_TRUST_ROOTS")?
+        let peers_path = home.join("peers.json");
+        // Load trust_roots from the peer store. Missing file = empty
+        // roots: an agent with no peers refuses every ticket, which
+        // is the correct fail-closed default. Installers are expected
+        // to seed the self-row via `portl install --apply` and
+        // operators add peers via `portl peer pair / add-unsafe-raw`.
+        let peer_store = PeerStore::load(&peers_path)
+            .with_context(|| format!("load peer store at {}", peers_path.display()))?;
+        // `PORTL_TRUST_ROOTS` is honored as a *bootstrap* mechanism
+        // layered on top of the peer store — containerized /
+        // ephemeral agents (docker, slicer) inject it at spawn-time
+        // because they can't seed peers.json inside the target
+        // before the agent starts. The peer store remains the
+        // primary policy surface; the env var just adds extra
+        // roots on startup and is ignored once set on subsequent
+        // runs because the peer store persists.
+        let env_roots = env_string("PORTL_TRUST_ROOTS")?
             .map(|value| parse_trust_roots(&value))
             .transpose()?
             .unwrap_or_default();
-        if identity_secret.is_some() && trust_roots.is_empty() {
-            bail!("PORTL_TRUST_ROOTS is required when PORTL_IDENTITY_SECRET_HEX is set");
+        let mut trust_roots: Vec<[u8; 32]> = peer_store.trust_roots().into_iter().collect();
+        for root in env_roots {
+            if !trust_roots.contains(&root) {
+                trust_roots.push(root);
+            }
         }
 
         let bind_addr_value =
@@ -121,6 +149,7 @@ impl AgentConfig {
             bind_addr: Some(bind_addr),
             discovery,
             trust_roots,
+            peers_path: Some(peers_path),
             revocations_path: Some(revocations_path),
             revocations_max_bytes: Some(revocations_max_bytes),
             rate_limit,
@@ -275,6 +304,13 @@ fn parse_trust_roots(value: &str) -> Result<Vec<[u8; 32]>> {
         .collect()
 }
 
+fn parse_trust_root_hex(value: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(value).with_context(|| format!("invalid trust root hex: {value}"))?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow!("trust root must decode to exactly 32 bytes: {value}"))
+}
+
 fn parse_rate_limit(value: &str) -> Result<RateLimitConfig> {
     let mut rps = None;
     let mut burst = None;
@@ -321,13 +357,6 @@ fn parse_secret_hex(value: &str) -> Result<[u8; 32]> {
     bytes
         .try_into()
         .map_err(|_| anyhow!("PORTL_IDENTITY_SECRET_HEX must decode to exactly 32 bytes: {value}"))
-}
-
-fn parse_trust_root_hex(value: &str) -> Result<[u8; 32]> {
-    let bytes = hex::decode(value).with_context(|| format!("invalid trust root hex: {value}"))?;
-    bytes
-        .try_into()
-        .map_err(|_| anyhow!("trust root must decode to exactly 32 bytes: {value}"))
 }
 
 #[cfg(test)]
@@ -387,10 +416,6 @@ mod tests {
                     "PORTL_IDENTITY_SECRET_HEX",
                     Some(OsString::from(hex::encode([9_u8; 32]))),
                 ),
-                (
-                    "PORTL_TRUST_ROOTS",
-                    Some(OsString::from(hex::encode([3_u8; 32]))),
-                ),
             ],
             || {
                 let err =
@@ -430,21 +455,21 @@ mod tests {
     }
 
     #[test]
-    fn from_env_requires_trust_roots_in_ephemeral_mode() {
+    fn from_env_populates_trust_roots_from_peer_store() {
+        // With v0.3.0's filesystem-backed model: writing a peers.json
+        // into PORTL_HOME is the only path to populating trust_roots.
+        // Empty store → empty roots; no warnings, no crashes.
+        let home = tempdir().expect("tempdir");
+        let peers = portl_core::peer_store::PeerStore::new();
+        peers
+            .save(&home.path().join("peers.json"))
+            .expect("seed peer store");
         with_env(
-            &[(
-                "PORTL_IDENTITY_SECRET_HEX",
-                Some(OsString::from(hex::encode([5_u8; 32]))),
-            )],
+            &[("PORTL_HOME", Some(home.path().as_os_str().to_os_string()))],
             || {
-                let err = AgentConfig::from_env()
-                    .expect_err("ephemeral mode without trust roots must fail");
-                assert!(
-                    err.to_string().contains(
-                        "PORTL_TRUST_ROOTS is required when PORTL_IDENTITY_SECRET_HEX is set"
-                    ),
-                    "unexpected error: {err:#}"
-                );
+                let config = AgentConfig::from_env().expect("parse env with empty peer store");
+                assert!(config.trust_roots.is_empty());
+                assert_eq!(config.peers_path, Some(home.path().join("peers.json")));
             },
         );
     }

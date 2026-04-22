@@ -3,6 +3,144 @@
 All notable changes land here. This project follows
 [Semantic Versioning](https://semver.org/) from v0.1.0 onward.
 
+## 0.3.0 — 2026-04-22
+
+Major rework of the trust and credential surface. v0.3.0 retires
+the hidden `PORTL_TRUST_ROOTS` env var and replaces it with a
+first-class two-store model (peers + tickets) backed by JSON files
+on disk, reloaded live by the agent.
+
+This is a **breaking release**. Nothing is preserved from v0.2.x
+on the env var / alias side (intentional; nothing had shipped yet
+under the v0.2 vocabulary that justified carrying a compat layer).
+
+### Added
+
+- **`portl peer`** subcommand (replaces the hidden
+  `PORTL_TRUST_ROOTS` env surface):
+  - `portl peer ls` — tabulate peer entries (label, endpoint,
+    relationship, origin).
+  - `portl peer unlink <label>` — remove a peer. Refuses to unlink
+    the self-row to preserve the self-host contract.
+  - `portl peer add-unsafe-raw <endpoint_hex> --label <name>
+    {--mutual|--inbound|--outbound} [--yes]` — direct escape
+    hatch for pinning a peer by raw endpoint_id. Requires the
+    user to retype the full endpoint_id at a confirmation prompt
+    (unless `--yes`) because it grants root-equivalent authority.
+- **`portl ticket`** subcommand:
+  - `portl ticket issue` — replaces the top-level `portl mint`.
+    Identical args and behavior.
+  - `portl ticket save <label> <string>` — parse a ticket string,
+    bind its endpoint_id + expiry, and write it to the local
+    ticket store under a user-chosen label. Subsequent
+    `portl shell <label>` (etc.) resolve through the saved ticket.
+  - `portl ticket ls` / `rm` / `prune` — manage the store.
+  - `portl ticket revoke` — replaces the top-level `portl revoke`.
+- **`portl whoami`** — two-line output (label + endpoint_id) for
+  copy-paste sharing of the local identity.
+- **Peer store** (`crates/portl-core/src/peer_store.rs`):
+  atomic-write JSON at `$CONFIG_DIR/peers.json`. Carries label,
+  endpoint_id, `(accepts_from_them, they_accept_from_me)` booleans
+  so relationships can be inbound / outbound / mutual / held,
+  `origin` (self / paired / accepted / raw), and `since`. Provides
+  `trust_roots()` which filters held entries.
+- **Ticket store** (`crates/portl-core/src/ticket_store.rs`):
+  atomic-write JSON at `$CONFIG_DIR/tickets.json`. Parses endpoint
+  and `not_after` at save time so `portl ticket ls` is O(n) in
+  display time, and `prune` can bulk-remove expired entries.
+- **Cross-store label uniqueness** (`store_index::label_in_use`):
+  creating a peer or ticket with a name already used by the other
+  store hard-errors to prevent silent route ambiguity.
+- **Agent-side live reload**: the agent loads `peers.json` at
+  startup, then polls every 500ms in a background task and swaps
+  the in-memory `TrustRoots` set when the file changes. `portl
+  peer add-unsafe-raw` takes effect without a service restart.
+- **`portl install --apply`** now seeds the peer store with a
+  self-row (`label=self`, `is_self=true`, `origin=self`, mutual).
+  This fixes the "BadChain on fresh install" class of errors at
+  the source: the agent starts with a non-empty trust set.
+- **`portl doctor`** gains two lines:
+  - `peers: N total (S self, M mutual, I inbound, O outbound, H held)`
+  - `tickets-saved: N saved (soonest expires in …)`
+
+### Removed
+
+- **`PORTL_TRUST_ROOTS` env var** entirely. The agent no longer
+  reads it. Trust configuration is the peer store and only the
+  peer store.
+- **`portl mint`** top-level command — moved to `portl ticket issue`.
+- **`portl revoke`** top-level command — moved to `portl ticket revoke`.
+- The `trust roots required when ephemeral secret set` startup
+  check in `AgentConfig::from_env` (was tied to the env var).
+  Ephemeral agents now have the same peer-store-backed policy.
+- `mint-root` alias (was hidden; removed from parser).
+- v0.2.6's `AgentEnv` plumbing + `PORTL_TRUST_ROOTS=<hex>` env
+  injection in `portl install --apply` rendered plists / unit
+  files. Install no longer writes env files for trust purposes
+  (it still leaves `EnvironmentFile=-…` in the systemd unit for
+  operators who want to set `PORTL_RATE_LIMIT`, etc.).
+
+### Changed
+
+- **Resolution cascade** in `shell` / `exec` / `tcp` / `udp` /
+  `status`: the old alias-store + raw-ticket-string fallback is
+  gone. The new cascade (printed on success as `using <source>`
+  to stderr):
+  1. peer entry with `they_accept_from_me=true` → mint fresh
+     5-minute ticket and dial.
+  2. saved ticket, unexpired → use it.
+  3. peer entry with `they_accept_from_me=false` → hard error
+     naming the asymmetry and the fix.
+  4. raw 64-char hex endpoint_id → mint fresh, dial. One-off.
+  5. otherwise → hard error listing possible sources.
+- `AgentConfig.trust_roots` is now populated from `peers.json`
+  via `PeerStore::trust_roots()`. Added `AgentConfig.peers_path`
+  so the reload task knows where to re-read from.
+- `AgentState.trust_roots` is now `RwLock<TrustRoots>` (was
+  plain `TrustRoots`). The ticket handler takes a read lock
+  during acceptance evaluation; the reload task takes a write
+  lock on change.
+
+### Migration
+
+There is no compat path from v0.2.x. Anyone who was running a
+v0.2.x install should:
+
+1. `portl install --apply` again (seeds the new peer store with
+   the self-row).
+2. For each remote peer they want mutual trust with:
+   - `portl whoami` on both sides to collect endpoint_ids.
+   - `portl peer add-unsafe-raw <their_eid> --label <name> --mutual`
+     on both sides.
+3. `portl shell <name>` works as in v0.2.x, but now routed
+   through the peer store.
+
+Saved tickets (if any) can be imported with
+`portl ticket save <label> <ticket-string>`.
+
+### Follow-ups (v0.3.1+)
+
+- `portl peer invite` + `peer pair` + `peer accept` — network
+  pairing handshake over a new `portl/pair/v1` ALPN, so users
+  don't need to paste endpoint_ids between machines to pair.
+  Deferred because `peer add-unsafe-raw` covers the immediate
+  self-host use case.
+- `portl peer hold` / `resume` for temporary suspension.
+- `portl peer rename` for relabel-without-unlink.
+
+### Validation
+
+- `cargo fmt`, `cargo clippy -D warnings`,
+  `cargo nextest run --workspace --all-features --profile ci` →
+  314 passed, 5 skipped, 0 failed.
+- Manual smoke: `PORTL_HOME=/tmp/portl-test portl install
+  dockerfile --apply --output /tmp/portl-test-out --yes`
+  produces a peers.json with a self-row; `portl peer ls` renders
+  it; `portl peer add-unsafe-raw` adds a mutual peer; `portl
+  doctor` reports the expected counts.
+- Help snapshot regenerated for the new CLI surface (wrap_help
+  still honored; help output still wraps cleanly).
+
 ## 0.2.6 — 2026-04-22
 
 Quality-of-life fix for the self-host paved path: `portl install`

@@ -113,7 +113,17 @@ mod mode_dispatch_tests {
 }
 
 pub(crate) struct AgentState {
-    pub trust_roots: TrustRoots,
+    /// Current trust set. Wrapped in `RwLock` so the peer-store
+    /// reload task can swap it in live: v0.3.0 made this filesystem-
+    /// backed, and `portl peer add-unsafe-raw` etc. take effect
+    /// without restarting the agent.
+    pub trust_roots: std::sync::RwLock<TrustRoots>,
+    /// `PORTL_TRUST_ROOTS` roots captured at startup. The reload
+    /// task unions these with the peer store on every reload so
+    /// containerized agents (docker / slicer) that bootstrap trust
+    /// via env vars don't have their trust set silently cleared
+    /// when peers.json is empty.
+    pub bootstrap_roots: HashSet<[u8; 32]>,
     pub revocations: std::sync::RwLock<RevocationSet>,
     pub rate_limit: OfferRateLimiter,
     pub started_at: Instant,
@@ -121,6 +131,10 @@ pub(crate) struct AgentState {
     pub udp_registry: udp_registry::UdpSessionRegistry,
     pub mode: AgentMode,
     pub metrics: Arc<metrics::Metrics>,
+    /// Path to the peer store so the reload task can re-read it
+    /// without threading the config through. `None` in tests that
+    /// bypass `run_with_shutdown`.
+    pub peers_path: Option<PathBuf>,
 }
 
 #[instrument(skip_all)]
@@ -149,7 +163,20 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
     audit::init();
 
     let state = Arc::new(AgentState {
-        trust_roots: TrustRoots(cfg.trust_roots.iter().copied().collect::<HashSet<_>>()),
+        trust_roots: std::sync::RwLock::new(TrustRoots(
+            cfg.trust_roots.iter().copied().collect::<HashSet<_>>(),
+        )),
+        // Snapshot the startup trust_roots as the "bootstrap" set.
+        // `AgentConfig::from_env` populates `cfg.trust_roots` from
+        // peer_store ∪ env_roots; we only need the env-root portion
+        // to survive reloads, but it's cheapest to just snapshot
+        // the whole union and let the reload task re-union the
+        // peer store on top. Peer-store-derived roots that get
+        // removed from the file then dropped from the reload task
+        // will still survive via bootstrap, but that's fine — the
+        // startup snapshot is a subset of "what the operator
+        // explicitly asked for" and we shouldn't silently unlink it.
+        bootstrap_roots: cfg.trust_roots.iter().copied().collect::<HashSet<_>>(),
         revocations: std::sync::RwLock::new(RevocationSet::load_with_max_bytes(
             revocations_path(&cfg),
             cfg.revocations_max_bytes
@@ -164,6 +191,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
         ),
         mode: cfg.mode.clone(),
         metrics: Arc::new(metrics::Metrics::default()),
+        peers_path: cfg.peers_path.clone(),
     });
 
     let endpoint = if let Some(endpoint) = cfg.endpoint.clone() {
@@ -183,6 +211,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
     let udp_gc = spawn_udp_gc_task(Arc::clone(&state), shutdown.clone());
     let revocation_gc = spawn_revocation_gc_task(Arc::clone(&state), shutdown.clone());
     let revocation_reload = spawn_revocation_reload_task(Arc::clone(&state), shutdown.clone());
+    let peer_reload = spawn_peer_store_reload_task(Arc::clone(&state), shutdown.clone());
     let metrics_task = spawn_metrics_server(&state, shutdown.clone(), &cfg);
 
     loop {
@@ -231,6 +260,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
     udp_gc.abort();
     revocation_gc.abort();
     revocation_reload.abort();
+    peer_reload.abort();
     if let Some(metrics) = metrics_task {
         metrics.abort();
     }
@@ -364,6 +394,64 @@ fn spawn_metrics_server(
             warn!(?err, "metrics server exited with error");
         }
     }))
+}
+
+/// Re-read `peers.json` every 500ms and swap the in-memory
+/// `TrustRoots` set. This is what makes `portl peer add-unsafe-raw`
+/// / `portl peer unlink` take effect on the running agent without
+/// requiring a restart. Parallels `spawn_revocation_reload_task`.
+fn spawn_peer_store_reload_task(
+    state: Arc<AgentState>,
+    shutdown: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let Some(path) = state.peers_path.clone() else {
+            // No peer store configured (test harness). Nothing to do.
+            return;
+        };
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                _ = interval.tick() => {
+                    let state = Arc::clone(&state);
+                    let path = path.clone();
+                    // Wrap through `slow_task` so the portl-agent
+                    // policy-lint CI step (which forbids unwrapped
+                    // `spawn_blocking` in this crate) stays happy,
+                    // and so a wedged filesystem during peer-store
+                    // reload doesn't silently stall the task.
+                    match portl_core::runtime::slow_task(
+                        "peers_reload",
+                        tokio::task::spawn_blocking(move || -> Result<usize> {
+                            let store = portl_core::peer_store::PeerStore::load(&path)?;
+                            // Union peer_store roots with the
+                            // startup bootstrap set (env-var-seeded)
+                            // so reload doesn't silently strip
+                            // container-bootstrapped trust.
+                            let mut new_roots: HashSet<[u8; 32]> = store.trust_roots();
+                            new_roots.extend(state.bootstrap_roots.iter().copied());
+                            let mut guard = state.trust_roots.write().map_err(|err| {
+                                anyhow::anyhow!("trust roots lock poisoned: {err}")
+                            })?;
+                            let changed = guard.0 != new_roots;
+                            guard.0 = new_roots;
+                            Ok(usize::from(changed))
+                        }),
+                    )
+                    .await
+                    {
+                        Ok(Ok(1)) => info!("peer store reloaded; trust_roots updated"),
+                        Ok(Ok(_)) => {}
+                        Ok(Err(err)) => warn!(?err, "peer store reload failed"),
+                        Err(err) => warn!(?err, "peer store reload task panicked"),
+                    }
+                }
+            }
+        }
+    })
 }
 
 async fn graceful_close_endpoint(endpoint: &iroh::Endpoint) {

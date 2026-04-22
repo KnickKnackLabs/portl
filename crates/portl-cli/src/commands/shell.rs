@@ -12,7 +12,7 @@ use portl_core::ticket::schema::{Capabilities, EnvPolicy, ShellCaps};
 use tokio::io::{AsyncWriteExt, copy};
 use tracing::debug;
 
-use crate::commands::peer::connect_peer;
+use crate::commands::peer_resolve::connect_peer;
 
 pub fn run(peer: &str, cwd: Option<&str>, user: Option<&str>) -> Result<ExitCode> {
     let runtime = tokio::runtime::Runtime::new()?;

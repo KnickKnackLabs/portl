@@ -12,7 +12,7 @@ use portl_core::ticket::mint::mint_root;
 
 use crate::alias_store::AliasStore;
 use crate::commands::mint_root::{parse_caps, parse_ttl};
-use crate::commands::peer::{bind_client_endpoint, resolve_peer_ticket};
+use crate::commands::peer_resolve::{bind_client_endpoint, resolve_peer_ticket};
 use crate::release_binary;
 
 use super::aliases::{resolve_alias_record, save_injected_alias};

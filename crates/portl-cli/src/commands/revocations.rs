@@ -21,7 +21,7 @@ const PUBLISH_TIMEOUT: Duration = Duration::from_secs(10);
 use portl_core::ticket::schema::{Capabilities, MetaCaps};
 
 use crate::alias_store::AliasStore;
-use crate::commands::peer::{bind_client_endpoint, connect_peer_with_endpoint};
+use crate::commands::peer_resolve::{bind_client_endpoint, connect_peer_with_endpoint};
 use crate::commands::revoke::local_revocations_path;
 
 /// Dispatch for the `publish` subcommand.
@@ -39,7 +39,7 @@ pub fn publish(peer: Option<&str>, all_peers: bool) -> Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
 
-        let identity_path = crate::commands::peer::resolve_identity_path(None);
+        let identity_path = crate::commands::peer_resolve::resolve_identity_path(None);
         let identity = store::load(&identity_path).context("load local identity")?;
         let endpoint = bind_client_endpoint(&identity).await?;
 

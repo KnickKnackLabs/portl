@@ -40,10 +40,14 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
                 .revocations
                 .read()
                 .map_err(|_| anyhow!("revocations lock poisoned"))?;
+            let trust_roots = state
+                .trust_roots
+                .read()
+                .map_err(|_| anyhow!("trust roots lock poisoned"))?;
             evaluate_offer(&AcceptanceInput {
                 offer: &offer,
                 source_id,
-                trust_roots: &state.trust_roots,
+                trust_roots: &trust_roots,
                 revocations: &revocations,
                 now: unix_now_secs()?,
                 rate_limit: &state.rate_limit,

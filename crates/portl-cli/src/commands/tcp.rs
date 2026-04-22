@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use portl_core::net::run_local_forward;
 use portl_core::ticket::schema::{Capabilities, PortRule};
 
-use crate::commands::peer::connect_peer;
+use crate::commands::peer_resolve::connect_peer;
 
 pub fn run(peer: &str, specs: &[String]) -> Result<ExitCode> {
     let runtime = tokio::runtime::Runtime::new()?;

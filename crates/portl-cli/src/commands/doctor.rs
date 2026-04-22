@@ -11,7 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use iroh_tickets::Ticket;
 use portl_core::id::store;
+use portl_core::peer_store::PeerStore;
 use portl_core::ticket::schema::PortlTicket;
+use portl_core::ticket_store::TicketStore;
 
 use crate::alias_store::AliasStore;
 
@@ -35,6 +37,8 @@ pub fn run() -> ExitCode {
         check_identity(),
         check_listener_bind(),
         check_discovery_config(),
+        check_peer_store(),
+        check_ticket_store(),
         check_stored_ticket_expiry(),
     ];
 
@@ -279,6 +283,127 @@ fn check_stored_ticket_expiry() -> CheckResult {
             status: Status::Ok,
             detail: "all stored tickets are valid".to_owned(),
         }
+    }
+}
+
+/// Summarize the peer store: total count and breakdown by
+/// relationship. Doesn't hit the network. Warns when the store is
+/// empty on a host that looks like it should be the listener side
+/// (has an identity file), because an empty peer store rejects
+/// every handshake.
+fn check_peer_store() -> CheckResult {
+    let peers = match PeerStore::load(&PeerStore::default_path()) {
+        Ok(p) => p,
+        Err(err) => {
+            return CheckResult {
+                name: "peers",
+                status: Status::Fail,
+                detail: format!("read peer store: {err}"),
+            };
+        }
+    };
+    if peers.is_empty() {
+        return CheckResult {
+            name: "peers",
+            status: Status::Warn,
+            detail: "empty; agent will reject every ticket. Run `portl install --apply` \
+                 (seeds self-row) or `portl peer add-unsafe-raw …`."
+                .to_owned(),
+        };
+    }
+    let mut mutual = 0usize;
+    let mut inbound = 0usize;
+    let mut outbound = 0usize;
+    let mut held = 0usize;
+    let mut selves = 0usize;
+    for entry in peers.iter() {
+        if entry.last_hold_at.is_some() {
+            held += 1;
+            continue;
+        }
+        if entry.is_self {
+            selves += 1;
+            continue;
+        }
+        match (entry.accepts_from_them, entry.they_accept_from_me) {
+            (true, true) => mutual += 1,
+            (true, false) => inbound += 1,
+            (false, true) => outbound += 1,
+            _ => {}
+        }
+    }
+    CheckResult {
+        name: "peers",
+        status: Status::Ok,
+        detail: format!(
+            "{} total ({selves} self, {mutual} mutual, {inbound} inbound, {outbound} outbound, {held} held)",
+            peers.len()
+        ),
+    }
+}
+
+/// Summarize the ticket store: total + soonest expiry.
+fn check_ticket_store() -> CheckResult {
+    let tickets = match TicketStore::load(&TicketStore::default_path()) {
+        Ok(t) => t,
+        Err(err) => {
+            return CheckResult {
+                name: "tickets-saved",
+                status: Status::Fail,
+                detail: format!("read ticket store: {err}"),
+            };
+        }
+    };
+    if tickets.is_empty() {
+        return CheckResult {
+            name: "tickets-saved",
+            status: Status::Ok,
+            detail: "no saved tickets".to_owned(),
+        };
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let expired: Vec<_> = tickets
+        .iter()
+        .filter(|(_, e)| e.expires_at <= now)
+        .map(|(k, _)| k.clone())
+        .collect();
+    if !expired.is_empty() {
+        return CheckResult {
+            name: "tickets-saved",
+            status: Status::Warn,
+            detail: format!(
+                "{expired_count} of {total} expired: {names} (run `portl ticket prune`)",
+                expired_count = expired.len(),
+                total = tickets.len(),
+                names = expired.join(", ")
+            ),
+        };
+    }
+    let soonest = tickets
+        .soonest_expiry(now)
+        .map_or_else(|| "none active".to_owned(), format_ttl);
+    CheckResult {
+        name: "tickets-saved",
+        status: Status::Ok,
+        detail: format!(
+            "{total} saved (soonest expires {soonest})",
+            total = tickets.len()
+        ),
+    }
+}
+
+fn format_ttl(secs: u64) -> String {
+    if secs >= 24 * 3600 {
+        format!("in {}d", secs / (24 * 3600))
+    } else if secs >= 3600 {
+        format!("in {}h", secs / 3600)
+    } else if secs >= 60 {
+        format!("in {}m", secs / 60)
+    } else {
+        format!("in {secs}s")
     }
 }
 

@@ -136,22 +136,26 @@ fn shell_exec_tcp_and_udp_subcommands_parse() {
 }
 
 #[test]
-fn revoke_subcommands_parse() {
-    let revoke =
-        parse(argv(&["portl", "revoke", "demo", "--publish"])).expect("parse revoke with publish");
+fn ticket_revoke_subcommands_parse() {
+    // v0.3.0 moved `revoke` under the `ticket` subcommand. No
+    // behavior change; the move groups all credential-lifecycle
+    // verbs under one subcommand.
+    let revoke = parse(argv(&["portl", "ticket", "revoke", "demo", "--publish"]))
+        .expect("parse ticket revoke with publish");
     assert_eq!(
         revoke,
-        Command::Revoke {
+        Command::TicketRevoke {
             id: Some("demo".to_owned()),
             list: false,
             publish: true,
         }
     );
 
-    let list = parse(argv(&["portl", "revoke", "--list"])).expect("parse revoke list");
+    let list =
+        parse(argv(&["portl", "ticket", "revoke", "--list"])).expect("parse ticket revoke list");
     assert_eq!(
         list,
-        Command::Revoke {
+        Command::TicketRevoke {
             id: None,
             list: true,
             publish: false,
