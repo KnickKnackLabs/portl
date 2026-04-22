@@ -39,8 +39,18 @@ pub async fn open_ticket_v1(
     chain: &[PortlTicket],
     identity: &Identity,
 ) -> Result<(Connection, PeerSession)> {
-    endpoint.inner().online().await;
-
+    // NOTE: we used to `await endpoint.inner().online()` here to
+    // ensure a relay was connected before dialing. That call has an
+    // iroh 0.98.x bug (see crash on `Endpoint::online` /
+    // `endpoint.rs:1291`): when `any()` on the home-relay-status
+    // Flatten iterator short-circuits, dropping the underlying
+    // `Vec<Option<(RelayUrl, HomeRelayStatus)>>` aborts the process
+    // with `malloc: pointer being freed was not allocated` on
+    // macOS. `Endpoint::connect()` already picks a relay on its own
+    // if one isn't yet connected, so skipping the pre-wait costs us
+    // only a tiny bit of first-dial latency in exchange for not
+    // crashing the CLI. Drop this workaround once we move to an
+    // iroh release that fixes the `online()` drop path.
     let connection = endpoint
         .inner()
         .connect(ticket.addr.clone(), portl_alpn::ALPN_TICKET_V1)

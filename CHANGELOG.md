@@ -3,6 +3,54 @@
 All notable changes land here. This project follows
 [Semantic Versioning](https://semver.org/) from v0.1.0 onward.
 
+## 0.2.5 — 2026-04-22
+
+Bug-fix release. Actually fixes the macOS TLS SIGABRT that v0.2.4
+only papered over. No other user-visible changes.
+
+### Fixed
+
+- **`portl shell` / `portl status` / any peer-handshake path still
+  aborted on macOS in v0.2.4** with
+  `malloc: *** error for object 0x…: pointer being freed was not
+  allocated`. After symbolicating the crash report with a
+  non-stripped release build, the real failure was not the
+  aws-lc-rs/ring collision we fixed in v0.2.4 but a drop-path bug
+  in `iroh 0.98.1`'s `Endpoint::online()`: when `any()` short-
+  circuits on the home-relay-status Flatten iterator, dropping the
+  outer `Vec<Option<(RelayUrl, HomeRelayStatus)>>` frees a pointer
+  libmalloc says was never allocated (`endpoint.rs:1291`). Every
+  portl handshake path went through `online().await` before
+  dialing, so every `portl shell`, `portl status`, `portl mint …`
+  → `portl shell` flow crashed before touching the wire.
+
+### Changed
+
+- `portl_core::net::client::open_ticket_v1` no longer calls
+  `endpoint.inner().online().await`. `Endpoint::connect()` already
+  picks a relay on its own when no home relay is cached, so the
+  pre-wait was a latency optimization, not a correctness
+  requirement. A prominent TODO comment points at the iroh bug and
+  asks us to restore the pre-wait once an iroh release fixes it.
+- The aws-lc-rs → ring switch shipped in v0.2.4 is retained: it
+  still drops the `aws-lc-sys` C dependency (~1.5 MB of binary
+  bloat on macOS, known footgun per `rustls/rustls#1877`). It was
+  just never the actual cause of the SIGABRT.
+
+### Validation
+
+- Local: 10 consecutive `portl mint shell` + `portl status` runs
+  on macOS arm64 (`thinh@max`), all clean exits (expected
+  "Connecting to ourself is not supported"), zero SIGABRTs. Before
+  the fix: 4/5 runs crashed.
+- Cross-machine: Linux x86_64 (`vn3`) → macOS arm64 (`max`), 5/5
+  `portl status` runs from an unauthorized Linux peer to the max
+  agent, all clean exits with the expected `BadChain` ticket
+  rejection from the relay'd handshake.
+- `cargo fmt`, `cargo clippy -D warnings`,
+  `cargo nextest run --workspace --all-features --profile ci` →
+  310 passed, 5 skipped, 0 failed.
+
 ## 0.2.4 — 2026-04-22
 
 Bug-fix release. Ships one critical fix for the v0.2.x line; no
