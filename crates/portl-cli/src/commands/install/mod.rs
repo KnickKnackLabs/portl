@@ -45,6 +45,47 @@ pub fn detect_host() -> DetectResult {
     detect_host_with(&DetectionContext::from_host())
 }
 
+/// v0.3.1: expose self-row seeding so `portl init` can call it.
+/// Idempotent — returns `Ok(None)` if the row already exists and
+/// points at the current identity (no disk write).
+pub fn seed_peer_store_self_row_if_missing() -> Result<Option<String>> {
+    use portl_core::id::store;
+    let Ok(identity) = store::load(&store::default_path()) else {
+        return Ok(None);
+    };
+    let eid = identity.verifying_key();
+    let eid_hex = hex::encode(eid);
+    let path = PeerStore::default_path();
+    let mut peers = PeerStore::load(&path).context("load peer store")?;
+    if let Some(existing) = peers.get_by_endpoint(&eid)
+        && existing.is_self
+        && existing.accepts_from_them
+        && existing.they_accept_from_me
+    {
+        // Already seeded correctly; avoid touching disk (the agent
+        // reload task picks up on mtime changes).
+        return Ok(None);
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock before unix epoch")?
+        .as_secs();
+    peers
+        .insert_or_update(PeerEntry {
+            label: "self".to_owned(),
+            endpoint_id_hex: eid_hex.clone(),
+            accepts_from_them: true,
+            they_accept_from_me: true,
+            since: now,
+            origin: PeerOrigin::Zelf,
+            last_hold_at: None,
+            is_self: true,
+        })
+        .context("insert self-row in peer store")?;
+    peers.save(&path).context("save peer store")?;
+    Ok(Some(eid_hex))
+}
+
 #[allow(clippy::fn_params_excessive_bools)]
 pub fn run(
     target: Option<InstallTarget>,
@@ -57,6 +98,31 @@ pub fn run(
     let detect_result = detect_host();
     if detect {
         println!("{}", serde_json::to_string_pretty(&detect_result)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // v0.3.1: inside a container `portl install --apply` is
+    // effectively peers-only — seed the self-row so the agent
+    // accepts its own tickets, then point the operator at
+    // `portl-agent` direct invocation. launchctl / systemctl
+    // inside a container is a dead end and the original
+    // `resolve_target` refuses such installs outright, which is
+    // correct for service install but not for peer seeding.
+    if detect_result.inside_docker {
+        if apply && !yes {
+            bail!("`portl install --apply` inside a container requires `--yes`");
+        }
+        if apply {
+            seed_peer_store_self_row_with_reporting();
+            println!(
+                "container detected; skipping service install.\n\
+                 next: portl-agent &           # start the agent in the background\n\
+                 note: launchd / systemd aren't available in containers; run\n\
+                       portl-agent directly under your container supervisor."
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
+        println!("container detected; `portl install --apply --yes` will seed peers.json only");
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -144,12 +210,16 @@ pub fn run(
 /// short enough to keep clippy happy (it flagged the inline one as
 /// a `let...else` candidate).
 fn seed_peer_store_self_row_with_reporting() {
-    match seed_peer_store_self_row() {
+    match seed_peer_store_self_row_if_missing() {
         Ok(Some(eid_hex)) => println!(
             "seeded peer store with self-row: {eid_short}…",
             eid_short = &eid_hex[..16]
         ),
-        Ok(None) => {}
+        Ok(None) => {
+            // Row already present (idempotent re-run) or identity
+            // hasn't been created yet (`portl install` before
+            // `portl init`, unusual but possible).
+        }
         Err(err) => eprintln!(
             "warning: failed to seed peer store self-row ({err:#}); \
              run `portl init` and re-run install, or add the self-row \
@@ -157,35 +227,6 @@ fn seed_peer_store_self_row_with_reporting() {
              manually."
         ),
     }
-}
-
-fn seed_peer_store_self_row() -> Result<Option<String>> {
-    use portl_core::id::store;
-    let Ok(identity) = store::load(&store::default_path()) else {
-        return Ok(None);
-    };
-    let eid = identity.verifying_key();
-    let eid_hex = hex::encode(eid);
-    let path = PeerStore::default_path();
-    let mut peers = PeerStore::load(&path).context("load peer store")?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock before unix epoch")?
-        .as_secs();
-    peers
-        .insert_or_update(PeerEntry {
-            label: "self".to_owned(),
-            endpoint_id_hex: eid_hex.clone(),
-            accepts_from_them: true,
-            they_accept_from_me: true,
-            since: now,
-            origin: PeerOrigin::Zelf,
-            last_hold_at: None,
-            is_self: true,
-        })
-        .context("insert self-row in peer store")?;
-    peers.save(&path).context("save peer store")?;
-    Ok(Some(eid_hex))
 }
 
 #[cfg(test)]

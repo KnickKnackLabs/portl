@@ -16,15 +16,29 @@ const TICKET_EXPLORER_URL: &str = "https://ticket.iroh.computer/#";
 const ONE_YEAR_SECONDS: u64 = 365 * 24 * 60 * 60;
 
 pub fn run(
-    caps: &str,
+    caps: Option<&str>,
     ttl: &str,
     to: Option<&str>,
     from: Option<&str>,
     print: MintRootPrint,
     endpoint: Option<&str>,
+    list_caps: bool,
 ) -> Result<ExitCode> {
+    if list_caps {
+        print!("{}", caps_reference());
+        return Ok(ExitCode::SUCCESS);
+    }
+    let caps = caps.context(
+        "missing <CAPS> argument; run `portl ticket issue --list-caps` \
+         for the capability reference",
+    )?;
     let identity = store::load(&store::default_path())?;
-    let caps = parse_caps(caps)?;
+    let caps = parse_caps(caps).with_context(|| {
+        format!(
+            "parse capability spec '{caps}'\n\n{}",
+            caps_reference_short()
+        )
+    })?;
     let ttl_secs = parse_ttl(ttl)?;
     let to = to.map(parse_endpoint_bytes).transpose()?;
     let now = SystemTime::now()
@@ -89,7 +103,12 @@ pub(crate) fn parse_caps(spec: &str) -> Result<Capabilities> {
             }
             _ if entry.starts_with("tcp:") => tcp.push(parse_port_rule(&entry[4..])?),
             _ if entry.starts_with("udp:") => udp.push(parse_port_rule(&entry[4..])?),
-            _ => bail!("unsupported cap {entry}"),
+            _ => bail!(
+                "unsupported cap '{entry}'\n\
+                 valid caps: shell, meta:ping, meta:info, \
+                 tcp:<host>:<port>[-<port>], udp:<host>:<port>[-<port>], all\n\
+                 run `portl ticket issue --list-caps` for the full reference"
+            ),
         }
     }
 
@@ -116,6 +135,61 @@ pub(crate) fn parse_caps(spec: &str) -> Result<Capabilities> {
         vpn: None,
         meta,
     })
+}
+
+/// Full human-readable reference dumped by `portl ticket issue --list-caps`.
+pub(crate) fn caps_reference() -> String {
+    "\
+Capability reference for `portl ticket issue`
+
+Caps are comma-separated. Any combination can be granted in one
+ticket. Use `all` as a wildcard only for dev / self-trust.
+
+  shell
+      Full shell access — PTY allowed, exec allowed, no env filter.
+      Grants `portl shell <target>` and `portl exec <target> <cmd>`.
+
+  meta:ping
+      Respond to liveness pings. Pairs well with uptime monitoring;
+      does NOT expose identity or version.
+
+  meta:info
+      Expose agent metadata (version, uptime, feature flags).
+      Use with `portl status <ticket>`.
+
+  tcp:<host_glob>:<port>
+  tcp:<host_glob>:<port_min>-<port_max>
+      TCP port forward. `<host_glob>` is matched against target
+      hostnames; `*` matches everything. `<port>` or range is
+      matched against destination port.
+      Grants `portl tcp <target> -L <local>:<host>:<port>`.
+
+  udp:<host_glob>:<port>
+  udp:<host_glob>:<port_min>-<port_max>
+      UDP port forward. Same semantics as tcp:… but for UDP.
+      Grants `portl udp <target> -L <local>:<host>:<port>`.
+
+  all
+      Wildcard — grants every cap above with `*:1-65535` for
+      tcp/udp. Intended for self-trust / dev, not production.
+
+Examples:
+
+  portl ticket issue shell --ttl 10m
+  portl ticket issue 'shell,tcp:*:8080' --ttl 1h
+  portl ticket issue 'tcp:127.0.0.1:6000-6100' --ttl 30m
+  portl ticket issue 'meta:ping,meta:info' --ttl 30d
+  portl ticket issue all --ttl 1h       # dev only
+"
+    .to_owned()
+}
+
+/// Abbreviated reference for error messages (keeps the failure
+/// output narrow).
+pub(crate) fn caps_reference_short() -> String {
+    "valid caps: shell | meta:ping | meta:info | tcp:<host>:<range> | udp:<host>:<range> | all\n\
+     full reference: portl ticket issue --list-caps"
+        .to_owned()
 }
 
 fn all_caps() -> Capabilities {

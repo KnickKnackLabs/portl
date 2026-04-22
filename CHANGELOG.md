@@ -3,6 +3,55 @@
 All notable changes land here. This project follows
 [Semantic Versioning](https://semver.org/) from v0.1.0 onward.
 
+## 0.3.1 — 2026-04-23
+
+Ergonomics release. Three P0 container-bootstrap regressions from
+v0.3.0 + three categories of UX polish driven by live self-host
+testing.
+
+### Container bootstrap
+
+- `portl init` now seeds the peer-store self-row automatically. v0.3.0
+  put this in `portl install --apply`, which refuses to run inside a
+  container (launchd / systemd aren't available), leaving container
+  operators with an empty peer store and `BadChain` on every ticket.
+  Idempotent on re-run.
+- `portl install --apply` in container mode seeds peers and prints a
+  next-step hint (`portl-agent &`) instead of refusing outright. The
+  service-install path still refuses (correctly).
+- `portl init` prints a container-aware "next step" hint pointing at
+  `portl-agent &` when a container is detected.
+
+### Capability discoverability
+
+- `portl ticket issue --help` now includes a full capability grammar
+  + four examples covering common cases (shell, tcp port range,
+  meta-only, all wildcard).
+- `portl ticket issue --list-caps` prints the full capability
+  reference — suitable for `grep`/paging.
+- Invalid cap specs now emit an error listing valid caps + pointing
+  at `--list-caps` for the full reference.
+- Help text for `--ttl` and `--to` explains units and bearer
+  semantics.
+
+### Doctor drift detection
+
+- `[…] package:` line — detects mise / homebrew / nix installs and
+  surfaces upgrade hints for each.
+- `[…] binaries:` line — walks `$PATH` for portl / portl-agent
+  copies and warns on version drift (catches the common "upgraded
+  CLI but running agent is stale" state).
+- `[…] service:` line — launchd (macOS) / systemd (Linux) drift
+  detection: warns when both user and system services are loaded
+  (they fight over UDP binds), when no service is loaded,
+  pointing at `portl install --apply` or `portl-agent &` as the
+  remedy.
+
+### CLI ergonomics
+
+- `portl whoami --eid` prints just the 64-char endpoint_id hex —
+  saves the `awk` dance common in scripts.
+
 ## 0.3.0 — 2026-04-22
 
 Major rework of the trust and credential surface. v0.3.0 retires

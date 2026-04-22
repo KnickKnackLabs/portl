@@ -75,12 +75,13 @@ pub enum Command {
         yes: bool,
     },
     TicketIssue {
-        caps: String,
+        caps: Option<String>,
         ttl: String,
         to: Option<String>,
         from: Option<String>,
         print: MintRootPrint,
         endpoint: Option<String>,
+        list_caps: bool,
     },
     TicketSave {
         label: String,
@@ -96,7 +97,9 @@ pub enum Command {
         list: bool,
         publish: bool,
     },
-    Whoami,
+    Whoami {
+        eid: bool,
+    },
     Install {
         target: Option<InstallTarget>,
         apply: bool,
@@ -315,13 +318,15 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             from,
             print,
             endpoint,
+            list_caps,
         } => commands::ticket::issue::run(
-            &caps,
+            caps.as_deref(),
             &ttl,
             to.as_deref(),
             from.as_deref(),
             print,
             endpoint.as_deref(),
+            list_caps,
         ),
         Command::TicketSave { label, ticket } => commands::ticket::save::run(&label, &ticket),
         Command::TicketLs => commands::ticket::ls::run(),
@@ -330,7 +335,7 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
         Command::TicketRevoke { id, list, publish } => {
             commands::ticket::revoke::run(id.as_deref(), list, publish)
         }
-        Command::Whoami => commands::whoami::run(),
+        Command::Whoami { eid } => commands::whoami::run(eid),
         Command::Install {
             target,
             apply,
@@ -507,7 +512,11 @@ enum TopLevel {
         action: TicketAction,
     },
     /// Print the local identity's `endpoint_id` and peer-store label.
-    Whoami,
+    Whoami {
+        /// Print only the 64-char `endpoint_id` hex (script-friendly).
+        #[arg(long)]
+        eid: bool,
+    },
     /// Install the daemon for a supported target.
     Install {
         target: Option<InstallTarget>,
@@ -569,10 +578,32 @@ enum PeerAction {
 #[derive(Subcommand, Debug)]
 enum TicketAction {
     /// Mint a new ticket signed by the local identity.
+    ///
+    /// <CAPS> is a comma-separated capability spec:
+    ///
+    ///   shell                            full shell access (pty + exec, no env filter)
+    ///   meta:ping                        respond to liveness pings
+    ///   meta:info                        expose agent metadata (version, uptime)
+    ///   tcp:<host>:<port>[-<port>]       TCP port forward (glob + range)
+    ///   udp:<host>:<port>[-<port>]       UDP port forward (glob + range)
+    ///   all                              every cap above (dev only)
+    ///
+    /// Examples:
+    ///   portl ticket issue shell --ttl 10m
+    ///   portl ticket issue shell,tcp:*:8080 --ttl 1h
+    ///   portl ticket issue 'meta:ping,meta:info' --ttl 30d
+    ///   portl ticket issue all --ttl 1h    # dev only; grants everything
+    ///
+    /// Run `portl ticket issue --list-caps` for the full reference.
     Issue {
-        caps: String,
+        /// Capability spec — see command help for the grammar.
+        #[arg(required_unless_present = "list_caps")]
+        caps: Option<String>,
+        /// Time-to-live for the ticket, e.g. `10m`, `1h`, `30d`, `3600` (seconds).
         #[arg(long, default_value = "30d")]
         ttl: String,
+        /// Restrict this ticket to a specific caller `endpoint_id` (64-hex).
+        /// Omit for a bearer ticket usable by anyone who has the string.
         #[arg(long)]
         to: Option<String>,
         #[arg(long = "from")]
@@ -581,6 +612,9 @@ enum TicketAction {
         print: MintRootPrint,
         #[arg(long, hide = true, alias = "node")]
         endpoint: Option<String>,
+        /// Print the capability reference and exit without minting.
+        #[arg(long, conflicts_with_all = ["ttl", "to", "from"])]
+        list_caps: bool,
     },
     /// Save a ticket string under a local label.
     Save { label: String, ticket: String },
@@ -741,6 +775,7 @@ impl Cli {
                         from,
                         print,
                         endpoint,
+                        list_caps,
                     },
             } => Command::TicketIssue {
                 caps,
@@ -749,6 +784,7 @@ impl Cli {
                 from,
                 print,
                 endpoint,
+                list_caps,
             },
             TopLevel::Ticket {
                 action: TicketAction::Save { label, ticket },
@@ -765,7 +801,7 @@ impl Cli {
             TopLevel::Ticket {
                 action: TicketAction::Revoke { id, list, publish },
             } => Command::TicketRevoke { id, list, publish },
-            TopLevel::Whoami => Command::Whoami,
+            TopLevel::Whoami { eid } => Command::Whoami { eid },
             TopLevel::Install {
                 target,
                 apply,

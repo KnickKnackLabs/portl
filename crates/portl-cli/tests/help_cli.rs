@@ -211,19 +211,49 @@ Options:
         ),
         (
             &["ticket", "issue", "--help"][..],
-            r#"Mint a new ticket signed by the local identity
+            r#"Mint a new ticket signed by the local identity.
 
-Usage: portl ticket issue [OPTIONS] <CAPS>
+<CAPS> is a comma-separated capability spec:
+
+shell                            full shell access (pty + exec, no env filter) meta:ping
+respond to liveness pings meta:info                        expose agent metadata (version, uptime)
+tcp:<host>:<port>[-<port>]       TCP port forward (glob + range) udp:<host>:<port>[-<port>]
+UDP port forward (glob + range) all                              every cap above (dev only)
+
+Examples: portl ticket issue shell --ttl 10m portl ticket issue shell,tcp:*:8080 --ttl 1h portl
+ticket issue 'meta:ping,meta:info' --ttl 30d portl ticket issue all --ttl 1h    # dev only; grants
+everything
+
+Run `portl ticket issue --list-caps` for the full reference.
+
+Usage: portl ticket issue [OPTIONS] [CAPS]
 
 Arguments:
-  <CAPS>  
+  [CAPS]
+          Capability spec — see command help for the grammar
 
 Options:
-      --ttl <TTL>      [default: 30d]
-      --to <TO>        
-      --from <FROM>    
-  -o, --print <PRINT>  [default: string] [possible values: string, qr, url]
-  -h, --help           Print help
+      --ttl <TTL>
+          Time-to-live for the ticket, e.g. `10m`, `1h`, `30d`, `3600` (seconds)
+          
+          [default: 30d]
+
+      --to <TO>
+          Restrict this ticket to a specific caller `endpoint_id` (64-hex). Omit for a bearer ticket
+          usable by anyone who has the string
+
+      --from <FROM>
+          
+
+  -o, --print <PRINT>
+          [default: string]
+          [possible values: string, qr, url]
+
+      --list-caps
+          Print the capability reference and exit without minting
+
+  -h, --help
+          Print help (see a summary with '-h')
 "#,
         ),
         (
@@ -245,9 +275,10 @@ Options:
             &["whoami", "--help"][..],
             r#"Print the local identity's `endpoint_id` and peer-store label
 
-Usage: portl whoami
+Usage: portl whoami [OPTIONS]
 
 Options:
+      --eid   Print only the 64-char `endpoint_id` hex (script-friendly)
   -h, --help  Print help
 "#,
         ),

@@ -6,6 +6,8 @@
 
 use std::net::UdpSocket;
 use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command as ProcessCommand;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,6 +42,9 @@ pub fn run() -> ExitCode {
         check_peer_store(),
         check_ticket_store(),
         check_stored_ticket_expiry(),
+        check_package_manager(),
+        check_binary_drift(),
+        check_service_drift(),
     ];
 
     let mut any_fail = false;
@@ -405,6 +410,222 @@ fn format_ttl(secs: u64) -> String {
     } else {
         format!("in {secs}s")
     }
+}
+
+/// v0.3.1: package-manager awareness. Detects whether the portl
+/// binary was installed via mise (path contains `/mise/installs/`)
+/// and emits an `[info]`-style warn with upgrade guidance. Adds
+/// zero overhead for non-mise users.
+fn check_package_manager() -> CheckResult {
+    let current = std::env::current_exe().ok();
+    let Some(path) = current else {
+        return CheckResult {
+            name: "package",
+            status: Status::Warn,
+            detail: "could not resolve current executable".to_owned(),
+        };
+    };
+    let path_str = path.display().to_string();
+    if path_str.contains("/mise/installs/") || path_str.contains("/mise/shims/") {
+        return CheckResult {
+            name: "package",
+            status: Status::Warn,
+            detail: format!(
+                "mise-managed ({path_str}). On version bump re-run \
+                 `portl install --apply --yes` so the LaunchAgent/unit \
+                 picks up the new binary."
+            ),
+        };
+    }
+    if path_str.contains("/homebrew/") || path_str.starts_with("/opt/homebrew/") {
+        return CheckResult {
+            name: "package",
+            status: Status::Ok,
+            detail: format!("homebrew-managed ({path_str})"),
+        };
+    }
+    if path_str.contains("/nix/store/") {
+        return CheckResult {
+            name: "package",
+            status: Status::Ok,
+            detail: format!("nix-managed ({path_str})"),
+        };
+    }
+    CheckResult {
+        name: "package",
+        status: Status::Ok,
+        detail: format!("running {path_str}"),
+    }
+}
+
+/// v0.3.1: detect multiple portl / portl-agent binaries on $PATH
+/// and warn if their versions disagree. Catches the common "I
+/// upgraded portl but the running agent still reports old version"
+/// failure mode surfaced during v0.3.0.1 testing.
+fn check_binary_drift() -> CheckResult {
+    let Some(path_env) = std::env::var_os("PATH") else {
+        return CheckResult {
+            name: "binaries",
+            status: Status::Warn,
+            detail: "$PATH is unset".to_owned(),
+        };
+    };
+    let mut found: Vec<(PathBuf, String)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for dir in std::env::split_paths(&path_env) {
+        for name in ["portl", "portl-agent"] {
+            let candidate = dir.join(name);
+            let Ok(resolved) = candidate.canonicalize() else {
+                continue;
+            };
+            if !seen.insert(resolved.clone()) {
+                continue;
+            }
+            let version = ProcessCommand::new(&candidate)
+                .arg("--version")
+                .output()
+                .ok()
+                .and_then(|out| String::from_utf8(out.stdout).ok())
+                .and_then(|s| s.split_whitespace().nth(1).map(str::to_owned))
+                .unwrap_or_else(|| "?".to_owned());
+            found.push((candidate, version));
+        }
+    }
+    if found.is_empty() {
+        return CheckResult {
+            name: "binaries",
+            status: Status::Warn,
+            detail: "no portl binaries on $PATH".to_owned(),
+        };
+    }
+    let versions: std::collections::HashSet<&str> = found.iter().map(|(_, v)| v.as_str()).collect();
+    if versions.len() > 1 {
+        let list = found
+            .iter()
+            .map(|(p, v)| format!("{} ({v})", p.display()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return CheckResult {
+            name: "binaries",
+            status: Status::Warn,
+            detail: format!(
+                "version drift across $PATH: {list}. \
+                 Upgrade the stragglers or remove stale copies."
+            ),
+        };
+    }
+    CheckResult {
+        name: "binaries",
+        status: Status::Ok,
+        detail: format!(
+            "{count} on $PATH (all v{ver})",
+            count = found.len(),
+            ver = versions.iter().next().unwrap_or(&"?")
+        ),
+    }
+}
+
+/// v0.3.1: surface multi-service-loaded state (the user-level
+/// `LaunchAgent` + system `LaunchDaemon` footgun from the v0.3.0
+/// install thread). Non-fatal — this is common during migrations
+/// but should get cleaned up before relying on the service.
+fn check_service_drift() -> CheckResult {
+    #[cfg(target_os = "macos")]
+    {
+        let uid_str = format!("{}", nix::unistd::getuid());
+        let user_loaded = launchctl_is_loaded(&format!("gui/{uid_str}/com.portl.agent"));
+        let system_loaded = launchctl_is_loaded("system/com.portl.agent");
+        match (user_loaded, system_loaded) {
+            (true, true) => CheckResult {
+                name: "service",
+                status: Status::Warn,
+                detail: "both user LaunchAgent (gui/{uid}) and system LaunchDaemon are loaded; \
+                 they'll fight over UDP binds. Pick one lane: \
+                 `launchctl bootout system/com.portl.agent` + \
+                 `sudo rm /Library/LaunchDaemons/com.portl.agent.plist`"
+                    .replace("{uid}", &uid_str),
+            },
+            (true, false) => CheckResult {
+                name: "service",
+                status: Status::Ok,
+                detail: format!("user LaunchAgent loaded (gui/{uid_str})"),
+            },
+            (false, true) => CheckResult {
+                name: "service",
+                status: Status::Ok,
+                detail: "system LaunchDaemon loaded".to_owned(),
+            },
+            (false, false) => CheckResult {
+                name: "service",
+                status: Status::Warn,
+                detail: "no portl-agent service loaded. Run \
+                 `portl install --apply --yes` to install one, or \
+                 `portl-agent &` to run ad-hoc."
+                    .to_owned(),
+            },
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let user = systemctl_is_active(&["--user"]);
+        let system = systemctl_is_active(&[]);
+        match (user, system) {
+            (true, true) => CheckResult {
+                name: "service",
+                status: Status::Warn,
+                detail: "both user and system portl-agent.service are active; \
+                 they'll fight over UDP binds. Pick one lane."
+                    .to_owned(),
+            },
+            (true, false) => CheckResult {
+                name: "service",
+                status: Status::Ok,
+                detail: "user systemd unit active".to_owned(),
+            },
+            (false, true) => CheckResult {
+                name: "service",
+                status: Status::Ok,
+                detail: "system systemd unit active".to_owned(),
+            },
+            (false, false) => CheckResult {
+                name: "service",
+                status: Status::Warn,
+                detail: "no portl-agent service active. Run \
+                 `portl install --apply --yes` to install one, or \
+                 `portl-agent &` to run ad-hoc."
+                    .to_owned(),
+            },
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        CheckResult {
+            name: "service",
+            status: Status::Ok,
+            detail: "service drift check skipped on this OS".to_owned(),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_is_loaded(target: &str) -> bool {
+    ProcessCommand::new("launchctl")
+        .args(["print", target])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn systemctl_is_active(extra: &[&str]) -> bool {
+    let mut args: Vec<&str> = Vec::new();
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&["is-active", "portl-agent.service"]);
+    ProcessCommand::new("systemctl")
+        .args(&args)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
