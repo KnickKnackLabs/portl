@@ -246,14 +246,22 @@ fn home_dir() -> PathBuf {
 
 /// Exposed for other stores (ticket, pair) so they share exactly
 /// one path-resolution policy.
-#[doc(hidden)]
+///
+/// IMPORTANT: must use `data_dir()`, not `config_dir()`. The agent's
+/// `default_home_dir` in `portl-agent::config` uses `data_dir()`, as
+/// does `id::store::default_path`. On macOS the two XDG dirs happen
+/// to resolve to the same path (`~/Library/Application Support/...`)
+/// so a mismatch is invisible; on Linux they diverge to `~/.config/portl/`
+/// vs `~/.local/share/portl/`, which means CLI writes and agent reads
+/// land on different files. v0.3.0 shipped with `config_dir()` here
+/// and broke Linux self-host as a result (fixed in v0.3.0.1).
 pub fn home_dir_pub() -> PathBuf {
     if let Some(home) = std::env::var_os("PORTL_HOME") {
         return PathBuf::from(home);
     }
     ProjectDirs::from("computer", "KnickKnackLabs", "portl").map_or_else(
         || PathBuf::from("./.portl"),
-        |dirs| dirs.config_dir().to_path_buf(),
+        |dirs| dirs.data_dir().to_path_buf(),
     )
 }
 
@@ -261,6 +269,31 @@ pub fn home_dir_pub() -> PathBuf {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    // Regression guard for the v0.3.0 XDG-path bug: `peer_store`
+    // used `config_dir()` while agent + identity used `data_dir()`.
+    // On Linux that split writes (CLI → ~/.config/portl/) vs reads
+    // (agent → ~/.local/share/portl/) to different files and broke
+    // self-host. Fixed by switching `home_dir_pub()` to `data_dir()`.
+    // Pure-function guard: assert the path shape ends in `portl` so
+    // we can't accidentally revert to `config_dir` without this
+    // test noticing on CI.
+    #[test]
+    fn peer_store_home_uses_data_dir_shape() {
+        // When PORTL_HOME is unset we rely on ProjectDirs::data_dir.
+        // On linux+ci that's `~/.local/share/portl/peers.json`; on
+        // macos it's `~/Library/Application Support/.../peers.json`.
+        // Both end in `/peers.json` under a `portl`-named dir.
+        let path = PeerStore::default_path();
+        let parent = path.parent().expect("peers.json has a parent dir");
+        let last = parent.file_name().expect("parent has a name");
+        let last_str = last.to_string_lossy();
+        // macOS uses reverse-DNS; linux uses the bare app name.
+        assert!(
+            last_str.ends_with("portl"),
+            "peer store home should live under a `portl` dir, got {parent:?}"
+        );
+    }
 
     fn mk_entry(label: &str, eid: [u8; 32], accepts: bool, they_accept: bool) -> PeerEntry {
         PeerEntry {

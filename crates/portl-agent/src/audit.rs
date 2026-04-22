@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use tracing::Level;
-use tracing_subscriber::prelude::*;
+use tracing_subscriber::{EnvFilter, prelude::*};
 
 use crate::session::Session;
 
@@ -20,15 +20,33 @@ static SHELL_EXIT_AUDIT_FILE: OnceLock<Option<Mutex<File>>> = OnceLock::new();
 pub(crate) fn init() {
     let () = *AUDIT_INIT.get_or_init(|| {
         let _ = SHELL_EXIT_AUDIT_FILE.get_or_init(init_shell_exit_audit_file);
+        // Default to INFO for the agent's own crates and WARN for
+        // noisy deps (iroh / quinn / rustls / h2 / hickory / pkarr).
+        // Operators override via `RUST_LOG` env var as usual.
+        // Without this, tracing_subscriber defaults to TRACE which
+        // is unusable in production.
+        let default_filter = "info,\
+            iroh=warn,iroh_net=warn,iroh_quinn=warn,iroh_relay=warn,\
+            iroh_base=warn,iroh_dns=warn,\
+            quinn=warn,quinn_proto=warn,quinn_udp=warn,\
+            rustls=warn,h2=warn,hickory_proto=warn,hickory_resolver=warn,\
+            pkarr=warn,mainline=warn,portmapper=warn,netwatch=warn";
+        let env_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+
         #[cfg(target_os = "linux")]
         {
             if let Ok(layer) = tracing_journald::layer() {
-                let _ = tracing_subscriber::registry().with(layer).try_init();
+                let _ = tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(layer)
+                    .try_init();
                 return;
             }
         }
 
         let _ = tracing_subscriber::registry()
+            .with(env_filter)
             .with(tracing_subscriber::fmt::layer())
             .try_init();
     });
