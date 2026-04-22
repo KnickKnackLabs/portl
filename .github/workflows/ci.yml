@@ -324,6 +324,18 @@ jobs:
           # `sha256sum -c ...sha256` next to the tarball without
           # recreating a dist/ directory.
           (cd dist && shasum -a 256 "${NAME}.tar.zst" > "${NAME}.tar.zst.sha256")
+
+          # Also publish tar.gz so install.sh works on minimal
+          # containers (debian:stable-slim, alpine without zstd
+          # preinstalled). ~20% bigger than tar.zst; gzip is
+          # available in every libc and busybox tar.
+          tar_gz_flags=(-C staging -czf "dist/${NAME}.tar.gz" "${NAME}")
+          if tar --help 2>&1 | grep -q -- --no-mac-metadata; then
+              tar --no-mac-metadata "${tar_gz_flags[@]}"
+          else
+              tar "${tar_gz_flags[@]}"
+          fi
+          (cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
       - uses: actions/upload-artifact@v5
         with:
           name: portl-${{ matrix.target }}

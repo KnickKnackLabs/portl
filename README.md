@@ -16,15 +16,56 @@ followed by `portl docker run <image>` or `portl slicer run <image>`.
 Runtime orchestration, install targets, local revocation propagation,
 and the collapsed CLI surface are all in place.
 
-## Quickstart (Docker adapter)
+## Install
+
+### One-liner (recommended)
 
 ```bash
-# Install from source:
+# client-only (just the CLI binaries)
+curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash
+
+# install + enable the portl-agent service (launchd on macOS, systemd on Linux)
+curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash -s -- --agent
+
+# pin a version
+curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash -s -- --version 0.3.0
+
+# toggle back to client-only (removes service, keeps binaries + identity)
+curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash -s -- --client-only --yes
+
+# fully uninstall (keeps $PORTL_HOME)
+curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash -s -- --uninstall --yes
+```
+
+The installer is idempotent — re-run it any time to upgrade, switch
+between client-only and agent modes, or pin a specific version.
+Works in Docker containers (service install is auto-skipped).
+Supports darwin arm64 / x86_64 and linux-musl arm64 / x86_64.
+
+### From a package manager
+
+```bash
+# mise
+mise use -g github:KnickKnackLabs/portl@0.3.0
+# (mise only shims `portl`; if you want the agent, run `install.sh --agent`
+#  afterwards or symlink `portl-agent` into ~/.local/bin manually)
+
+# cargo
+cargo install --git https://github.com/KnickKnackLabs/portl --locked portl
+```
+
+### From source
+
+```bash
 git clone https://github.com/KnickKnackLabs/portl
 cd portl
 cargo install --path crates/portl-cli
+```
 
-# One-time setup:
+## Quickstart (Docker adapter)
+
+```bash
+# One-time setup (created automatically by install.sh if run for the first time):
 portl init
 
 # Spin up an ephemeral container + mint a ticket:

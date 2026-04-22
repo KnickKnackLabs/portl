@@ -362,7 +362,6 @@ fn parse_secret_hex(value: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
-    use std::path::PathBuf;
     use std::sync::{LazyLock, Mutex};
 
     use tempfile::tempdir;
@@ -374,34 +373,38 @@ mod tests {
 
     #[test]
     fn from_env_parses_defaults_in_empty_env() {
-        with_env(&[], || {
-            let config = AgentConfig::from_env().expect("parse empty env");
-            let home = default_home();
+        let tmp = tempdir().expect("tempdir");
+        with_env(
+            &[("PORTL_HOME", Some(tmp.path().as_os_str().to_os_string()))],
+            || {
+                let config = AgentConfig::from_env().expect("parse empty env");
+                let home = tmp.path().to_path_buf();
 
-            assert_eq!(config.identity_path, Some(home.join("identity.bin")));
-            assert_eq!(
-                config.bind_addr,
-                Some("[::]:0".parse().expect("default listen addr"))
-            );
-            assert_eq!(config.discovery, DiscoveryConfig::default());
-            assert!(config.trust_roots.is_empty());
-            assert_eq!(
-                config.revocations_path,
-                Some(home.join("revocations.jsonl"))
-            );
-            assert_eq!(
-                config.revocations_max_bytes,
-                Some(crate::revocations::DEFAULT_REVOCATIONS_MAX_BYTES)
-            );
-            assert_eq!(config.rate_limit, RateLimitConfig::default());
-            assert_eq!(config.mode, AgentMode::Listener);
-            assert_eq!(
-                config.udp_session_linger_secs,
-                Some(DEFAULT_UDP_SESSION_LINGER_SECS)
-            );
-            assert_eq!(config.metrics_enabled, Some(true));
-            assert_eq!(config.metrics_socket_path, Some(home.join("metrics.sock")));
-        });
+                assert_eq!(config.identity_path, Some(home.join("identity.bin")));
+                assert_eq!(
+                    config.bind_addr,
+                    Some("[::]:0".parse().expect("default listen addr"))
+                );
+                assert_eq!(config.discovery, DiscoveryConfig::default());
+                assert!(config.trust_roots.is_empty());
+                assert_eq!(
+                    config.revocations_path,
+                    Some(home.join("revocations.jsonl"))
+                );
+                assert_eq!(
+                    config.revocations_max_bytes,
+                    Some(crate::revocations::DEFAULT_REVOCATIONS_MAX_BYTES)
+                );
+                assert_eq!(config.rate_limit, RateLimitConfig::default());
+                assert_eq!(config.mode, AgentMode::Listener);
+                assert_eq!(
+                    config.udp_session_linger_secs,
+                    Some(DEFAULT_UDP_SESSION_LINGER_SECS)
+                );
+                assert_eq!(config.metrics_enabled, Some(true));
+                assert_eq!(config.metrics_socket_path, Some(home.join("metrics.sock")));
+            },
+        );
     }
 
     #[test]
@@ -472,11 +475,6 @@ mod tests {
                 assert_eq!(config.peers_path, Some(home.path().join("peers.json")));
             },
         );
-    }
-
-    fn default_home() -> PathBuf {
-        directories::ProjectDirs::from("computer", "KnickKnackLabs", "portl")
-            .map_or_else(|| PathBuf::from("."), |dirs| dirs.data_dir().to_path_buf())
     }
 
     #[allow(unsafe_code)]
