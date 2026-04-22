@@ -37,7 +37,10 @@ pub enum Command {
         force: bool,
         role: Option<InitRole>,
     },
-    Doctor,
+    Doctor {
+        fix: bool,
+        yes: bool,
+    },
     Status {
         peer: String,
         relay: bool,
@@ -288,7 +291,10 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             commands::agent::run::run(mode, upstream_url.as_deref())
         }
         Command::Init { force, role } => commands::init::run(force, role),
-        Command::Doctor => Ok(commands::doctor::run()),
+        Command::Doctor { fix, yes } => Ok(commands::doctor::run(commands::doctor::RunOpts {
+            fix,
+            yes,
+        })),
         Command::Status { peer, relay } => commands::status::run(&peer, relay),
         Command::Shell { peer, cwd, user } => {
             commands::shell::run(&peer, cwd.as_deref(), user.as_deref())
@@ -463,7 +469,15 @@ enum TopLevel {
         role: Option<InitRole>,
     },
     /// Print strictly local diagnostics (clock, identity, listener bind, discovery config, ticket expiry).
-    Doctor,
+    Doctor {
+        /// Attempt to auto-remediate warnings where possible. Currently handles
+        /// duplicate launchd / systemd services (bootout + rm the wrong lane).
+        #[arg(long)]
+        fix: bool,
+        /// Skip confirmation prompts. Required in non-TTY contexts when --fix is set.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Query peer reachability and metadata.
     Status {
         peer: String,
@@ -726,7 +740,7 @@ impl Cli {
     fn into_command(self) -> Command {
         match self.command {
             TopLevel::Init { force, role } => Command::Init { force, role },
-            TopLevel::Doctor => Command::Doctor,
+            TopLevel::Doctor { fix, yes } => Command::Doctor { fix, yes },
             TopLevel::Status { peer, relay } => Command::Status { peer, relay },
             TopLevel::Shell { peer, cwd, user } => Command::Shell { peer, cwd, user },
             TopLevel::Exec {

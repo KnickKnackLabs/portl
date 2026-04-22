@@ -284,6 +284,18 @@ fn parse_discovery(value: &str) -> Result<DiscoveryConfig> {
             "pkarr" => discovery.pkarr = true,
             "local" => discovery.local = true,
             "relay" => discovery.relay.clone_from(&default_relay),
+            other if other.starts_with("relay:") || other.starts_with("relay=") => {
+                // v0.3.1.2: accept explicit relay URL via
+                // `relay:https://relay.mynet.com` (or `relay=<url>`).
+                // Parsed via `RelayUrl::from_str` so invalid URLs
+                // surface a clear error rather than silently
+                // falling back to the default.
+                let url_str = &other["relay:".len()..];
+                let url = url_str
+                    .parse::<RelayUrl>()
+                    .with_context(|| format!("parse relay URL from PORTL_DISCOVERY entry `{other}`"))?;
+                discovery.relay = Some(url);
+            }
             other => bail!("unsupported PORTL_DISCOVERY backend: {other}"),
         }
     }
@@ -453,6 +465,56 @@ mod tests {
                 assert!(!config.discovery.pkarr);
                 assert!(config.discovery.local);
                 assert!(config.discovery.relay.is_some());
+            },
+        );
+    }
+
+    #[test]
+    fn from_env_parses_discovery_with_custom_relay_url() {
+        // v0.3.1.2: `relay:<url>` syntax overrides the default n0
+        // relay with an operator-provided one. Parser MUST round-
+        // trip to the same URL via RelayUrl::from_str.
+        with_env(
+            &[(
+                "PORTL_DISCOVERY",
+                Some(OsString::from("relay:https://relay.mynet.com./")),
+            )],
+            || {
+                let config = AgentConfig::from_env().expect("parse custom relay env");
+                let relay = config.discovery.relay.expect("relay set");
+                assert_eq!(relay.as_str(), "https://relay.mynet.com./");
+            },
+        );
+    }
+
+    #[test]
+    fn from_env_parses_discovery_with_custom_relay_url_alt_separator() {
+        // Accept `relay=<url>` as an alias for `relay:<url>` so users
+        // who instinctively reach for `=` aren't surprised.
+        with_env(
+            &[(
+                "PORTL_DISCOVERY",
+                Some(OsString::from("dns,relay=https://relay.mynet.com./")),
+            )],
+            || {
+                let config = AgentConfig::from_env().expect("parse custom relay env");
+                let relay = config.discovery.relay.expect("relay set");
+                assert_eq!(relay.as_str(), "https://relay.mynet.com./");
+                assert!(config.discovery.dns);
+            },
+        );
+    }
+
+    #[test]
+    fn from_env_rejects_invalid_custom_relay_url() {
+        with_env(
+            &[("PORTL_DISCOVERY", Some(OsString::from("relay:not a url")))],
+            || {
+                let err = AgentConfig::from_env().expect_err("invalid url must error");
+                assert!(
+                    err.to_string().contains("parse relay URL"),
+                    "expected parse-relay-URL error, got: {err}"
+                );
             },
         );
     }

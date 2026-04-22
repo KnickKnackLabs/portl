@@ -33,7 +33,13 @@ struct CheckResult {
     detail: String,
 }
 
-pub fn run() -> ExitCode {
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunOpts {
+    pub fix: bool,
+    pub yes: bool,
+}
+
+pub fn run(opts: RunOpts) -> ExitCode {
     let results: Vec<CheckResult> = vec![
         check_clock_skew(),
         check_identity(),
@@ -58,6 +64,20 @@ pub fn run() -> ExitCode {
             any_fail = true;
         }
         println!("[{tag}] {}: {}", result.name, result.detail);
+    }
+
+    if opts.fix {
+        match fix_service_drift(opts.yes) {
+            Ok(summary) => {
+                if !summary.is_empty() {
+                    println!("{summary}");
+                }
+            }
+            Err(e) => {
+                eprintln!("fix failed: {e:#}");
+                return ExitCode::FAILURE;
+            }
+        }
     }
 
     if any_fail {
@@ -626,6 +646,108 @@ fn systemctl_is_active(extra: &[&str]) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Auto-remediate the duplicate-service drift detected by
+/// [`check_service_drift`].
+///
+/// Strategy: keep the *user* lane (`LaunchAgent` / `--user` systemd
+/// unit), tear down the *system* lane. User-scope is what `portl
+/// install --apply` writes by default for non-root invocations and
+/// is the lane new docs steer toward. The wrong-lane removal is
+/// reversible by re-running `portl install --apply` as root.
+///
+/// Returns a short human-readable summary of what was done. Returns
+/// `Ok("")` when there's nothing to fix.
+fn fix_service_drift(yes: bool) -> anyhow::Result<String> {
+    use anyhow::bail;
+
+    #[cfg(target_os = "macos")]
+    {
+        let uid_str = format!("{}", nix::unistd::getuid());
+        let user_loaded = launchctl_is_loaded(&format!("gui/{uid_str}/com.portl.agent"));
+        let system_loaded = launchctl_is_loaded("system/com.portl.agent");
+
+        if !(user_loaded && system_loaded) {
+            return Ok(String::new());
+        }
+
+        let cmds = [
+            ("sudo", &["launchctl", "bootout", "system/com.portl.agent"][..]),
+            ("sudo", &["rm", "-f", "/Library/LaunchDaemons/com.portl.agent.plist"][..]),
+        ];
+
+        if !yes && !confirm_fix(&cmds)? {
+            bail!("aborted by user");
+        }
+
+        for (bin, args) in cmds {
+            run_remediation(bin, args)?;
+        }
+        Ok("removed system LaunchDaemon; user LaunchAgent retained".to_owned())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let user = systemctl_is_active(&["--user"]);
+        let system = systemctl_is_active(&[]);
+
+        if !(user && system) {
+            return Ok(String::new());
+        }
+
+        let cmds = [
+            ("sudo", &["systemctl", "disable", "--now", "portl-agent.service"][..]),
+            ("sudo", &["rm", "-f", "/etc/systemd/system/portl-agent.service"][..]),
+        ];
+
+        if !yes && !confirm_fix(&cmds)? {
+            bail!("aborted by user");
+        }
+
+        for (bin, args) in cmds {
+            run_remediation(bin, args)?;
+        }
+        Ok("removed system portl-agent.service; user --user unit retained".to_owned())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = yes;
+        Ok(String::new())
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn confirm_fix(cmds: &[(&str, &[&str])]) -> anyhow::Result<bool> {
+    use std::io::{IsTerminal, Write};
+
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("--fix requires --yes when stdin is not a TTY");
+    }
+
+    println!("the following commands will run:");
+    for (bin, args) in cmds {
+        println!("    {bin} {}", args.join(" "));
+    }
+    print!("proceed? [y/N] ");
+    std::io::stdout().flush().ok();
+
+    let mut buf = String::new();
+    std::io::stdin().read_line(&mut buf)?;
+    Ok(matches!(buf.trim(), "y" | "Y" | "yes"))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn run_remediation(bin: &str, args: &[&str]) -> anyhow::Result<()> {
+    use anyhow::Context;
+    println!("    -> {bin} {}", args.join(" "));
+    let status = ProcessCommand::new(bin)
+        .args(args)
+        .status()
+        .with_context(|| format!("spawn {bin}"))?;
+    if !status.success() {
+        anyhow::bail!("{bin} {} exited {status}", args.join(" "));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

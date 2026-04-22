@@ -92,9 +92,12 @@ Options:
             &["doctor", "--help"][..],
             r#"Print strictly local diagnostics (clock, identity, listener bind, discovery config, ticket expiry)
 
-Usage: portl doctor
+Usage: portl doctor [OPTIONS]
 
 Options:
+      --fix   Attempt to auto-remediate warnings where possible. Currently handles duplicate launchd
+              / systemd services (bootout + rm the wrong lane)
+      --yes   Skip confirmation prompts. Required in non-TTY contexts when --fix is set
   -h, --help  Print help
 "#,
         ),

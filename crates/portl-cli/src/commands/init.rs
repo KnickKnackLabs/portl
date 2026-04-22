@@ -38,7 +38,7 @@ pub fn run(force: bool, role: Option<InitRole>) -> Result<ExitCode> {
         );
     }
 
-    let doctor = crate::commands::doctor::run();
+    let doctor = crate::commands::doctor::run(crate::commands::doctor::RunOpts::default());
     if doctor != ExitCode::SUCCESS {
         return Ok(doctor);
     }
