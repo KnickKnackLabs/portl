@@ -5,6 +5,104 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.3.2 — 2026-04-23
+
+Observability dashboard. No wire or schema changes; additive new
+HTTP routes on `metrics.sock` and a new `portl status` dashboard
+mode. Workspace version stays `0.3.1` per the v0.3.0.1 /
+v0.3.1.1 / v0.3.1.2 / v0.3.1.3 / v0.3.1.4 precedent.
+
+### Agent
+
+- New per-peer `ConnectionRegistry` tracks path kind
+  (direct-udp / relay / mixed / unknown), RTT, rx/tx bytes, and
+  up-since-unix. Populated and drained by `ticket_handler` in
+  lockstep with the existing `active_connections` gauge.
+- `metrics.sock` gained path-based HTTP dispatch. Existing
+  `OpenMetrics` is served on `GET /` (and `GET /metrics` as an
+  alias); three new JSON routes land alongside:
+    - `GET /status` — agent info + connections + network
+    - `GET /status/connections` — connections list only
+    - `GET /status/network` — discovery config + relay URLs
+  Unknown paths return `404` with a structured JSON error
+  envelope (`{schema, kind:"error", error:{code,message}}`).
+- Shared JSON envelope with `schema: 1` and a `kind` tag so
+  future additions can coexist on the same socket without
+  version sniffing.
+
+### CLI
+
+- `portl status` gained an optional `<peer>` arg. With no args,
+  prints a local dashboard by hitting the new `/status` route
+  over the agent's UDS. With `<peer>`, runs the existing
+  ticket-handshake reachability probe unchanged.
+- `portl status --json` pretty-prints the `/status` JSON.
+- `portl status --watch <SECS>` re-renders the dashboard every
+  N seconds (1..=3600). On a TTY it uses an ANSI clear + redraw;
+  non-TTY callers see `--- tick N ---` separators instead.
+  Ctrl+C exits clean. `--watch` is rejected with `--json`.
+- New internal `agent_ipc` module wraps the UDS HTTP client so
+  follow-up verbs can share one parser.
+
+### Deferred to v0.3.3 (additive, within the same spec)
+
+- Focused subsections (`status agent`, `status peers`, etc.).
+- `--json` rollout on `doctor`, `peer ls`, `ticket ls`, `whoami`.
+- `portl peer ls --active` runtime overlay.
+- `doctor --verbose` (default hides passing checks).
+
+### Tests & quality
+
+361 tests pass (was 343 in v0.3.1.4); clippy clean under
+`--all-features -D warnings`. No new unsafe; no new heavy deps
+(RFC3339 formatting uses an inline `civil_from_days`
+implementation rather than pulling in `chrono` or `time`).
+
+## 0.3.1.4 — 2026-04-23
+
+Hand-editable config file and multi-relay support. No wire
+changes; existing env-var configuration continues to work with
+identical precedence above portl.toml and below CLI flags.
+Workspace version stays `0.3.1`.
+
+### portl.toml
+
+- New `$PORTL_HOME/portl.toml` (optional). Schema is
+  `schema = 1`; unknown fields are tolerated for forward-compat.
+  Sections:
+    - `[agent]` — `listen_addr`
+    - `[agent.discovery]` — `dns`, `pkarr`, `local`, `relays`
+    - `[agent.rate_limit]` — `rps`, `burst`
+    - `[agent.udp]` — `session_linger_secs`
+    - `[cli]` — reserved for future CLI-local settings
+- Precedence remains CLI flags > env vars > portl.toml >
+  compiled defaults.
+- New `portl config` verb with four subcommands:
+    - `portl config show` — effective merged config
+    - `portl config path` — resolved file location
+    - `portl config default` — print a template (no write)
+    - `portl config validate [PATH]` — parse without applying
+- No auto-creation: the file is only read when it exists.
+  `portl config default > ~/.local/share/portl/portl.toml`
+  bootstraps it explicitly.
+
+### Multi-relay
+
+- `DiscoveryConfig.relays: Vec<RelayUrl>` replaces the old
+  `Option<RelayUrl>`. Empty list disables relay; any entries
+  form an explicit relay set passed to iroh's `RelayMode::custom`.
+- `PORTL_DISCOVERY` grammar extended:
+    - `relay` (bare) — n0 defaults
+    - `relay:<url>` — append a custom URL
+    - `disabled` — no relay
+  The env token and the `[agent.discovery].relays = [...]`
+  TOML list accept the same `"default"` alias and dedupe.
+
+### Tests & quality
+
+343 tests pass (was 329); clippy clean; shellcheck clean
+on `install.sh`.
+
 ## 0.3.1.3 — 2026-04-23
 
 CI / release pipeline cleanup. No binary or CLI changes; workspace
