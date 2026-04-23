@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use portl_agent::status_schema::{ConnectionsResponse, NetworkResponse, StatusResponse};
+use portl_agent::status_schema::{
+    ConnectionsResponse, NetworkResponse, RelayResponse, StatusResponse,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
@@ -48,6 +50,18 @@ pub async fn fetch_connections(socket: &Path) -> Result<ConnectionsResponse> {
 pub async fn fetch_network(socket: &Path) -> Result<NetworkResponse> {
     let body = get(socket, "/status/network").await?;
     serde_json::from_str::<NetworkResponse>(&body).context("decode /status/network JSON")
+}
+
+/// Fetch `/status/relay`.
+///
+/// Not yet directly consumed; the relay section is folded into
+/// the dashboard response today. Kept available as a focused
+/// endpoint for `portl status relay` in v0.3.3.1 without
+/// further agent-side changes.
+#[allow(dead_code)]
+pub async fn fetch_relay(socket: &Path) -> Result<RelayResponse> {
+    let body = get(socket, "/status/relay").await?;
+    serde_json::from_str::<RelayResponse>(&body).context("decode /status/relay JSON")
 }
 
 /// Perform a minimal HTTP/1.1 GET over the given UDS path. Reads

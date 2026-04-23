@@ -5,6 +5,68 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.3.3 — 2026-04-23
+
+Embedded relay (preview MVP). The agent can now optionally serve as
+an iroh-relay for its peers, in-process, gated by the same peer
+store that authorizes ticket handshakes. HTTP-only in this release;
+HTTPS + ACME deferred to v0.3.3.1. Workspace version bumped to
+`0.3.3` (ending the "workspace stays at parent" precedent — minor
+releases now track the tag so `portl --version` matches reality).
+
+### Agent
+
+- New `crates/portl-agent/src/relay.rs` wraps `iroh_relay::server`
+  and gates accept by consulting `state.trust_roots`. Because the
+  trust set is reloaded live by `spawn_peer_store_reload_task`,
+  relay access tracks `peers.json` edits without restart.
+- Three policy tiers exposed via `PORTL_RELAY_POLICY`:
+    - `open`        — `AccessConfig::Everyone`
+    - `peers-only`  — endpoint must be in `trust_roots` (default)
+    - `pairs-only`  — same as `peers-only` in v0.3.3; full
+      enforcement waits on the v0.3.4 pair protocol. Falling back
+      is reported as `pairs_only_pending_v034: true` in the JSON
+      and called out in the human dashboard.
+- Configuration via env vars only in this preview:
+    - `PORTL_RELAY_ENABLE` (`0`/`1`, default `0`)
+    - `PORTL_RELAY_BIND` (default `0.0.0.0:3340`)
+    - `PORTL_RELAY_HOSTNAME` (default = bind IP)
+    - `PORTL_RELAY_POLICY` (`open`/`peers-only`/`pairs-only`)
+- The relay shares one process / one identity / one
+  `tokio::Runtime` with the existing portl-protocol UDP listener.
+  Drop of `RelayHandle` aborts the supervisor.
+- New `/status/relay` IPC route on `metrics.sock` (JSON, schema v1
+  envelope). The relay snapshot is also folded into the top-level
+  `/status` response.
+
+### CLI
+
+- `portl status` (no args) now shows a `relay:` section when the
+  agent has the embedded relay enabled. Hidden when disabled to
+  keep the output uncluttered for the common single-host case.
+- `--json` output of `portl status` includes the new `relay`
+  field. Schema bump deferred until v0.4 — the addition is
+  non-breaking and consumers that ignore unknown fields keep
+  working.
+
+### Out of scope (deferred to v0.3.3.1 within the same spec)
+
+- HTTPS / ACME / operator-provided cert paths.
+- `portl install --apply --with-relay` plist/unit emission.
+- Per-policy / per-reason rejection counters in OpenMetrics.
+- `portl status relay` focused subsection (the dashboard fold-in
+  covers the operator workflow today; the dedicated route exists
+  on the agent side via `/status/relay` for future use).
+
+### Tests & quality
+
+367 tests pass (was 361 in v0.3.2); clippy clean under
+`--all-features -D warnings`. The relay listener is not exercised
+by the unit tests (depends on a free TCP port and live iroh-relay
+spawn); covered by manual smoke testing with a two-endpoint
+loopback locally. Integration tests land alongside HTTPS in
+v0.3.3.1.
+
 ## 0.3.2 — 2026-04-23
 
 Observability dashboard. No wire or schema changes; additive new

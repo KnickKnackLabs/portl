@@ -10,9 +10,11 @@ use portl_core::peer_store::PeerStore;
 use serde::{Deserialize, Serialize};
 
 use crate::config_file::PortlConfig;
+use crate::relay::{RelayPolicy, RelayServerConfig};
 use crate::udp_registry::DEFAULT_UDP_SESSION_LINGER_SECS;
 
 const DEFAULT_LISTEN_ADDR: &str = "[::]:0";
+const DEFAULT_RELAY_BIND: &str = "0.0.0.0:3340";
 #[cfg(test)]
 const AGENT_ENV_VARS: &[&str] = &[
     "PORTL_HOME",
@@ -26,6 +28,10 @@ const AGENT_ENV_VARS: &[&str] = &[
     "PORTL_RATE_LIMIT",
     "PORTL_UDP_SESSION_LINGER_SECS",
     "PORTL_MODE",
+    "PORTL_RELAY_ENABLE",
+    "PORTL_RELAY_BIND",
+    "PORTL_RELAY_HOSTNAME",
+    "PORTL_RELAY_POLICY",
 ];
 
 #[derive(Debug, Clone, Default)]
@@ -54,6 +60,9 @@ pub struct AgentConfig {
     pub udp_session_linger_secs: Option<u64>,
     pub metrics_enabled: Option<bool>,
     pub metrics_socket_path: Option<PathBuf>,
+    /// Optional in-process relay server. `None` = disabled
+    /// (the default). See `PORTL_RELAY_ENABLE` + related vars.
+    pub relay_server: Option<RelayServerConfig>,
 }
 
 impl AgentConfig {
@@ -183,6 +192,8 @@ impl AgentConfig {
             .transpose()?
             .unwrap_or(AgentMode::Listener);
 
+        let relay_server = parse_relay_server_config()?;
+
         Ok(Self {
             identity_path: persistent.then_some(identity_path),
             identity_secret,
@@ -198,6 +209,7 @@ impl AgentConfig {
             udp_session_linger_secs: Some(udp_session_linger_secs),
             metrics_enabled: Some(metrics_enabled),
             metrics_socket_path: Some(home.join("metrics.sock")),
+            relay_server,
         })
     }
 }
@@ -493,6 +505,34 @@ fn parse_secret_hex(value: &str) -> Result<[u8; 32]> {
     bytes
         .try_into()
         .map_err(|_| anyhow!("PORTL_IDENTITY_SECRET_HEX must decode to exactly 32 bytes: {value}"))
+}
+
+/// Parse the `PORTL_RELAY_*` surface. Returns `None` when the relay
+/// is disabled (the default).
+fn parse_relay_server_config() -> Result<Option<RelayServerConfig>> {
+    let enabled = match env_string("PORTL_RELAY_ENABLE")? {
+        Some(value) => parse_bool_env("PORTL_RELAY_ENABLE", &value)?,
+        None => false,
+    };
+    if !enabled {
+        return Ok(None);
+    }
+    let http_bind_value =
+        env_string("PORTL_RELAY_BIND")?.unwrap_or_else(|| DEFAULT_RELAY_BIND.to_owned());
+    let http_bind: SocketAddr = http_bind_value
+        .parse()
+        .with_context(|| format!("parse PORTL_RELAY_BIND as socket address: {http_bind_value}"))?;
+    let hostname =
+        env_string("PORTL_RELAY_HOSTNAME")?.unwrap_or_else(|| http_bind.ip().to_string());
+    let policy = match env_string("PORTL_RELAY_POLICY")? {
+        Some(value) => value.parse::<RelayPolicy>()?,
+        None => RelayPolicy::PeersOnly,
+    };
+    Ok(Some(RelayServerConfig {
+        http_bind,
+        hostname,
+        policy,
+    }))
 }
 
 #[cfg(test)]

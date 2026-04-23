@@ -33,6 +33,7 @@ ed25519-dalek = { workspace = true }
 rand        = { workspace = true }
 iroh        = { workspace = true }
 iroh-base   = { workspace = true }
+iroh-relay  = { workspace = true }
 tokio       = { workspace = true }
 tokio-util  = { workspace = true }
 governor    = { workspace = true }

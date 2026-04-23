@@ -129,6 +129,21 @@ fn render_dashboard_human(snap: &portl_agent::status_schema::StatusResponse) -> 
         );
     }
     let _ = writeln!(s);
+    if snap.relay.enabled {
+        let addr = snap.relay.http_addr.as_deref().unwrap_or("(bind pending)");
+        let policy = snap.relay.policy.as_deref().unwrap_or("peers-only");
+        let _ = writeln!(s, "relay:          enabled, policy={policy}, bind={addr}");
+        if let Some(hostname) = &snap.relay.hostname {
+            let _ = writeln!(s, "                hostname: {hostname}");
+        }
+        if snap.relay.pairs_only_pending_v034 {
+            let _ = writeln!(
+                s,
+                "                note: pairs-only falls back to peers-only until v0.3.4"
+            );
+        }
+        let _ = writeln!(s);
+    }
     let _ = writeln!(s, "connections:    {} active", snap.connections.len());
     for c in &snap.connections {
         let rtt = c

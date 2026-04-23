@@ -22,6 +22,7 @@ pub mod meta_handler;
 pub mod metrics;
 pub mod pipeline;
 pub mod rate_limit;
+pub mod relay;
 pub mod revocations;
 pub mod session;
 pub mod shell_handler;
@@ -151,6 +152,11 @@ pub(crate) struct AgentState {
     pub metrics_socket: PathBuf,
     /// Agent process start time as unix seconds. For `up_since` fields.
     pub started_at_unix: u64,
+    /// Snapshot of the embedded-relay status for `/status/relay`.
+    /// Set to `disabled` when the relay is off; swapped to the live
+    /// config on startup when enabled. `RwLock` keeps it
+    /// trivially cheap to read from the metrics server.
+    pub relay_status: std::sync::RwLock<relay::RelayStatus>,
 }
 
 impl metrics::StatusSource for AgentState {
@@ -182,6 +188,12 @@ impl metrics::StatusSource for AgentState {
                 local: self.discovery.local,
             },
         }
+    }
+
+    fn relay_status(&self) -> relay::RelayStatus {
+        self.relay_status
+            .read()
+            .map_or_else(|_| relay::RelayStatus::disabled(), |g| g.clone())
     }
 }
 
@@ -256,6 +268,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
+        relay_status: std::sync::RwLock::new(relay::RelayStatus::disabled()),
     });
 
     let endpoint = if let Some(endpoint) = cfg.endpoint.clone() {
@@ -277,6 +290,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
     let revocation_reload = spawn_revocation_reload_task(Arc::clone(&state), shutdown.clone());
     let peer_reload = spawn_peer_store_reload_task(Arc::clone(&state), shutdown.clone());
     let metrics_task = spawn_metrics_server(&state, shutdown.clone(), &cfg);
+    let relay_handle = spawn_relay_if_enabled(&state, shutdown.clone(), &cfg).await?;
 
     loop {
         tokio::select! {
@@ -327,6 +341,11 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
     peer_reload.abort();
     if let Some(metrics) = metrics_task {
         metrics.abort();
+    }
+    if let Some(handle) = relay_handle
+        && let Err(err) = handle.shutdown().await
+    {
+        warn!(?err, "relay shutdown reported error");
     }
 
     if signal_shutdown.load(Ordering::SeqCst) && !all_sessions_reaped {
@@ -459,6 +478,25 @@ fn spawn_metrics_server(
             warn!(?err, "metrics server exited with error");
         }
     }))
+}
+
+/// Spawn the in-process iroh-relay if `cfg.relay_server` is
+/// populated. Returns the live handle (drop = shutdown) or `None`
+/// when the relay is disabled.
+async fn spawn_relay_if_enabled(
+    state: &Arc<AgentState>,
+    shutdown: CancellationToken,
+    cfg: &AgentConfig,
+) -> Result<Option<relay::RelayHandle>> {
+    let Some(relay_cfg) = cfg.relay_server.clone() else {
+        return Ok(None);
+    };
+    let handle = relay::spawn(relay_cfg, Arc::clone(state), shutdown).await?;
+    let status = relay::RelayStatus::from_handle(&handle);
+    if let Ok(mut guard) = state.relay_status.write() {
+        *guard = status;
+    }
+    Ok(Some(handle))
 }
 
 /// Re-read `peers.json` every 500ms and swap the in-memory

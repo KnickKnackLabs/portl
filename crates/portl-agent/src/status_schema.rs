@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::conn_registry::ConnectionSnapshot;
+use crate::relay::RelayStatus;
 
 /// Current schema version. Emitted in every response envelope.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -24,6 +25,10 @@ pub struct StatusResponse {
     pub agent: AgentInfo,
     pub connections: Vec<ConnectionSnapshot>,
     pub network: NetworkInfo,
+    /// Embedded-relay snapshot. Always present; `enabled=false` when
+    /// the agent is not acting as a relay.
+    #[serde(default = "RelayStatus::disabled")]
+    pub relay: RelayStatus,
 }
 
 impl StatusResponse {
@@ -32,6 +37,7 @@ impl StatusResponse {
         agent: AgentInfo,
         connections: Vec<ConnectionSnapshot>,
         network: NetworkInfo,
+        relay: RelayStatus,
     ) -> Self {
         Self {
             schema: SCHEMA_VERSION,
@@ -40,6 +46,7 @@ impl StatusResponse {
             agent,
             connections,
             network,
+            relay,
         }
     }
 }
@@ -83,6 +90,27 @@ impl NetworkResponse {
             kind: "status.network".to_owned(),
             generated_at: rfc3339_now(),
             network,
+        }
+    }
+}
+
+/// `/status/relay` response — embedded-relay status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayResponse {
+    pub schema: u32,
+    pub kind: String,
+    pub generated_at: String,
+    pub relay: RelayStatus,
+}
+
+impl RelayResponse {
+    #[must_use]
+    pub fn new(relay: RelayStatus) -> Self {
+        Self {
+            schema: SCHEMA_VERSION,
+            kind: "status.relay".to_owned(),
+            generated_at: rfc3339_now(),
+            relay,
         }
     }
 }
@@ -223,6 +251,7 @@ mod tests {
                     local: false,
                 },
             },
+            RelayStatus::disabled(),
         );
         let json = serde_json::to_string(&r).expect("serialize");
         assert!(json.contains("\"schema\":1"));

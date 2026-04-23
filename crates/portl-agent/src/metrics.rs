@@ -24,7 +24,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::status_schema::{
-    AgentInfo, ConnectionsResponse, ErrorResponse, NetworkInfo, NetworkResponse, StatusResponse,
+    AgentInfo, ConnectionsResponse, ErrorResponse, NetworkInfo, NetworkResponse, RelayResponse,
+    StatusResponse,
 };
 
 #[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
@@ -140,6 +141,7 @@ pub trait StatusSource: Send + Sync + 'static {
     fn agent_info(&self) -> AgentInfo;
     fn connections(&self) -> Vec<crate::conn_registry::ConnectionSnapshot>;
     fn network_info(&self) -> NetworkInfo;
+    fn relay_status(&self) -> crate::relay::RelayStatus;
 }
 
 /// Run the metrics server on the given unix socket path. Blocks until
@@ -244,6 +246,7 @@ async fn serve_one<S: StatusSource>(
                 s.agent_info(),
                 s.connections(),
                 s.network_info(),
+                s.relay_status(),
             ))?,
             None => render_error(
                 503,
@@ -261,6 +264,14 @@ async fn serve_one<S: StatusSource>(
         },
         Some("/status/network") => match status.as_ref() {
             Some(s) => render_json(&NetworkResponse::new(s.network_info()))?,
+            None => render_error(
+                503,
+                "status_unavailable",
+                "agent is too young to expose status",
+            ),
+        },
+        Some("/status/relay") => match status.as_ref() {
+            Some(s) => render_json(&RelayResponse::new(s.relay_status()))?,
             None => render_error(
                 503,
                 "status_unavailable",
@@ -353,6 +364,9 @@ impl StatusSource for NoStatus {
         unreachable!("NoStatus is never invoked")
     }
     fn network_info(&self) -> NetworkInfo {
+        unreachable!("NoStatus is never invoked")
+    }
+    fn relay_status(&self) -> crate::relay::RelayStatus {
         unreachable!("NoStatus is never invoked")
     }
 }

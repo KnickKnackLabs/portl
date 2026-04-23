@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version      = "0.3.1"
+version      = "0.3.3"
 edition      = "2024"
 license      = "MIT"
 repository   = "https://github.com/KnickKnackLabs/portl"
@@ -22,6 +22,7 @@ rust-version = "1.89"
 # transport
 iroh         = { version = "0.98", features = ["address-lookup-mdns"] }
 iroh-base    = "0.98"
+iroh-relay   = { version = "0.98", default-features = false, features = ["server"] }
 iroh-tickets = "0.5"
 tokio        = { version = "1", features = ["full"] }
 tokio-util   = "0.7"
