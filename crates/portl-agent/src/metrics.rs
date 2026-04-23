@@ -23,6 +23,10 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use crate::status_schema::{
+    AgentInfo, ConnectionsResponse, ErrorResponse, NetworkInfo, NetworkResponse, StatusResponse,
+};
+
 #[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
 pub struct AckReasonLabel {
     pub reason: String,
@@ -129,12 +133,31 @@ pub fn default_socket_path() -> PathBuf {
     home.join("metrics.sock")
 }
 
+/// Abstraction over "what the agent knows right now" for the
+/// `/status` IPC routes. Implemented by `AgentState`; tests can
+/// supply a stub.
+pub trait StatusSource: Send + Sync + 'static {
+    fn agent_info(&self) -> AgentInfo;
+    fn connections(&self) -> Vec<crate::conn_registry::ConnectionSnapshot>;
+    fn network_info(&self) -> NetworkInfo;
+}
+
 /// Run the metrics server on the given unix socket path. Blocks until
 /// `shutdown` fires. On drop, removes the socket file.
 pub async fn serve(
     metrics: Arc<Metrics>,
     path: PathBuf,
     shutdown: CancellationToken,
+) -> Result<()> {
+    serve_with_status(metrics, path, shutdown, None::<Arc<NoStatus>>).await
+}
+
+/// Variant that also exposes `/status*` routes backed by `status`.
+pub async fn serve_with_status<S: StatusSource>(
+    metrics: Arc<Metrics>,
+    path: PathBuf,
+    shutdown: CancellationToken,
+    status: Option<Arc<S>>,
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -176,8 +199,9 @@ pub async fn serve(
                     }
                 };
                 let metrics = Arc::clone(&metrics);
+                let status = status.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = serve_one(stream, metrics).await {
+                    if let Err(err) = serve_one(stream, metrics, status).await {
                         debug!(?err, "metrics client handler ended");
                     }
                 });
@@ -198,27 +222,185 @@ impl Drop for SocketGuard {
     }
 }
 
-async fn serve_one(mut stream: UnixStream, metrics: Arc<Metrics>) -> Result<()> {
+async fn serve_one<S: StatusSource>(
+    mut stream: UnixStream,
+    metrics: Arc<Metrics>,
+    status: Option<Arc<S>>,
+) -> Result<()> {
     let mut buf = [0u8; 8192];
-    // Best-effort read of the HTTP request line + headers. We don't
-    // actually branch on the path; any request returns metrics.
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await;
+    let read_result =
+        tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await;
+    let n = match read_result {
+        Ok(Ok(n)) => n,
+        _ => 0,
+    };
+    let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
+    let path = parse_request_path(request);
 
+    let response = match path.as_deref() {
+        Some("/" | "/metrics") => render_metrics(&metrics)?,
+        Some("/status") => match status.as_ref() {
+            Some(s) => render_json(&StatusResponse::new(
+                s.agent_info(),
+                s.connections(),
+                s.network_info(),
+            ))?,
+            None => render_error(
+                503,
+                "status_unavailable",
+                "agent is too young to expose status",
+            ),
+        },
+        Some("/status/connections") => match status.as_ref() {
+            Some(s) => render_json(&ConnectionsResponse::new(s.connections()))?,
+            None => render_error(
+                503,
+                "status_unavailable",
+                "agent is too young to expose status",
+            ),
+        },
+        Some("/status/network") => match status.as_ref() {
+            Some(s) => render_json(&NetworkResponse::new(s.network_info()))?,
+            None => render_error(
+                503,
+                "status_unavailable",
+                "agent is too young to expose status",
+            ),
+        },
+        Some(_) => render_error(404, "not_found", "no such route"),
+        None => render_error(400, "bad_request", "could not parse HTTP request"),
+    };
+
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .context("write IPC response")?;
+    stream.shutdown().await.context("shutdown IPC stream")?;
+    Ok(())
+}
+
+/// Extract the path component from an HTTP request line, e.g. "GET
+/// /status HTTP/1.1\r\n…" → Some("/status"). Returns `None` if the
+/// request couldn't be parsed.
+fn parse_request_path(request: &str) -> Option<String> {
+    let line = request.lines().next()?;
+    let mut parts = line.split_ascii_whitespace();
+    let _method = parts.next()?;
+    let path_with_query = parts.next()?;
+    // Strip query string if present.
+    let path = path_with_query
+        .split_once('?')
+        .map_or(path_with_query, |(p, _)| p);
+    Some(path.to_owned())
+}
+
+fn render_metrics(metrics: &Metrics) -> Result<String> {
     let body = metrics.encode_text()?;
-    let response = format!(
+    Ok(format!(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: application/openmetrics-text; version=1.0.0; charset=utf-8\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\r\n{}",
         body.len(),
         body
-    );
-    stream
-        .write_all(response.as_bytes())
-        .await
-        .context("write metrics response")?;
-    stream.shutdown().await.context("shutdown metrics stream")?;
-    Ok(())
+    ))
+}
+
+fn render_json<T: serde::Serialize>(payload: &T) -> Result<String> {
+    let body = serde_json::to_string(payload).context("serialize JSON IPC response")?;
+    Ok(format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n{}",
+        body.len(),
+        body
+    ))
+}
+
+fn render_error(code: u16, error_code: &'static str, message: &str) -> String {
+    let body =
+        serde_json::to_string(&ErrorResponse::new(error_code, message)).unwrap_or_else(|_| {
+            String::from(
+                r#"{"schema":1,"kind":"error","error":{"code":"serialize_failed","message":""}}"#,
+            )
+        });
+    let reason = match code {
+        400 => "Bad Request",
+        404 => "Not Found",
+        503 => "Service Unavailable",
+        _ => "Error",
+    };
+    format!(
+        "HTTP/1.1 {code} {reason}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
+/// Sentinel `StatusSource` for callers that don't supply one. Returns
+/// `503` for `/status*` routes by virtue of `Option::None`.
+pub struct NoStatus;
+
+impl StatusSource for NoStatus {
+    fn agent_info(&self) -> AgentInfo {
+        unreachable!("NoStatus is never invoked")
+    }
+    fn connections(&self) -> Vec<crate::conn_registry::ConnectionSnapshot> {
+        unreachable!("NoStatus is never invoked")
+    }
+    fn network_info(&self) -> NetworkInfo {
+        unreachable!("NoStatus is never invoked")
+    }
+}
+
+#[cfg(test)]
+mod ipc_tests {
+    use super::*;
+
+    #[test]
+    fn parse_request_path_handles_basic_get() {
+        let req = "GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        assert_eq!(parse_request_path(req).as_deref(), Some("/status"));
+    }
+
+    #[test]
+    fn parse_request_path_strips_query_string() {
+        let req = "GET /status?foo=bar HTTP/1.1\r\n\r\n";
+        assert_eq!(parse_request_path(req).as_deref(), Some("/status"));
+    }
+
+    #[test]
+    fn parse_request_path_handles_root() {
+        let req = "GET / HTTP/1.1\r\n\r\n";
+        assert_eq!(parse_request_path(req).as_deref(), Some("/"));
+    }
+
+    #[test]
+    fn parse_request_path_returns_none_on_garbage() {
+        assert_eq!(parse_request_path(""), None);
+        assert_eq!(parse_request_path("garbage"), None);
+    }
+
+    #[test]
+    fn render_error_response_is_well_formed_http() {
+        let resp = render_error(404, "not_found", "no");
+        assert!(resp.starts_with("HTTP/1.1 404 Not Found\r\n"));
+        assert!(resp.contains("Content-Type: application/json"));
+        assert!(resp.contains(r#""kind":"error""#));
+        assert!(resp.contains(r#""code":"not_found""#));
+    }
+
+    #[test]
+    fn render_metrics_response_uses_openmetrics_content_type() {
+        let m = Metrics::default();
+        let resp = render_metrics(&m).expect("render");
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(resp.contains("application/openmetrics-text"));
+    }
 }
 
 #[cfg(test)]

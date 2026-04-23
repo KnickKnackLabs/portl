@@ -57,7 +57,7 @@ Commands:
   init     Create identity, run doctor, and print next steps
   doctor   Print strictly local diagnostics (clock, identity, listener bind, discovery config,
            ticket expiry)
-  status   Query peer reachability and metadata
+  status   Dashboard (no args) or reachability probe against a peer
   shell    Open an interactive remote PTY shell
   exec     Run a remote command without a PTY
   tcp      Set up one or more local TCP forwards
@@ -104,16 +104,18 @@ Options:
         ),
         (
             &["status", "--help"][..],
-            r#"Query peer reachability and metadata
+            r#"Dashboard (no args) or reachability probe against a peer
 
-Usage: portl status [OPTIONS] <PEER>
+Usage: portl status [OPTIONS] [PEER]
 
 Arguments:
-  <PEER>  
+  [PEER]  Peer identifier (label, `endpoint_id`, or ticket). Omit for the local dashboard
 
 Options:
-      --relay  Also force the handshake over the peer's relay path
-  -h, --help   Print help
+      --relay         Force the handshake over the peer's relay path. Requires <peer>
+      --json          Emit JSON instead of human-readable output
+      --watch <SECS>  Re-render every N seconds (min 1, max 3600). Incompatible with --json
+  -h, --help          Print help
 "#,
         ),
         (

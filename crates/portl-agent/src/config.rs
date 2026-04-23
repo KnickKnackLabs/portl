@@ -9,8 +9,8 @@ use portl_core::endpoint::Endpoint;
 use portl_core::peer_store::PeerStore;
 use serde::{Deserialize, Serialize};
 
-use crate::udp_registry::DEFAULT_UDP_SESSION_LINGER_SECS;
 use crate::config_file::PortlConfig;
+use crate::udp_registry::DEFAULT_UDP_SESSION_LINGER_SECS;
 
 const DEFAULT_LISTEN_ADDR: &str = "[::]:0";
 #[cfg(test)]
@@ -79,9 +79,8 @@ impl AgentConfig {
         // short and avoids a two-pass structure.
         let home = env_path("PORTL_HOME").unwrap_or_else(default_home_dir);
         let file_path = PortlConfig::default_path(&home);
-        let file = PortlConfig::load(&file_path).with_context(|| {
-            format!("load config from {}", file_path.display())
-        })?;
+        let file = PortlConfig::load(&file_path)
+            .with_context(|| format!("load config from {}", file_path.display()))?;
         Self::build(Some(&file))
     }
 
@@ -133,9 +132,7 @@ impl AgentConfig {
         }
 
         let bind_addr_value = env_string("PORTL_LISTEN_ADDR")?
-            .or_else(|| {
-                file.and_then(|f| f.agent.listen_addr.clone())
-            })
+            .or_else(|| file.and_then(|f| f.agent.listen_addr.clone()))
             .unwrap_or_else(|| DEFAULT_LISTEN_ADDR.to_owned());
         let bind_addr = bind_addr_value.parse().with_context(|| {
             format!("parse PORTL_LISTEN_ADDR as socket address: {bind_addr_value}")
@@ -167,17 +164,16 @@ impl AgentConfig {
             })
             .transpose()?
             .unwrap_or(crate::revocations::DEFAULT_REVOCATIONS_MAX_BYTES);
-        let udp_session_linger_secs = if let Some(value) =
-            env_string("PORTL_UDP_SESSION_LINGER_SECS")?
-        {
-            value.parse::<u64>().with_context(|| {
-                format!("parse PORTL_UDP_SESSION_LINGER_SECS as an integer: {value}")
-            })?
-        } else {
-            file.and_then(|f| f.agent.udp.as_ref())
-                .and_then(|u| u.session_linger_secs)
-                .unwrap_or(DEFAULT_UDP_SESSION_LINGER_SECS)
-        };
+        let udp_session_linger_secs =
+            if let Some(value) = env_string("PORTL_UDP_SESSION_LINGER_SECS")? {
+                value.parse::<u64>().with_context(|| {
+                    format!("parse PORTL_UDP_SESSION_LINGER_SECS as an integer: {value}")
+                })?
+            } else {
+                file.and_then(|f| f.agent.udp.as_ref())
+                    .and_then(|u| u.session_linger_secs)
+                    .unwrap_or(DEFAULT_UDP_SESSION_LINGER_SECS)
+            };
         let metrics_enabled = env_string("PORTL_METRICS")?
             .map(|value| parse_bool_env("PORTL_METRICS", &value))
             .transpose()?
@@ -610,7 +606,11 @@ mod tests {
             || {
                 let config = AgentConfig::from_env().expect("parse custom relay env");
                 let relays = &config.discovery.relays;
-                assert_eq!(relays.len(), 1, "expected exactly one relay, got {relays:?}");
+                assert_eq!(
+                    relays.len(),
+                    1,
+                    "expected exactly one relay, got {relays:?}"
+                );
                 assert_eq!(relays[0].as_str(), "https://relay.mynet.com./");
             },
         );
@@ -686,7 +686,9 @@ mod tests {
                     relays.len() >= 2,
                     "expected n0 default + custom, got {relays:?}"
                 );
-                let has_custom = relays.iter().any(|u| u.as_str() == "https://mine.example./");
+                let has_custom = relays
+                    .iter()
+                    .any(|u| u.as_str() == "https://mine.example./");
                 assert!(has_custom, "custom relay missing from {relays:?}");
             },
         );

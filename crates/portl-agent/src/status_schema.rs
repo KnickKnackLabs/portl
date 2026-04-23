@@ -1,0 +1,239 @@
+//! JSON schema v1 for `GET /status*` endpoints.
+//!
+//! Stable contract for v0.3.2+. Additive field changes keep
+//! `schema: 1`; type changes or removals bump to `schema: 2`.
+//!
+//! Consumers should tolerate unknown fields (serde does this
+//! automatically).
+
+use serde::{Deserialize, Serialize};
+
+use crate::conn_registry::ConnectionSnapshot;
+
+/// Current schema version. Emitted in every response envelope.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// Top-level `/status` response — composite of every subsection the
+/// agent can answer for without querying external sources.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusResponse {
+    pub schema: u32,
+    pub kind: String,
+    /// RFC3339 UTC timestamp of response generation.
+    pub generated_at: String,
+    pub agent: AgentInfo,
+    pub connections: Vec<ConnectionSnapshot>,
+    pub network: NetworkInfo,
+}
+
+impl StatusResponse {
+    #[must_use]
+    pub fn new(
+        agent: AgentInfo,
+        connections: Vec<ConnectionSnapshot>,
+        network: NetworkInfo,
+    ) -> Self {
+        Self {
+            schema: SCHEMA_VERSION,
+            kind: "status".to_owned(),
+            generated_at: rfc3339_now(),
+            agent,
+            connections,
+            network,
+        }
+    }
+}
+
+/// `/status/connections` response — just the list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectionsResponse {
+    pub schema: u32,
+    pub kind: String,
+    pub generated_at: String,
+    pub connections: Vec<ConnectionSnapshot>,
+}
+
+impl ConnectionsResponse {
+    #[must_use]
+    pub fn new(connections: Vec<ConnectionSnapshot>) -> Self {
+        Self {
+            schema: SCHEMA_VERSION,
+            kind: "status.connections".to_owned(),
+            generated_at: rfc3339_now(),
+            connections,
+        }
+    }
+}
+
+/// `/status/network` response — relay URL list, NAT type placeholder,
+/// discovery backends.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkResponse {
+    pub schema: u32,
+    pub kind: String,
+    pub generated_at: String,
+    pub network: NetworkInfo,
+}
+
+impl NetworkResponse {
+    #[must_use]
+    pub fn new(network: NetworkInfo) -> Self {
+        Self {
+            schema: SCHEMA_VERSION,
+            kind: "status.network".to_owned(),
+            generated_at: rfc3339_now(),
+            network,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentInfo {
+    pub pid: u32,
+    pub version: String,
+    /// Unix seconds when the agent process started.
+    pub started_at_unix: u64,
+    /// Absolute path of `$PORTL_HOME`.
+    pub home: String,
+    /// Absolute path of `metrics.sock`, surfaced so clients don't
+    /// re-derive it.
+    pub metrics_socket: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkInfo {
+    /// Ordered list of relay URLs the agent is configured to use.
+    /// Empty = relay disabled locally.
+    pub relays: Vec<String>,
+    pub discovery: DiscoveryInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveryInfo {
+    pub dns: bool,
+    pub pkarr: bool,
+    pub local: bool,
+}
+
+/// JSON error envelope used for 4xx/5xx replies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorResponse {
+    pub schema: u32,
+    pub kind: String,
+    pub error: ErrorBody,
+}
+
+impl ErrorResponse {
+    #[must_use]
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            schema: SCHEMA_VERSION,
+            kind: "error".to_owned(),
+            error: ErrorBody {
+                code: code.to_owned(),
+                message: message.into(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorBody {
+    pub code: String,
+    pub message: String,
+}
+
+fn rfc3339_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Minimal RFC3339 without pulling in chrono/time: render UTC
+    // from unix seconds. Good enough for "observability timestamp"
+    // (sub-second precision isn't needed for a dashboard).
+    let (year, month, day, hh, mm, ss) = unix_to_ymdhms(secs);
+    format!("{year:04}-{month:02}-{day:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
+/// Small RFC3339 UTC decomposer. Gregorian, UTC, no leap-second
+/// handling (UNIX time smears them anyway). Uses Howard Hinnant's
+/// `civil_from_days` algorithm.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::many_single_char_names
+)]
+fn unix_to_ymdhms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
+    let days = i64::try_from(secs / 86_400).unwrap_or(0);
+    let rem = (secs % 86_400) as u32;
+    let hours = rem / 3600;
+    let minutes = (rem % 3600) / 60;
+    let seconds_of_minute = rem % 60;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u32; // [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y_i64 = i64::from(yoe) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y_i64 + 1 } else { y_i64 };
+    (year as u32, month, day, hours, minutes, seconds_of_minute)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unix_epoch_decomposes_correctly() {
+        assert_eq!(unix_to_ymdhms(0), (1970, 1, 1, 0, 0, 0));
+    }
+
+    #[test]
+    fn known_timestamp_decomposes_correctly() {
+        // 2024-01-01T00:00:00Z = 1_704_067_200
+        assert_eq!(
+            unix_to_ymdhms(1_704_067_200),
+            (2024, 1, 1, 0, 0, 0),
+            "unix_to_ymdhms(2024-01-01 epoch)"
+        );
+    }
+
+    #[test]
+    fn status_response_serializes_with_schema_and_kind() {
+        let r = StatusResponse::new(
+            AgentInfo {
+                pid: 1,
+                version: "0.3.2".to_owned(),
+                started_at_unix: 1_704_067_200,
+                home: "/home".into(),
+                metrics_socket: "/home/metrics.sock".into(),
+            },
+            Vec::new(),
+            NetworkInfo {
+                relays: vec!["https://relay.example./".into()],
+                discovery: DiscoveryInfo {
+                    dns: true,
+                    pkarr: true,
+                    local: false,
+                },
+            },
+        );
+        let json = serde_json::to_string(&r).expect("serialize");
+        assert!(json.contains("\"schema\":1"));
+        assert!(json.contains("\"kind\":\"status\""));
+        assert!(json.contains("\"version\":\"0.3.2\""));
+    }
+
+    #[test]
+    fn error_response_stable_shape() {
+        let e = ErrorResponse::new("agent_unreachable", "couldn't reach IPC");
+        let json = serde_json::to_string(&e).expect("serialize");
+        assert!(json.contains("\"kind\":\"error\""));
+        assert!(json.contains("\"code\":\"agent_unreachable\""));
+    }
+}

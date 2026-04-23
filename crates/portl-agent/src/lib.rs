@@ -15,6 +15,7 @@ pub mod audit;
 pub mod caps_enforce;
 pub mod config;
 pub mod config_file;
+pub mod conn_registry;
 pub mod endpoint;
 pub mod gateway;
 pub mod meta_handler;
@@ -25,6 +26,7 @@ pub mod revocations;
 pub mod session;
 pub mod shell_handler;
 pub mod shell_registry;
+pub mod status_schema;
 pub mod stream_io;
 pub mod tcp_handler;
 pub mod ticket_handler;
@@ -132,10 +134,55 @@ pub(crate) struct AgentState {
     pub udp_registry: udp_registry::UdpSessionRegistry,
     pub mode: AgentMode,
     pub metrics: Arc<metrics::Metrics>,
+    /// Per-peer connection tracker. Populated from ticket/shell/tcp/udp
+    /// handlers, read by the `/status/connections` IPC route.
+    pub connections: conn_registry::ConnectionRegistry,
     /// Path to the peer store so the reload task can re-read it
     /// without threading the config through. `None` in tests that
     /// bypass `run_with_shutdown`.
     pub peers_path: Option<PathBuf>,
+    /// Snapshot of discovery config taken at startup. Used by the
+    /// `/status/network` IPC route. Discovery reconfig requires a
+    /// restart in v0.3.2; that's fine for the dashboard use-case.
+    pub discovery: DiscoveryConfig,
+    /// Absolute path of `$PORTL_HOME`; surfaced via `/status`.
+    pub home: PathBuf,
+    /// Absolute path of `metrics.sock`; surfaced via `/status`.
+    pub metrics_socket: PathBuf,
+    /// Agent process start time as unix seconds. For `up_since` fields.
+    pub started_at_unix: u64,
+}
+
+impl metrics::StatusSource for AgentState {
+    fn agent_info(&self) -> status_schema::AgentInfo {
+        status_schema::AgentInfo {
+            pid: std::process::id(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            started_at_unix: self.started_at_unix,
+            home: self.home.display().to_string(),
+            metrics_socket: self.metrics_socket.display().to_string(),
+        }
+    }
+
+    fn connections(&self) -> Vec<conn_registry::ConnectionSnapshot> {
+        self.connections.snapshot()
+    }
+
+    fn network_info(&self) -> status_schema::NetworkInfo {
+        status_schema::NetworkInfo {
+            relays: self
+                .discovery
+                .relays
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            discovery: status_schema::DiscoveryInfo {
+                dns: self.discovery.dns,
+                pkarr: self.discovery.pkarr,
+                local: self.discovery.local,
+            },
+        }
+    }
 }
 
 #[instrument(skip_all)]
@@ -160,6 +207,7 @@ fn maybe_test_panic() {
 fn maybe_test_panic() {}
 
 #[instrument(skip_all)]
+#[allow(clippy::too_many_lines)]
 pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) -> Result<()> {
     audit::init();
 
@@ -192,7 +240,22 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
         ),
         mode: cfg.mode.clone(),
         metrics: Arc::new(metrics::Metrics::default()),
+        connections: conn_registry::ConnectionRegistry::new(),
         peers_path: cfg.peers_path.clone(),
+        discovery: cfg.discovery.clone(),
+        home: cfg
+            .peers_path
+            .as_ref()
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+            .unwrap_or_else(std::env::temp_dir),
+        metrics_socket: cfg
+            .metrics_socket_path
+            .clone()
+            .unwrap_or_else(metrics::default_socket_path),
+        started_at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
     });
 
     let endpoint = if let Some(endpoint) = cfg.endpoint.clone() {
@@ -390,8 +453,9 @@ fn spawn_metrics_server(
         .clone()
         .unwrap_or_else(metrics::default_socket_path);
     let metrics = Arc::clone(&state.metrics);
+    let status = Arc::clone(state);
     Some(tokio::spawn(async move {
-        if let Err(err) = metrics::serve(metrics, path, shutdown).await {
+        if let Err(err) = metrics::serve_with_status(metrics, path, shutdown, Some(status)).await {
             warn!(?err, "metrics server exited with error");
         }
     }))

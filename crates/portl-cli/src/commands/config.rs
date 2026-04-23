@@ -58,8 +58,7 @@ pub enum ConfigAction {
 
 fn run_show() -> Result<()> {
     let path = effective_path();
-    let cfg = PortlConfig::load(&path)
-        .with_context(|| format!("load {}", path.display()))?;
+    let cfg = PortlConfig::load(&path).with_context(|| format!("load {}", path.display()))?;
     let text = toml::to_string_pretty(&cfg).context("serialize config")?;
     println!("# effective file config (env overrides not shown)");
     println!("# source: {}", path.display());
@@ -76,8 +75,7 @@ fn run_validate(path: Option<PathBuf>) -> Result<()> {
     if !path.exists() {
         anyhow::bail!("{} does not exist", path.display());
     }
-    let _cfg = PortlConfig::load(&path)
-        .with_context(|| format!("parse {}", path.display()))?;
+    let _cfg = PortlConfig::load(&path).with_context(|| format!("parse {}", path.display()))?;
     println!("ok: {} parses cleanly", path.display());
     Ok(())
 }
@@ -85,10 +83,8 @@ fn run_validate(path: Option<PathBuf>) -> Result<()> {
 /// Resolve the effective `portl.toml` path. Honors `PORTL_HOME`;
 /// falls back to the platform default home dir.
 fn effective_path() -> PathBuf {
-    let home = std::env::var_os("PORTL_HOME").map_or_else(
-        portl_agent::config::default_home_dir,
-        PathBuf::from,
-    );
+    let home = std::env::var_os("PORTL_HOME")
+        .map_or_else(portl_agent::config::default_home_dir, PathBuf::from);
     PortlConfig::default_path(&home)
 }
 

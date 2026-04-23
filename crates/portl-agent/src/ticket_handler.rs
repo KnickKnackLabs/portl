@@ -88,6 +88,13 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
             audit::ticket_accepted(&session);
             state.metrics.tickets_accepted.inc();
             state.metrics.active_connections.inc();
+            // v0.3.2: track this connection in the per-peer registry
+            // so `portl status connections` can list it. Path is
+            // best-effort: iroh exposes conn_type but it can change
+            // post-handshake; we set Unknown initially.
+            state
+                .connections
+                .insert(source_id, crate::conn_registry::PathKind::Unknown);
             Some(session)
         }
         AcceptanceOutcome::Rejected { reason } => {
@@ -120,6 +127,8 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
     let udp_context = Arc::new(UdpConnectionContext::new(state.udp_registry.clone()));
     let _conn_gauge_guard = ConnectionGaugeGuard {
         metrics: Arc::clone(&state.metrics),
+        connections: state.connections.clone(),
+        peer_eid: source_id,
     };
 
     loop {
@@ -233,15 +242,19 @@ fn unix_now_secs() -> Result<u64> {
         .as_secs())
 }
 
-/// Decrement `active_connections` when the authenticated stream loop
-/// exits, regardless of whether it exited cleanly or via an error.
+/// Decrement `active_connections` and drop the per-peer entry from
+/// `ConnectionRegistry` when the authenticated stream loop exits,
+/// regardless of whether it exited cleanly or via an error.
 struct ConnectionGaugeGuard {
     metrics: Arc<crate::metrics::Metrics>,
+    connections: crate::conn_registry::ConnectionRegistry,
+    peer_eid: [u8; 32],
 }
 
 impl Drop for ConnectionGaugeGuard {
     fn drop(&mut self) {
         self.metrics.active_connections.dec();
+        self.connections.remove(&self.peer_eid);
     }
 }
 

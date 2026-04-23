@@ -7,6 +7,7 @@
 //! on a structured [`Command`] value without caring about
 //! stdout, exit codes, or process setup.
 
+mod agent_ipc;
 mod alias_store;
 mod commands;
 mod release_binary;
@@ -42,8 +43,10 @@ pub enum Command {
         yes: bool,
     },
     Status {
-        peer: String,
+        peer: Option<String>,
         relay: bool,
+        json: bool,
+        watch: Option<u64>,
     },
     Shell {
         peer: String,
@@ -298,7 +301,12 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             fix,
             yes,
         })),
-        Command::Status { peer, relay } => commands::status::run(&peer, relay),
+        Command::Status {
+            peer,
+            relay,
+            json,
+            watch,
+        } => commands::status::run(peer.as_deref(), relay, json, watch),
         Command::Shell { peer, cwd, user } => {
             commands::shell::run(&peer, cwd.as_deref(), user.as_deref())
         }
@@ -482,12 +490,20 @@ enum TopLevel {
         #[arg(long)]
         yes: bool,
     },
-    /// Query peer reachability and metadata.
+    /// Dashboard (no args) or reachability probe against a peer.
     Status {
-        peer: String,
-        /// Also force the handshake over the peer's relay path.
+        /// Peer identifier (label, `endpoint_id`, or ticket). Omit for
+        /// the local dashboard.
+        peer: Option<String>,
+        /// Force the handshake over the peer's relay path. Requires <peer>.
         #[arg(long)]
         relay: bool,
+        /// Emit JSON instead of human-readable output.
+        #[arg(long)]
+        json: bool,
+        /// Re-render every N seconds (min 1, max 3600). Incompatible with --json.
+        #[arg(long, value_name = "SECS")]
+        watch: Option<u64>,
     },
     /// Open an interactive remote PTY shell.
     Shell {
@@ -766,7 +782,17 @@ impl Cli {
         match self.command {
             TopLevel::Init { force, role } => Command::Init { force, role },
             TopLevel::Doctor { fix, yes } => Command::Doctor { fix, yes },
-            TopLevel::Status { peer, relay } => Command::Status { peer, relay },
+            TopLevel::Status {
+                peer,
+                relay,
+                json,
+                watch,
+            } => Command::Status {
+                peer,
+                relay,
+                json,
+                watch,
+            },
             TopLevel::Shell { peer, cwd, user } => Command::Shell { peer, cwd, user },
             TopLevel::Exec {
                 peer,

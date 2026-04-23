@@ -19,12 +19,132 @@ use serde::{Deserialize, Serialize};
 
 use crate::alias_store::AliasStore;
 
-pub fn run(peer: &str, relay: bool) -> Result<ExitCode> {
-    run_with_identity_path_mode(peer, None, relay)
+pub fn run(peer: Option<&str>, relay: bool, json: bool, watch: Option<u64>) -> Result<ExitCode> {
+    if let Some(p) = peer {
+        if json || watch.is_some() {
+            bail!("--json and --watch are only supported on the no-arg dashboard form");
+        }
+        run_with_identity_path_mode(p, None, relay)
+    } else {
+        if relay {
+            bail!("--relay requires <peer>");
+        }
+        run_dashboard(json, watch)
+    }
 }
 
 pub fn run_with_identity_path(peer: &str, identity_path: Option<&Path>) -> Result<ExitCode> {
     run_with_identity_path_mode(peer, identity_path, false)
+}
+
+/// No-peer-arg dashboard: pull from the agent's IPC socket and
+/// render either as a human table or as JSON.
+fn run_dashboard(json: bool, watch: Option<u64>) -> Result<ExitCode> {
+    if json && watch.is_some() {
+        bail!("--watch --json is not supported (watching JSON is meaningless)");
+    }
+    let Some(interval_secs) = watch else {
+        return render_once(json);
+    };
+    if !(1..=3600).contains(&interval_secs) {
+        bail!("--watch interval must be between 1 and 3600 seconds");
+    }
+    let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async move {
+        let mut tick = 0u64;
+        let ctrl_c = tokio::signal::ctrl_c();
+        tokio::pin!(ctrl_c);
+        loop {
+            if is_tty {
+                print!("\x1b[2J\x1b[H");
+            } else {
+                println!("--- tick {tick} ---");
+            }
+            match dashboard_snapshot().await {
+                Ok(snap) => println!("{}", render_dashboard_human(&snap)),
+                Err(e) => {
+                    eprintln!("(status unavailable: {e:#}) — retrying in {interval_secs}s");
+                }
+            }
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(interval_secs)) => {}
+                _ = &mut ctrl_c => break,
+            }
+            tick += 1;
+        }
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn render_once(json: bool) -> Result<ExitCode> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let snap = runtime.block_on(async { dashboard_snapshot().await })?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&snap)?);
+    } else {
+        println!("{}", render_dashboard_human(&snap));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn dashboard_snapshot() -> Result<portl_agent::status_schema::StatusResponse> {
+    let socket = crate::agent_ipc::default_socket_path();
+    crate::agent_ipc::fetch_status(&socket)
+        .await
+        .with_context(|| format!("contact agent at {}", socket.display()))
+}
+
+fn render_dashboard_human(snap: &portl_agent::status_schema::StatusResponse) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(snap.agent.started_at_unix);
+    let up = now.saturating_sub(snap.agent.started_at_unix);
+    let _ = writeln!(
+        s,
+        "agent:          pid {} v{} up {}",
+        snap.agent.pid,
+        snap.agent.version,
+        humantime::format_duration(std::time::Duration::from_secs(up))
+    );
+    let _ = writeln!(s, "                home: {}", snap.agent.home);
+    let _ = writeln!(s, "                metrics: {}", snap.agent.metrics_socket);
+    let _ = writeln!(s);
+    let _ = writeln!(
+        s,
+        "network:        discovery: dns={} pkarr={} local={}",
+        snap.network.discovery.dns, snap.network.discovery.pkarr, snap.network.discovery.local
+    );
+    if snap.network.relays.is_empty() {
+        let _ = writeln!(s, "                relays:    (disabled)");
+    } else {
+        let _ = writeln!(
+            s,
+            "                relays:    {}",
+            snap.network.relays.join(", ")
+        );
+    }
+    let _ = writeln!(s);
+    let _ = writeln!(s, "connections:    {} active", snap.connections.len());
+    for c in &snap.connections {
+        let rtt = c
+            .rtt_micros
+            .map_or_else(|| "—".to_owned(), |u| format!("{}ms", u / 1000));
+        let up_secs = now.saturating_sub(c.up_since_unix);
+        let _ = writeln!(
+            s,
+            "                - {eid_short}…  path={path}  rtt={rtt}  up={up_secs}s  rx={rx}B tx={tx}B",
+            eid_short = &c.peer_eid[..16.min(c.peer_eid.len())],
+            path = c.path.as_str(),
+            rx = c.bytes_rx,
+            tx = c.bytes_tx,
+        );
+    }
+    s
 }
 
 fn run_with_identity_path_mode(

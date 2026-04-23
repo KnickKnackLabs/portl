@@ -135,8 +135,9 @@ impl PortlConfig {
     /// config."
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
-            Ok(text) => Self::parse_toml(&text)
-                .with_context(|| format!("parse {}", path.display())),
+            Ok(text) => {
+                Self::parse_toml(&text).with_context(|| format!("parse {}", path.display()))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
         }
@@ -193,7 +194,12 @@ schema = 1
 relays = ["default", "https://relay.mynet.com./"]
 "#;
         let cfg = PortlConfig::parse_toml(text).expect("parse");
-        let relays = cfg.agent.discovery.expect("discovery").relays.expect("relays");
+        let relays = cfg
+            .agent
+            .discovery
+            .expect("discovery")
+            .relays
+            .expect("relays");
         assert_eq!(relays.len(), 2);
         assert_eq!(relays[0], "default");
     }
