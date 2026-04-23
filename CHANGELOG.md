@@ -3,6 +3,99 @@
 All notable changes land here. This project follows
 [Semantic Versioning](https://semver.org/) from v0.1.0 onward.
 
+## Unreleased
+
+## 0.3.1.3 — 2026-04-23
+
+CI / release pipeline cleanup. No binary or CLI changes; workspace
+version stays `0.3.1` per the v0.3.0.1 / v0.3.1.1 / v0.3.1.2
+precedent.
+
+### CI / release pipeline
+
+- Release workflow split out of CI. `.github/workflows/ci.yml`
+  now fires on main pushes and PRs only; tag pushes (`v*`) trigger
+  a dedicated `.github/workflows/release.yml` that gates on CI
+  being green for the tagged SHA via a parallel
+  `fountainhead/action-wait-for-check` matrix (one leg per required
+  check — `cargo test`, `rustfmt`, `clippy`, `cargo deny`,
+  `dep-guard`, `docker integration smoke` — with `fail-fast: true`
+  so any red check cancels the rest immediately). Net effect: one
+  CI run + one Release run per tagged release, instead of the
+  previous duplicated CI matrix when a tag pointed at a commit
+  already on main.
+- GitHub release notes now contain only the CHANGELOG section for
+  the released version (extracted from the matching
+  `## <version> — <date>` heading) instead of the full
+  CHANGELOG.md. Release publish fails fast with an actionable
+  error if no matching section exists for the tag, so tagging
+  without a CHANGELOG entry becomes a hard fail rather than a
+  silent "entire history dumped as release body".
+
+## 0.3.1.2 — 2026-04-23
+
+Two additive fixes driven by gaps hit during v0.3.1 self-host
+testing. No CLI / wire / schema changes beyond the additive flag
+surface; workspace version stays `0.3.1` per the v0.3.0.1 /
+v0.3.1.1 precedent.
+
+### Relay / discovery
+
+- `PORTL_DISCOVERY` now accepts an operator-provided relay URL via
+  `relay:<url>` or `relay=<url>`. Previously the bare `relay`
+  token meant "use the iroh default n0 relay" and any URL suffix
+  was rejected as an unsupported backend, leaving self-hosted
+  relay operators without a way to point agents at their own
+  server. URLs are parsed through `iroh::RelayUrl::from_str`, so
+  malformed values surface a clear error instead of a generic
+  "unsupported PORTL_DISCOVERY backend".
+
+  ```
+  PORTL_DISCOVERY=dns,pkarr,local,relay:https://relay.mynet.com
+  ```
+
+### Doctor
+
+- `portl doctor --fix` auto-remediates the duplicate-service drift
+  that the v0.3.1 doctor started warning about (both user
+  LaunchAgent + system LaunchDaemon loaded on macOS, or both
+  user + system systemd units active on Linux — they fight over
+  UDP binds). Strategy: keep the user lane (what
+  `portl install --apply` writes by default for non-root
+  invocations); tear down the system lane via
+  `sudo launchctl bootout system/com.portl.agent` /
+  `sudo systemctl disable --now portl-agent.service` plus unit
+  file removal.
+- `--yes` is required when stdin is non-TTY (scripting contexts).
+- No-drift state is a clean no-op.
+
+## 0.3.1.1 — 2026-04-23
+
+Hotfix for a P0 install regression in v0.3.1: a fresh install
+ended with a 0-byte `portl` binary.
+
+### Container / install
+
+- `portl install --apply` no longer truncates the portl binary to
+  0 bytes on reinstall. Two compounding bugs caused the regression:
+  `install.sh` created `portl-agent` + `portl-gateway` as symlinks
+  to `portl`, and `portl install --apply` then called
+  `std::fs::copy(current_exe, "…/portl-agent")`, which opens dst
+  with `O_WRONLY|O_CREAT|O_TRUNC` *before* reading src. The open
+  followed the symlink and truncated `portl` itself, so the
+  subsequent read returned 0 bytes.
+- Double fix, defense in depth:
+  - `install.sh` now uses `install -m 0755` to create real copies
+    of the multicall entrypoints (~10 MB each; trivially cheap).
+    Eliminates the footgun class for the install.sh code path.
+  - `portl install --apply` gains `install_binary_safely()`:
+    canonicalizes src and dst, short-circuits on same-inode
+    (handles idempotent re-apply and symlink-to-self), and
+    unlinks dst before the copy — breaks any inode identity
+    *before* dst is opened for writing, so even a symlink
+    introduced between canonicalization and open can't truncate
+    src.
+
 ## 0.3.1 — 2026-04-23
 
 Ergonomics release. Three P0 container-bootstrap regressions from

@@ -1,0 +1,228 @@
+name: Release
+
+# Fires on `v*` tag pushes. Gated on `ci.yml` being green for the
+# tagged SHA (see `ci-gate` job) — we never re-run CI on the tag, so
+# tagging a commit that already passed main-CI costs only one extra
+# workflow run (Release) instead of a duplicated CI matrix.
+#
+# Requirements before pushing a `v*` tag:
+#  - The tagged commit has a green run of `ci.yml` on the same SHA.
+#    (Usually true because you tag a commit that already landed on
+#    main. If not, `ci-gate` polls for up to 30 min waiting for a
+#    CI run to appear and complete.)
+#  - CHANGELOG.md has a matching `## <version> — YYYY-MM-DD` section
+#    for the tag. `release-publish` extracts that section as the
+#    GitHub release body and fails if it's missing.
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  ci-gate:
+    # One parallel gate job per required CI check. Matrix legs run
+    # concurrently, so if any check fails, `fail-fast: true` cancels
+    # the other legs instead of waiting on the slowest to finish.
+    # `release-build` depends on `ci-gate`, and `needs:` against a
+    # matrix job requires every leg to succeed before downstream
+    # jobs start.
+    #
+    # `matrix.check` values must match the `name:` fields on the
+    # corresponding jobs in ci.yml exactly. If you rename a CI job,
+    # update the matching entry here or the gate will hang until
+    # timeout waiting for a check that will never appear.
+    name: wait for `${{ matrix.check }}`
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        check:
+          - cargo test
+          - rustfmt
+          - clippy
+          - cargo deny
+          - dep-guard
+          - docker integration smoke
+    steps:
+      - id: wait
+        uses: fountainhead/action-wait-for-check@v1.2.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          checkName: ${{ matrix.check }}
+          ref: ${{ github.sha }}
+          timeoutSeconds: 1800
+          intervalSeconds: 15
+      # fountainhead/action-wait-for-check exits 0 on both
+      # `conclusion: success` AND timeout/failure (it only sets the
+      # `conclusion` output). Assert explicitly so a non-success
+      # conclusion fails this leg and, via fail-fast, cancels the
+      # rest of the gate.
+      - name: Assert `${{ matrix.check }}` concluded success
+        env:
+          CONCLUSION: ${{ steps.wait.outputs.conclusion }}
+          CHECK: ${{ matrix.check }}
+        run: |
+          set -euo pipefail
+          if [ "$CONCLUSION" != "success" ]; then
+            echo "::error ::CI check '$CHECK' conclusion was '$CONCLUSION' (expected 'success')"
+            exit 1
+          fi
+          echo "OK: $CHECK -> $CONCLUSION"
+
+  release-build:
+    name: release build (${{ matrix.target }})
+    needs: [ci-gate]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux builds use musl for a fully static binary that runs
+          # on any glibc version, Alpine, distroless, etc.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            linux: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            linux: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      # Per-target cache. `shared-key: release-<target>` so successive
+      # release tags (v0.1.1 → v0.1.2 → …) warm-start each other on the
+      # same target. First release on a new target is cold; after
+      # that, same-target releases benefit. Cross-target sharing is
+      # impossible because rustc output differs per target triple.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+          cache-shared-key: "release-${{ matrix.target }}"
+          cache-save-if: true
+          cache-on-failure: true
+      - name: Install zig (linux only)
+        if: matrix.linux
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+      - name: Install cargo-zigbuild (linux only)
+        # taiki-e/install-action downloads the prebuilt cargo-zigbuild
+        # binary — ~5 s vs ~1 min source build, decoupled from our
+        # pinned 1.89 toolchain.
+        if: matrix.linux
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Build (linux musl via zigbuild)
+        if: matrix.linux
+        run: cargo zigbuild --release --target ${{ matrix.target }} --bin portl
+      - name: Build (macOS native)
+        if: matrix.linux != true
+        run: cargo build --release --target ${{ matrix.target }} --bin portl
+      - name: Package (tar.zst level 19)
+        env:
+          # Disable macOS AppleDouble metadata so tarballs produced on
+          # the macos-latest runners stay clean when extracted on linux.
+          COPYFILE_DISABLE: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p dist staging
+          NAME="portl-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "staging/${NAME}"
+          cp "target/${{ matrix.target }}/release/portl" "staging/${NAME}/portl"
+          (
+            cd "staging/${NAME}"
+            ln -sf portl portl-agent
+            ln -sf portl portl-gateway
+            test -L portl-agent
+            test -L portl-gateway
+          )
+          cp LICENSE-MIT CHANGELOG.md "staging/${NAME}/"
+          # --no-mac-metadata strips any remaining com.apple.* xattrs
+          # on macos-latest runners; GNU tar on ubuntu-latest ignores
+          # the flag silently, so the invocation is portable.
+          tar_flags=(-C staging \
+              --use-compress-program='zstd -19 -T0 --long' \
+              -cf "dist/${NAME}.tar.zst" "${NAME}")
+          if tar --help 2>&1 | grep -q -- --no-mac-metadata; then
+              tar --no-mac-metadata "${tar_flags[@]}"
+          else
+              tar "${tar_flags[@]}"
+          fi
+          # Write the shasum with a path-less filename so users can
+          # `sha256sum -c ...sha256` next to the tarball without
+          # recreating a dist/ directory.
+          (cd dist && shasum -a 256 "${NAME}.tar.zst" > "${NAME}.tar.zst.sha256")
+
+          # Also publish tar.gz so install.sh works on minimal
+          # containers (debian:stable-slim, alpine without zstd
+          # preinstalled). ~20% bigger than tar.zst; gzip is
+          # available in every libc and busybox tar.
+          tar_gz_flags=(-C staging -czf "dist/${NAME}.tar.gz" "${NAME}")
+          if tar --help 2>&1 | grep -q -- --no-mac-metadata; then
+              tar --no-mac-metadata "${tar_gz_flags[@]}"
+          else
+              tar "${tar_gz_flags[@]}"
+          fi
+          (cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
+      - uses: actions/upload-artifact@v5
+        with:
+          name: portl-${{ matrix.target }}
+          path: dist/*
+
+  release-publish:
+    name: publish GitHub release
+    needs: [release-build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+      # Extract only the CHANGELOG section matching this tag's version
+      # so the GitHub release body shows what's new in this release,
+      # not the full file. CHANGELOG.md uses Keep-a-Changelog style
+      # headings like "## 0.3.1 — 2026-04-23"; we match on the second
+      # whitespace-delimited token after `## `. Fail if no section
+      # exists for the tag — tagging without a CHANGELOG entry is
+      # almost always a mistake.
+      - name: Extract release notes for ${{ github.ref_name }}
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          awk -v ver="$version" '
+            /^## / {
+              if (in_section) exit
+              if ($2 == ver) { in_section = 1; next }
+            }
+            in_section { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error ::no CHANGELOG.md section found for version $version"
+            echo "::error ::add a '## $version — YYYY-MM-DD' heading to CHANGELOG.md before tagging"
+            exit 1
+          fi
+          echo "--- release notes for $TAG ---"
+          cat release-notes.md
+          echo "--- end release notes ---"
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: portl ${{ github.ref_name }}
+          files: dist/*
+          body_path: release-notes.md
+          fail_on_unmatched_files: true
