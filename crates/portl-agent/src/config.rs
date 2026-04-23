@@ -10,11 +10,12 @@ use portl_core::peer_store::PeerStore;
 use serde::{Deserialize, Serialize};
 
 use crate::config_file::PortlConfig;
-use crate::relay::{RelayPolicy, RelayServerConfig};
+use crate::relay::{RelayPolicy, RelayServerConfig, RelayTlsConfig};
 use crate::udp_registry::DEFAULT_UDP_SESSION_LINGER_SECS;
 
 const DEFAULT_LISTEN_ADDR: &str = "[::]:0";
 const DEFAULT_RELAY_BIND: &str = "0.0.0.0:3340";
+const DEFAULT_RELAY_HTTPS_BIND: &str = "0.0.0.0:443";
 #[cfg(test)]
 const AGENT_ENV_VARS: &[&str] = &[
     "PORTL_HOME",
@@ -32,6 +33,9 @@ const AGENT_ENV_VARS: &[&str] = &[
     "PORTL_RELAY_BIND",
     "PORTL_RELAY_HOSTNAME",
     "PORTL_RELAY_POLICY",
+    "PORTL_RELAY_HTTPS_BIND",
+    "PORTL_RELAY_CERT",
+    "PORTL_RELAY_KEY",
 ];
 
 #[derive(Debug, Clone, Default)]
@@ -528,11 +532,54 @@ fn parse_relay_server_config() -> Result<Option<RelayServerConfig>> {
         Some(value) => value.parse::<RelayPolicy>()?,
         None => RelayPolicy::PeersOnly,
     };
+    let tls = parse_relay_tls_config(http_bind)?;
     Ok(Some(RelayServerConfig {
         http_bind,
         hostname,
         policy,
+        tls,
     }))
+}
+
+/// Parse the `PORTL_RELAY_CERT` / `PORTL_RELAY_KEY` /
+/// `PORTL_RELAY_HTTPS_BIND` triple. Returns `None` when no cert path
+/// is set (HTTP-only mode). Both cert and key must be set when
+/// either is; bailing here early gives operators a clear error
+/// instead of a confusing TLS failure later.
+#[allow(clippy::similar_names)]
+fn parse_relay_tls_config(http_bind: SocketAddr) -> Result<Option<RelayTlsConfig>> {
+    let cert = env_path("PORTL_RELAY_CERT");
+    let key = env_path("PORTL_RELAY_KEY");
+    match (cert, key) {
+        (None, None) => Ok(None),
+        (Some(_), None) => {
+            bail!("PORTL_RELAY_CERT is set but PORTL_RELAY_KEY is not; set both or neither")
+        }
+        (None, Some(_)) => {
+            bail!("PORTL_RELAY_KEY is set but PORTL_RELAY_CERT is not; set both or neither")
+        }
+        (Some(cert_path), Some(key_path)) => {
+            let explicit_https = env_string("PORTL_RELAY_HTTPS_BIND")?;
+            let https_bind_value = explicit_https
+                .clone()
+                .unwrap_or_else(|| DEFAULT_RELAY_HTTPS_BIND.to_owned());
+            let mut https_bind: SocketAddr = https_bind_value.parse().with_context(|| {
+                format!("parse PORTL_RELAY_HTTPS_BIND as socket address: {https_bind_value}")
+            })?;
+            // If the operator didn't explicitly override the HTTPS
+            // bind but did set the HTTP bind to something
+            // non-default, inherit the IP for HTTPS too. Keeps the
+            // common case "bind both on 127.0.0.1" ergonomic.
+            if explicit_https.is_none() {
+                https_bind.set_ip(http_bind.ip());
+            }
+            Ok(Some(RelayTlsConfig {
+                https_bind,
+                cert_path,
+                key_path,
+            }))
+        }
+    }
 }
 
 #[cfg(test)]

@@ -5,6 +5,60 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.3.3.2 — 2026-04-23
+
+Relay HTTPS + rejection metrics. Operators can now serve the
+embedded iroh-relay over TLS using a standard PEM cert + key
+pair. ACME and install-time plist/unit integration still deferred
+to v0.3.3.3. Workspace `Cargo.toml` stays at `0.3.3` (4-component
+SemVer isn't legal).
+
+### Agent
+
+- New `RelayTlsConfig { https_bind, cert_path, key_path }`. Wired
+  up from `PORTL_RELAY_CERT` + `PORTL_RELAY_KEY` (both required
+  together; setting one without the other fails at startup).
+  `PORTL_RELAY_HTTPS_BIND` defaults to `0.0.0.0:443`, inheriting
+  the HTTP bind IP when left at the default.
+- Cert chain + private key loaded from PEM once at startup via
+  `rustls-pemfile`. Fails cleanly on missing file, unreadable
+  file, empty file, or zero-PEM-block content. Process-global
+  rustls crypto provider initialized lazily (ring, matching the
+  workspace's v0.2.4 no-aws-lc-rs convention).
+- iroh-relay's `CertConfig::Manual` variant receives the cert
+  chain; `rustls::ServerConfig::builder().with_single_cert(...)`
+  builds the TLS server config. QUIC address discovery is not
+  enabled (`QuicConfig = None`).
+- `RelayStatus` gains `https_addr`. `/status/relay` and the
+  dashboard surface it alongside `http_addr`.
+- New metrics:
+    - `portl_relay_accepts_total` — counter, every allowed
+      authorization decision.
+    - `portl_relay_rejects_total{reason}` — counter by reason;
+      only `not_in_peer_store` fires in this release.
+
+### CLI
+
+- No CLI changes in this release; relay is still env-configured.
+  Install-time wiring lands in v0.3.3.3.
+
+### Out of scope (still deferred to v0.3.3.3)
+
+- Let's Encrypt / ACME onboarding (`--relay-acme-email`).
+- `portl install --apply --with-relay` plist / unit emission.
+- Cert mtime reload (operator-provided cert rotation requires
+  agent restart today).
+- True integration test against a live iroh-relay client
+  (iroh-relay's client isn't easy to spin up outside
+  `iroh::Endpoint`; deferred to v0.3.4 when the pair protocol
+  gives us a natural client-side harness).
+
+### Tests & quality
+
+371 tests pass (was 367 in v0.3.3.1); clippy clean under
+`--all-features -D warnings`. The 4 new tests exercise PEM
+cert/key loading (empty file, missing file, garbage input).
+
 ## 0.3.3.1 — 2026-04-23
 
 Observability polish. No agent-side changes; this release is all

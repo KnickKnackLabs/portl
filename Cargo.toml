@@ -24,6 +24,12 @@ iroh         = { version = "0.98", features = ["address-lookup-mdns"] }
 iroh-base    = "0.98"
 iroh-relay   = { version = "0.98", default-features = false, features = ["server"] }
 iroh-tickets = "0.5"
+# TLS for the embedded relay server (v0.3.3.2+). Feature set
+# matches iroh-relay's own default: ring provider, tls12, logging
+# off by default. No aws-lc-rs (v0.2.4 removed it to fix the macOS
+# SIGABRT).
+rustls         = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+rustls-pemfile = "2"
 tokio        = { version = "1", features = ["full"] }
 tokio-util   = "0.7"
 bytes        = "1"

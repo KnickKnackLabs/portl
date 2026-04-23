@@ -42,6 +42,11 @@ pub struct Metrics {
     pub udp_sessions_opened: Counter,
     pub active_connections: Gauge,
     pub active_udp_sessions: Gauge,
+    /// Relay endpoint authorization counters. Incremented by the
+    /// embedded relay's access-gate closure on each connect
+    /// attempt.
+    pub relay_accepts_total: Counter,
+    pub relay_rejects_total: Family<AckReasonLabel, Counter>,
 }
 
 impl Default for Metrics {
@@ -97,6 +102,20 @@ impl Default for Metrics {
             active_udp_sessions.clone(),
         );
 
+        let relay_accepts_total = Counter::default();
+        registry.register(
+            "relay_accepts_total",
+            "Relay endpoint authorization decisions that allowed the connection",
+            relay_accepts_total.clone(),
+        );
+
+        let relay_rejects_total = Family::<AckReasonLabel, Counter>::default();
+        registry.register(
+            "relay_rejects_total",
+            "Relay endpoint authorization decisions that denied the connection, by reason",
+            relay_rejects_total.clone(),
+        );
+
         portl_core::runtime::register_metrics(&mut registry);
 
         Self {
@@ -108,6 +127,8 @@ impl Default for Metrics {
             udp_sessions_opened,
             active_connections,
             active_udp_sessions,
+            relay_accepts_total,
+            relay_rejects_total,
         }
     }
 }
