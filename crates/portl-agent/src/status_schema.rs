@@ -163,7 +163,8 @@ fn rfc3339_now() -> String {
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
-    clippy::many_single_char_names
+    clippy::many_single_char_names,
+    clippy::similar_names
 )]
 fn unix_to_ymdhms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     let days = i64::try_from(secs / 86_400).unwrap_or(0);
