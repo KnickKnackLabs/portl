@@ -40,7 +40,7 @@ mod discovery_local {
             dns: false,
             pkarr: false,
             local: true,
-            relay: None,
+            relays: Vec::new(),
         };
         let cfg = AgentConfig {
             bind_addr: Some("127.0.0.1:0".parse().expect("bind addr")),

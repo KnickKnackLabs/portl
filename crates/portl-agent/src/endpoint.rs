@@ -13,9 +13,10 @@ pub async fn bind(cfg: &AgentConfig, identity: &Identity) -> Result<iroh::Endpoi
         .secret_key(SecretKey::from_bytes(&identity.signing_key().to_bytes()))
         .alpns(vec![portl_proto::ticket_v1::ALPN_TICKET_V1.to_vec()]);
 
-    builder = match &cfg.discovery.relay {
-        Some(relay) => builder.relay_mode(RelayMode::custom([relay.clone()])),
-        None => builder.relay_mode(RelayMode::Disabled),
+    builder = if cfg.discovery.relays.is_empty() {
+        builder.relay_mode(RelayMode::Disabled)
+    } else {
+        builder.relay_mode(RelayMode::custom(cfg.discovery.relays.iter().cloned()))
     };
 
     if cfg.discovery.pkarr {

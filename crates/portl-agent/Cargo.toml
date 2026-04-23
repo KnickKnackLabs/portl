@@ -23,8 +23,9 @@ portl-core  = { version = "0.3.1", path = "../portl-core" }
 portl-proto = { version = "0.3.1", path = "../portl-proto" }
  anyhow      = { workspace = true }
  thiserror   = { workspace = true }
- serde       = { workspace = true }
- serde_json  = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+toml        = { workspace = true }
 postcard    = { workspace = true }
 hex         = { workspace = true }
 tracing     = { workspace = true }

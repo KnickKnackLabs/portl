@@ -14,6 +14,7 @@ use tracing::{info, instrument, warn};
 pub mod audit;
 pub mod caps_enforce;
 pub mod config;
+pub mod config_file;
 pub mod endpoint;
 pub mod gateway;
 pub mod meta_handler;

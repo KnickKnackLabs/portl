@@ -1,0 +1,51 @@
+# portl.toml — local agent + CLI configuration
+#
+# Lives at $PORTL_HOME/portl.toml. All values are optional; missing
+# keys fall back to env vars (PORTL_*), then compiled defaults.
+#
+# Precedence (high → low):
+#   1. CLI flags
+#   2. Environment variables
+#   3. This file
+#   4. Compiled defaults
+#
+# Reload semantics: settings are read at agent startup. Edit + restart
+# the agent to apply changes:
+#   macOS:  launchctl kickstart -k gui/$(id -u)/com.portl.agent
+#   Linux:  systemctl --user restart portl-agent.service
+
+schema = 1
+
+[agent]
+# Socket address to bind the QUIC listener on. "[::]:0" picks a random
+# port on all interfaces (recommended; relay/holepunch handles the
+# rest). Pin to a specific port if you're punching through static NAT
+# rules.
+# listen_addr = "[::]:0"
+
+[agent.discovery]
+# How peers find us (publish) and how we find them (resolve).
+# Setting all four to false is valid for in-process / loopback tests.
+dns   = true     # publish + resolve via n0's DNS service
+pkarr = true     # publish + resolve via pkarr (mainline DHT)
+local = true     # mDNS on the local network
+
+# Ordered list of relays. Each entry is one of:
+#   "default"               — iroh's built-in n0 relay(s)
+#   "https://<host>/"       — explicit URL (your own relay or any
+#                             other reachable iroh-relay endpoint)
+# Empty list = relay disabled (peers must hole-punch or be on LAN).
+relays = ["default"]
+
+[agent.rate_limit]
+# Token-bucket on inbound ticket-accept attempts. Defaults are quite
+# tight; bump for trusted networks.
+# rps   = 1
+# burst = 10
+
+[agent.udp]
+# Idle seconds before a UDP forwarder session is reaped.
+# session_linger_secs = 60
+
+# [cli] section reserved for future use.
+# [cli]

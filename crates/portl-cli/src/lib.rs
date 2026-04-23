@@ -103,6 +103,9 @@ pub enum Command {
     Whoami {
         eid: bool,
     },
+    Config {
+        action: commands::config::ConfigAction,
+    },
     Install {
         target: Option<InstallTarget>,
         apply: bool,
@@ -342,6 +345,7 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             commands::ticket::revoke::run(id.as_deref(), list, publish)
         }
         Command::Whoami { eid } => commands::whoami::run(eid),
+        Command::Config { action } => Ok(commands::config::run(action)),
         Command::Install {
             target,
             apply,
@@ -531,6 +535,11 @@ enum TopLevel {
         #[arg(long)]
         eid: bool,
     },
+    /// Read or scaffold `portl.toml`.
+    Config {
+        #[command(subcommand)]
+        action: ConfigSub,
+    },
     /// Install the daemon for a supported target.
     Install {
         target: Option<InstallTarget>,
@@ -645,6 +654,22 @@ enum TicketAction {
         list: bool,
         #[arg(long, requires = "id")]
         publish: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigSub {
+    /// Print the effective file-layer config (env overrides not shown).
+    Show,
+    /// Print the absolute path to portl.toml.
+    Path,
+    /// Print a commented default template. Pipe into portl.toml to scaffold.
+    Default,
+    /// Parse + type-check a `portl.toml`. Defaults to `$PORTL_HOME/portl.toml`.
+    Validate {
+        /// Path to the file. Defaults to `$PORTL_HOME/portl.toml`.
+        #[arg(long = "file")]
+        path: Option<PathBuf>,
     },
 }
 
@@ -816,6 +841,16 @@ impl Cli {
                 action: TicketAction::Revoke { id, list, publish },
             } => Command::TicketRevoke { id, list, publish },
             TopLevel::Whoami { eid } => Command::Whoami { eid },
+            TopLevel::Config { action } => Command::Config {
+                action: match action {
+                    ConfigSub::Show => commands::config::ConfigAction::Show,
+                    ConfigSub::Path => commands::config::ConfigAction::Path,
+                    ConfigSub::Default => commands::config::ConfigAction::Default,
+                    ConfigSub::Validate { path } => {
+                        commands::config::ConfigAction::Validate { path }
+                    }
+                },
+            },
             TopLevel::Install {
                 target,
                 apply,

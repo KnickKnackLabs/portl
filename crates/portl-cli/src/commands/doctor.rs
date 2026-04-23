@@ -202,11 +202,16 @@ fn check_discovery_config() -> CheckResult {
     match portl_agent::AgentConfig::from_env() {
         Ok(cfg) => {
             let discovery = &cfg.discovery;
-            let relay = cfg
-                .discovery
-                .relay
-                .as_ref()
-                .map_or_else(|| "none".to_owned(), ToString::to_string);
+            let relay = if cfg.discovery.relays.is_empty() {
+                "none".to_owned()
+            } else {
+                cfg.discovery
+                    .relays
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
             let detail = format!(
                 "dns={} pkarr={} local={} relay={}",
                 discovery.dns, discovery.pkarr, discovery.local, relay

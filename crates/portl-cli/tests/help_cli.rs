@@ -24,7 +24,7 @@ fn cli_help_lists_expected_top_level_commands() {
     let help = help_output(&["--help"]);
     for command in [
         "init", "doctor", "status", "shell", "exec", "tcp", "udp", "peer", "ticket", "whoami",
-        "install", "docker", "slicer", "gateway",
+        "config", "install", "docker", "slicer", "gateway",
     ] {
         assert!(
             help.contains(command),
@@ -65,6 +65,7 @@ Commands:
   peer     Manage peer trust (the filesystem-backed `peers.json` store)
   ticket   Manage saved tickets (outbound credentials)
   whoami   Print the local identity's `endpoint_id` and peer-store label
+  config   Read or scaffold `portl.toml`
   install  Install the daemon for a supported target
   docker   Docker target management
   slicer   Slicer target management

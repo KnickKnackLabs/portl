@@ -10,6 +10,7 @@ use portl_core::peer_store::PeerStore;
 use serde::{Deserialize, Serialize};
 
 use crate::udp_registry::DEFAULT_UDP_SESSION_LINGER_SECS;
+use crate::config_file::PortlConfig;
 
 const DEFAULT_LISTEN_ADDR: &str = "[::]:0";
 #[cfg(test)]
@@ -56,7 +57,35 @@ pub struct AgentConfig {
 }
 
 impl AgentConfig {
+    /// Load config from env vars only, for backward-compat with tests
+    /// and any caller that explicitly wants the pre-v0.3.1.2 layering.
+    /// Skips the `portl.toml` file load entirely.
+    #[cfg(test)]
+    pub fn from_env_only() -> Result<Self> {
+        Self::build(None)
+    }
+
+    /// Load effective config. Order of precedence (high to low):
+    ///
+    /// 1. Environment variables (`PORTL_*`)
+    /// 2. `portl.toml` at `$PORTL_HOME/portl.toml` (if present)
+    /// 3. Compiled defaults
+    ///
+    /// CLI flags sit above this layer and are merged by the
+    /// caller after `from_env` returns.
     pub fn from_env() -> Result<Self> {
+        // Resolve home up-front so we know where to look for the
+        // file. We duplicate the logic from `build` here but it's
+        // short and avoids a two-pass structure.
+        let home = env_path("PORTL_HOME").unwrap_or_else(default_home_dir);
+        let file_path = PortlConfig::default_path(&home);
+        let file = PortlConfig::load(&file_path).with_context(|| {
+            format!("load config from {}", file_path.display())
+        })?;
+        Self::build(Some(&file))
+    }
+
+    fn build(file: Option<&PortlConfig>) -> Result<Self> {
         let identity_secret = env_string("PORTL_IDENTITY_SECRET_HEX")
             .and_then(|value| value.map(|value| parse_secret_hex(&value)).transpose())?;
         let persistent = identity_secret.is_none();
@@ -103,21 +132,33 @@ impl AgentConfig {
             }
         }
 
-        let bind_addr_value =
-            env_string("PORTL_LISTEN_ADDR")?.unwrap_or_else(|| DEFAULT_LISTEN_ADDR.to_owned());
+        let bind_addr_value = env_string("PORTL_LISTEN_ADDR")?
+            .or_else(|| {
+                file.and_then(|f| f.agent.listen_addr.clone())
+            })
+            .unwrap_or_else(|| DEFAULT_LISTEN_ADDR.to_owned());
         let bind_addr = bind_addr_value.parse().with_context(|| {
             format!("parse PORTL_LISTEN_ADDR as socket address: {bind_addr_value}")
         })?;
-        let discovery = env_string("PORTL_DISCOVERY")?
-            .map(|value| parse_discovery(&value))
-            .transpose()?
-            .unwrap_or_default();
+        let discovery = if let Some(value) = env_string("PORTL_DISCOVERY")? {
+            parse_discovery(&value)?
+        } else if let Some(section) = file.and_then(|f| f.agent.discovery.as_ref()) {
+            build_discovery_from_file(section)?
+        } else {
+            DiscoveryConfig::default()
+        };
         let revocations_path =
             env_path("PORTL_REVOCATIONS_PATH").unwrap_or_else(|| home.join("revocations.jsonl"));
-        let rate_limit = env_string("PORTL_RATE_LIMIT")?
-            .map(|value| parse_rate_limit(&value))
-            .transpose()?
-            .unwrap_or_default();
+        let rate_limit = if let Some(value) = env_string("PORTL_RATE_LIMIT")? {
+            parse_rate_limit(&value)?
+        } else if let Some(section) = file.and_then(|f| f.agent.rate_limit.as_ref()) {
+            RateLimitConfig {
+                rps: section.rps.unwrap_or(RateLimitConfig::default().rps),
+                burst: section.burst.unwrap_or(RateLimitConfig::default().burst),
+            }
+        } else {
+            RateLimitConfig::default()
+        };
         let revocations_max_bytes = env_string("PORTL_REVOCATIONS_MAX_BYTES")?
             .map(|value| {
                 value.parse::<u64>().with_context(|| {
@@ -126,14 +167,17 @@ impl AgentConfig {
             })
             .transpose()?
             .unwrap_or(crate::revocations::DEFAULT_REVOCATIONS_MAX_BYTES);
-        let udp_session_linger_secs = env_string("PORTL_UDP_SESSION_LINGER_SECS")?
-            .map(|value| {
-                value.parse::<u64>().with_context(|| {
-                    format!("parse PORTL_UDP_SESSION_LINGER_SECS as an integer: {value}")
-                })
-            })
-            .transpose()?
-            .unwrap_or(DEFAULT_UDP_SESSION_LINGER_SECS);
+        let udp_session_linger_secs = if let Some(value) =
+            env_string("PORTL_UDP_SESSION_LINGER_SECS")?
+        {
+            value.parse::<u64>().with_context(|| {
+                format!("parse PORTL_UDP_SESSION_LINGER_SECS as an integer: {value}")
+            })?
+        } else {
+            file.and_then(|f| f.agent.udp.as_ref())
+                .and_then(|u| u.session_linger_secs)
+                .unwrap_or(DEFAULT_UDP_SESSION_LINGER_SECS)
+        };
         let metrics_enabled = env_string("PORTL_METRICS")?
             .map(|value| parse_bool_env("PORTL_METRICS", &value))
             .transpose()?
@@ -178,7 +222,21 @@ pub struct DiscoveryConfig {
     pub dns: bool,
     pub pkarr: bool,
     pub local: bool,
-    pub relay: Option<RelayUrl>,
+    /// Ordered list of relay URLs. Empty vec = relay disabled.
+    /// First entry is the preferred relay (iroh's `RelayMode::Custom`
+    /// accepts any iterable; preference inside the list is determined
+    /// by iroh's relay-selection heuristic, typically RTT-based).
+    ///
+    /// Populated via `PORTL_DISCOVERY`:
+    ///
+    /// - `relay` (bare): n0's default relay
+    /// - `relay:https://mine.com`: custom URL
+    /// - `relay,relay:https://mine.com`: both (n0 + custom; order preserved)
+    /// - `relay:https://a.com,relay:https://b.com`: two customs
+    ///
+    /// Duplicates are silently deduplicated (first occurrence wins
+    /// its position).
+    pub relays: Vec<RelayUrl>,
 }
 
 impl DiscoveryConfig {
@@ -188,23 +246,23 @@ impl DiscoveryConfig {
             dns: false,
             pkarr: false,
             local: false,
-            relay: None,
+            relays: Vec::new(),
         }
     }
 }
 
 impl Default for DiscoveryConfig {
     fn default() -> Self {
-        let relay = iroh::endpoint::default_relay_mode()
+        let relays = iroh::endpoint::default_relay_mode()
             .relay_map()
             .urls::<Vec<_>>()
             .into_iter()
-            .next();
+            .collect();
         Self {
             dns: true,
             pkarr: true,
             local: true,
-            relay,
+            relays,
         }
     }
 }
@@ -238,7 +296,7 @@ pub fn parse_gateway_mode(url: &str) -> Result<AgentMode> {
     })
 }
 
-fn default_home_dir() -> PathBuf {
+pub fn default_home_dir() -> PathBuf {
     ProjectDirs::from("computer", "KnickKnackLabs", "portl")
         .map_or_else(|| PathBuf::from("."), |dirs| dirs.data_dir().to_path_buf())
 }
@@ -271,7 +329,7 @@ fn parse_discovery(value: &str) -> Result<DiscoveryConfig> {
     }
 
     let mut discovery = DiscoveryConfig::in_process();
-    let default_relay = DiscoveryConfig::default().relay;
+    let default_relays = DiscoveryConfig::default().relays;
     let mut saw_entry = false;
     for item in value
         .split(',')
@@ -283,7 +341,17 @@ fn parse_discovery(value: &str) -> Result<DiscoveryConfig> {
             "dns" => discovery.dns = true,
             "pkarr" => discovery.pkarr = true,
             "local" => discovery.local = true,
-            "relay" => discovery.relay.clone_from(&default_relay),
+            "relay" => {
+                // Bare `relay` token appends iroh's default relay(s).
+                // Dedup against what's already collected so
+                // `relay,relay` or `relay:<same>,relay` don't
+                // double-insert.
+                for url in &default_relays {
+                    if !discovery.relays.contains(url) {
+                        discovery.relays.push(url.clone());
+                    }
+                }
+            }
             other if other.starts_with("relay:") || other.starts_with("relay=") => {
                 // v0.3.1.2: accept explicit relay URL via
                 // `relay:https://relay.mynet.com` (or `relay=<url>`).
@@ -294,7 +362,9 @@ fn parse_discovery(value: &str) -> Result<DiscoveryConfig> {
                 let url = url_str.parse::<RelayUrl>().with_context(|| {
                     format!("parse relay URL from PORTL_DISCOVERY entry `{other}`")
                 })?;
-                discovery.relay = Some(url);
+                if !discovery.relays.contains(&url) {
+                    discovery.relays.push(url);
+                }
             }
             other => bail!("unsupported PORTL_DISCOVERY backend: {other}"),
         }
@@ -305,6 +375,64 @@ fn parse_discovery(value: &str) -> Result<DiscoveryConfig> {
     }
 
     Ok(discovery)
+}
+
+/// Build a [`DiscoveryConfig`] from a `[agent.discovery]` TOML
+/// section. Missing fields fall back to [`DiscoveryConfig::default`]
+/// per-field, matching the env-var precedence model.
+///
+/// Special relay tokens recognized in the `relays` array:
+///
+/// - `"default"` — append iroh's built-in n0 relays
+/// - `"disabled"` (alone) — empty list, relay disabled
+/// - any other string — parsed as a `RelayUrl`
+fn build_discovery_from_file(
+    section: &crate::config_file::DiscoverySection,
+) -> Result<DiscoveryConfig> {
+    let defaults = DiscoveryConfig::default();
+    let mut cfg = DiscoveryConfig {
+        dns: section.dns.unwrap_or(defaults.dns),
+        pkarr: section.pkarr.unwrap_or(defaults.pkarr),
+        local: section.local.unwrap_or(defaults.local),
+        relays: Vec::new(),
+    };
+
+    let entries = if let Some(list) = section.relays.as_ref() {
+        list.clone()
+    } else {
+        cfg.relays = defaults.relays;
+        return Ok(cfg);
+    };
+
+    if entries.len() == 1 && entries[0].trim() == "disabled" {
+        return Ok(cfg);
+    }
+
+    let default_relays = defaults.relays;
+    for entry in entries {
+        let trimmed = entry.trim();
+        if trimmed == "default" {
+            for url in &default_relays {
+                if !cfg.relays.contains(url) {
+                    cfg.relays.push(url.clone());
+                }
+            }
+        } else if trimmed == "disabled" {
+            // Ignored when not the only entry; logged for visibility.
+            tracing::warn!(
+                "ignoring `disabled` in [agent.discovery].relays mixed with other entries"
+            );
+        } else {
+            let url = trimmed.parse::<RelayUrl>().with_context(|| {
+                format!("parse relay URL `{trimmed}` from [agent.discovery].relays")
+            })?;
+            if !cfg.relays.contains(&url) {
+                cfg.relays.push(url);
+            }
+        }
+    }
+
+    Ok(cfg)
 }
 
 fn parse_trust_roots(value: &str) -> Result<Vec<[u8; 32]>> {
@@ -464,7 +592,7 @@ mod tests {
                 assert!(!config.discovery.dns);
                 assert!(!config.discovery.pkarr);
                 assert!(config.discovery.local);
-                assert!(config.discovery.relay.is_some());
+                assert!(!config.discovery.relays.is_empty());
             },
         );
     }
@@ -481,8 +609,9 @@ mod tests {
             )],
             || {
                 let config = AgentConfig::from_env().expect("parse custom relay env");
-                let relay = config.discovery.relay.expect("relay set");
-                assert_eq!(relay.as_str(), "https://relay.mynet.com./");
+                let relays = &config.discovery.relays;
+                assert_eq!(relays.len(), 1, "expected exactly one relay, got {relays:?}");
+                assert_eq!(relays[0].as_str(), "https://relay.mynet.com./");
             },
         );
     }
@@ -498,8 +627,9 @@ mod tests {
             )],
             || {
                 let config = AgentConfig::from_env().expect("parse custom relay env");
-                let relay = config.discovery.relay.expect("relay set");
-                assert_eq!(relay.as_str(), "https://relay.mynet.com./");
+                let relays = &config.discovery.relays;
+                assert_eq!(relays.len(), 1);
+                assert_eq!(relays[0].as_str(), "https://relay.mynet.com./");
                 assert!(config.discovery.dns);
             },
         );
@@ -515,6 +645,66 @@ mod tests {
                     err.to_string().contains("parse relay URL"),
                     "expected parse-relay-URL error, got: {err}"
                 );
+            },
+        );
+    }
+
+    #[test]
+    fn from_env_parses_discovery_with_multiple_custom_relays() {
+        // v0.3.1.2: multiple `relay:<url>` entries produce an ordered
+        // list. First entry first, in the order written, deduplicated.
+        with_env(
+            &[(
+                "PORTL_DISCOVERY",
+                Some(OsString::from(
+                    "relay:https://a.example./,relay:https://b.example./",
+                )),
+            )],
+            || {
+                let config = AgentConfig::from_env().expect("parse env");
+                let relays = &config.discovery.relays;
+                assert_eq!(relays.len(), 2, "expected 2 relays, got {relays:?}");
+                assert_eq!(relays[0].as_str(), "https://a.example./");
+                assert_eq!(relays[1].as_str(), "https://b.example./");
+            },
+        );
+    }
+
+    #[test]
+    fn from_env_parses_discovery_mixing_default_and_custom_relays() {
+        // The most useful combo: keep n0's default relay for
+        // bootstrap + fallback, add your own custom one too.
+        with_env(
+            &[(
+                "PORTL_DISCOVERY",
+                Some(OsString::from("relay,relay:https://mine.example./")),
+            )],
+            || {
+                let config = AgentConfig::from_env().expect("parse env");
+                let relays = &config.discovery.relays;
+                assert!(
+                    relays.len() >= 2,
+                    "expected n0 default + custom, got {relays:?}"
+                );
+                let has_custom = relays.iter().any(|u| u.as_str() == "https://mine.example./");
+                assert!(has_custom, "custom relay missing from {relays:?}");
+            },
+        );
+    }
+
+    #[test]
+    fn from_env_deduplicates_relays() {
+        // Same URL listed twice produces only one entry.
+        with_env(
+            &[(
+                "PORTL_DISCOVERY",
+                Some(OsString::from(
+                    "relay:https://a.example./,relay:https://a.example./",
+                )),
+            )],
+            || {
+                let config = AgentConfig::from_env().expect("parse env");
+                assert_eq!(config.discovery.relays.len(), 1);
             },
         );
     }
