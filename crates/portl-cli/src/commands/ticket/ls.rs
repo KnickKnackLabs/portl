@@ -9,9 +9,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use portl_core::ticket_store::TicketStore;
 
-pub fn run() -> Result<ExitCode> {
+pub fn run(json_out: bool) -> Result<ExitCode> {
     let tickets = TicketStore::load(&TicketStore::default_path())?;
     if tickets.is_empty() {
+        if json_out {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema": 1,
+                    "kind": "ticket.ls",
+                    "tickets": [],
+                }))?
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
         println!("no tickets saved. Save one with:\n  portl ticket save <label> <ticket-string>");
         return Ok(ExitCode::SUCCESS);
     }
@@ -22,6 +33,29 @@ pub fn run() -> Result<ExitCode> {
 
     let mut rows: Vec<_> = tickets.iter().collect();
     rows.sort_by(|a, b| a.0.cmp(b.0));
+
+    if json_out {
+        let tickets_json: Vec<_> = rows
+            .iter()
+            .map(|(label, entry)| {
+                serde_json::json!({
+                    "label": label,
+                    "endpoint_id": entry.endpoint_id_hex,
+                    "expires_at": entry.expires_at,
+                    "expired": entry.expires_at <= now,
+                    "expires_in_secs": entry.expires_at.saturating_sub(now),
+                })
+            })
+            .collect();
+        let envelope = serde_json::json!({
+            "schema": 1,
+            "kind": "ticket.ls",
+            "now_unix": now,
+            "tickets": tickets_json,
+        });
+        println!("{}", serde_json::to_string_pretty(&envelope)?);
+        return Ok(ExitCode::SUCCESS);
+    }
 
     println!("{:<14} {:<22} {:<14}", "LABEL", "ENDPOINT", "EXPIRES");
     for (label, entry) in rows {

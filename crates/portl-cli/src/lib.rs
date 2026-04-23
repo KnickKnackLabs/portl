@@ -41,6 +41,8 @@ pub enum Command {
     Doctor {
         fix: bool,
         yes: bool,
+        verbose: bool,
+        json: bool,
     },
     Status {
         peer: Option<String>,
@@ -68,7 +70,10 @@ pub enum Command {
         local: Vec<String>,
     },
     // v0.3.0: peer / ticket / whoami replace top-level mint + revoke.
-    PeerLs,
+    PeerLs {
+        json: bool,
+        active: bool,
+    },
     PeerUnlink {
         label: String,
     },
@@ -93,7 +98,9 @@ pub enum Command {
         label: String,
         ticket: String,
     },
-    TicketLs,
+    TicketLs {
+        json: bool,
+    },
     TicketRm {
         label: String,
     },
@@ -105,6 +112,7 @@ pub enum Command {
     },
     Whoami {
         eid: bool,
+        json: bool,
     },
     Config {
         action: commands::config::ConfigAction,
@@ -297,9 +305,16 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             commands::agent::run::run(mode, upstream_url.as_deref())
         }
         Command::Init { force, role } => commands::init::run(force, role),
-        Command::Doctor { fix, yes } => Ok(commands::doctor::run(commands::doctor::RunOpts {
+        Command::Doctor {
             fix,
             yes,
+            verbose,
+            json,
+        } => Ok(commands::doctor::run(commands::doctor::RunOpts {
+            fix,
+            yes,
+            verbose,
+            json,
         })),
         Command::Status {
             peer,
@@ -318,7 +333,7 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
         } => commands::exec::run(&peer, cwd.as_deref(), user.as_deref(), &argv),
         Command::Tcp { peer, local } => commands::tcp::run(&peer, &local),
         Command::Udp { peer, local } => commands::udp::run(&peer, &local),
-        Command::PeerLs => commands::peer::ls::run(),
+        Command::PeerLs { json, active } => commands::peer::ls::run(json, active),
         Command::PeerUnlink { label } => commands::peer::unlink::run(&label),
         Command::PeerAddUnsafeRaw {
             endpoint,
@@ -346,13 +361,13 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             list_caps,
         ),
         Command::TicketSave { label, ticket } => commands::ticket::save::run(&label, &ticket),
-        Command::TicketLs => commands::ticket::ls::run(),
+        Command::TicketLs { json } => commands::ticket::ls::run(json),
         Command::TicketRm { label } => commands::ticket::rm::run(&label),
         Command::TicketPrune => commands::ticket::prune::run(),
         Command::TicketRevoke { id, list, publish } => {
             commands::ticket::revoke::run(id.as_deref(), list, publish)
         }
-        Command::Whoami { eid } => commands::whoami::run(eid),
+        Command::Whoami { eid, json } => commands::whoami::run(eid, json),
         Command::Config { action } => Ok(commands::config::run(action)),
         Command::Install {
             target,
@@ -489,6 +504,12 @@ enum TopLevel {
         /// Skip confirmation prompts. Required in non-TTY contexts when --fix is set.
         #[arg(long)]
         yes: bool,
+        /// Show every check, including passing ones. Default hides `ok` rows.
+        #[arg(long)]
+        verbose: bool,
+        /// Emit structured JSON instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
     },
     /// Dashboard (no args) or reachability probe against a peer.
     Status {
@@ -550,6 +571,9 @@ enum TopLevel {
         /// Print only the 64-char `endpoint_id` hex (script-friendly).
         #[arg(long)]
         eid: bool,
+        /// Emit structured JSON. Ignored when --eid is set.
+        #[arg(long)]
+        json: bool,
     },
     /// Read or scaffold `portl.toml`.
     Config {
@@ -587,7 +611,14 @@ enum TopLevel {
 #[derive(Subcommand, Debug)]
 enum PeerAction {
     /// List stored peers.
-    Ls,
+    Ls {
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+        /// Overlay live-connection state by querying the agent IPC.
+        #[arg(long)]
+        active: bool,
+    },
     /// Remove a peer by label.
     Unlink { label: String },
     /// Add a peer by raw `endpoint_id` without a pairing handshake.
@@ -658,7 +689,11 @@ enum TicketAction {
     /// Save a ticket string under a local label.
     Save { label: String, ticket: String },
     /// List saved tickets.
-    Ls,
+    Ls {
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove a saved ticket.
     Rm { label: String },
     /// Bulk-remove expired tickets.
@@ -781,7 +816,17 @@ impl Cli {
     fn into_command(self) -> Command {
         match self.command {
             TopLevel::Init { force, role } => Command::Init { force, role },
-            TopLevel::Doctor { fix, yes } => Command::Doctor { fix, yes },
+            TopLevel::Doctor {
+                fix,
+                yes,
+                verbose,
+                json,
+            } => Command::Doctor {
+                fix,
+                yes,
+                verbose,
+                json,
+            },
             TopLevel::Status {
                 peer,
                 relay,
@@ -808,8 +853,8 @@ impl Cli {
             TopLevel::Tcp { local, peer } => Command::Tcp { peer, local },
             TopLevel::Udp { local, peer } => Command::Udp { peer, local },
             TopLevel::Peer {
-                action: PeerAction::Ls,
-            } => Command::PeerLs,
+                action: PeerAction::Ls { json, active },
+            } => Command::PeerLs { json, active },
             TopLevel::Peer {
                 action: PeerAction::Unlink { label },
             } => Command::PeerUnlink { label },
@@ -855,8 +900,8 @@ impl Cli {
                 action: TicketAction::Save { label, ticket },
             } => Command::TicketSave { label, ticket },
             TopLevel::Ticket {
-                action: TicketAction::Ls,
-            } => Command::TicketLs,
+                action: TicketAction::Ls { json },
+            } => Command::TicketLs { json },
             TopLevel::Ticket {
                 action: TicketAction::Rm { label },
             } => Command::TicketRm { label },
@@ -866,7 +911,7 @@ impl Cli {
             TopLevel::Ticket {
                 action: TicketAction::Revoke { id, list, publish },
             } => Command::TicketRevoke { id, list, publish },
-            TopLevel::Whoami { eid } => Command::Whoami { eid },
+            TopLevel::Whoami { eid, json } => Command::Whoami { eid, json },
             TopLevel::Config { action } => Command::Config {
                 action: match action {
                     ConfigSub::Show => commands::config::ConfigAction::Show,

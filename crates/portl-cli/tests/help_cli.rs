@@ -96,10 +96,12 @@ Options:
 Usage: portl doctor [OPTIONS]
 
 Options:
-      --fix   Attempt to auto-remediate warnings where possible. Currently handles duplicate launchd
-              / systemd services (bootout + rm the wrong lane)
-      --yes   Skip confirmation prompts. Required in non-TTY contexts when --fix is set
-  -h, --help  Print help
+      --fix      Attempt to auto-remediate warnings where possible. Currently handles duplicate
+                 launchd / systemd services (bootout + rm the wrong lane)
+      --yes      Skip confirmation prompts. Required in non-TTY contexts when --fix is set
+      --verbose  Show every check, including passing ones. Default hides `ok` rows
+      --json     Emit structured JSON instead of the human-readable table
+  -h, --help     Print help
 "#,
         ),
         (
@@ -285,6 +287,7 @@ Usage: portl whoami [OPTIONS]
 
 Options:
       --eid   Print only the 64-char `endpoint_id` hex (script-friendly)
+      --json  Emit structured JSON. Ignored when --eid is set
   -h, --help  Print help
 "#,
         ),

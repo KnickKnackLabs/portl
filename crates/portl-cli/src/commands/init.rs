@@ -38,7 +38,13 @@ pub fn run(force: bool, role: Option<InitRole>) -> Result<ExitCode> {
         );
     }
 
-    let doctor = crate::commands::doctor::run(crate::commands::doctor::RunOpts::default());
+    // `init` is a one-shot onboarding flow; operators want to see
+    // every check passed explicitly, so force verbose output even
+    // though the default (for `portl doctor`) hides passing rows.
+    let doctor = crate::commands::doctor::run(crate::commands::doctor::RunOpts {
+        verbose: true,
+        ..Default::default()
+    });
     if doctor != ExitCode::SUCCESS {
         return Ok(doctor);
     }

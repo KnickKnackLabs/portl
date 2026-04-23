@@ -34,9 +34,15 @@ struct CheckResult {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct RunOpts {
     pub fix: bool,
     pub yes: bool,
+    /// Show all checks including passing ones. Default hides `ok`
+    /// rows so operators see only actionable output.
+    pub verbose: bool,
+    /// Emit structured JSON instead of the human-readable table.
+    pub json: bool,
 }
 
 pub fn run(opts: RunOpts) -> ExitCode {
@@ -53,17 +59,11 @@ pub fn run(opts: RunOpts) -> ExitCode {
         check_service_drift(),
     ];
 
-    let mut any_fail = false;
-    for result in &results {
-        let tag = match result.status {
-            Status::Ok => "ok  ",
-            Status::Warn => "warn",
-            Status::Fail => "fail",
-        };
-        if result.status == Status::Fail {
-            any_fail = true;
-        }
-        println!("[{tag}] {}: {}", result.name, result.detail);
+    let any_fail = results.iter().any(|r| r.status == Status::Fail);
+    if opts.json {
+        render_json(&results);
+    } else {
+        render_human(&results, opts.verbose);
     }
 
     if opts.fix {
@@ -84,6 +84,53 @@ pub fn run(opts: RunOpts) -> ExitCode {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+fn render_human(results: &[CheckResult], verbose: bool) {
+    let mut hidden = 0usize;
+    for result in results {
+        if !verbose && result.status == Status::Ok {
+            hidden += 1;
+            continue;
+        }
+        let tag = match result.status {
+            Status::Ok => "ok  ",
+            Status::Warn => "warn",
+            Status::Fail => "fail",
+        };
+        println!("[{tag}] {}: {}", result.name, result.detail);
+    }
+    if !verbose && hidden > 0 {
+        println!("({hidden} passing checks hidden — use --verbose to show)");
+    }
+}
+
+fn render_json(results: &[CheckResult]) {
+    use serde_json::json;
+    let checks: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| {
+            json!({
+                "name": r.name,
+                "status": match r.status {
+                    Status::Ok => "ok",
+                    Status::Warn => "warn",
+                    Status::Fail => "fail",
+                },
+                "detail": r.detail,
+            })
+        })
+        .collect();
+    let envelope = json!({
+        "schema": 1,
+        "kind": "doctor",
+        "any_fail": results.iter().any(|r| r.status == Status::Fail),
+        "checks": checks,
+    });
+    match serde_json::to_string_pretty(&envelope) {
+        Ok(s) => println!("{s}"),
+        Err(e) => eprintln!("failed to serialize doctor JSON: {e}"),
     }
 }
 

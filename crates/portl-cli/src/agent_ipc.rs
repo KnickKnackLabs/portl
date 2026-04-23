@@ -33,10 +33,7 @@ pub async fn fetch_status(socket: &Path) -> Result<StatusResponse> {
 
 /// Fetch `/status/connections`.
 ///
-/// Not yet consumed by a CLI verb; present so `portl status
-/// connections` (a focused section) can land as an isolated change
-/// without touching the IPC client.
-#[allow(dead_code)]
+/// Consumed by `portl peer ls --active` for the runtime overlay.
 pub async fn fetch_connections(socket: &Path) -> Result<ConnectionsResponse> {
     let body = get(socket, "/status/connections").await?;
     serde_json::from_str::<ConnectionsResponse>(&body).context("decode /status/connections JSON")

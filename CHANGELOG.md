@@ -5,6 +5,43 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.3.3.1 — 2026-04-23
+
+Observability polish. No agent-side changes; this release is all
+CLI ergonomics: the `--json` rollout promised in the v0.3.2
+"deferred" list, plus `doctor --verbose` / `peer ls --active`.
+Workspace `Cargo.toml` stays at `0.3.3` — SemVer doesn't accept
+4-component versions, and the 4-component tag pattern matches
+the earlier `v0.3.0.1` / `v0.3.1.x` precedent (tag = release,
+workspace = parent minor). `portl --version` still reports
+`0.3.3` on these binaries; the release artifact names include
+the full tag.
+
+### CLI
+
+- `portl doctor` default output now hides passing checks (prints
+  a `(N passing checks hidden — use --verbose to show)` footer
+  instead). `portl doctor --verbose` restores the full table.
+  `portl init` forces `--verbose` internally so onboarding shows
+  every green check explicitly.
+- `portl doctor --json` emits the structured `{schema,kind,checks}`
+  envelope. Exit code still tracks fail presence.
+- `portl whoami --json` adds the structured view. `--eid` still
+  takes precedence (scripts that already consume the bare hex
+  don't break).
+- `portl peer ls --json` emits the structured view.
+- `portl peer ls --active` overlays an agent IPC call against
+  `/status/connections` and adds a `LIVE` column. Graceful
+  degradation when the agent isn't running (shows all peers as
+  inactive; no hard error).
+- `portl ticket ls --json` emits the structured view (incl.
+  `expires_at` / `expires_in_secs` / `expired`).
+
+### Tests & quality
+
+367 tests pass, clippy clean under `--all-features -D warnings`,
+fmt clean. Help snapshots regenerated for doctor + whoami.
+
 ## 0.3.3 — 2026-04-23
 
 Embedded relay (preview MVP). The agent can now optionally serve as
