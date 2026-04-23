@@ -205,8 +205,8 @@ pub fn run(
 fn seed_peer_store_self_row_with_reporting() {
     match seed_peer_store_self_row_if_missing() {
         Ok(Some(eid_hex)) => println!(
-            "seeded peer store with self-row: {eid_short}…",
-            eid_short = &eid_hex[..16]
+            "seeded peer store with self-row: {eid_short}",
+            eid_short = crate::eid::format_short(&eid_hex)
         ),
         Ok(None) => {
             // Row already present (idempotent re-run) or identity

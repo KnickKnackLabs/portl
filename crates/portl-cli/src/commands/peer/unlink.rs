@@ -26,8 +26,8 @@ pub fn run(label: &str) -> Result<ExitCode> {
         Some(entry) => {
             peers.save(&path)?;
             println!(
-                "unlinked peer '{label}' ({short}…)",
-                short = &entry.endpoint_id_hex[..16]
+                "unlinked peer '{label}' ({short})",
+                short = crate::eid::format_short(&entry.endpoint_id_hex)
             );
             Ok(ExitCode::SUCCESS)
         }

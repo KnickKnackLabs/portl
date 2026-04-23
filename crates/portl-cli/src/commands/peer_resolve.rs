@@ -1,29 +1,25 @@
-//! Resolve a `peer` argument (as seen by `portl shell`, `exec`, `tcp`,
-//! and `udp`) to a `PortlTicket` ready for handshake. v0.3.0 put this
-//! behind a two-store lookup (`peers.json`, `tickets.json`) plus a raw
-//! `endpoint_id` fallback for one-off dials. The old alias-store /
-//! raw-ticket fallback surface is gone — tickets that aren't saved
-//! locally have to be parsed via `ticket save <label> <string>` first.
+//! Resolve a `peer` argument to a `PortlTicket` ready for handshake.
 //!
-//! Resolution cascade (first match wins, each prints `using …` to
-//! stderr so routing is always observable):
+//! Single resolution cascade shared by every command that takes a
+//! `<peer>` argument (`shell`, `exec`, `tcp`, `udp`, `forward`,
+//! `status`, `docker run`, …). Each step prints `using …` to stderr
+//! so routing is always observable. First match wins:
 //!
-//! 1. `<name>` matches a peer with `they_accept_from_me=true`
-//!    (outbound / mutual / self) → mint a short-lived fresh ticket
-//!    against that endpoint's address.
-//! 2. `<name>` matches a ticket in the ticket store, unexpired →
-//!    return the saved ticket as-is.
-//! 3. `<name>` matches a peer with inbound-only relationship →
-//!    hard error naming the asymmetry and the fix.
-//! 4. `<name>` is 32-byte hex → mint a fresh ticket against that
-//!    endpoint. Ephemeral dial path.
-//! 5. `<name>` parses as a raw ticket string (`portl…`) → use it
-//!    directly. This covers the bearer-ticket flow: a third party
-//!    mints a ticket for you and you paste the whole string.
+//! 1. **Inline ticket** — `peer` deserializes as a full `portl…`
+//!    ticket string. Used as-is (optionally force-relay-ed).
+//! 2. **Label → `peers.json`** — a paired peer with
+//!    `they_accept_from_me=true` mints a short-lived fresh ticket
+//!    against that endpoint. Inbound-only or held peers return a
+//!    specific error naming the fix.
+//! 3. **Label → `tickets.json`** — a saved, unexpired ticket is
+//!    returned as-is.
+//! 4. **Label → `aliases.json`** — a container-adapter alias either
+//!    points to a stored ticket file or supplies a bare
+//!    `endpoint_id` to mint against.
+//! 5. **Endpoint-id token** — full 64-char hex or middle-elided
+//!    `PPPP…SSSS` (via `crate::eid::resolve`) mints an ephemeral
+//!    ticket against that endpoint.
 //! 6. Otherwise: hard error listing possible sources.
-//!
-//! Call sites: `shell::run`, `exec::run`, `tcp::run`, `udp::run`,
-//! `status::run`.
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,6 +36,61 @@ use portl_core::peer_store::PeerStore;
 use portl_core::ticket::mint::mint_root;
 use portl_core::ticket::schema::{Capabilities, PortlTicket};
 use portl_core::ticket_store::TicketStore;
+
+use crate::alias_store::AliasStore;
+
+/// Which store a `resolve_peer` call matched in. Surfaced in
+/// `ResolvedPeer.source` for callers that want to report it, and
+/// used internally to shape the "using …" stderr message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerSource {
+    /// Full `portl…` ticket string pasted as the argument.
+    Inline,
+    /// Label hit in `peers.json`; ticket minted against the stored
+    /// `endpoint_id`.
+    PeerStore,
+    /// Label hit in `tickets.json`; the saved ticket was returned.
+    TicketStore,
+    /// Label hit in `aliases.json` and pointed to an on-disk ticket
+    /// file.
+    AliasStoreTicket,
+    /// Label hit in `aliases.json` with only an `endpoint_id`;
+    /// ticket minted against it.
+    AliasStoreEid,
+    /// `peer` parsed as a raw `endpoint_id` (full hex or elided form).
+    RawEid,
+}
+
+/// Resolution output. `discovery` describes how the address was
+/// located ("cached" for inline tickets, "stored-ticket" for any
+/// label→stored-ticket hit, or the iroh discovery provenance like
+/// "dns" / "pkarr" / "mdns" / "relay" for ephemeral mints).
+pub(crate) struct ResolvedPeer {
+    pub(crate) ticket: PortlTicket,
+    /// Which store/form the argument resolved against. Kept so
+    /// future callers (e.g. `peer ls --expand`) can reason about
+    /// provenance without reparsing.
+    #[allow(dead_code)]
+    pub(crate) source: PeerSource,
+    pub(crate) discovery: String,
+}
+
+/// Options to `resolve_peer`. Kept tiny on purpose — anything
+/// command-specific (e.g. the auditor-friendly stderr line) happens
+/// at the call site, not in here.
+pub(crate) struct ResolveOpts<'a> {
+    /// Capabilities baked into any ephemeral ticket this call mints.
+    /// Ignored for `Inline` / `TicketStore` / `AliasStoreTicket`
+    /// paths, since those return a pre-existing ticket.
+    pub(crate) caps: Capabilities,
+    /// Force the resolved ticket's address to the peer's relay URL
+    /// only, dropping direct-UDP candidates. Useful when the direct
+    /// path is known-broken (NAT, captive portal) and you want to
+    /// pin the session to the relay.
+    pub(crate) force_relay: bool,
+    pub(crate) identity: &'a Identity,
+    pub(crate) endpoint: &'a iroh::Endpoint,
+}
 
 pub(crate) struct ConnectedPeer {
     pub(crate) endpoint: iroh::Endpoint,
@@ -74,8 +125,17 @@ pub(crate) async fn connect_peer_with_endpoint(
     endpoint: &iroh::Endpoint,
 ) -> Result<ConnectedPeer> {
     let endpoint_wrapper = Endpoint::from(endpoint.clone());
-    let ticket = resolve_peer_ticket(peer, identity, endpoint, caps).await?;
-    let (connection, session) = open_ticket_v1(&endpoint_wrapper, &ticket, &[], identity)
+    let resolved = resolve_peer(
+        peer,
+        &ResolveOpts {
+            caps,
+            force_relay: false,
+            identity,
+            endpoint,
+        },
+    )
+    .await?;
+    let (connection, session) = open_ticket_v1(&endpoint_wrapper, &resolved.ticket, &[], identity)
         .await
         .context("run ticket handshake")?;
     Ok(ConnectedPeer {
@@ -85,19 +145,46 @@ pub(crate) async fn connect_peer_with_endpoint(
     })
 }
 
-/// Run the v0.3.0 resolution cascade. Emits `using <source>` to
-/// stderr on success so routing is auditable without a separate
-/// `--explain` flag.
-pub(crate) async fn resolve_peer_ticket(
-    peer: &str,
-    identity: &Identity,
-    endpoint: &iroh::Endpoint,
-    caps: Capabilities,
-) -> Result<PortlTicket> {
+/// Unified resolution cascade. See module docs for the order. Emits
+/// a single `using …` line to stderr on success, naming the source.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn resolve_peer(peer: &str, opts: &ResolveOpts<'_>) -> Result<ResolvedPeer> {
+    // 1) Inline `portl…` ticket pasted as the arg. Check first so
+    //    paste-a-ticket workflows work even when a label happens to
+    //    collide (unlikely: tickets start with `portl`).
+    if let Ok(ticket) = <PortlTicket as Ticket>::deserialize(peer) {
+        if ticket.body.parent.is_some() {
+            bail!(
+                "delegated tickets not yet supported by this command; use the root ticket \
+                 or pass --chain"
+            );
+        }
+        eprintln!("using inline ticket");
+        return Ok(ResolvedPeer {
+            ticket: maybe_force_relay_ticket(ticket, opts.force_relay)?,
+            source: PeerSource::Inline,
+            discovery: "cached".to_owned(),
+        });
+    }
+
+    // Load the name-keyed stores once. Each lookup is cheap after
+    // load; no file IO in the hot path.
     let peers = PeerStore::load(&PeerStore::default_path()).context("load peer store")?;
     let tickets = TicketStore::load(&TicketStore::default_path()).context("load ticket store")?;
+    let aliases = AliasStore::default();
 
-    // 1) Peer store: outbound-capable entries get a fresh mint.
+    // 2) Label → peer store.
+    //
+    // Held peers hard-error (the user explicitly held them — do not
+    // surprise-dial via a stale ticket).
+    //
+    // Outbound-capable peers mint a fresh ephemeral ticket with the
+    // caller's caps — the ergonomic common case.
+    //
+    // Inbound-only peers *fall through* to the ticket / alias stores
+    // before bailing: our own error message for this case instructs
+    // users to `portl ticket save <peer> …`, so looking up the saved
+    // ticket under the same label is exactly the flow we documented.
     if let Some(entry) = peers.get_by_label(peer) {
         if entry.last_hold_at.is_some() {
             bail!(
@@ -110,19 +197,21 @@ pub(crate) async fn resolve_peer_ticket(
             let eid = entry.endpoint_id_bytes()?;
             let endpoint_id =
                 EndpointId::from_bytes(&eid).context("peer endpoint_id is not a valid iroh id")?;
-            let addr = resolve_endpoint_addr(endpoint, endpoint_id).await?;
-            return mint_fresh(identity, addr, caps);
+            let (addr, provenance) =
+                resolve_endpoint_addr(opts.endpoint, endpoint_id, opts.force_relay).await?;
+            let ticket = mint_fresh(opts.identity, addr, opts.caps.clone())?;
+            return Ok(ResolvedPeer {
+                ticket,
+                source: PeerSource::PeerStore,
+                discovery: normalize_discovery_source(&provenance),
+            });
         }
-        // Entry exists but is inbound-only: hard error with the fix.
-        bail!(
-            "peer '{peer}' is inbound-only — they accept from us, but we don't have \
-             outbound authority to mint into them. Ask the peer to run \
-             `portl ticket issue <caps> --ttl <dur> --to {our_eid}` and paste the ticket \
-             back; then save it with `portl ticket save {peer} <ticket-string>`.",
-            our_eid = hex::encode(identity.verifying_key())
-        );
+        // Inbound-only: intentionally drop through. If no saved
+        // ticket / alias matches, the final bail! reports the
+        // inbound-only diagnosis with the same fix as before.
     }
-    // 2) Ticket store: saved, unexpired ticket.
+
+    // 3) Label → ticket store.
     if let Some(entry) = tickets.get(peer) {
         let now = unix_now()?;
         if entry.expires_at <= now {
@@ -135,29 +224,81 @@ pub(crate) async fn resolve_peer_ticket(
         eprintln!("using ticket \"{peer}\"");
         let ticket = <PortlTicket as Ticket>::deserialize(&entry.ticket_string)
             .map_err(|err| anyhow!("stored ticket '{peer}' is malformed: {err}"))?;
-        return Ok(ticket);
+        return Ok(ResolvedPeer {
+            ticket: maybe_force_relay_ticket(ticket, opts.force_relay)?,
+            source: PeerSource::TicketStore,
+            discovery: "stored-ticket".to_owned(),
+        });
     }
-    // 3) Raw endpoint_id (64 hex chars). Ephemeral one-off dial.
-    if let Ok(endpoint_id) = parse_endpoint_id(peer) {
-        eprintln!(
-            "using raw endpoint \"{short}\"",
-            short = &peer[..16.min(peer.len())]
+
+    // 4) Label → alias store. Container adapters register aliases
+    //    pointing to either a saved ticket file or a bare
+    //    endpoint_id.
+    if let Some(alias) = aliases.get(peer)? {
+        if let Some(spec) = aliases.get_spec(peer)?
+            && let Some(ticket_path) = spec.ticket_file_path
+        {
+            let raw = std::fs::read_to_string(&ticket_path)
+                .with_context(|| format!("read stored ticket {}", ticket_path.display()))?;
+            let ticket = <PortlTicket as Ticket>::deserialize(raw.trim())
+                .map_err(|err| anyhow!("parse stored ticket {}: {err}", ticket_path.display()))?;
+            eprintln!("using alias \"{peer}\" (stored ticket)");
+            return Ok(ResolvedPeer {
+                ticket: maybe_force_relay_ticket(ticket, opts.force_relay)?,
+                source: PeerSource::AliasStoreTicket,
+                discovery: "stored-ticket".to_owned(),
+            });
+        }
+        let endpoint_id = crate::eid::resolve(&alias.endpoint_id, None, None)
+            .context("alias endpoint_id is not valid hex")?;
+        let (addr, provenance) =
+            resolve_endpoint_addr(opts.endpoint, endpoint_id, opts.force_relay).await?;
+        eprintln!("using alias \"{peer}\"");
+        let ticket = mint_fresh(opts.identity, addr, opts.caps.clone())?;
+        return Ok(ResolvedPeer {
+            ticket,
+            source: PeerSource::AliasStoreEid,
+            discovery: normalize_discovery_source(&provenance),
+        });
+    }
+
+    // 5) Endpoint-id token: full 64-char hex or middle-elided form.
+    if let Ok(endpoint_id) = crate::eid::resolve(peer, Some(&peers), Some(&tickets)) {
+        let short = crate::eid::format_short(&hex::encode(endpoint_id.as_bytes()));
+        eprintln!("using endpoint \"{short}\"");
+        let (addr, provenance) =
+            resolve_endpoint_addr(opts.endpoint, endpoint_id, opts.force_relay).await?;
+        let ticket = mint_fresh(opts.identity, addr, opts.caps.clone())?;
+        return Ok(ResolvedPeer {
+            ticket,
+            source: PeerSource::RawEid,
+            discovery: normalize_discovery_source(&provenance),
+        });
+    }
+
+    // If we reached this point and the peer store had an entry that
+    // was just inbound-only, give the same inbound-only diagnosis as
+    // before — it's more actionable than the generic "unknown peer"
+    // message when the user genuinely has a paired-but-inbound peer.
+    if peers
+        .get_by_label(peer)
+        .is_some_and(|e| !e.they_accept_from_me)
+    {
+        bail!(
+            "peer '{peer}' is inbound-only — they accept from us, but we don't have \
+             outbound authority to mint into them, and no ticket / alias named \
+             '{peer}' is stored locally. Ask the peer to run \
+             `portl ticket issue <caps> --ttl <dur> --to {our_eid}` and paste the \
+             ticket back; then save it with `portl ticket save {peer} <ticket-string>`.",
+            our_eid = hex::encode(opts.identity.verifying_key())
         );
-        let addr = resolve_endpoint_addr(endpoint, endpoint_id).await?;
-        return mint_fresh(identity, addr, caps);
-    }
-    // 4) Raw ticket string (bearer-ticket flow: someone minted a
-    //    ticket for you and you're pasting it as-is).
-    if let Ok(ticket) = <PortlTicket as Ticket>::deserialize(peer) {
-        eprintln!("using inline ticket");
-        return Ok(ticket);
     }
 
     bail!(
         "unknown peer or ticket name '{peer}'. Options:\n  \
          - `portl peer ls` to see stored peers\n  \
          - `portl ticket ls` to see saved tickets\n  \
-         - pass a 64-char hex endpoint_id for a one-off dial\n  \
+         - pass a 64-char hex endpoint_id (or elided `PPPP…SSSS` form)\n  \
          - pass a `portl…` ticket string directly\n  \
          - `portl peer add-unsafe-raw <endpoint_id> --label {peer} …` to pin"
     );
@@ -176,19 +317,44 @@ fn unix_now() -> Result<u64> {
         .as_secs())
 }
 
-async fn resolve_endpoint_addr(
+/// Run iroh's address discovery for `endpoint_id` and return the
+/// first usable `EndpointAddr`, plus its provenance string ("dns",
+/// "pkarr", "mdns", "relay", …) for surfacing to users.
+///
+/// When `force_relay` is true, the returned addr is rewritten to
+/// the peer's relay URL only (direct-UDP candidates dropped). This
+/// errors clearly if the peer has no relay address configured.
+pub(crate) async fn resolve_endpoint_addr(
     endpoint: &iroh::Endpoint,
     endpoint_id: EndpointId,
-) -> Result<EndpointAddr> {
+    force_relay: bool,
+) -> Result<(EndpointAddr, String)> {
+    if force_relay && relay_discovery_disabled() {
+        bail!(
+            "PORTL_DISCOVERY=none disables relay discovery and DNS lookups; unset it or \
+             pass a ticket with a relay address"
+        );
+    }
     let mut stream = endpoint
         .address_lookup()
         .context("access address lookup")?
         .resolve(endpoint_id);
     while let Some(item) = stream.next().await {
         match item {
-            Ok(Ok(item)) => return Ok(item.into_endpoint_addr()),
+            Ok(Ok(item)) => {
+                let provenance = item.provenance().to_owned();
+                let addr = item.into_endpoint_addr();
+                let addr = maybe_force_relay_addr(endpoint_id, addr, force_relay)?;
+                return Ok((addr, provenance));
+            }
             Ok(Err(_)) => {}
             Err(AddressLookupFailed::NoServiceConfigured { .. }) => {
+                if force_relay {
+                    bail!(
+                        "no discovery services configured for relay probing; unset \
+                         PORTL_DISCOVERY=none or pass a ticket with a relay address"
+                    );
+                }
                 bail!("no discovery services configured")
             }
             Err(AddressLookupFailed::NoResults { errors, .. }) => {
@@ -206,10 +372,42 @@ async fn resolve_endpoint_addr(
     bail!("discovery returned no addresses")
 }
 
-fn parse_endpoint_id(spec: &str) -> Result<EndpointId> {
-    let bytes = hex::decode(spec).context("endpoint id must be hex or a portl ticket URI")?;
-    let bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow!("endpoint id must be exactly 32 bytes"))?;
-    EndpointId::from_bytes(&bytes).context("invalid endpoint id")
+fn maybe_force_relay_ticket(mut ticket: PortlTicket, force_relay: bool) -> Result<PortlTicket> {
+    if force_relay {
+        ticket.addr = relay_only_addr(ticket.addr.id, &ticket.addr)?;
+    }
+    Ok(ticket)
+}
+
+fn maybe_force_relay_addr(
+    endpoint_id: EndpointId,
+    addr: EndpointAddr,
+    force_relay: bool,
+) -> Result<EndpointAddr> {
+    if force_relay {
+        return relay_only_addr(endpoint_id, &addr);
+    }
+    Ok(addr)
+}
+
+fn relay_only_addr(endpoint_id: EndpointId, addr: &EndpointAddr) -> Result<EndpointAddr> {
+    let relay_url = addr.relay_urls().next().cloned().context(
+        "peer does not advertise a relay address; rerun without --relay or use a ticket \
+         with relay information",
+    )?;
+    Ok(EndpointAddr::new(endpoint_id).with_relay_url(relay_url))
+}
+
+fn relay_discovery_disabled() -> bool {
+    matches!(std::env::var("PORTL_DISCOVERY"), Ok(value) if value.trim() == "none")
+}
+
+/// Map iroh's discovery-source slug to the portl-canonical name
+/// surfaced by `portl status <peer>` output. Keeps "local" as the
+/// user-facing term for mDNS.
+pub(crate) fn normalize_discovery_source(source: &str) -> String {
+    match source {
+        "mdns" => "local".to_owned(),
+        other => other.to_owned(),
+    }
 }

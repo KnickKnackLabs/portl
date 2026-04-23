@@ -5,6 +5,102 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.3.4.1 — 2026-04-24
+
+Observability correctness + CLI resolution unification. The
+v0.3.2 live-connection registry had a keying bug that hid live
+connections; the v0.3.0 peer-resolution cascade had drifted into
+two copies with different behaviour. This release fixes both and
+consolidates endpoint-id display/parsing across the CLI.
+
+### Agent — live-connection registry
+
+- `ConnectionRegistry` is now keyed by `(peer_eid, stable_id)`
+  instead of `peer_eid` alone. Two concurrent QUIC connections
+  from the same peer no longer collapse into a single row, and
+  the first connection to close no longer wipes the row for
+  other live connections.
+- The registry stores an `iroh::endpoint::Connection` per row;
+  `snapshot()` derives `path`, `rtt_micros`, `bytes_rx`, and
+  `bytes_tx` live from iroh at query time. The previously
+  dead `set_rtt` / `set_path` / `add_bytes` APIs are gone; the
+  `portl status` dashboard fields that were hard-coded to
+  `unknown` / `—` / `0B` now report real values.
+- `ConnectionSnapshot` gains `connection_id: u64` so concurrent
+  connections from the same peer are distinguishable in output.
+- `portl_active_connections` and `portl_active_udp_sessions`
+  Prometheus gauges are derived from the corresponding
+  registry's `len()` at scrape time instead of being manually
+  incremented/decremented. No more gauge-vs-registry drift.
+- `ConnectionGaugeGuard` renamed to `ConnectionRegistryGuard`
+  and keys on the full `ConnKey`, removing only its own row.
+- `StatusSource` trait gains `active_connection_count()` and
+  `active_udp_session_count()` for the derived-gauge sync.
+
+### CLI — unified peer resolution
+
+- Single `peer_resolve::resolve_peer(peer, opts)` replaces the
+  two drifting copies in `peer_resolve` (used by `shell`,
+  `exec`, `tcp`, `udp`, `forward`, `docker run`) and
+  `status::resolve_peer` (used by `portl status <peer>`).
+- Unified cascade (first match wins, prints `using …` to
+  stderr):
+  1. Inline `portl…` ticket string.
+  2. Label → `peers.json`.
+  3. Label → `tickets.json`.
+  4. Label → `aliases.json` (container adapters; stored ticket
+     file or bare endpoint_id).
+  5. Endpoint-id token (full 64-hex or middle-elided
+     `PPPP…SSSS`).
+- Inbound-only paired peers now fall through from step 2 to
+  steps 3/4/5 before bailing. The prior behaviour instructed
+  users to `portl ticket save <peer> …` but then refused to use
+  that ticket under the same label — fixed.
+- Held peers still hard-error (unchanged: holding is an
+  explicit "don't dial" signal).
+- `--relay` (previously status-only, via `force_relay`) is now
+  supported uniformly through `ResolveOpts` — any caller can
+  opt in.
+- Deleted as duplicates: `status::resolve_peer`,
+  `status::resolve_endpoint_addr`,
+  `status::maybe_force_relay_*`,
+  `status::relay_only_addr`,
+  `status::relay_discovery_disabled`,
+  `status::parse_endpoint_id`,
+  `status::normalize_discovery_source`,
+  `peer_resolve::resolve_peer_ticket`,
+  `peer_resolve::parse_endpoint_id`.
+
+### CLI — endpoint-id display & parse
+
+- New `crate::eid` module owns `format_short` (canonical
+  `PPPPPPPP…SSSS`, 8-hex prefix + 4-hex suffix) and `resolve`
+  (full 64-hex, or middle-elided form matched against peer ∪
+  ticket stores).
+- `resolve` requires the `…` character for the short form;
+  bare hex prefixes are rejected to prevent a mistyped label
+  that happens to be hex-ish from silently matching. Ambiguous
+  short forms error with the candidates listed.
+- Switched to `format_short` in user-facing tabular output:
+  `portl status` dashboard per-connection rows, `portl peer ls`,
+  `portl ticket ls`, `portl peer unlink` confirmation,
+  `portl peer pair` confirmation, `portl install --apply` self-row
+  message. Full hex retained in copy-paste targets (`portl whoami`,
+  `portl status <peer>` `endpoint:` line) and error messages that
+  embed a command the user runs.
+- `portl shell <elided>` / `portl status <elided>` / `portl tcp
+  <elided>` etc. now all accept the elided form.
+
+### Metrics
+
+- `portl_active_connections` and `portl_active_udp_sessions`
+  gauges are now correct by construction (derived from the live
+  registries at scrape time), resolving a long-standing
+  divergence where the gauge could stick above the registry
+  count after a hung `accept_bi` loop.
+- `portl_active_udp_sessions` is no longer a permanent zero —
+  previously registered but never incremented.
+
 ## 0.3.4 — 2026-04-23
 
 Peer pairing handshake. Completes the v0.3.0 deferral: three new

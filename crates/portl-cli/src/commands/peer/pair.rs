@@ -171,7 +171,7 @@ fn apply_response(
             };
             println!(
                 "handshake ok.\nadded peer '{label}' ({})  — {mode_label}{relay_note}",
-                &hex::encode(invite.inviter_eid)[..12]
+                crate::eid::format_short_bytes(&invite.inviter_eid)
             );
             let _ = identity; // consumed for side-effect binding above
             Ok(ExitCode::SUCCESS)

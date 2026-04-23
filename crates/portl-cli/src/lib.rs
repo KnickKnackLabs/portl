@@ -10,6 +10,7 @@
 mod agent_ipc;
 mod alias_store;
 mod commands;
+mod eid;
 mod release_binary;
 
 pub use commands::init::InitRole;

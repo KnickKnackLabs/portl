@@ -59,12 +59,7 @@ pub fn run(json_out: bool) -> Result<ExitCode> {
 
     println!("{:<14} {:<22} {:<14}", "LABEL", "ENDPOINT", "EXPIRES");
     for (label, entry) in rows {
-        let eid_hex = &entry.endpoint_id_hex;
-        let eid_short = format!(
-            "{}…{}",
-            &eid_hex[..8.min(eid_hex.len())],
-            &eid_hex[eid_hex.len().saturating_sub(4)..]
-        );
+        let eid_short = crate::eid::format_short(&entry.endpoint_id_hex);
         let expires = if entry.expires_at <= now {
             "EXPIRED".to_owned()
         } else {

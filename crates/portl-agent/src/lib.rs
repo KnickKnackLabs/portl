@@ -196,6 +196,14 @@ impl metrics::StatusSource for AgentState {
             .read()
             .map_or_else(|_| relay::RelayStatus::disabled(), |g| g.clone())
     }
+
+    fn active_connection_count(&self) -> usize {
+        self.connections.len()
+    }
+
+    fn active_udp_session_count(&self) -> usize {
+        self.udp_registry.len()
+    }
 }
 
 #[instrument(skip_all)]

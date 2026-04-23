@@ -87,14 +87,11 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
             };
             audit::ticket_accepted(&session);
             state.metrics.tickets_accepted.inc();
-            state.metrics.active_connections.inc();
-            // v0.3.2: track this connection in the per-peer registry
-            // so `portl status connections` can list it. Path is
-            // best-effort: iroh exposes conn_type but it can change
-            // post-handshake; we set Unknown initially.
-            state
-                .connections
-                .insert(source_id, crate::conn_registry::PathKind::Unknown);
+            // Track this connection in the registry so
+            // `/status/connections` (and the derived
+            // `portl_active_connections` gauge) reflect reality.
+            // Keyed by `(eid, stable_id)` so N concurrent connections
+            // from the same peer coexist.
             Some(session)
         }
         AcceptanceOutcome::Rejected { reason } => {
@@ -125,10 +122,10 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
     };
 
     let udp_context = Arc::new(UdpConnectionContext::new(state.udp_registry.clone()));
-    let _conn_gauge_guard = ConnectionGaugeGuard {
-        metrics: Arc::clone(&state.metrics),
+    let conn_key = state.connections.insert(source_id, connection.clone());
+    let _conn_registry_guard = ConnectionRegistryGuard {
         connections: state.connections.clone(),
-        peer_eid: source_id,
+        key: conn_key,
     };
 
     loop {
@@ -242,19 +239,19 @@ fn unix_now_secs() -> Result<u64> {
         .as_secs())
 }
 
-/// Decrement `active_connections` and drop the per-peer entry from
-/// `ConnectionRegistry` when the authenticated stream loop exits,
-/// regardless of whether it exited cleanly or via an error.
-struct ConnectionGaugeGuard {
-    metrics: Arc<crate::metrics::Metrics>,
+/// Drop the per-connection entry from `ConnectionRegistry` when the
+/// authenticated stream loop exits, regardless of whether it exited
+/// cleanly or via an error. The `active_connections` gauge is
+/// derived from `registry.len()` at scrape time, so no manual
+/// accounting is needed here.
+struct ConnectionRegistryGuard {
     connections: crate::conn_registry::ConnectionRegistry,
-    peer_eid: [u8; 32],
+    key: crate::conn_registry::ConnKey,
 }
 
-impl Drop for ConnectionGaugeGuard {
+impl Drop for ConnectionRegistryGuard {
     fn drop(&mut self) {
-        self.metrics.active_connections.dec();
-        self.connections.remove(&self.peer_eid);
+        self.connections.remove(&self.key);
     }
 }
 

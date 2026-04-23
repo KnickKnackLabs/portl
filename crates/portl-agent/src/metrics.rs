@@ -163,6 +163,12 @@ pub trait StatusSource: Send + Sync + 'static {
     fn connections(&self) -> Vec<crate::conn_registry::ConnectionSnapshot>;
     fn network_info(&self) -> NetworkInfo;
     fn relay_status(&self) -> crate::relay::RelayStatus;
+    /// Number of live QUIC connections. Drives the
+    /// `portl_active_connections` gauge at scrape time.
+    fn active_connection_count(&self) -> usize;
+    /// Number of UDP sessions currently in the registry. Drives the
+    /// `portl_active_udp_sessions` gauge at scrape time.
+    fn active_udp_session_count(&self) -> usize;
 }
 
 /// Run the metrics server on the given unix socket path. Blocks until
@@ -259,6 +265,19 @@ async fn serve_one<S: StatusSource>(
     };
     let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
     let path = parse_request_path(request);
+
+    // Sync derived gauges from the live registries before rendering
+    // Prometheus output, so `portl_active_connections` and
+    // `portl_active_udp_sessions` always match what `/status`
+    // reports without manual inc/dec bookkeeping.
+    if let Some(s) = status.as_ref() {
+        metrics
+            .active_connections
+            .set(i64::try_from(s.active_connection_count()).unwrap_or(i64::MAX));
+        metrics
+            .active_udp_sessions
+            .set(i64::try_from(s.active_udp_session_count()).unwrap_or(i64::MAX));
+    }
 
     let response = match path.as_deref() {
         Some("/" | "/metrics") => render_metrics(&metrics)?,
@@ -389,6 +408,12 @@ impl StatusSource for NoStatus {
     }
     fn relay_status(&self) -> crate::relay::RelayStatus {
         unreachable!("NoStatus is never invoked")
+    }
+    fn active_connection_count(&self) -> usize {
+        0
+    }
+    fn active_udp_session_count(&self) -> usize {
+        0
     }
 }
 

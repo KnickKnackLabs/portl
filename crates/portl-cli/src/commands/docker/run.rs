@@ -12,7 +12,7 @@ use portl_core::ticket::mint::mint_root;
 
 use crate::alias_store::AliasStore;
 use crate::commands::mint_root::{parse_caps, parse_ttl};
-use crate::commands::peer_resolve::{bind_client_endpoint, resolve_peer_ticket};
+use crate::commands::peer_resolve::{ResolveOpts, bind_client_endpoint, resolve_peer};
 use crate::release_binary;
 
 use super::aliases::{resolve_alias_record, save_injected_alias};
@@ -162,17 +162,20 @@ pub(super) async fn finalize_connectable_ticket(
     let endpoint = bind_client_endpoint(operator).await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        match resolve_peer_ticket(
+        match resolve_peer(
             &plan.endpoint_id_hex,
-            operator,
-            &endpoint,
-            plan.caps.clone(),
+            &ResolveOpts {
+                caps: plan.caps.clone(),
+                force_relay: false,
+                identity: operator,
+                endpoint: &endpoint,
+            },
         )
         .await
         {
-            Ok(ticket) => {
-                plan.root_ticket_id = ticket_id(&ticket.sig);
-                plan.ticket = ticket;
+            Ok(resolved) => {
+                plan.root_ticket_id = ticket_id(&resolved.ticket.sig);
+                plan.ticket = resolved.ticket;
                 return Ok(());
             }
             Err(err) if tokio::time::Instant::now() < deadline => {

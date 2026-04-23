@@ -73,12 +73,7 @@ pub fn run(json_out: bool, active: bool) -> Result<ExitCode> {
         "LABEL", "ENDPOINT", "REL", "ORIGIN"
     );
     for entry in rows {
-        let eid_hex = &entry.endpoint_id_hex;
-        let eid_short = format!(
-            "{}…{}",
-            &eid_hex[..8.min(eid_hex.len())],
-            &eid_hex[eid_hex.len().saturating_sub(4)..]
-        );
+        let eid_short = crate::eid::format_short(&entry.endpoint_id_hex);
         let live_cell = if active {
             if active_set.contains(&entry.endpoint_id_hex) {
                 " ●"

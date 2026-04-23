@@ -122,7 +122,7 @@ async fn status_refuses_delegated_tickets() -> Result<()> {
 
     assert!(
         format!("{err:#}").contains(
-            "delegated tickets not yet supported by status; use the root ticket or pass --chain"
+            "delegated tickets not yet supported by this command; use the root ticket or pass --chain"
         ),
         "unexpected error: {err:#}"
     );

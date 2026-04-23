@@ -188,6 +188,14 @@ impl UdpSessionRegistry {
         Ok(())
     }
 
+    /// Number of UDP sessions currently in the registry (live or
+    /// lingering). Used to derive `portl_active_udp_sessions` at
+    /// scrape time.
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        self.inner.sessions.len()
+    }
+
     pub async fn shutdown(&self) {
         let _attach_guard = self.inner.attach_lock.lock().await;
         let session_ids = self
