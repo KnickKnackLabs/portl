@@ -291,9 +291,9 @@ fn parse_discovery(value: &str) -> Result<DiscoveryConfig> {
                 // surface a clear error rather than silently
                 // falling back to the default.
                 let url_str = &other["relay:".len()..];
-                let url = url_str
-                    .parse::<RelayUrl>()
-                    .with_context(|| format!("parse relay URL from PORTL_DISCOVERY entry `{other}`"))?;
+                let url = url_str.parse::<RelayUrl>().with_context(|| {
+                    format!("parse relay URL from PORTL_DISCOVERY entry `{other}`")
+                })?;
                 discovery.relay = Some(url);
             }
             other => bail!("unsupported PORTL_DISCOVERY backend: {other}"),

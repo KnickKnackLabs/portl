@@ -673,8 +673,14 @@ fn fix_service_drift(yes: bool) -> anyhow::Result<String> {
         }
 
         let cmds = [
-            ("sudo", &["launchctl", "bootout", "system/com.portl.agent"][..]),
-            ("sudo", &["rm", "-f", "/Library/LaunchDaemons/com.portl.agent.plist"][..]),
+            (
+                "sudo",
+                &["launchctl", "bootout", "system/com.portl.agent"][..],
+            ),
+            (
+                "sudo",
+                &["rm", "-f", "/Library/LaunchDaemons/com.portl.agent.plist"][..],
+            ),
         ];
 
         if !yes && !confirm_fix(&cmds)? {
@@ -696,8 +702,14 @@ fn fix_service_drift(yes: bool) -> anyhow::Result<String> {
         }
 
         let cmds = [
-            ("sudo", &["systemctl", "disable", "--now", "portl-agent.service"][..]),
-            ("sudo", &["rm", "-f", "/etc/systemd/system/portl-agent.service"][..]),
+            (
+                "sudo",
+                &["systemctl", "disable", "--now", "portl-agent.service"][..],
+            ),
+            (
+                "sudo",
+                &["rm", "-f", "/etc/systemd/system/portl-agent.service"][..],
+            ),
         ];
 
         if !yes && !confirm_fix(&cmds)? {
