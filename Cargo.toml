@@ -28,8 +28,10 @@ iroh-tickets = "0.5"
 # matches iroh-relay's own default: ring provider, tls12, logging
 # off by default. No aws-lc-rs (v0.2.4 removed it to fix the macOS
 # SIGABRT).
-rustls         = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
-rustls-pemfile = "2"
+rustls          = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+# PEM loading uses rustls-pki-types' PemObject trait (replacement
+# for the archived rustls-pemfile crate).
+rustls-pki-types = { version = "1", features = ["std"] }
 tokio        = { version = "1", features = ["full"] }
 tokio-util   = "0.7"
 bytes        = "1"

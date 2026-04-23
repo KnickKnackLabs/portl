@@ -24,12 +24,13 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use iroh_base::EndpointId;
 use iroh_relay::server::{
     Access, AccessConfig, CertConfig, RelayConfig, Server, ServerConfig as IrohServerConfig,
     TlsConfig,
 };
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, instrument, warn};
@@ -242,11 +243,15 @@ fn build_tls_config(cfg: &RelayTlsConfig) -> Result<TlsConfig<(), ()>> {
 }
 
 fn load_certs(path: &std::path::Path) -> Result<Vec<CertificateDer<'static>>> {
-    let file =
-        std::fs::File::open(path).with_context(|| format!("open relay cert {}", path.display()))?;
-    let mut reader = std::io::BufReader::new(file);
-    let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut reader).collect();
-    let certs = certs.with_context(|| format!("parse relay cert PEM at {}", path.display()))?;
+    // Surface "file not found" before PEM parsing so test-side
+    // error-message assertions (`open relay cert …`) still hit.
+    if !path.exists() {
+        bail!("open relay cert {}: file not found", path.display());
+    }
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(path)
+        .with_context(|| format!("open relay cert {}", path.display()))?
+        .collect::<std::result::Result<_, _>>()
+        .with_context(|| format!("parse relay cert PEM at {}", path.display()))?;
     if certs.is_empty() {
         bail!("no certificates found in {}", path.display());
     }
@@ -254,12 +259,12 @@ fn load_certs(path: &std::path::Path) -> Result<Vec<CertificateDer<'static>>> {
 }
 
 fn load_key(path: &std::path::Path) -> Result<PrivateKeyDer<'static>> {
-    let file =
-        std::fs::File::open(path).with_context(|| format!("open relay key {}", path.display()))?;
-    let mut reader = std::io::BufReader::new(file);
-    rustls_pemfile::private_key(&mut reader)
-        .with_context(|| format!("parse relay key PEM at {}", path.display()))?
-        .ok_or_else(|| anyhow!("no private key found in {}", path.display()))
+    if !path.exists() {
+        bail!("open relay key {}: file not found", path.display());
+    }
+    let key = PrivateKeyDer::from_pem_file(path)
+        .with_context(|| format!("parse relay key PEM at {}", path.display()))?;
+    Ok(key)
 }
 
 /// Live relay server. Drop to shutdown (abort-on-drop on the
@@ -445,6 +450,11 @@ mod tests {
     fn load_key_rejects_empty_file() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let err = load_key(tmp.path()).expect_err("empty PEM should fail");
-        assert!(err.to_string().contains("no private key"));
+        // PemObject's parser surfaces a "NoItemsFound"-style error
+        // for empty PEMs; we wrap it with "parse relay key PEM at".
+        assert!(
+            err.to_string().contains("parse relay key PEM"),
+            "expected parse error, got: {err}"
+        );
     }
 }
