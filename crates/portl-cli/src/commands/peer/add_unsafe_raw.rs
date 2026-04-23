@@ -110,6 +110,8 @@ pub fn run(
         origin: PeerOrigin::Raw,
         last_hold_at: None,
         is_self: false,
+        relay_hint: None,
+        schema_version: 2,
     })?;
     peers.save(&peers_path)?;
     println!("added peer '{label}' (raw). Agent will pick up the change within ~500ms.");

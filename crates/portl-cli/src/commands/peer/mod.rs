@@ -11,5 +11,7 @@
 //! motivated the rework.
 
 pub mod add_unsafe_raw;
+pub mod invite;
 pub mod ls;
+pub mod pair;
 pub mod unlink;

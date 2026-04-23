@@ -57,9 +57,24 @@ pub struct PeerEntry {
     /// True only for the `self` row. Convenience flag for doctor and
     /// install seeding.
     pub is_self: bool,
+    /// Remembered relay URL for this peer (v2+). `None` on legacy
+    /// entries and when no hint was learned. Serde default keeps
+    /// this field forward/backward compatible with v1 files.
+    #[serde(default)]
+    pub relay_hint: Option<String>,
+    /// Per-entry schema version. `1` for entries written before
+    /// v0.3.4; `2` for anything with a `relay_hint` field. Serde
+    /// default keeps v1 entries loadable without migration.
+    #[serde(default = "PeerEntry::default_schema_version")]
+    pub schema_version: u8,
 }
 
 impl PeerEntry {
+    #[must_use]
+    pub fn default_schema_version() -> u8 {
+        1
+    }
+
     /// 32-byte `endpoint_id` as raw bytes. Returns error if the
     /// on-disk hex is malformed (should not happen for stores we
     /// wrote ourselves, but guards against manual edits).
@@ -305,6 +320,8 @@ mod tests {
             origin: PeerOrigin::Raw,
             last_hold_at: None,
             is_self: false,
+            relay_hint: None,
+            schema_version: 2,
         }
     }
 

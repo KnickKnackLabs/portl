@@ -192,6 +192,9 @@ Commands:
                   retype the `endpoint_id` at a confirmation prompt to guard against blind
                   paste-ins; pick exactly one of --mutual / --inbound / --outbound to set
                   relationship
+  invite          Issue, list, or revoke a peer-pairing invite code
+  pair            Consume an invite code and establish mutual trust
+  accept          Consume an invite code and accept one-way inbound access
   help            Print this message or the help of the given subcommand(s)
 
 Options:

@@ -11,7 +11,10 @@ use crate::config::AgentConfig;
 pub async fn bind(cfg: &AgentConfig, identity: &Identity) -> Result<iroh::Endpoint> {
     let mut builder = iroh::Endpoint::builder(presets::Minimal)
         .secret_key(SecretKey::from_bytes(&identity.signing_key().to_bytes()))
-        .alpns(vec![portl_proto::ticket_v1::ALPN_TICKET_V1.to_vec()]);
+        .alpns(vec![
+            portl_proto::ticket_v1::ALPN_TICKET_V1.to_vec(),
+            portl_proto::pair_v1::ALPN_PAIR_V1.to_vec(),
+        ]);
 
     builder = if cfg.discovery.relays.is_empty() {
         builder.relay_mode(RelayMode::Disabled)

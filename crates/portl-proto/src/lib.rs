@@ -8,6 +8,7 @@
 
 pub mod error;
 pub mod meta_v1;
+pub mod pair_v1;
 pub mod shell_v1;
 pub mod tcp_v1;
 pub mod ticket_v1;

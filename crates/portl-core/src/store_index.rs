@@ -37,6 +37,8 @@ mod tests {
                 origin: PeerOrigin::Raw,
                 last_hold_at: None,
                 is_self: false,
+                relay_hint: None,
+                schema_version: 2,
             })
             .unwrap();
         let mut tickets = TicketStore::new();

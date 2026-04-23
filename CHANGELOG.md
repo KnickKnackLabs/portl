@@ -5,6 +5,116 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.3.4 — 2026-04-23
+
+Peer pairing handshake. Completes the v0.3.0 deferral: three new
+verbs replace the copy-paste-endpoint-id workflow, peer entries
+gain `relay_hint`, and new ALPN `portl/pair/v1` lands on the
+agent's existing iroh listener. Workspace bumped to `0.3.4`.
+
+### CLI
+
+- `portl peer invite [--ttl 1h] [--for <label>]` — issue a
+  single-use invite code (`PORTLINV-…`) + write it to
+  `$PORTL_HOME/pending_invites.json`. Default TTL 1h; supports
+  bare seconds or shorthand (`s`/`m`/`h`/`d`).
+- `portl peer invite --list` — tabulate pending invites with
+  nonce prefix, `for_label` hint, and expiry.
+- `portl peer invite --revoke <nonce-prefix>` — delete a pending
+  invite. Ambiguous prefix fails clean.
+- `portl peer pair <code>` — decode the invite, dial the inviter,
+  and establish mutual trust. Both sides end up with matching
+  peer entries (`PeerOrigin::Paired`).
+- `portl peer accept <code>` — same dial, but one-way: caller
+  gains `PeerOrigin::Accepted` inbound from the inviter, no
+  outbound privilege back. Matches the "remote support / IoT"
+  use case.
+- All three JSON-aware where it makes sense (invite issue + list).
+
+### Protocol
+
+- New ALPN `portl/pair/v1`, added to the agent's `set_alpns` list
+  alongside `portl/ticket/v1`.
+- Wire types live in `portl-proto::pair_v1`: `PairRequest`,
+  `PairResponse`, `PairResult { Ok, NonceExpired, NonceUnknown,
+  AlreadyPaired { existing_label }, PolicyRejected(msg) }`,
+  `PairMode { Pair, Accept }`. Postcard-encoded with u32 LE
+  length prefix.
+- Invite code format: base32 (RFC-4648, no pad) of `{version:1,
+  inviter_eid:32, nonce:16, not_after:u64_le, relay_hint_len:1,
+  relay_hint:variable}`, prefixed `PORTLINV-`. ~80 chars at
+  typical relay-hint lengths.
+
+### Stores
+
+- New `$PORTL_HOME/pending_invites.json` tracked by
+  `portl-core::pair_store::PairStore`. Same atomic-write pattern
+  as `peer_store`. Missing file = no pending invites.
+- `PeerEntry` gained `relay_hint: Option<String>` and
+  `schema_version: u8` fields. Backward-compatible: v1 entries
+  load with `relay_hint: None, schema_version: 1`; next save
+  writes schema v2. No file migration needed.
+- Caller's `endpoint_id` is read from the QUIC TLS peer cert,
+  never from wire content — the wire format can't spoof identity.
+
+### Agent
+
+- New `crates/portl-agent/src/pair_handler.rs`:
+    1. Read one postcard `PairRequest` from an accepted bi-stream.
+    2. Validate the nonce against `pending_invites.json`
+       (exists + not expired).
+    3. Insert/update the caller in `peers.json` with the right
+       `(accepts_from_them, they_accept_from_me)` tuple per
+       `PairMode`. `Pair` → `(true, true)`; `Accept` →
+       `(true, false)`.
+    4. Consume the nonce (remove from `pending_invites.json`).
+    5. Reply with `PairResponse::Ok` including the server's own
+       `relay_hint` (from `RelayStatus`) and its `self` label.
+- `AlreadyPaired` is idempotent: nonce still consumed, existing
+  label returned verbatim, caller gets told to `peer ls`.
+- Label-collision fallback: `<candidate>-<4-hex-of-eid>`.
+
+### Security
+
+- Nonces are 128-bit from `OsRng`; single-use; default 1h TTL;
+  revocable.
+- Invite codes are *not* secrets — they bind to a single inviter
+  eid, have a short TTL, and are single-use. Leaked codes give
+  an attacker at most one pair attempt against a single agent
+  in a short window.
+- No transitive trust: a pairs-with-B does not imply A-reaches-C
+  via B.
+
+### Version bump
+
+Workspace `Cargo.toml` bumped to `0.3.4` (ends the diverge-from-tag
+pattern for minor releases; `portl --version` now reports `0.3.4`
+on all v0.3.4 artifacts).
+
+### Tests & quality
+
+400 tests pass (was 371 in v0.3.3.2), clippy clean under
+`--all-features -D warnings`, fmt clean. 29 new tests cover:
+invite code roundtrip (5), pair store ops (7), pair wire types
+(4), TTL parsing (4), and end-to-end `handle_pair` paths
+(5: happy path, accept mode, unknown/expired nonce, already-
+paired idempotency).
+
+### Out of scope (deferred)
+
+- Agent-side reload task for `pending_invites.json` (today the
+  pair handler reads the file per-request, which is already
+  reload-on-every-call; a polling task would be redundant).
+- Caller-side relay-hint propagation (the `caller_relay_hint`
+  field in PairRequest is always `None` today; picking it up
+  from the caller's own `RelayServerConfig` is v0.3.4.1).
+- `portl peer ls` RELAY_HINT column (field is persisted; display
+  column lands with v0.3.4.1 when the full relay-hint story
+  is wired through `peer_resolve`).
+- Integration test dialing through a live relay — iroh-relay's
+  client + pair ALPN e2e still blocked by same harness gap
+  as v0.3.3.2.
+
 ## 0.3.3.2 — 2026-04-23
 
 Relay HTTPS + rejection metrics. Operators can now serve the

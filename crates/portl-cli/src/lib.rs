@@ -85,6 +85,19 @@ pub enum Command {
         outbound: bool,
         yes: bool,
     },
+    PeerInvite {
+        ttl: Option<String>,
+        for_label: Option<String>,
+        list: bool,
+        revoke: Option<String>,
+        json: bool,
+    },
+    PeerPair {
+        code: String,
+    },
+    PeerAccept {
+        code: String,
+    },
     TicketIssue {
         caps: Option<String>,
         ttl: String,
@@ -343,6 +356,27 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             outbound,
             yes,
         } => commands::peer::add_unsafe_raw::run(&endpoint, label, mutual, inbound, outbound, yes),
+        Command::PeerInvite {
+            ttl,
+            for_label,
+            list,
+            revoke,
+            json,
+        } => {
+            if let Some(prefix) = revoke.as_deref() {
+                commands::peer::invite::revoke(prefix)
+            } else if list {
+                commands::peer::invite::list(json)
+            } else {
+                commands::peer::invite::issue(ttl.as_deref(), for_label.as_deref(), json)
+            }
+        }
+        Command::PeerPair { code } => {
+            commands::peer::pair::run(&code, portl_proto::pair_v1::PairMode::Pair)
+        }
+        Command::PeerAccept { code } => {
+            commands::peer::pair::run(&code, portl_proto::pair_v1::PairMode::Accept)
+        }
         Command::TicketIssue {
             caps,
             ttl,
@@ -643,6 +677,40 @@ enum PeerAction {
         #[arg(long)]
         yes: bool,
     },
+    /// Issue, list, or revoke a peer-pairing invite code.
+    Invite {
+        /// Time-to-live for the issued invite. Accepts seconds
+        /// (`3600`) or duration shorthand (`10m`, `1h`, `30d`).
+        /// Default `1h`.
+        #[arg(long)]
+        ttl: Option<String>,
+        /// Optional label hint for the new peer. Consumed by the
+        /// acceptor when they don't supply their own label.
+        #[arg(long = "for")]
+        for_label: Option<String>,
+        /// List pending invites instead of issuing a new one.
+        #[arg(long, conflicts_with_all = ["ttl", "for_label", "revoke"])]
+        list: bool,
+        /// Revoke a pending invite by nonce prefix.
+        #[arg(long, value_name = "NONCE_PREFIX", conflicts_with_all = ["ttl", "for_label"])]
+        revoke: Option<String>,
+        /// Emit structured JSON (applies to issue + list; revoke
+        /// is text-only).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Consume an invite code and establish mutual trust.
+    Pair {
+        /// `PORTLINV-<base32>` invite code from the inviter.
+        code: String,
+    },
+    /// Consume an invite code and accept one-way inbound access.
+    ///
+    /// After `pair`, both sides can initiate connections. After
+    /// `accept`, only the inviter can initiate — useful for
+    /// remote-support and `IoT` scenarios where you don't want to
+    /// grant outbound from the customer's box.
+    Accept { code: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -876,6 +944,28 @@ impl Cli {
                 outbound,
                 yes,
             },
+            TopLevel::Peer {
+                action:
+                    PeerAction::Invite {
+                        ttl,
+                        for_label,
+                        list,
+                        revoke,
+                        json,
+                    },
+            } => Command::PeerInvite {
+                ttl,
+                for_label,
+                list,
+                revoke,
+                json,
+            },
+            TopLevel::Peer {
+                action: PeerAction::Pair { code },
+            } => Command::PeerPair { code },
+            TopLevel::Peer {
+                action: PeerAction::Accept { code },
+            } => Command::PeerAccept { code },
             TopLevel::Ticket {
                 action:
                     TicketAction::Issue {

@@ -11,6 +11,8 @@ pub mod error;
 pub mod id;
 pub mod io;
 pub mod net;
+pub mod pair_code;
+pub mod pair_store;
 pub mod peer_store;
 pub mod runtime;
 pub mod store_index;

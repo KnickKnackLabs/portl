@@ -80,6 +80,8 @@ pub fn seed_peer_store_self_row_if_missing() -> Result<Option<String>> {
             origin: PeerOrigin::Zelf,
             last_hold_at: None,
             is_self: true,
+            relay_hint: None,
+            schema_version: 2,
         })
         .context("insert self-row in peer store")?;
     peers.save(&path).context("save peer store")?;

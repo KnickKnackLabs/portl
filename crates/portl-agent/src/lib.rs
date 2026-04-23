@@ -20,6 +20,7 @@ pub mod endpoint;
 pub mod gateway;
 pub mod meta_handler;
 pub mod metrics;
+pub mod pair_handler;
 pub mod pipeline;
 pub mod rate_limit;
 pub mod relay;
@@ -272,9 +273,10 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
     });
 
     let endpoint = if let Some(endpoint) = cfg.endpoint.clone() {
-        endpoint
-            .inner()
-            .set_alpns(vec![portl_proto::ticket_v1::ALPN_TICKET_V1.to_vec()]);
+        endpoint.inner().set_alpns(vec![
+            portl_proto::ticket_v1::ALPN_TICKET_V1.to_vec(),
+            portl_proto::pair_v1::ALPN_PAIR_V1.to_vec(),
+        ]);
         endpoint.inner().clone()
     } else {
         let identity = load_identity(&cfg)?;
@@ -313,8 +315,17 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
                 if connection.alpn() == portl_proto::ticket_v1::ALPN_TICKET_V1 {
                     let state = Arc::clone(&state);
                     tokio::spawn(async move {
-                        if let Err(err) = ticket_handler::serve_connection(connection, state).await {
+                        if let Err(err) = ticket_handler::serve_connection(connection, state).await
+                        {
                             warn!(?err, "ticket connection failed");
+                        }
+                    });
+                } else if connection.alpn() == portl_proto::pair_v1::ALPN_PAIR_V1 {
+                    let state = Arc::clone(&state);
+                    tokio::spawn(async move {
+                        if let Err(err) = pair_handler::serve_connection(connection, state).await
+                        {
+                            warn!(?err, "pair connection failed");
                         }
                     });
                 } else {
