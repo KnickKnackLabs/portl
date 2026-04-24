@@ -61,7 +61,7 @@ pub fn run(
             {
                 bail!(
                     "label '{label}' already points at a different peer; \
-                     pick another label or `portl peer unlink {label}` first"
+pick another label or `portl peer rm {label}` first"
                 );
             }
         } else {

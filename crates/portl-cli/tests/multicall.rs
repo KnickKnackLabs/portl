@@ -63,10 +63,12 @@ fn global_verbose_flags_do_not_change_command_shape() {
     assert_eq!(
         cmd,
         Command::Status {
-            peer: None,
+            target: None,
             relay: false,
             json: false,
             watch: None,
+            count: 1,
+            timeout: humantime::parse_duration("5s").expect("duration"),
         }
     );
 
@@ -74,15 +76,15 @@ fn global_verbose_flags_do_not_change_command_shape() {
         "portl",
         "--log",
         "portl_cli=debug,iroh=info",
-        "peer",
-        "pair",
+        "accept",
         "PORTLINV-AAAA",
     ]))
-    .expect("parse --log peer pair");
+    .expect("parse --log accept");
     assert_eq!(
         cmd,
-        Command::PeerPair {
+        Command::Accept {
             code: "PORTLINV-AAAA".to_owned(),
+            yes: false,
         }
     );
 
@@ -94,6 +96,7 @@ fn global_verbose_flags_do_not_change_command_shape() {
             yes: false,
             verbose: true,
             json: false,
+            quiet: false,
         }
     );
 }
@@ -181,25 +184,27 @@ fn ticket_revoke_subcommands_parse() {
     // v0.3.0 moved `revoke` under the `ticket` subcommand. No
     // behavior change; the move groups all credential-lifecycle
     // verbs under one subcommand.
-    let revoke = parse(argv(&["portl", "ticket", "revoke", "demo", "--publish"]))
-        .expect("parse ticket revoke with publish");
+    let revoke = parse(argv(&[
+        "portl", "ticket", "revoke", "publish", "demo", "--yes",
+    ]))
+    .expect("parse ticket revoke publish");
     assert_eq!(
         revoke,
         Command::TicketRevoke {
-            id: Some("demo".to_owned()),
-            list: false,
-            publish: true,
+            id: None,
+            action: Some(portl_cli::RevokeAction::Publish {
+                id: Some("demo".to_owned()),
+                yes: true,
+            }),
         }
     );
 
-    let list =
-        parse(argv(&["portl", "ticket", "revoke", "--list"])).expect("parse ticket revoke list");
+    let list = parse(argv(&["portl", "ticket", "revoke", "ls"])).expect("parse ticket revoke list");
     assert_eq!(
         list,
         Command::TicketRevoke {
             id: None,
-            list: true,
-            publish: false,
+            action: Some(portl_cli::RevokeAction::Ls { json: false }),
         }
     );
 }

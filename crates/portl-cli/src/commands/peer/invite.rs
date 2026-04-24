@@ -1,4 +1,4 @@
-//! `portl peer invite` — issue, list, revoke pair invite codes.
+//! `portl invite` — issue, list, revoke pair invite codes.
 //!
 //! Writes `pending_invites.json` in `$PORTL_HOME`. The running
 //! agent picks up new invites within ~500ms via the existing
@@ -6,18 +6,25 @@
 //! for the invite store, but reads are already safe because each
 //! `pair_handler::handle_pair` call loads the file fresh).
 
+use std::io::{self, IsTerminal, Write as _};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use portl_core::id::store;
-use portl_core::pair_code::InviteCode;
+use portl_core::pair_code::{InitiatorMode, InviteCode};
 use portl_core::pair_store::{PairStore, PendingInvite};
 use rand::RngCore;
 
 const DEFAULT_TTL_SECS: u64 = 3600;
 
-pub fn issue(ttl: Option<&str>, for_label: Option<&str>, json: bool) -> Result<ExitCode> {
+pub fn issue(
+    initiator: InitiatorMode,
+    ttl: Option<&str>,
+    for_label: Option<&str>,
+    json: bool,
+    yes: bool,
+) -> Result<ExitCode> {
     let ttl_secs = parse_ttl(ttl)?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -33,11 +40,26 @@ pub fn issue(ttl: Option<&str>, for_label: Option<&str>, json: bool) -> Result<E
     // Inviter's endpoint_id is the local identity's verifying key.
     let identity = store::load(&store::default_path()).context("load local identity")?;
     let inviter_eid = identity.verifying_key();
+    let inviter_label = hex::encode(inviter_eid)[..8].to_owned();
+
+    if !yes && io::stdin().is_terminal() {
+        println!("You are about to issue an invite as '{inviter_label}'.\n");
+        println!("  After {} accepts this code:", for_label.unwrap_or("they"));
+        for line in
+            inviter_relationship_lines(&inviter_label, for_label.unwrap_or("them"), initiator)
+        {
+            println!("    {line}");
+        }
+        if !confirm_default_yes("\nIssue? [Y/n] ")? {
+            return Ok(ExitCode::FAILURE);
+        }
+    }
 
     let invite = PendingInvite {
         nonce_hex: nonce_hex.clone(),
         issued_at_unix: now,
         not_after_unix,
+        initiator,
         for_label_hint: for_label.map(ToOwned::to_owned),
     };
 
@@ -45,7 +67,7 @@ pub fn issue(ttl: Option<&str>, for_label: Option<&str>, json: bool) -> Result<E
     store_file.insert(invite);
     store_file.save().context("save pair store")?;
 
-    let code = InviteCode::new(inviter_eid, nonce, not_after_unix, None)
+    let code = InviteCode::new(inviter_eid, nonce, not_after_unix, initiator, None)
         .encode()
         .context("encode invite code")?;
 
@@ -58,6 +80,7 @@ pub fn issue(ttl: Option<&str>, for_label: Option<&str>, json: bool) -> Result<E
             "expires_at_unix": not_after_unix,
             "expires_in_secs": ttl_secs,
             "for_label": for_label,
+            "initiator": format!("{initiator:?}").to_ascii_lowercase(),
         });
         println!("{}", serde_json::to_string_pretty(&envelope)?);
     } else {
@@ -66,9 +89,15 @@ pub fn issue(ttl: Option<&str>, for_label: Option<&str>, json: bool) -> Result<E
             "expires: in {} (unix {not_after_unix})",
             fmt_duration(ttl_secs)
         );
+        println!("initiator: {initiator:?}");
+        println!("relationship:");
+        for line in
+            inviter_relationship_lines(&inviter_label, for_label.unwrap_or("them"), initiator)
+        {
+            println!("  {line}");
+        }
         println!("share this code over a trusted channel (DM, signed email, etc.)");
-        println!("  pair:   portl peer pair <code>     # mutual trust");
-        println!("  accept: portl peer accept <code>   # one-way: they can reach you");
+        println!("  accept: portl accept <code>");
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -91,6 +120,7 @@ pub fn list(json: bool) -> Result<ExitCode> {
                     "expired": i.not_after_unix <= now,
                     "expires_in_secs": i.not_after_unix.saturating_sub(now),
                     "for_label": i.for_label_hint,
+                    "initiator": format!("{:?}", i.initiator).to_ascii_lowercase(),
                 })
             })
             .collect();
@@ -105,7 +135,7 @@ pub fn list(json: bool) -> Result<ExitCode> {
     }
 
     if store.is_empty() {
-        println!("no pending invites. Issue one with:\n  portl peer invite");
+        println!("no pending invites. Issue one with:\n  portl invite");
         return Ok(ExitCode::SUCCESS);
     }
     println!("{:<16} {:<14} {:<14}", "NONCE", "FOR_LABEL", "EXPIRES");
@@ -136,6 +166,37 @@ pub fn revoke(nonce_prefix: &str) -> Result<ExitCode> {
     store.save()?;
     println!("revoked invite {nonce_hex}");
     Ok(ExitCode::SUCCESS)
+}
+
+fn confirm_default_yes(prompt: &str) -> Result<bool> {
+    print!("{prompt}");
+    io::stdout().flush().context("flush confirmation prompt")?;
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .context("read confirmation")?;
+    let answer = answer.trim().to_ascii_lowercase();
+    Ok(answer.is_empty() || matches!(answer.as_str(), "y" | "yes"))
+}
+
+fn inviter_relationship_lines(
+    inviter_label: &str,
+    acceptor_label: &str,
+    initiator: InitiatorMode,
+) -> Vec<String> {
+    match initiator {
+        InitiatorMode::Mutual => vec![format!(
+            "{inviter_label} and {acceptor_label} can reach each other"
+        )],
+        InitiatorMode::Me => vec![
+            format!("{inviter_label} can reach {acceptor_label}"),
+            format!("{acceptor_label} cannot reach {inviter_label}"),
+        ],
+        InitiatorMode::Them => vec![
+            format!("{acceptor_label} can reach {inviter_label}"),
+            format!("{inviter_label} cannot reach {acceptor_label}"),
+        ],
+    }
 }
 
 fn parse_ttl(ttl: Option<&str>) -> Result<u64> {
@@ -186,6 +247,22 @@ mod tests {
         assert_eq!(parse_ttl(Some("10m")).unwrap(), 600);
         assert_eq!(parse_ttl(Some("1h")).unwrap(), 3600);
         assert_eq!(parse_ttl(Some("30d")).unwrap(), 30 * 86_400);
+    }
+
+    #[test]
+    fn relationship_lines_match_model_a_phrasing() {
+        assert_eq!(
+            inviter_relationship_lines("max", "laptop", InitiatorMode::Mutual),
+            vec!["max and laptop can reach each other"]
+        );
+        assert_eq!(
+            inviter_relationship_lines("max", "laptop", InitiatorMode::Me),
+            vec!["max can reach laptop", "laptop cannot reach max"]
+        );
+        assert_eq!(
+            inviter_relationship_lines("max", "laptop", InitiatorMode::Them),
+            vec!["laptop can reach max", "max cannot reach laptop"]
+        );
     }
 
     #[test]

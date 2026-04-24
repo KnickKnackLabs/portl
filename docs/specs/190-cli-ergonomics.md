@@ -29,7 +29,7 @@ name or shape and deletes the old one rather than carrying
 alias debt. Tier 2 splits the two verb-in-flag commands
 into proper subverbs, restructures `config` with a
 `template` verb and stdin-friendly validation, adds
-`ls`/`rm` aliases across the tree, extends `status [PEER]`
+`ls`/`rm` aliases across the tree, extends `status [TARGET]`
 into a unified self-or-peer health verb, ships `portl
 man`, stabilizes exit codes, and audits the `PORTL_*`
 env-var surface.
@@ -74,6 +74,8 @@ Three structural recommendations from the initial audit are
   an independent forwarding primitive; revisit once the role
   is clearer.
 - Touching any wire protocol. This is pure CLI surface.
+  Persistent session protocol work is specified separately in
+  `200-persistent-sessions.md`.
 - Touching any on-disk file layout, config key, or default
   value. `portl.toml` parses unchanged before and after this
   work.
@@ -95,7 +97,7 @@ affect any existing invocation.
 - §5:  top-level help restructure
 - §6:  fill every missing arg/flag docstring
 - §7:  `after_long_help` examples on high-traffic verbs
-- §8:  `<PEER>` help constant, reused everywhere
+- §8:  `<TARGET>` help constant, reused everywhere
 - §9:  clap `requires` / `conflicts_with` audit
 - §10: `portl completions <shell>`
 - §11: actionable error messages
@@ -116,7 +118,7 @@ tools we don't control — notably docker/slicer `list` →
 - §17: `config` restructure
   (`template` / `init` / `edit`)
 - §18: `ls` / `rm` aliases across the tree
-- §19: `portl status [PEER]` unified self-or-peer health
+- §19: `portl status [TARGET]` unified self-or-target health
 - §20: `portl man` via `clap_mangen`
 - §21: exit code stabilization
 - §22: `PORTL_*` env var audit + `PORTL_JSON` /
@@ -144,14 +146,18 @@ Groups, in the order they render:
 - **Setup**: `init`, `doctor`, `install`, `config`, `whoami`
 - **Trust**: `peer`, `invite`
 - **Pairing**: `accept`
-- **Sessions (advanced)**: `ticket`
-- **Connect**: `status`, `shell`, `exec`, `tcp`, `udp`
+- **Connect**: `status`, `shell`, `session`, `exec`, `tcp`, `udp`
+- **Permissions**: `ticket`
 - **Integrations**: `docker`, `slicer`, `gateway`
 - **Utility**: `completions`, `help`
 
 The `ticket` demotion, the new `invite` namespace, and the
-`accept` flat verb are all finalized in §14. This section
-only reflects the grouping outcome.
+`accept` flat verb are all finalized in §14. `session` is
+introduced by `200-persistent-sessions.md`; until that spec
+lands, the Connect group contains `status`, `shell`, `exec`,
+`tcp`, and `udp`. The grouping decision remains the same:
+`ticket` is advanced permission management, not a newcomer-facing
+connection verb.
 
 ### 5.2 Top-level `long_about` + `after_long_help`
 
@@ -163,9 +169,10 @@ portl — peer-to-peer remote access and port forwarding.
 
 Pair two machines:
   $ portl init
-  $ portl invite                   # on the other machine (receive a code)
-  $ portl accept PORTLINV-…        # on this machine (paste the code)
-  $ portl shell other-machine      # connect
+  $ portl invite                       # on the other machine
+  $ portl accept PORTLINV-…            # on this machine
+  $ portl shell other-machine          # one-shot interactive shell
+  $ portl session attach other-machine # persistent shell, if available
 
 Run `portl <COMMAND> --help` for details on any subcommand.
 ```
@@ -192,7 +199,8 @@ text today. Biggest gaps (from the initial audit):
 `install`, `docker`, `slicer`, `shell`, `exec`, `tcp`,
 `udp`, `gateway`, `init --force/--role`,
 `peer add-unsafe-raw`, and the new verbs introduced in
-§14–§19.
+§14–§19. When `200-persistent-sessions.md` lands, include
+`session` and its subcommands in the same pass.
 
 Action: add `help = "…"` to every `#[arg(…)]` in
 `crates/portl-cli/src/`. Use `long_help` for args where
@@ -251,6 +259,8 @@ of worked commands only, no prose.
 
 Connect:
 - `portl shell`
+- `portl session attach` / `portl session providers`
+  (`200-persistent-sessions.md`)
 - `portl exec`
 - `portl tcp`
 - `portl udp`
@@ -305,30 +315,38 @@ if that changes.
 
 None.
 
-## 8. `<PEER>` help constant
+## 8. `<TARGET>` help constant
 
-New `const PEER_HELP: &str = …` in `crates/portl-cli/src/lib.rs`
-used as `#[arg(help = PEER_HELP)]` on every `<PEER>` positional
-(today: `status`, `shell`, `exec`, `tcp`, `udp`).
+New `const TARGET_HELP: &str = …` in `crates/portl-cli/src/lib.rs`
+used as `#[arg(help = TARGET_HELP)]` on every positional that
+resolves through `peer_resolve` (today: `status`, `shell`,
+`exec`, `tcp`, `udp`; after `200-persistent-sessions.md`, also
+`session`).
 
 Content:
 
 ```text
-Peer identifier. Accepts any of:
+Target identifier. Accepts any of:
 
-  * label       — short name from `portl peer ls`
-  * endpoint_id — 64-char hex (see `portl whoami --eid`)
-  * ticket      — a saved-ticket label or raw ticket string
+  * peer label    — short name from `portl peer ls`
+  * adapter alias — Docker/Slicer target from `portl docker ls`
+                    or `portl slicer ls`
+  * ticket label  — saved ticket from `portl ticket ls`
+  * ticket string — raw `portl...` ticket
+  * endpoint_id   — 64-char hex endpoint id
 
-Disambiguation: label is tried first, then endpoint_id, then
-ticket.
+Resolution follows portl's connection cascade: inline ticket,
+peer label, saved ticket, adapter alias, then endpoint_id.
 ```
+
+`<PEER>` remains appropriate for commands that require a peer-store
+entry specifically. Connection commands should use `<TARGET>`.
 
 ### 8.1 Acceptance
 
 - One constant, used by at least 5 positional args.
-- Error text from "peer not found" (§11) references the same
-  three identifier types.
+- Error text from "unknown target" (§11) references the same
+  identifier types.
 
 ## 9. clap `requires` / `conflicts_with` audit
 
@@ -338,10 +356,10 @@ we're moving runtime errors earlier to clap's parse phase.
 
 | Command | Change |
 |---|---|
-| `status --relay` | `requires = "peer"` (also §19.6) |
-| `status --count` | `requires = "peer"` (also §19.6) |
-| `status --timeout` | `requires = "peer"` (also §19.6) |
-| `status --watch` | `conflicts_with = "peer"` (also §19.6) |
+| `status --relay` | `requires = "target"` (also §19.6) |
+| `status --count` | `requires = "target"` (also §19.6) |
+| `status --timeout` | `requires = "target"` (also §19.6) |
+| `status --watch` | `conflicts_with = "target"` (also §19.6) |
 | `whoami --eid` | `conflicts_with = "json"` |
 | `whoami --json` | `conflicts_with = "eid"` |
 | `install --yes` | `requires = "apply"` |
@@ -356,7 +374,7 @@ we're moving runtime errors earlier to clap's parse phase.
 
 ### 9.1 Acceptance
 
-- `portl status --relay` (no peer) prints a clap error, not a
+- `portl status --relay` (no target) prints a clap error, not a
   runtime error.
 - `portl whoami --eid --json` prints a clap error.
 - `portl install --apply --output foo.toml` prints a clap
@@ -439,7 +457,8 @@ appended via `anyhow::Context` or a tiny `suggest!` macro.
 | Trigger | Before | After |
 |---|---|---|
 | No identity | `Error: identity file not found` | `error: no local identity. Run \`portl init\` first.` |
-| Peer not found (label) | `Error: peer not found: foo` | `error: no peer labeled 'foo'. Run \`portl peer ls\` to see known peers, or \`portl accept <code>\` to add one from an invite.` |
+| Unknown target | `Error: peer not found: foo` | `error: unknown target 'foo'. A target can be a peer, saved ticket, docker/slicer alias, inline ticket, or endpoint id. Run \`portl peer ls\`, \`portl ticket ls\`, \`portl docker ls\`, or \`portl slicer ls\`.` |
+| Peer not found (peer command) | `Error: peer not found: foo` | `error: no peer labeled 'foo'. Run \`portl peer ls\` to see known peers, or \`portl accept <code>\` to add one from an invite.` |
 | Malformed `-L` spec | `Error: invalid local forward spec` | `error: invalid forward '8080'. Expected [LOCAL_HOST:]LOCAL_PORT:REMOTE_HOST:REMOTE_PORT (e.g. 8080:localhost:80).` |
 | Agent not running (IPC calls) | `Error: could not open UDS: connection refused` | `error: agent is not running. Start it with \`portl install --apply\` or run \`portl-agent\` in the foreground.` |
 | Ticket expired | `Error: ticket expired at …` | `error: ticket expired at <RFC3339>. Issue a fresh one with \`portl ticket issue\` on the peer.` |
@@ -530,6 +549,10 @@ Documented here so we don't rediscover them.
 - Different flag surface is warranted
   (`shell` needs resize signalling, `exec` needs exit-code
   passthrough).
+- Persistent sessions are also additive, not a reason to
+  collapse the verbs. `portl session attach` is specified in
+  `200-persistent-sessions.md` as a persistent terminal workspace,
+  distinct from one-shot `shell` and script-safe `exec`.
 
 ### 13.2 Do NOT rename `peer add-unsafe-raw`
 
@@ -988,8 +1011,8 @@ Trust:
   peer      Manage paired machines
   invite    Issue codes to pair with new machines
 
-Sessions (advanced):
-  ticket    Manage session credentials
+Permissions:
+  ticket    Manage bounded permission tickets
 
 Pairing:
   accept    Consume an invite code
@@ -997,9 +1020,10 @@ Pairing:
 
 `ticket` keeps the same clap implementation and continues
 to respond to `portl ticket --help`; it simply moves to a
-less-prominent group so the tier-1 help reflects the
-common-case surface. This is the only roundtable change
-that touches §5's grouping table.
+less-prominent permissions group so the tier-1 help reflects
+the common-case surface. `session` is intentionally reserved
+for the persistent terminal workspace command in
+`200-persistent-sessions.md`.
 
 ### 14.12 Getting Started block (docs + `portl --help`
 after_long_help)
@@ -1007,14 +1031,18 @@ after_long_help)
 ```text
 Pair two machines:
   $ portl init
-  $ portl invite                  # on the other machine (receive a code)
-  $ portl accept PORTLINV-…       # on this machine (paste the code)
-  $ portl shell other-machine     # connect
+  $ portl invite                       # on the other machine
+  $ portl accept PORTLINV-…            # on this machine
+  $ portl shell other-machine          # one-shot interactive shell
+  $ portl session attach other-machine # persistent shell, if available
 ```
 
-Four lines. Four verbs. The word "pair" lives in the
+Five lines. Five verbs. The word "pair" lives in the
 section header (task language preserved) while the verbs
 are honest about the asymmetric trust model underneath.
+`session` is shown as the persistent-shell path once
+`200-persistent-sessions.md` lands; `shell` remains the
+lowest-common-denominator interactive terminal.
 
 ### 14.13 Relationship to `peer` and `ticket`
 
@@ -1027,12 +1055,13 @@ see the map from any entry point.
 Owns on disk        peers.json        pending_invites.jsonl  tickets.json + revocations.jsonl
 Lifecycle           permanent         ephemeral (single-use) scoped by TTL
 When created        on accept         by `portl invite`      by `portl ticket issue`
-When consumed       on rm/unlink      on `portl accept`      every session
+When consumed       on rm/unlink      on `portl accept`      every connection/operation
 
 Workflow:
-    first contact     →  `portl invite` + `portl accept`  (writes peer row)
-    day-to-day auth   →  `portl shell <peer>`              (uses peer row implicitly)
-    advanced: bounded →  `portl ticket issue` + `ticket save` (session credentials)
+    first contact     →  `portl invite` + `portl accept`       (writes peer row)
+    day-to-day auth   →  `portl shell <target>`                (one-shot terminal)
+    persistent auth   →  `portl session attach <target>`       (200: persistent terminal)
+    advanced: bounded →  `portl ticket issue` + `ticket save`  (explicit permission)
 ```
 
 ### 14.14 Cross-verb error teaching
@@ -1416,7 +1445,15 @@ same release.
 - Help snapshots regenerate for `ticket --help` and
   `ticket caps --help`.
 
-### 16.8 Open questions
+### 16.8 Future session caps
+
+`200-persistent-sessions.md` defines the target shape for
+persistent-session capabilities. When that wire schema lands,
+`portl ticket caps` should add a `session` entry and friendly
+presets such as `session` and `dev` without changing the
+basic reference shape in this section.
+
+### 16.9 Open questions
 
 None.
 
@@ -1790,15 +1827,17 @@ Historical CHANGELOG entries (pre-Tier-2) stay as-is.
 
 None. Decisions captured in §§18.4–18.6.
 
-## 19. `portl status [PEER]`
+## 19. `portl status [TARGET]`
 
 ### 19.1 Summary
 
 `portl status` is the single "how are things?" verb. With
 no argument, it reports on **self** (local dashboard:
-agent health, paired peers, active sessions). With a
-`<PEER>` argument, it reports on a remote peer (one-shot
-reachability probe plus metadata).
+agent health, paired peers, active connections). With a
+`<TARGET>` argument, it reports on a remote target (one-shot
+reachability probe plus metadata). Persistent terminal
+sessions from `200-persistent-sessions.md` can extend the
+self dashboard after that spec lands.
 
 "Self" is the default because every operator's first
 question on a fresh machine is "am I set up?" — the
@@ -1814,28 +1853,29 @@ positional is the target.
 ### 19.2 Final surface
 
 ```text
-Usage: portl status [OPTIONS] [PEER]
+Usage: portl status [OPTIONS] [TARGET]
 
-Report health. With no PEER, reports on the local agent
-and paired peers (the "self" dashboard). With a PEER,
-probes that peer and prints the probe result.
+Report health. With no TARGET, reports on the local agent
+and paired peers (the "self" dashboard). With a TARGET,
+probes that target and prints the probe result.
 
 Arguments:
-  [PEER]   Label, endpoint_id, or ticket. Omit for the
-           local dashboard (self).
+  [TARGET] Target identifier (peer label, adapter alias,
+           saved-ticket label, raw ticket, or endpoint_id).
+           Omit for the local dashboard (self).
 
 Options (any target):
       --json             Emit structured JSON.
   -h, --help             Print help
 
-Options (self only; ignored when PEER is given):
+Options (self only; ignored when TARGET is given):
       --watch <SECS>     Re-render dashboard every N seconds
                          (min 1, max 3600). Incompatible
                          with --json.
 
-Options (peer only; error if PEER omitted):
+Options (target only; error if TARGET omitted):
       --relay            Force the handshake over the
-                         peer's relay path.
+                         target's relay path.
       --count <N>        Probe N times with 1s intervals
                          (default 1).
       --timeout <DUR>    Fail a single probe after DUR
@@ -1858,11 +1898,11 @@ Examples:
 clap enforces which flags apply to which mode. Flags in
 the wrong mode are rejected at parse time.
 
-| Flag | self (no PEER) | peer (PEER given) |
+| Flag | self (no TARGET) | target (TARGET given) |
 |---|---|---|
 | `--json`    | ok | ok |
-| `--watch`   | ok | **reject** (`--watch` requires no PEER) |
-| `--relay`   | **reject** (`--relay` requires a PEER) | ok |
+| `--watch`   | ok | **reject** (`--watch` requires no TARGET) |
+| `--relay`   | **reject** (`--relay` requires a TARGET) | ok |
 | `--count`   | **reject** | ok |
 | `--timeout` | **reject** | ok |
 
@@ -1870,10 +1910,10 @@ Reject messages name the offending flag and state the
 missing/forbidden argument — e.g.:
 
 ```text
-error: --watch cannot be used with a PEER argument
+error: --watch cannot be used with a TARGET argument
        (watch is for the self dashboard).
 
-error: --relay requires a PEER argument
+error: --relay requires a TARGET argument
        (nothing to relay when target is self).
 ```
 
@@ -1881,9 +1921,9 @@ error: --relay requires a PEER argument
 
 - Self dashboard renders successfully → 0.
 - Self dashboard: agent unreachable → 11.
-- Peer probe: any successful probe (at least one of N) → 0.
-- Peer probe: all probes fail → 21 (peer dial failed).
-- Peer probe: peer not found in local store → 20.
+- Target probe: any successful probe (at least one of N) → 0.
+- Target probe: all probes fail → 21 (target dial failed).
+- Target probe: target not found in local stores → 20.
 - Argument mode violation → 2 (clap).
 
 ### 19.5 JSON shape
@@ -1899,17 +1939,24 @@ Self mode — single object:
   "peers": [
     { "label": "server", "endpoint_id": "…", "last_seen_s": 42 }
   ],
-  "sessions": [ … ]
+  "connections": [ … ]
 }
 ```
 
-Peer mode — NDJSON per probe (one line each with
+`connections` is reserved for current live portl activity
+(shell/exec/tcp/udp and similar connection registry rows).
+Persistent terminal sessions from `200-persistent-sessions.md`
+should use a distinct `persistent_sessions` or
+`session_providers` field when they are added, not overload
+`connections`.
+
+Target mode — NDJSON per probe (one line each with
 `--count N`):
 
 ```json
-{"schema":1,"kind":"status.probe","seq":0,"peer":"laptop","path":"direct","rtt_ms":14.2,"ok":true}
-{"schema":1,"kind":"status.probe","seq":1,"peer":"laptop","path":"relay","rtt_ms":87.1,"ok":true}
-{"schema":1,"kind":"status.probe","seq":2,"peer":"laptop","rtt_ms":null,"ok":false,"error":"timeout after 5s"}
+{"schema":1,"kind":"status.probe","seq":0,"target":"laptop","path":"direct","rtt_ms":14.2,"ok":true}
+{"schema":1,"kind":"status.probe","seq":1,"target":"laptop","path":"relay","rtt_ms":87.1,"ok":true}
+{"schema":1,"kind":"status.probe","seq":2,"target":"laptop","rtt_ms":null,"ok":false,"error":"timeout after 5s"}
 ```
 
 `kind` differs between modes (`status.self` vs
@@ -1921,21 +1968,21 @@ without peeking at the top-level shape.
 ```rust
 #[derive(Args, Debug)]
 struct StatusArgs {
-    peer: Option<String>,
+    target: Option<String>,
 
     #[arg(long)] json: bool,
 
     // Self-only.
-    #[arg(long, conflicts_with = "peer")]
+    #[arg(long, conflicts_with = "target")]
     watch: Option<u64>,
 
-    // Peer-only. `requires = "peer"` makes each a parse
-    // error when PEER is absent.
-    #[arg(long, requires = "peer")]
+    // Target-only. `requires = "target"` makes each a parse
+    // error when TARGET is absent.
+    #[arg(long, requires = "target")]
     relay: bool,
-    #[arg(long, requires = "peer", default_value_t = 1)]
+    #[arg(long, requires = "target", default_value_t = 1)]
     count: u32,
-    #[arg(long, requires = "peer", default_value = "5s",
+    #[arg(long, requires = "target", default_value = "5s",
           value_parser = parse_duration)]
     timeout: Duration,
 }
@@ -1948,7 +1995,7 @@ dispatch layer.
 ### 19.7 Tier placement
 
 **Tier 2.** The flag matrix (requires/conflicts) and
-added peer-mode options are new surface; ships alongside
+added target-mode options are new surface; ships alongside
 §14–§18 in the same release.
 
 ### 19.8 Acceptance
@@ -1968,12 +2015,12 @@ added peer-mode options are new surface; ships alongside
 - `portl status laptop --timeout 200ms` fails fast.
 - `portl status laptop --relay` records `"path":"relay"`.
 - `portl status --relay` exits 2 with "--relay requires
-  a PEER".
+  a TARGET".
 - `portl status --count 3` exits 2 with "--count
-  requires a PEER".
+  requires a TARGET".
 - `portl status laptop --watch 2` exits 2 with "--watch
-  cannot be used with a PEER".
-- `portl status bogus-peer` exits 20 (peer not found).
+  cannot be used with a TARGET".
+- `portl status bogus-target` exits 20 (target not found).
 - Help snapshots regenerate.
 - `docs/` references `portl status` (not `portl ping`)
   everywhere it used to say `ping`.
@@ -2206,6 +2253,12 @@ Adds two new public-tier vars: `PORTL_JSON` and
 | `PORTL_JSON` | *New.* If `1`/`true`, force `--json` on every command that supports it. CLI `--json` overrides. |
 | `PORTL_QUIET` | *New.* If `1`/`true`, force `--quiet` on every command that supports it. CLI `--quiet` overrides. |
 | `NO_COLOR` | Standard; respect everywhere. |
+
+Session-provider vars such as `PORTL_SESSION_PROVIDER`,
+`PORTL_SESSION_PROVIDER_PATH`, and `PORTL_SESSION_DIR` are
+reserved for `200-persistent-sessions.md`. Add them to this
+public/operator tier when the provider surface lands rather
+than treating them as ad-hoc internals.
 
 ### 22.3 Relay operator tier (documented in `portl-relay --help`)
 

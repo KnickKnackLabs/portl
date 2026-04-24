@@ -7,6 +7,7 @@
 //! v0.3.0 and parses + binds a ticket string so the resolver can
 //! use it by label.
 
+pub mod caps;
 pub mod issue;
 pub mod ls;
 pub mod prune;

@@ -1,0 +1,366 @@
+use std::process::Command as ProcessCommand;
+
+use assert_cmd::{Command, cargo::CommandCargoExt};
+use portl_cli::{Command as ParsedCommand, ParseError, parse};
+use tempfile::tempdir;
+
+fn parse_args(cli_args: &[&str]) -> Result<ParsedCommand, ParseError> {
+    let mut argv = vec!["portl".into()];
+    argv.extend(cli_args.iter().map(|arg| (*arg).into()));
+    parse(argv)
+}
+
+fn assert_clap_error(args: &[&str], needles: &[&str]) {
+    let err = parse_args(args).expect_err("expected clap parse error");
+    let ParseError::Clap(err) = err else {
+        panic!("expected clap error, got {err:?}");
+    };
+    let text = err.to_string();
+    for needle in needles {
+        assert!(text.contains(needle), "missing {needle:?} in {text}");
+    }
+}
+
+#[test]
+fn config_surface_matches_spec() {
+    assert_eq!(
+        parse_args(&["config", "show", "--json"]).expect("parse"),
+        ParsedCommand::Config {
+            action: portl_cli::ConfigAction::Show { json: true },
+        }
+    );
+    assert_eq!(
+        parse_args(&["config", "template"]).expect("parse"),
+        ParsedCommand::Config {
+            action: portl_cli::ConfigAction::Template,
+        }
+    );
+    assert_eq!(
+        parse_args(&["config", "validate", "--path", "./portl.toml", "--json"]).expect("parse"),
+        ParsedCommand::Config {
+            action: portl_cli::ConfigAction::Validate {
+                path: Some("./portl.toml".into()),
+                stdin: false,
+                json: true,
+            },
+        }
+    );
+    assert_eq!(
+        parse_args(&["config", "validate", "--stdin"]).expect("parse"),
+        ParsedCommand::Config {
+            action: portl_cli::ConfigAction::Validate {
+                path: None,
+                stdin: true,
+                json: false,
+            },
+        }
+    );
+
+    assert_clap_error(&["config", "default"], &["unrecognized subcommand"]);
+    assert_clap_error(
+        &["config", "validate", "--file", "./portl.toml"],
+        &["unexpected argument", "--file"],
+    );
+    assert_clap_error(
+        &["config", "validate", "--path", "./portl.toml", "--stdin"],
+        &["cannot be used with", "--path", "--stdin"],
+    );
+}
+
+#[test]
+fn invite_accept_surface_matches_spec() {
+    use portl_cli::InitiatorMode;
+
+    assert_eq!(
+        parse_args(&[
+            "invite",
+            "--initiator",
+            "me",
+            "--for",
+            "laptop",
+            "--ttl",
+            "10m",
+            "--json",
+            "--yes",
+        ])
+        .expect("parse"),
+        ParsedCommand::InviteIssue {
+            initiator: InitiatorMode::Me,
+            ttl: Some("10m".to_owned()),
+            for_label: Some("laptop".to_owned()),
+            json: true,
+            yes: true,
+        }
+    );
+    assert_eq!(
+        parse_args(&["invite", "issue", "--initiator", "them"]).expect("parse"),
+        ParsedCommand::InviteIssue {
+            initiator: InitiatorMode::Them,
+            ttl: None,
+            for_label: None,
+            json: false,
+            yes: false,
+        }
+    );
+    assert_eq!(
+        parse_args(&["invite", "ls", "--json"]).expect("parse"),
+        ParsedCommand::InviteLs { json: true }
+    );
+    assert_eq!(
+        parse_args(&["invite", "rm", "abc123"]).expect("parse"),
+        ParsedCommand::InviteRm {
+            prefix: "abc123".to_owned(),
+        }
+    );
+    assert_eq!(
+        parse_args(&["invite", "accept", "PORTLINV-AAAA", "--yes"]).expect("parse"),
+        ParsedCommand::Accept {
+            code: "PORTLINV-AAAA".to_owned(),
+            yes: true,
+        }
+    );
+    assert_eq!(
+        parse_args(&["accept", "PORTLINV-AAAA", "--yes"]).expect("parse"),
+        ParsedCommand::Accept {
+            code: "PORTLINV-AAAA".to_owned(),
+            yes: true,
+        }
+    );
+
+    assert_clap_error(&["peer", "invite"], &["unrecognized subcommand"]);
+    assert_clap_error(
+        &["peer", "pair", "PORTLINV-AAAA"],
+        &["unrecognized subcommand"],
+    );
+    assert_clap_error(
+        &["peer", "accept", "PORTLINV-AAAA"],
+        &["unrecognized subcommand"],
+    );
+    assert_clap_error(
+        &["invite", "--initiator", "me", "ls"],
+        &["cannot be used with"],
+    );
+}
+
+#[test]
+fn accept_and_ticket_save_teach_wrong_prefix() {
+    let accept = ProcessCommand::cargo_bin("portl")
+        .expect("cargo bin")
+        .args(["accept", "PORTLTKT-abc"])
+        .output()
+        .expect("run accept");
+    assert!(!accept.status.success());
+    let stderr = String::from_utf8_lossy(&accept.stderr);
+    assert!(stderr.contains("looks like a ticket string"), "{stderr}");
+    assert!(
+        stderr.contains("portl ticket save PORTLTKT-abc"),
+        "{stderr}"
+    );
+
+    let save = ProcessCommand::cargo_bin("portl")
+        .expect("cargo bin")
+        .args(["ticket", "save", "PORTLINV-abc"])
+        .output()
+        .expect("run ticket save");
+    assert!(!save.status.success());
+    let stderr = String::from_utf8_lossy(&save.stderr);
+    assert!(stderr.contains("looks like an invite code"), "{stderr}");
+    assert!(stderr.contains("portl accept PORTLINV-abc"), "{stderr}");
+}
+
+#[test]
+fn ticket_caps_and_revoke_surface_match_spec() {
+    assert_eq!(
+        parse_args(&["ticket", "caps", "--cap", "tcp", "--json"]).expect("parse"),
+        ParsedCommand::TicketCaps {
+            cap: Some("tcp".to_owned()),
+            json: true,
+        }
+    );
+    assert_eq!(
+        parse_args(&["ticket", "revoke", "0011223344556677"]).expect("parse"),
+        ParsedCommand::TicketRevoke {
+            id: Some("0011223344556677".to_owned()),
+            action: None,
+        }
+    );
+    assert_eq!(
+        parse_args(&["ticket", "revoke", "ls", "--json"]).expect("parse"),
+        ParsedCommand::TicketRevoke {
+            id: None,
+            action: Some(portl_cli::RevokeAction::Ls { json: true }),
+        }
+    );
+    assert_eq!(
+        parse_args(&["ticket", "revoke", "publish", "0011223344556677", "--yes"]).expect("parse"),
+        ParsedCommand::TicketRevoke {
+            id: None,
+            action: Some(portl_cli::RevokeAction::Publish {
+                id: Some("0011223344556677".to_owned()),
+                yes: true,
+            }),
+        }
+    );
+
+    assert_clap_error(
+        &["ticket", "issue", "--list-caps"],
+        &["unexpected argument"],
+    );
+    assert_clap_error(&["ticket", "revoke", "--list"], &["unexpected argument"]);
+    assert_clap_error(&["ticket", "revoke", "--publish"], &["unexpected argument"]);
+}
+
+#[test]
+fn ls_rm_and_status_flag_matrix_match_spec() {
+    assert_eq!(
+        parse_args(&["docker", "ls", "--json"]).expect("parse"),
+        parse_args(&["docker", "list", "--json"]).expect("parse")
+    );
+    assert_eq!(
+        parse_args(&["slicer", "ls", "--base-url", "http://example", "--json"]).expect("parse"),
+        parse_args(&["slicer", "list", "--base-url", "http://example", "--json"]).expect("parse")
+    );
+    assert_eq!(
+        parse_args(&["peer", "rm", "laptop"]).expect("parse"),
+        ParsedCommand::PeerRm {
+            label: "laptop".to_owned(),
+        }
+    );
+    assert_clap_error(&["peer", "unlink", "laptop"], &["unrecognized subcommand"]);
+
+    assert_eq!(
+        parse_args(&[
+            "status",
+            "laptop",
+            "--relay",
+            "--count",
+            "3",
+            "--timeout",
+            "200ms",
+            "--json",
+        ])
+        .expect("parse"),
+        ParsedCommand::Status {
+            target: Some("laptop".to_owned()),
+            relay: true,
+            json: true,
+            watch: None,
+            count: 3,
+            timeout: humantime::parse_duration("200ms").expect("duration"),
+        }
+    );
+    assert_clap_error(&["status", "--relay"], &["required", "TARGET"]);
+    assert_clap_error(&["status", "--count", "2"], &["required", "TARGET"]);
+    assert_clap_error(
+        &["status", "laptop", "--watch", "2"],
+        &["cannot be used with"],
+    );
+}
+
+#[test]
+fn exit_code_and_env_contracts_match_spec() {
+    Command::cargo_bin("portl")
+        .expect("cargo bin")
+        .arg("definitely-not-a-command")
+        .assert()
+        .code(2);
+
+    let invalid_env = ProcessCommand::cargo_bin("portl")
+        .expect("cargo bin")
+        .env("PORTL_JSON", "maybe")
+        .arg("status")
+        .output()
+        .expect("run invalid env");
+    assert_eq!(invalid_env.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&invalid_env.stderr);
+    assert!(
+        stderr.contains("PORTL_JSON must be a boolean value"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn relationship_map_appears_in_trust_help() {
+    for args in [
+        vec!["invite", "--help"],
+        vec!["peer", "--help"],
+        vec!["ticket", "--help"],
+    ] {
+        let output = ProcessCommand::cargo_bin("portl")
+            .expect("cargo bin")
+            .args(args)
+            .output()
+            .expect("run help");
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("Relationship between portl trust objects"),
+            "{stdout}"
+        );
+        assert!(stdout.contains("first contact"), "{stdout}");
+        assert!(stdout.contains("portl invite` + `portl accept"), "{stdout}");
+    }
+}
+
+#[test]
+fn completions_man_and_init_quiet_are_available() {
+    let completion = ProcessCommand::cargo_bin("portl")
+        .expect("cargo bin")
+        .args(["completions", "bash"])
+        .output()
+        .expect("run completions");
+    assert!(
+        completion.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&completion.stderr)
+    );
+    assert!(String::from_utf8_lossy(&completion.stdout).contains("_portl"));
+
+    let man = ProcessCommand::cargo_bin("portl")
+        .expect("cargo bin")
+        .arg("man")
+        .output()
+        .expect("run man");
+    assert!(
+        man.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&man.stderr)
+    );
+    assert!(String::from_utf8_lossy(&man.stdout).contains(".TH portl"));
+
+    let home = tempdir().expect("tempdir");
+    Command::cargo_bin("portl")
+        .expect("cargo bin")
+        .env("PORTL_HOME", home.path())
+        .args(["init", "--quiet"])
+        .assert()
+        .success()
+        .stdout("");
+}
+
+#[test]
+fn config_template_validates_from_stdin() {
+    let portl = assert_cmd::cargo::cargo_bin("portl");
+    let template = ProcessCommand::new(&portl)
+        .args(["config", "template"])
+        .output()
+        .expect("template");
+    assert!(template.status.success());
+
+    let mut validate = ProcessCommand::new(&portl)
+        .args(["config", "validate", "--stdin", "--json"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn validate");
+    std::io::Write::write_all(validate.stdin.as_mut().expect("stdin"), &template.stdout)
+        .expect("write stdin");
+    let output = validate.wait_with_output().expect("wait validate");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(json["ok"], true);
+}

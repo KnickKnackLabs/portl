@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 use iroh::endpoint::Connection;
 use portl_core::pair_store::PairStore;
 use portl_core::peer_store::{PeerEntry, PeerOrigin, PeerStore};
-use portl_proto::pair_v1::{PairMode, PairRequest, PairResponse, PairResult};
+use portl_proto::pair_v1::{PairRequest, PairResponse, PairResult};
 use tracing::{debug, info, instrument};
 
 use crate::AgentState;
@@ -40,7 +40,7 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
     let (request, _buffered): (PairRequest, _) = read_postcard_prefix(recv, MAX_PAIR_REQ_BYTES)
         .await
         .context("read PairRequest")?;
-    debug!(mode = ?request.mode, nonce = %short_nonce(&request.nonce), "received pair request");
+    debug!(initiator = ?request.initiator, nonce = %short_nonce(&request.nonce), "received pair request");
 
     let response = handle_pair(&state, caller_eid, &request)?;
     debug!(result = ?response.result, "sending pair response");
@@ -100,7 +100,7 @@ pub(crate) fn handle_pair(
         pair_store = %pair_path.display(),
         peers_store = %peers_path.display(),
         nonce = %short_nonce(&request.nonce),
-        mode = ?request.mode,
+        initiator = ?request.initiator,
         "handling pair request"
     );
     let Some(invite) = pair_store.find_by_nonce(&nonce_hex).cloned() else {
@@ -116,6 +116,15 @@ pub(crate) fn handle_pair(
         return Ok(PairResponse {
             version: 1,
             result: PairResult::NonceExpired,
+            responder_relay_hint: relay_hint_for_response(state),
+            responder_chosen_label: None,
+            responder_self_label: responder_self_label(state),
+        });
+    }
+    if request.initiator != invite.initiator {
+        return Ok(PairResponse {
+            version: 1,
+            result: PairResult::PolicyRejected("invite initiator mismatch".to_owned()),
             responder_relay_hint: relay_hint_for_response(state),
             responder_chosen_label: None,
             responder_self_label: responder_self_label(state),
@@ -149,12 +158,8 @@ pub(crate) fn handle_pair(
         invite.for_label_hint.as_deref(),
         &caller_eid_hex,
     );
-    let (accepts_from_them, they_accept_from_me) = match request.mode {
-        PairMode::Pair => (true, true),
-        // Accept = caller gains inbound (we accept their tickets)
-        // but we do NOT ask them to accept ours.
-        PairMode::Accept => (true, false),
-    };
+    let (accepts_from_them, they_accept_from_me) =
+        invite.initiator.relationship().inviter_peer_flags();
 
     peers
         .insert_or_update(PeerEntry {
@@ -163,10 +168,7 @@ pub(crate) fn handle_pair(
             accepts_from_them,
             they_accept_from_me,
             since: now,
-            origin: match request.mode {
-                PairMode::Pair => PeerOrigin::Paired,
-                PairMode::Accept => PeerOrigin::Accepted,
-            },
+            origin: PeerOrigin::Paired,
             last_hold_at: None,
             is_self: false,
             relay_hint: request.caller_relay_hint.clone(),
@@ -181,7 +183,7 @@ pub(crate) fn handle_pair(
     info!(
         caller_eid = %hex::encode(caller_eid),
         label = %chosen_label,
-        mode = ?request.mode,
+        initiator = ?invite.initiator,
         "accepted pair request"
     );
 
@@ -245,16 +247,27 @@ fn responder_self_label(state: &AgentState) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use portl_core::pair_code::InitiatorMode;
     use portl_core::pair_store::PendingInvite;
     use tempfile::tempdir;
 
     fn put_invite(store_path: &std::path::Path, nonce_hex: &str, not_after: u64) {
+        put_invite_with_initiator(store_path, nonce_hex, not_after, InitiatorMode::Mutual);
+    }
+
+    fn put_invite_with_initiator(
+        store_path: &std::path::Path,
+        nonce_hex: &str,
+        not_after: u64,
+        initiator: InitiatorMode,
+    ) {
         let mut store = PairStore::load(store_path).unwrap();
         store.insert(PendingInvite {
             nonce_hex: nonce_hex.to_owned(),
             issued_at_unix: 0,
             not_after_unix: not_after,
             for_label_hint: Some("friend-laptop".to_owned()),
+            initiator,
         });
         store.save().unwrap();
     }
@@ -333,7 +346,7 @@ mod tests {
         let req = PairRequest {
             version: 1,
             nonce: [7u8; 16],
-            mode: PairMode::Pair,
+            initiator: InitiatorMode::Mutual,
             caller_relay_hint: Some("https://relay.caller./".to_owned()),
             caller_label: Some("onyx".to_owned()),
         };
@@ -358,17 +371,77 @@ mod tests {
     }
 
     #[test]
-    fn handle_pair_accept_mode_is_inbound_only() {
+    fn handle_pair_uses_inviter_dictated_initiator_me() {
         let tmp = tempdir().unwrap();
         let peers_path = tmp.path().join("peers.json");
         let pair_path = tmp.path().join("pending_invites.json");
         seed_self(&peers_path);
-        put_invite(&pair_path, &hex::encode([7u8; 16]), u64::MAX / 2);
+        put_invite_with_initiator(
+            &pair_path,
+            &hex::encode([7u8; 16]),
+            u64::MAX / 2,
+            InitiatorMode::Me,
+        );
         let state = make_state(&peers_path);
         let req = PairRequest {
             version: 1,
             nonce: [7u8; 16],
-            mode: PairMode::Accept,
+            initiator: InitiatorMode::Me,
+            caller_relay_hint: None,
+            caller_label: Some("biz-customer".to_owned()),
+        };
+        let resp = handle_pair(&state, [33u8; 32], &req).unwrap();
+        assert_eq!(resp.result, PairResult::Ok);
+        let peers = PeerStore::load(&peers_path).unwrap();
+        let entry = peers.iter().find(|e| e.label == "biz-customer").unwrap();
+        assert!(!entry.accepts_from_them);
+        assert!(entry.they_accept_from_me);
+        assert_eq!(entry.origin, PeerOrigin::Paired);
+    }
+
+    #[test]
+    fn handle_pair_rejects_tampered_initiator() {
+        let tmp = tempdir().unwrap();
+        let peers_path = tmp.path().join("peers.json");
+        let pair_path = tmp.path().join("pending_invites.json");
+        seed_self(&peers_path);
+        put_invite_with_initiator(
+            &pair_path,
+            &hex::encode([7u8; 16]),
+            u64::MAX / 2,
+            InitiatorMode::Me,
+        );
+        let state = make_state(&peers_path);
+        let req = PairRequest {
+            version: 1,
+            nonce: [7u8; 16],
+            initiator: InitiatorMode::Them,
+            caller_relay_hint: None,
+            caller_label: Some("biz-customer".to_owned()),
+        };
+        let resp = handle_pair(&state, [33u8; 32], &req).unwrap();
+        assert!(
+            matches!(resp.result, PairResult::PolicyRejected(reason) if reason.contains("initiator"))
+        );
+    }
+
+    #[test]
+    fn handle_pair_initiator_them_is_inbound_only() {
+        let tmp = tempdir().unwrap();
+        let peers_path = tmp.path().join("peers.json");
+        let pair_path = tmp.path().join("pending_invites.json");
+        seed_self(&peers_path);
+        put_invite_with_initiator(
+            &pair_path,
+            &hex::encode([7u8; 16]),
+            u64::MAX / 2,
+            InitiatorMode::Them,
+        );
+        let state = make_state(&peers_path);
+        let req = PairRequest {
+            version: 1,
+            nonce: [7u8; 16],
+            initiator: InitiatorMode::Them,
             caller_relay_hint: None,
             caller_label: Some("biz-customer".to_owned()),
         };
@@ -378,7 +451,7 @@ mod tests {
         let entry = peers.iter().find(|e| e.label == "biz-customer").unwrap();
         assert!(entry.accepts_from_them);
         assert!(!entry.they_accept_from_me);
-        assert_eq!(entry.origin, PeerOrigin::Accepted);
+        assert_eq!(entry.origin, PeerOrigin::Paired);
     }
 
     #[test]
@@ -390,7 +463,7 @@ mod tests {
         let req = PairRequest {
             version: 1,
             nonce: [255u8; 16],
-            mode: PairMode::Pair,
+            initiator: InitiatorMode::Mutual,
             caller_relay_hint: None,
             caller_label: None,
         };
@@ -409,7 +482,7 @@ mod tests {
         let req = PairRequest {
             version: 1,
             nonce: [7u8; 16],
-            mode: PairMode::Pair,
+            initiator: InitiatorMode::Mutual,
             caller_relay_hint: None,
             caller_label: None,
         };
@@ -446,7 +519,7 @@ mod tests {
         let req = PairRequest {
             version: 1,
             nonce: [7u8; 16],
-            mode: PairMode::Pair,
+            initiator: InitiatorMode::Mutual,
             caller_relay_hint: None,
             caller_label: Some("new-label".to_owned()),
         };

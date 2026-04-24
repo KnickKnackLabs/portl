@@ -43,6 +43,8 @@ pub struct RunOpts {
     pub verbose: bool,
     /// Emit structured JSON instead of the human-readable table.
     pub json: bool,
+    /// Suppress non-error human output.
+    pub quiet: bool,
 }
 
 pub fn run(opts: RunOpts) -> ExitCode {
@@ -62,14 +64,14 @@ pub fn run(opts: RunOpts) -> ExitCode {
     let any_fail = results.iter().any(|r| r.status == Status::Fail);
     if opts.json {
         render_json(&results);
-    } else {
+    } else if !opts.quiet {
         render_human(&results, opts.verbose);
     }
 
     if opts.fix {
         match fix_service_drift(opts.yes) {
             Ok(summary) => {
-                if !summary.is_empty() {
+                if !summary.is_empty() && !opts.quiet {
                     println!("{summary}");
                 }
             }

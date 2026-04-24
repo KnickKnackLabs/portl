@@ -5,12 +5,13 @@
 //! - `portl config show` — effective merged config (file layer only;
 //!   env overrides are surfaced in `portl status agent` instead).
 //! - `portl config path` — print the absolute path to `portl.toml`.
-//! - `portl config default` — print a commented template; pipe into
+//! - `portl config template` — print a commented template; pipe into
 //!   `> ~/.local/share/portl/portl.toml` (or the `PORTL_HOME`
 //!   equivalent) to scaffold.
-//! - `portl config validate [PATH]` — parse + type-check a file.
-//!   Defaults to `$PORTL_HOME/portl.toml`.
+//! - `portl config validate [--path PATH|--stdin]` — parse + type-check
+//!   TOML. Defaults to `$PORTL_HOME/portl.toml`.
 
+use std::io::Read;
 use std::path::PathBuf;
 
 #[cfg(test)]
@@ -23,7 +24,7 @@ use portl_agent::config_file::PortlConfig;
 /// Subcommand dispatch.
 pub fn run(action: ConfigAction) -> ExitCode {
     match action {
-        ConfigAction::Show => match run_show() {
+        ConfigAction::Show { json } => match run_show(json) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("config show: {e:#}");
@@ -34,14 +35,29 @@ pub fn run(action: ConfigAction) -> ExitCode {
             run_path();
             ExitCode::SUCCESS
         }
-        ConfigAction::Default => {
+        ConfigAction::Template => {
             print!("{}", PortlConfig::default_template());
             ExitCode::SUCCESS
         }
-        ConfigAction::Validate { path } => match run_validate(path) {
-            Ok(()) => ExitCode::SUCCESS,
+        ConfigAction::Validate { path, stdin, json } => match run_validate(path, stdin, !json) {
+            Ok(()) => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"schema": 1, "kind": "config.validate", "ok": true, "errors": []})
+                    );
+                }
+                ExitCode::SUCCESS
+            }
             Err(e) => {
-                eprintln!("config validate: {e:#}");
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"schema": 1, "kind": "config.validate", "ok": false, "errors": [format!("{e:#}")]})
+                    );
+                } else {
+                    eprintln!("config validate: {e:#}");
+                }
                 ExitCode::FAILURE
             }
         },
@@ -50,19 +66,32 @@ pub fn run(action: ConfigAction) -> ExitCode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigAction {
-    Show,
+    Show {
+        json: bool,
+    },
     Path,
-    Default,
-    Validate { path: Option<PathBuf> },
+    Template,
+    Validate {
+        path: Option<PathBuf>,
+        stdin: bool,
+        json: bool,
+    },
 }
 
-fn run_show() -> Result<()> {
+fn run_show(json: bool) -> Result<()> {
     let path = effective_path();
     let cfg = PortlConfig::load(&path).with_context(|| format!("load {}", path.display()))?;
-    let text = toml::to_string_pretty(&cfg).context("serialize config")?;
-    println!("# effective file config (env overrides not shown)");
-    println!("# source: {}", path.display());
-    print!("{text}");
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&cfg).context("serialize config JSON")?
+        );
+    } else {
+        let text = toml::to_string_pretty(&cfg).context("serialize config")?;
+        println!("# effective file config (env overrides not shown)");
+        println!("# source: {}", path.display());
+        print!("{text}");
+    }
     Ok(())
 }
 
@@ -70,13 +99,27 @@ fn run_path() {
     println!("{}", effective_path().display());
 }
 
-fn run_validate(path: Option<PathBuf>) -> Result<()> {
+fn run_validate(path: Option<PathBuf>, stdin: bool, human_ok: bool) -> Result<()> {
+    if stdin {
+        let mut input = String::new();
+        std::io::stdin()
+            .read_to_string(&mut input)
+            .context("read config from stdin")?;
+        let _cfg: PortlConfig = toml::from_str(&input).context("parse stdin")?;
+        if human_ok {
+            println!("ok: stdin parses cleanly");
+        }
+        return Ok(());
+    }
+
     let path = path.unwrap_or_else(effective_path);
     if !path.exists() {
         anyhow::bail!("{} does not exist", path.display());
     }
     let _cfg = PortlConfig::load(&path).with_context(|| format!("parse {}", path.display()))?;
-    println!("ok: {} parses cleanly", path.display());
+    if human_ok {
+        println!("ok: {} parses cleanly", path.display());
+    }
     Ok(())
 }
 
@@ -98,7 +141,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("portl.toml");
         std::fs::write(&path, "not = = toml [[").expect("write");
-        let err = run_validate(Some(path)).expect_err("must reject");
+        let err = run_validate(Some(path), false, true).expect_err("must reject");
         assert!(err.to_string().contains("parse") || err.to_string().contains("TOML"));
     }
 
@@ -107,13 +150,13 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("portl.toml");
         std::fs::write(&path, PortlConfig::default_template()).expect("write");
-        run_validate(Some(path)).expect("template must validate");
+        run_validate(Some(path), false, true).expect("template must validate");
     }
 
     #[test]
     fn validate_errors_on_missing_file() {
         let path = Path::new("/tmp/does-not-exist-portl-validate.toml").to_owned();
-        let err = run_validate(Some(path)).expect_err("must error");
+        let err = run_validate(Some(path), false, true).expect_err("must error");
         assert!(err.to_string().contains("does not exist"));
     }
 }

@@ -29,7 +29,7 @@ pub fn run(
         return Ok(ExitCode::SUCCESS);
     }
     let caps = caps.context(
-        "missing <CAPS> argument; run `portl ticket issue --list-caps` \
+        "missing <CAPS> argument; run `portl ticket caps` \
          for the capability reference",
     )?;
     let identity = store::load(&store::default_path())?;
@@ -107,7 +107,7 @@ pub(crate) fn parse_caps(spec: &str) -> Result<Capabilities> {
                 "unsupported cap '{entry}'\n\
                  valid caps: shell, meta:ping, meta:info, \
                  tcp:<host>:<port>[-<port>], udp:<host>:<port>[-<port>], all\n\
-                 run `portl ticket issue --list-caps` for the full reference"
+                 run `portl ticket caps` for the full reference"
             ),
         }
     }
@@ -137,7 +137,7 @@ pub(crate) fn parse_caps(spec: &str) -> Result<Capabilities> {
     })
 }
 
-/// Full human-readable reference dumped by `portl ticket issue --list-caps`.
+/// Full human-readable reference dumped by `portl ticket caps`.
 pub(crate) fn caps_reference() -> String {
     "\
 Capability reference for `portl ticket issue`
@@ -188,7 +188,7 @@ Examples:
 /// output narrow).
 pub(crate) fn caps_reference_short() -> String {
     "valid caps: shell | meta:ping | meta:info | tcp:<host>:<range> | udp:<host>:<range> | all\n\
-     full reference: portl ticket issue --list-caps"
+     full reference: portl ticket caps"
         .to_owned()
 }
 

@@ -17,7 +17,18 @@ use portl_core::peer_store::PeerStore;
 use portl_core::ticket::schema::PortlTicket;
 use portl_core::ticket_store::{TicketEntry, TicketStore};
 
-pub fn run(label: &str, ticket_string: &str) -> Result<ExitCode> {
+pub fn run(label: &str, ticket_string: Option<&str>) -> Result<ExitCode> {
+    if label.trim().starts_with("PORTLINV-")
+        || ticket_string.is_some_and(|s| s.trim().starts_with("PORTLINV-"))
+    {
+        let invite = ticket_string.unwrap_or(label);
+        bail!(
+            "this looks like an invite code, not a ticket.\n       To redeem it and pair with the inviter:\n         portl accept {invite}"
+        );
+    }
+    let Some(ticket_string) = ticket_string else {
+        bail!("missing ticket string. Usage: portl ticket save <label> <ticket>");
+    };
     let ticket = <PortlTicket as Ticket>::deserialize(ticket_string)
         .map_err(|err| anyhow!("parse ticket: {err}"))?;
     // Pull endpoint_id and `not_after` directly from the ticket —

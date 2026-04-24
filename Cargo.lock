@@ -676,6 +676,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap_complete"
+version = "4.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ff7a1dccbdd8b078c2bdebff47e404615151534d5043da397ec50286816f9cb"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "clap_derive"
 version = "4.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -692,6 +701,16 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
+
+[[package]]
+name = "clap_mangen"
+version = "0.2.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e30ffc187e2e3aeafcd1c6e2aa416e29739454c0ccaa419226d5ecd181f2d78"
+dependencies = [
+ "clap",
+ "roff",
+]
 
 [[package]]
 name = "cmov"
@@ -1298,7 +1317,7 @@ dependencies = [
 
 [[package]]
 name = "docker-portl"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2904,7 +2923,7 @@ checksum = "d3d25b0e0b648a86960ac23b7ad4abb9717601dec6f66c165f5b037f3f03065f"
 
 [[package]]
 name = "manual-portl"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "portl-core",
@@ -3652,7 +3671,7 @@ dependencies = [
 
 [[package]]
 name = "portl-agent"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3691,7 +3710,7 @@ dependencies = [
 
 [[package]]
 name = "portl-cli"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3699,6 +3718,8 @@ dependencies = [
  "bollard",
  "bytes",
  "clap",
+ "clap_complete",
+ "clap_mangen",
  "crossterm",
  "docker-portl",
  "ed25519-dalek 2.2.0",
@@ -3736,7 +3757,7 @@ dependencies = [
 
 [[package]]
 name = "portl-core"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "age",
  "anyhow",
@@ -3773,7 +3794,7 @@ dependencies = [
 
 [[package]]
 name = "portl-proto"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "bytes",
  "iroh",
@@ -4437,6 +4458,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "roff"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "323c417e1d9665a65b263ec744ba09030cfb277e9daa0b018a4ab62e57bc8189"
+
+[[package]]
 name = "rpassword"
 version = "7.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5064,7 +5091,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slicer-portl"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "async-trait",

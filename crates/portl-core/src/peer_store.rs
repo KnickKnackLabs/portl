@@ -32,7 +32,7 @@ pub enum PeerOrigin {
     Zelf,
     /// Created by a successful pairing handshake.
     Paired,
-    /// Created by `portl peer accept <code>` — one-way grant.
+    /// Created by `portl accept <code>` — one-way grant.
     Accepted,
     /// Created via `portl peer add-unsafe-raw`. No handshake validated
     /// the endpoint — user pasted it in.
@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn label_reuse_on_same_endpoint_ok() {
-        // `portl peer invite` followed by a successful pair updates
+        // `portl invite` followed by a successful accept updates
         // the same endpoint row; this must not trip the collision
         // check.
         let mut store = PeerStore::new();

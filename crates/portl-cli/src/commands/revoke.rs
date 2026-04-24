@@ -30,6 +30,10 @@ pub fn run(id_or_target: Option<&str>, list: bool, publish: bool) -> Result<Exit
     if publish {
         return revocations::publish(Some(target), false);
     }
+    let id_hex = hex::encode(id);
+    println!(
+        "\nnote: this revocation is local only. To broadcast to paired peers:\n  portl ticket revoke publish {id_hex}\nor publish all unpushed revocations:\n  portl ticket revoke publish"
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -40,11 +44,37 @@ fn revoke_alias(name: &str, store: &AliasStore, path: &Path) -> Result<[u8; 16]>
 }
 
 fn revoke_ticket_uri(uri: &str, path: &Path) -> Result<[u8; 16]> {
+    if let Some(id) = parse_ticket_id_hex(uri)? {
+        append_manual_revocation(id, path)?;
+        return Ok(id);
+    }
+
     let ticket =
         <PortlTicket as Ticket>::deserialize(uri).map_err(|err| anyhow!("parse ticket: {err}"))?;
     let id = ticket_id(&ticket.sig);
     append_manual_revocation(id, path)?;
     Ok(id)
+}
+
+fn parse_ticket_id_hex(raw: &str) -> Result<Option<[u8; 16]>> {
+    let trimmed = raw.trim();
+    if !trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Ok(None);
+    }
+    let decoded = hex::decode(trimmed).context("decode ticket id hex")?;
+    match decoded.len() {
+        16 => {
+            let mut id = [0u8; 16];
+            id.copy_from_slice(&decoded);
+            Ok(Some(id))
+        }
+        8 => {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&decoded);
+            Ok(Some(id))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn alias_ticket_id(name: &str, store: &AliasStore) -> Result<[u8; 16]> {

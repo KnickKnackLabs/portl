@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::pair_code::InitiatorMode;
+
 const DEFAULT_FILE_NAME: &str = "pending_invites.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,8 +27,11 @@ pub struct PendingInvite {
     pub nonce_hex: String,
     pub issued_at_unix: u64,
     pub not_after_unix: u64,
+    /// Inviter-chosen relationship shape encoded into the invite code.
+    #[serde(default)]
+    pub initiator: InitiatorMode,
     /// Optional label hint the operator attached via
-    /// `peer invite --for <label>`. Server uses this as the
+    /// `portl invite --for <label>`. Server uses this as the
     /// auto-label when the caller doesn't supply one.
     pub for_label_hint: Option<String>,
 }
@@ -191,6 +196,7 @@ mod tests {
             nonce_hex: nonce.to_owned(),
             issued_at_unix: 1_000,
             not_after_unix: not_after,
+            initiator: InitiatorMode::Mutual,
             for_label_hint: None,
         }
     }

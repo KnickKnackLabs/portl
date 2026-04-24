@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use iroh::endpoint::Connection;
@@ -8,6 +8,7 @@ use iroh_base::{EndpointId, TransportAddr};
 use portl_core::endpoint::Endpoint;
 use portl_core::id::{Identity, store};
 use portl_core::net::{PeerSession, open_ticket_v1};
+use portl_core::peer_store::PeerStore;
 use portl_core::ticket::schema::{Capabilities, MetaCaps};
 use portl_proto::meta_v1::{MetaReq, MetaResp};
 use portl_proto::wire::StreamPreamble;
@@ -15,16 +16,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::commands::peer_resolve::{ResolveOpts, resolve_peer};
 
-pub fn run(peer: Option<&str>, relay: bool, json: bool, watch: Option<u64>) -> Result<ExitCode> {
-    if let Some(p) = peer {
-        if json || watch.is_some() {
-            bail!("--json and --watch are only supported on the no-arg dashboard form");
-        }
-        run_with_identity_path_mode(p, None, relay)
+pub fn run(
+    target: Option<&str>,
+    relay: bool,
+    json: bool,
+    watch: Option<u64>,
+    count: u32,
+    timeout: Duration,
+) -> Result<ExitCode> {
+    if let Some(target) = target {
+        run_target_count(target, relay, json, count.max(1), timeout)
     } else {
-        if relay {
-            bail!("--relay requires <peer>");
-        }
         run_dashboard(json, watch)
     }
 }
@@ -64,7 +66,7 @@ fn run_dashboard(json: bool, watch: Option<u64>) -> Result<ExitCode> {
                 }
             }
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(interval_secs)) => {}
+                () = tokio::time::sleep(Duration::from_secs(interval_secs)) => {}
                 _ = &mut ctrl_c => break,
             }
             tick += 1;
@@ -105,7 +107,7 @@ fn render_dashboard_human(snap: &portl_agent::status_schema::StatusResponse) -> 
         "agent:          pid {} v{} up {}",
         snap.agent.pid,
         snap.agent.version,
-        humantime::format_duration(std::time::Duration::from_secs(up))
+        humantime::format_duration(Duration::from_secs(up))
     );
     let _ = writeln!(s, "                home: {}", snap.agent.home);
     let _ = writeln!(s, "                metrics: {}", snap.agent.metrics_socket);
@@ -159,17 +161,102 @@ fn render_dashboard_human(snap: &portl_agent::status_schema::StatusResponse) -> 
     s
 }
 
+fn run_target_count(
+    peer: &str,
+    relay: bool,
+    json: bool,
+    count: u32,
+    timeout: Duration,
+) -> Result<ExitCode> {
+    let mut any_success = false;
+    for seq in 0..count {
+        let started = Instant::now();
+        let result = run_with_identity_path_mode_timeout(peer, None, relay, timeout);
+        match result {
+            Ok(code) if code == ExitCode::SUCCESS => {
+                any_success = true;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "schema": 1,
+                            "kind": "status.probe",
+                            "seq": seq,
+                            "target": peer,
+                            "path": if relay { "relay" } else { "unknown" },
+                            "rtt_ms": started.elapsed().as_secs_f64() * 1000.0,
+                            "ok": true,
+                        })
+                    );
+                }
+            }
+            Ok(code) if json => {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "schema": 1,
+                        "kind": "status.probe",
+                        "seq": seq,
+                        "target": peer,
+                        "rtt_ms": null,
+                        "ok": false,
+                        "error": format!("probe exited with {code:?}"),
+                    })
+                );
+            }
+            Err(err) if json => {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "schema": 1,
+                        "kind": "status.probe",
+                        "seq": seq,
+                        "target": peer,
+                        "rtt_ms": null,
+                        "ok": false,
+                        "error": format!("{err:#}"),
+                    })
+                );
+            }
+            Err(err) => return Err(err),
+            Ok(code) => return Ok(code),
+        }
+        if seq + 1 < count {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+    Ok(if any_success {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
 fn run_with_identity_path_mode(
     peer: &str,
     identity_path: Option<&Path>,
     relay: bool,
+) -> Result<ExitCode> {
+    run_with_identity_path_mode_timeout(peer, identity_path, relay, Duration::from_secs(5))
+}
+
+fn run_with_identity_path_mode_timeout(
+    peer: &str,
+    identity_path: Option<&Path>,
+    relay: bool,
+    timeout: Duration,
 ) -> Result<ExitCode> {
     let runtime = tokio::runtime::Runtime::new()?;
     let identity_path = resolve_identity_path(identity_path);
     runtime.block_on(async move {
         let identity = store::load(&identity_path).context("load local identity")?;
         let raw_endpoint = crate::client_endpoint::bind_client_endpoint(&identity).await?;
-        run_with_endpoint(peer, identity, raw_endpoint, relay).await
+        tokio::time::timeout(
+            timeout,
+            run_with_endpoint(peer, identity, raw_endpoint, relay),
+        )
+        .await
+        .with_context(|| format!("timeout after {}", humantime::format_duration(timeout)))?
     })
 }
 
@@ -209,11 +296,14 @@ async fn run_with_endpoint(
     let rtt = ping(&connection, &session).await?;
     let info = info(&connection, &session).await?;
     let path = path_label(&connection);
+    let remote_id = connection.remote_id();
+    let relationship = peer_relationship_label(peer, remote_id.as_bytes());
     print_status(
-        connection.remote_id(),
+        remote_id,
         &path,
         rtt,
         &resolved.discovery,
+        relationship.as_deref(),
         &info,
     );
 
@@ -237,7 +327,7 @@ fn meta_caps() -> Capabilities {
     }
 }
 
-async fn ping(connection: &Connection, session: &PeerSession) -> Result<std::time::Duration> {
+async fn ping(connection: &Connection, session: &PeerSession) -> Result<Duration> {
     let started = Instant::now();
     let response = meta_request(
         connection,
@@ -313,22 +403,35 @@ fn path_label(connection: &Connection) -> String {
 fn print_status(
     endpoint_id: EndpointId,
     path: &str,
-    rtt: std::time::Duration,
+    rtt: Duration,
     discovery: &str,
+    relationship: Option<&str>,
     info: &InfoView,
 ) {
     println!("{:<18}{}", "endpoint:", hex::encode(endpoint_id.as_bytes()));
     println!("{:<18}{}", "path:", path);
     println!("{:<18}{}ms", "rtt:", rtt.as_millis());
     println!("{:<18}{}", "discovery:", discovery);
+    if let Some(relationship) = relationship {
+        println!("{:<18}{}", "relationship:", relationship);
+    }
     println!("{:<18}{}", "agent_version:", info.agent_version);
     println!(
         "{:<18}{}",
         "uptime:",
-        humantime::format_duration(std::time::Duration::from_secs(info.uptime_s))
+        humantime::format_duration(Duration::from_secs(info.uptime_s))
     );
     println!("{:<18}{}", "hostname:", info.hostname);
     println!("{:<18}{}", "os:", info.os);
+}
+
+fn peer_relationship_label(target: &str, endpoint_id: &[u8; 32]) -> Option<String> {
+    let peers = PeerStore::load(&PeerStore::default_path()).ok()?;
+    peers
+        .get_by_label(target)
+        .or_else(|| peers.get_by_endpoint(endpoint_id))
+        .filter(|entry| !entry.is_self)
+        .map(|entry| entry.relationship().to_owned())
 }
 
 fn resolve_identity_path(explicit: Option<&Path>) -> PathBuf {

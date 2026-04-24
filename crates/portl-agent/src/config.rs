@@ -122,7 +122,7 @@ impl AgentConfig {
         // roots: an agent with no peers refuses every ticket, which
         // is the correct fail-closed default. Installers are expected
         // to seed the self-row via `portl install --apply` and
-        // operators add peers via `portl peer pair / add-unsafe-raw`.
+        // operators add peers via `portl accept` / `portl peer add-unsafe-raw`.
         let peer_store = PeerStore::load(&peers_path)
             .with_context(|| format!("load peer store at {}", peers_path.display()))?;
         // `PORTL_TRUST_ROOTS` is honored as a *bootstrap* mechanism

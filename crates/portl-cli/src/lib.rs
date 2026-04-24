@@ -15,10 +15,28 @@ mod eid;
 mod logging;
 mod release_binary;
 
+pub use commands::config::ConfigAction;
 pub use commands::init::InitRole;
 pub use commands::install::InstallTarget;
 pub use commands::status::run_with_identity_path as run_status_with_identity_path;
 pub use commands::status::run_with_identity_path_and_endpoint as run_status_with_identity_path_and_endpoint;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum InitiatorMode {
+    Mutual,
+    Me,
+    Them,
+}
+
+impl From<InitiatorMode> for portl_core::pair_code::InitiatorMode {
+    fn from(value: InitiatorMode) -> Self {
+        match value {
+            InitiatorMode::Mutual => Self::Mutual,
+            InitiatorMode::Me => Self::Me,
+            InitiatorMode::Them => Self::Them,
+        }
+    }
+}
 
 use std::{ffi::OsString, path::Path, path::PathBuf, process::ExitCode};
 
@@ -40,18 +58,22 @@ pub enum Command {
     Init {
         force: bool,
         role: Option<InitRole>,
+        quiet: bool,
     },
     Doctor {
         fix: bool,
         yes: bool,
         verbose: bool,
         json: bool,
+        quiet: bool,
     },
     Status {
-        peer: Option<String>,
+        target: Option<String>,
         relay: bool,
         json: bool,
         watch: Option<u64>,
+        count: u32,
+        timeout: std::time::Duration,
     },
     Shell {
         peer: String,
@@ -77,7 +99,7 @@ pub enum Command {
         json: bool,
         active: bool,
     },
-    PeerUnlink {
+    PeerRm {
         label: String,
     },
     PeerAddUnsafeRaw {
@@ -88,18 +110,22 @@ pub enum Command {
         outbound: bool,
         yes: bool,
     },
-    PeerInvite {
+    InviteIssue {
+        initiator: InitiatorMode,
         ttl: Option<String>,
         for_label: Option<String>,
-        list: bool,
-        revoke: Option<String>,
+        json: bool,
+        yes: bool,
+    },
+    InviteLs {
         json: bool,
     },
-    PeerPair {
-        code: String,
+    InviteRm {
+        prefix: String,
     },
-    PeerAccept {
+    Accept {
         code: String,
+        yes: bool,
     },
     TicketIssue {
         caps: Option<String>,
@@ -108,11 +134,14 @@ pub enum Command {
         from: Option<String>,
         print: MintRootPrint,
         endpoint: Option<String>,
-        list_caps: bool,
+    },
+    TicketCaps {
+        cap: Option<String>,
+        json: bool,
     },
     TicketSave {
         label: String,
-        ticket: String,
+        ticket: Option<String>,
     },
     TicketLs {
         json: bool,
@@ -123,15 +152,14 @@ pub enum Command {
     TicketPrune,
     TicketRevoke {
         id: Option<String>,
-        list: bool,
-        publish: bool,
+        action: Option<RevokeAction>,
     },
     Whoami {
         eid: bool,
         json: bool,
     },
     Config {
-        action: commands::config::ConfigAction,
+        action: ConfigAction,
     },
     Install {
         target: Option<InstallTarget>,
@@ -196,6 +224,19 @@ pub enum Command {
     Gateway {
         upstream_url: String,
     },
+    Completions {
+        shell: clap_complete::Shell,
+    },
+    Man {
+        out_dir: Option<PathBuf>,
+        section: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevokeAction {
+    Ls { json: bool },
+    Publish { id: Option<String>, yes: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -242,12 +283,27 @@ pub fn parse(argv: Vec<OsString>) -> Result<Command, ParseError> {
 }
 
 /// Library entry point wrapping parsing + dispatch.
+const EX_USAGE: u8 = 2;
+
 fn clap_exit_code(err: &clap::Error) -> ExitCode {
     match err.kind() {
         clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
             ExitCode::SUCCESS
         }
-        _ => ExitCode::FAILURE,
+        _ => ExitCode::from(EX_USAGE),
+    }
+}
+
+fn validate_bool_env(name: &str) -> Result<(), String> {
+    let Ok(value) = std::env::var(name) else {
+        return Ok(());
+    };
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "" | "0" | "1" | "false" | "true" | "no" | "yes" | "off" | "on" => Ok(()),
+        _ => Err(format!(
+            "{name} must be a boolean value (0/1, true/false, yes/no, on/off), got {value:?}"
+        )),
     }
 }
 
@@ -276,11 +332,12 @@ pub fn run(argv: Vec<OsString>) -> ExitCode {
         Ok(false) => {}
         Err(ParseError::EmptyArgv) => {
             eprintln!("portl: argv is empty");
-            return ExitCode::FAILURE;
+            return ExitCode::from(EX_USAGE);
         }
         Err(ParseError::Clap(err)) => {
+            let code = clap_exit_code(&err);
             let _ = err.print();
-            return ExitCode::FAILURE;
+            return code;
         }
     }
 
@@ -288,13 +345,21 @@ pub fn run(argv: Vec<OsString>) -> ExitCode {
         Ok(argv) => argv,
         Err(ParseError::EmptyArgv) => {
             eprintln!("portl: argv is empty");
-            return ExitCode::FAILURE;
+            return ExitCode::from(EX_USAGE);
         }
         Err(ParseError::Clap(err)) => {
+            let code = clap_exit_code(&err);
             let _ = err.print();
-            return ExitCode::FAILURE;
+            return code;
         }
     };
+
+    for name in ["PORTL_JSON", "PORTL_QUIET"] {
+        if let Err(err) = validate_bool_env(name) {
+            eprintln!("error: {err}");
+            return ExitCode::from(EX_USAGE);
+        }
+    }
 
     let cli = match Cli::try_parse_from(argv) {
         Ok(cli) => cli,
@@ -322,24 +387,28 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
         Command::AgentRun { mode, upstream_url } => {
             commands::agent::run::run(mode, upstream_url.as_deref())
         }
-        Command::Init { force, role } => commands::init::run(force, role),
+        Command::Init { force, role, quiet } => commands::init::run(force, role, quiet),
         Command::Doctor {
             fix,
             yes,
             verbose,
             json,
+            quiet,
         } => Ok(commands::doctor::run(commands::doctor::RunOpts {
             fix,
             yes,
             verbose,
             json,
+            quiet,
         })),
         Command::Status {
-            peer,
+            target,
             relay,
             json,
             watch,
-        } => commands::status::run(peer.as_deref(), relay, json, watch),
+            count,
+            timeout,
+        } => commands::status::run(target.as_deref(), relay, json, watch, count, timeout),
         Command::Shell { peer, cwd, user } => {
             commands::shell::run(&peer, cwd.as_deref(), user.as_deref())
         }
@@ -352,7 +421,7 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
         Command::Tcp { peer, local } => commands::tcp::run(&peer, &local),
         Command::Udp { peer, local } => commands::udp::run(&peer, &local),
         Command::PeerLs { json, active } => commands::peer::ls::run(json, active),
-        Command::PeerUnlink { label } => commands::peer::unlink::run(&label),
+        Command::PeerRm { label } => commands::peer::unlink::run(&label),
         Command::PeerAddUnsafeRaw {
             endpoint,
             label,
@@ -361,27 +430,22 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             outbound,
             yes,
         } => commands::peer::add_unsafe_raw::run(&endpoint, label, mutual, inbound, outbound, yes),
-        Command::PeerInvite {
+        Command::InviteIssue {
+            initiator,
             ttl,
             for_label,
-            list,
-            revoke,
             json,
-        } => {
-            if let Some(prefix) = revoke.as_deref() {
-                commands::peer::invite::revoke(prefix)
-            } else if list {
-                commands::peer::invite::list(json)
-            } else {
-                commands::peer::invite::issue(ttl.as_deref(), for_label.as_deref(), json)
-            }
-        }
-        Command::PeerPair { code } => {
-            commands::peer::pair::run(&code, portl_proto::pair_v1::PairMode::Pair)
-        }
-        Command::PeerAccept { code } => {
-            commands::peer::pair::run(&code, portl_proto::pair_v1::PairMode::Accept)
-        }
+            yes,
+        } => commands::peer::invite::issue(
+            initiator.into(),
+            ttl.as_deref(),
+            for_label.as_deref(),
+            json,
+            yes,
+        ),
+        Command::InviteLs { json } => commands::peer::invite::list(json),
+        Command::InviteRm { prefix } => commands::peer::invite::revoke(&prefix),
+        Command::Accept { code, yes } => commands::peer::pair::run(&code, yes),
         Command::TicketIssue {
             caps,
             ttl,
@@ -389,7 +453,6 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             from,
             print,
             endpoint,
-            list_caps,
         } => commands::ticket::issue::run(
             caps.as_deref(),
             &ttl,
@@ -397,15 +460,22 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             from.as_deref(),
             print,
             endpoint.as_deref(),
-            list_caps,
+            false,
         ),
-        Command::TicketSave { label, ticket } => commands::ticket::save::run(&label, &ticket),
+        Command::TicketCaps { cap, json } => commands::ticket::caps::run(cap.as_deref(), json),
+        Command::TicketSave { label, ticket } => {
+            commands::ticket::save::run(&label, ticket.as_deref())
+        }
         Command::TicketLs { json } => commands::ticket::ls::run(json),
         Command::TicketRm { label } => commands::ticket::rm::run(&label),
         Command::TicketPrune => commands::ticket::prune::run(),
-        Command::TicketRevoke { id, list, publish } => {
-            commands::ticket::revoke::run(id.as_deref(), list, publish)
-        }
+        Command::TicketRevoke { id, action } => match action {
+            None => commands::ticket::revoke::run(id.as_deref(), false, false),
+            Some(RevokeAction::Ls { json: _ }) => commands::ticket::revoke::run(None, true, false),
+            Some(RevokeAction::Publish { id, yes }) => {
+                commands::revocations::publish(id.as_deref(), yes || id.is_none())
+            }
+        },
         Command::Whoami { eid, json } => commands::whoami::run(eid, json),
         Command::Config { action } => Ok(commands::config::run(action)),
         Command::Install {
@@ -486,6 +556,8 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
         Command::Gateway { upstream_url } => {
             commands::agent::run::run(Some(AgentModeArg::Gateway), Some(&upstream_url))
         }
+        Command::Completions { shell } => Ok(commands::completions(shell)),
+        Command::Man { out_dir, section } => commands::man(out_dir.as_deref(), &section),
     }
 }
 
@@ -511,11 +583,21 @@ fn rewrite_multicall(mut argv: Vec<OsString>) -> Result<Vec<OsString>, ParseErro
     Ok(argv)
 }
 
-const PORTL_ABOUT: &str =
-    "portl CLI — multicall surface for `portl`, `portl-agent`, and `portl-gateway`.";
+const PORTL_ABOUT: &str = "portl — peer-to-peer remote access and port forwarding.";
+
+pub const TARGET_HELP: &str = "Target identifier. Accepts any of:\n\n  * peer label    — short name from `portl peer ls`\n  * adapter alias — Docker/Slicer target from `portl docker ls` or `portl slicer ls`\n  * ticket label  — saved ticket from `portl ticket ls`\n  * ticket string — raw `portl...` ticket\n  * endpoint_id   — 64-char hex endpoint id\n\nResolution follows portl's connection cascade: inline ticket, peer label, saved ticket, adapter alias, then endpoint_id.";
+
+const PORTL_AFTER_HELP: &str = "Pair two machines:\n  $ portl init\n  $ portl invite                       # on the other machine\n  $ portl accept PORTLINV-…            # on this machine\n  $ portl shell other-machine          # one-shot interactive shell\n  $ portl session attach other-machine # persistent shell, if available\n\nRun `portl <COMMAND> --help` for details on any subcommand.\n\nEnvironment variables:\n  PORTL_HOME       State directory override.\n  PORTL_CONFIG     Alt portl.toml path.\n  PORTL_JSON       Force --json where supported (0/1).\n  PORTL_QUIET      Force --quiet where supported (0/1).\n  NO_COLOR         Disable color output.\n\nSee `docs/ENV.md` for the full list including relay and internal variables.";
+
+const RELATIONSHIP_HELP: &str = "Relationship between portl trust objects:\n\n                    peer              invite                ticket\nOwns on disk        peers.json        pending_invites.json   tickets.json + revocations.jsonl\nLifecycle           permanent         ephemeral (single-use) scoped by TTL\nWhen created        on accept         by `portl invite`      by `portl ticket issue`\nWhen consumed       on rm             on `portl accept`      every connection/operation\n\nWorkflow:\n    first contact     →  `portl invite` + `portl accept`       (writes peer row)\n    day-to-day auth   →  `portl shell <target>`                (one-shot terminal)\n    persistent auth   →  `portl session attach <target>`       (persistent terminal, if available)\n    advanced: bounded →  `portl ticket issue` + `ticket save`  (explicit permission)";
+
+const INVITE_AFTER_HELP: &str = "Examples:\n  portl invite                              # mutual pair, 1h TTL\n  portl invite --initiator me --for cust    # remote-support invite\n  portl invite --ttl 10m --for laptop\n  portl invite ls\n  portl invite rm abc123\n\nRelationship between portl trust objects:\n\n                    peer              invite                ticket\nOwns on disk        peers.json        pending_invites.json   tickets.json + revocations.jsonl\nLifecycle           permanent         ephemeral (single-use) scoped by TTL\nWhen created        on accept         by `portl invite`      by `portl ticket issue`\nWhen consumed       on rm             on `portl accept`      every connection/operation\n\nWorkflow:\n    first contact     →  `portl invite` + `portl accept`       (writes peer row)\n    day-to-day auth   →  `portl shell <target>`                (one-shot terminal)\n    persistent auth   →  `portl session attach <target>`       (persistent terminal, if available)\n    advanced: bounded →  `portl ticket issue` + `ticket save`  (explicit permission)";
+
+const ACCEPT_AFTER_HELP: &str =
+    "Examples:\n  portl accept PORTLINV-ABCDEFGH…\n  portl accept --yes PORTLINV-ABCDEFGH…";
 
 #[derive(Parser, Debug)]
-#[command(name = "portl", bin_name = "portl", version, about = PORTL_ABOUT, long_about = None)]
+#[command(name = "portl", bin_name = "portl", version, about = PORTL_ABOUT, after_long_help = PORTL_AFTER_HELP)]
 struct Cli {
     /// Increase logging; in doctor, also show passing checks.
     #[arg(id = "log-verbose", short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
@@ -534,13 +616,20 @@ struct AgentCli {}
 #[derive(Subcommand, Debug)]
 enum TopLevel {
     /// Create identity, run doctor, and print next steps.
+    #[command(next_help_heading = "Setup", display_order = 10)]
     Init {
+        /// Overwrite any existing local identity.
         #[arg(long)]
         force: bool,
+        /// Tune next-step copy for this machine's role.
         #[arg(long, value_enum)]
         role: Option<InitRole>,
+        /// Suppress the doctor table and welcome banner.
+        #[arg(long, short = 'q')]
+        quiet: bool,
     },
     /// Print strictly local diagnostics (clock, identity, listener bind, discovery config, ticket expiry).
+    #[command(display_order = 20)]
     Doctor {
         /// Attempt to auto-remediate warnings where possible. Currently handles
         /// duplicate launchd / systemd services (bootout + rm the wrong lane).
@@ -553,23 +642,31 @@ enum TopLevel {
         #[arg(long)]
         json: bool,
     },
-    /// Dashboard (no args) or reachability probe against a peer.
+    /// Report health for this machine or probe a target.
+    #[command(next_help_heading = "Connect", display_order = 100)]
     Status {
-        /// Peer identifier (label, `endpoint_id`, or ticket). Omit for
-        /// the local dashboard.
-        peer: Option<String>,
-        /// Force the handshake over the peer's relay path. Requires <peer>.
-        #[arg(long)]
+        #[arg(help = TARGET_HELP)]
+        target: Option<String>,
+        /// Force the handshake over the target's relay path.
+        #[arg(long, requires = "target")]
         relay: bool,
-        /// Emit JSON instead of human-readable output.
+        /// Emit structured JSON.
         #[arg(long)]
         json: bool,
-        /// Re-render every N seconds (min 1, max 3600). Incompatible with --json.
-        #[arg(long, value_name = "SECS")]
+        /// Re-render every N seconds (min 1, max 3600). Self dashboard only.
+        #[arg(long, value_name = "SECS", conflicts_with = "target")]
         watch: Option<u64>,
+        /// Probe N times with one-second intervals. Target mode only.
+        #[arg(long, requires = "target", default_value_t = 1)]
+        count: u32,
+        /// Fail a single probe after this duration (for example, 500ms or 3s).
+        #[arg(long, requires = "target", default_value = "5s", value_parser = humantime::parse_duration)]
+        timeout: std::time::Duration,
     },
     /// Open an interactive remote PTY shell.
+    #[command(display_order = 110)]
     Shell {
+        #[arg(help = TARGET_HELP)]
         peer: String,
         #[arg(long)]
         cwd: Option<String>,
@@ -577,7 +674,9 @@ enum TopLevel {
         user: Option<String>,
     },
     /// Run a remote command without a PTY.
+    #[command(display_order = 120)]
     Exec {
+        #[arg(help = TARGET_HELP)]
         peer: String,
         #[arg(long)]
         cwd: Option<String>,
@@ -587,67 +686,175 @@ enum TopLevel {
         argv: Vec<String>,
     },
     /// Set up one or more local TCP forwards.
+    #[command(display_order = 130)]
     Tcp {
+        /// Local forward spec: `[LOCAL_HOST:]LOCAL_PORT:REMOTE_HOST:REMOTE_PORT`.
         #[arg(short = 'L', required = true)]
         local: Vec<String>,
+        #[arg(help = TARGET_HELP)]
         peer: String,
     },
     /// Set up one or more local UDP forwards.
+    #[command(display_order = 140)]
     Udp {
+        /// Local forward spec: `[LOCAL_HOST:]LOCAL_PORT:REMOTE_HOST:REMOTE_PORT`.
         #[arg(short = 'L', required = true)]
         local: Vec<String>,
+        #[arg(help = TARGET_HELP)]
         peer: String,
     },
-    /// Manage peer trust (the filesystem-backed `peers.json` store).
+    /// Manage paired machines.
+    #[command(next_help_heading = "Trust", display_order = 50, after_long_help = RELATIONSHIP_HELP)]
     Peer {
         #[command(subcommand)]
         action: PeerAction,
     },
-    /// Manage saved tickets (outbound credentials).
+    /// Issue codes to pair with new machines.
+    #[command(next_help_heading = "Trust", display_order = 60, after_long_help = INVITE_AFTER_HELP, args_conflicts_with_subcommands = true)]
+    Invite {
+        #[command(subcommand)]
+        action: Option<InviteAction>,
+        /// Who can open connections after pairing. Default: mutual.
+        #[arg(long, value_enum)]
+        initiator: Option<InitiatorMode>,
+        /// Time-to-live. Seconds or s/m/h/d shorthand. Default: 1h.
+        #[arg(long)]
+        ttl: Option<String>,
+        /// Hint the acceptor should use as the local peer label.
+        #[arg(long = "for")]
+        for_label: Option<String>,
+        /// Emit the issued code and metadata as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Skip the confirmation prompt. Implied in non-TTY.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Consume an invite code.
+    #[command(next_help_heading = "Pairing", display_order = 70, after_long_help = ACCEPT_AFTER_HELP)]
+    Accept {
+        /// PORTLINV-… code received from the inviter.
+        code: String,
+        /// Skip the confirmation prompt. Implied in non-TTY.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Manage bounded permission tickets.
+    #[command(next_help_heading = "Permissions", display_order = 200, after_long_help = RELATIONSHIP_HELP)]
     Ticket {
         #[command(subcommand)]
         action: TicketAction,
     },
     /// Print the local identity's `endpoint_id` and peer-store label.
+    #[command(next_help_heading = "Setup", display_order = 50)]
     Whoami {
         /// Print only the 64-char `endpoint_id` hex (script-friendly).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "json")]
         eid: bool,
-        /// Emit structured JSON. Ignored when --eid is set.
-        #[arg(long)]
+        /// Emit structured JSON.
+        #[arg(long, conflicts_with = "eid")]
         json: bool,
     },
     /// Read or scaffold `portl.toml`.
+    #[command(display_order = 40)]
     Config {
         #[command(subcommand)]
         action: ConfigSub,
     },
     /// Install the daemon for a supported target.
+    #[command(display_order = 30)]
     Install {
+        /// Target service manager or artifact type.
         target: Option<InstallTarget>,
-        #[arg(long)]
+        /// Write the rendered service or artifact to the host.
+        #[arg(long, conflicts_with_all = ["output", "detect", "dry_run"])]
         apply: bool,
-        #[arg(long)]
+        /// Skip confirmation prompts when applying changes.
+        #[arg(long, requires = "apply")]
         yes: bool,
-        #[arg(long)]
+        /// Detect the host's preferred install target and print it.
+        #[arg(long, conflicts_with_all = ["apply", "dry_run", "output"])]
         detect: bool,
-        #[arg(long = "dry-run")]
+        /// Render changes without writing or enabling anything.
+        #[arg(long = "dry-run", conflicts_with = "apply")]
         dry_run: bool,
+        /// Write rendered output to this path instead of stdout.
         #[arg(long)]
         output: Option<PathBuf>,
     },
     /// Docker target management.
+    #[command(next_help_heading = "Integrations", display_order = 300)]
     Docker {
         #[command(subcommand)]
         action: DockerAction,
     },
     /// Slicer target management.
+    #[command(display_order = 310)]
     Slicer {
         #[command(subcommand)]
         action: SlicerAction,
     },
     /// Run the slicer HTTP bridge against an upstream API.
+    #[command(display_order = 320)]
     Gateway { upstream_url: String },
+    /// Generate shell completions.
+    #[command(next_help_heading = "Utility", display_order = 400)]
+    Completions {
+        /// Shell to generate completions for.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+    /// Generate man pages from the CLI command tree.
+    #[command(display_order = 410)]
+    Man {
+        /// Write one man page per command to this directory.
+        #[arg(long = "out-dir")]
+        out_dir: Option<PathBuf>,
+        /// Man section for generated pages.
+        #[arg(long, default_value = "1")]
+        section: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum InviteAction {
+    /// Issue a code (explicit form).
+    Issue {
+        /// Who can open connections after pairing. Default: mutual.
+        #[arg(long, value_enum, default_value = "mutual")]
+        initiator: InitiatorMode,
+        /// Time-to-live. Seconds or s/m/h/d shorthand. Default: 1h.
+        #[arg(long)]
+        ttl: Option<String>,
+        /// Hint the acceptor should use as the local peer label.
+        #[arg(long = "for")]
+        for_label: Option<String>,
+        /// Emit the issued code and metadata as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Skip the confirmation prompt. Implied in non-TTY.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// List my pending invites.
+    Ls {
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke a pending invite.
+    Rm {
+        /// Nonce prefix of the pending invite to revoke.
+        prefix: String,
+    },
+    /// Consume a code (alias of `portl accept`).
+    Accept {
+        /// PORTLINV-… code received from the inviter.
+        code: String,
+        /// Skip the confirmation prompt. Implied in non-TTY.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -662,7 +869,7 @@ enum PeerAction {
         active: bool,
     },
     /// Remove a peer by label.
-    Unlink { label: String },
+    Rm { label: String },
     /// Add a peer by raw `endpoint_id` without a pairing handshake.
     /// Requires the user to retype the `endpoint_id` at a confirmation
     /// prompt to guard against blind paste-ins; pick exactly one of
@@ -685,66 +892,14 @@ enum PeerAction {
         #[arg(long)]
         yes: bool,
     },
-    /// Issue, list, or revoke a peer-pairing invite code.
-    Invite {
-        /// Time-to-live for the issued invite. Accepts seconds
-        /// (`3600`) or duration shorthand (`10m`, `1h`, `30d`).
-        /// Default `1h`.
-        #[arg(long)]
-        ttl: Option<String>,
-        /// Optional label hint for the new peer. Consumed by the
-        /// acceptor when they don't supply their own label.
-        #[arg(long = "for")]
-        for_label: Option<String>,
-        /// List pending invites instead of issuing a new one.
-        #[arg(long, conflicts_with_all = ["ttl", "for_label", "revoke"])]
-        list: bool,
-        /// Revoke a pending invite by nonce prefix.
-        #[arg(long, value_name = "NONCE_PREFIX", conflicts_with_all = ["ttl", "for_label"])]
-        revoke: Option<String>,
-        /// Emit structured JSON (applies to issue + list; revoke
-        /// is text-only).
-        #[arg(long)]
-        json: bool,
-    },
-    /// Consume an invite code and establish mutual trust.
-    Pair {
-        /// `PORTLINV-<base32>` invite code from the inviter.
-        code: String,
-    },
-    /// Consume an invite code and accept one-way inbound access.
-    ///
-    /// After `pair`, both sides can initiate connections. After
-    /// `accept`, only the inviter can initiate — useful for
-    /// remote-support and `IoT` scenarios where you don't want to
-    /// grant outbound from the customer's box.
-    Accept { code: String },
 }
 
 #[derive(Subcommand, Debug)]
 enum TicketAction {
     /// Mint a new ticket signed by the local identity.
-    ///
-    /// <CAPS> is a comma-separated capability spec:
-    ///
-    ///   shell                            full shell access (pty + exec, no env filter)
-    ///   meta:ping                        respond to liveness pings
-    ///   meta:info                        expose agent metadata (version, uptime)
-    ///   tcp:<host>:<port>[-<port>]       TCP port forward (glob + range)
-    ///   udp:<host>:<port>[-<port>]       UDP port forward (glob + range)
-    ///   all                              every cap above (dev only)
-    ///
-    /// Examples:
-    ///   portl ticket issue shell --ttl 10m
-    ///   portl ticket issue shell,tcp:*:8080 --ttl 1h
-    ///   portl ticket issue 'meta:ping,meta:info' --ttl 30d
-    ///   portl ticket issue all --ttl 1h    # dev only; grants everything
-    ///
-    /// Run `portl ticket issue --list-caps` for the full reference.
     Issue {
-        /// Capability spec — see command help for the grammar.
-        #[arg(required_unless_present = "list_caps")]
-        caps: Option<String>,
+        /// Capability spec — see `portl ticket caps` for the grammar.
+        caps: String,
         /// Time-to-live for the ticket, e.g. `10m`, `1h`, `30d`, `3600` (seconds).
         #[arg(long, default_value = "30d")]
         ttl: String,
@@ -758,12 +913,21 @@ enum TicketAction {
         print: MintRootPrint,
         #[arg(long, hide = true, alias = "node")]
         endpoint: Option<String>,
-        /// Print the capability reference and exit without minting.
-        #[arg(long, conflicts_with_all = ["ttl", "to", "from"])]
-        list_caps: bool,
+    },
+    /// Print the capability-grammar reference.
+    Caps {
+        /// Print only this capability entry.
+        #[arg(long, value_name = "NAME")]
+        cap: Option<String>,
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Save a ticket string under a local label.
-    Save { label: String, ticket: String },
+    Save {
+        label: String,
+        ticket: Option<String>,
+    },
     /// List saved tickets.
     Ls {
         /// Emit structured JSON.
@@ -776,27 +940,54 @@ enum TicketAction {
     Prune,
     /// Append a local ticket revocation, publish, or list revocations.
     Revoke {
+        /// Ticket id, ticket string, or saved-ticket label to revoke locally.
         id: Option<String>,
-        #[arg(long, conflicts_with = "id")]
-        list: bool,
-        #[arg(long, requires = "id")]
-        publish: bool,
+        #[command(subcommand)]
+        action: Option<RevokeSubcommand>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RevokeSubcommand {
+    /// List local revocations.
+    Ls {
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Broadcast revocations to paired peers.
+    Publish {
+        /// Publish only this ticket id. Omit to publish all unpushed revocations.
+        id: Option<String>,
+        /// Skip the confirmation prompt. Implied in non-TTY.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
 #[derive(Subcommand, Debug)]
 enum ConfigSub {
-    /// Print the effective file-layer config (env overrides not shown).
-    Show,
+    /// Print the effective file-layer config.
+    Show {
+        /// Emit structured JSON instead of TOML.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the absolute path to portl.toml.
     Path,
-    /// Print a commented default template. Pipe into portl.toml to scaffold.
-    Default,
+    /// Print a commented default template to stdout.
+    Template,
     /// Parse + type-check a `portl.toml`. Defaults to `$PORTL_HOME/portl.toml`.
     Validate {
-        /// Path to the file. Defaults to `$PORTL_HOME/portl.toml`.
-        #[arg(long = "file")]
+        /// Path to validate. Defaults to `$PORTL_HOME/portl.toml`.
+        #[arg(long = "path", conflicts_with = "stdin")]
         path: Option<PathBuf>,
+        /// Read TOML from standard input.
+        #[arg(long)]
+        stdin: bool,
+        /// Emit structured errors as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -831,8 +1022,10 @@ enum DockerAction {
     Detach {
         container: String,
     },
-    List {
-        #[arg(long, hide = true)]
+    #[command(name = "ls", alias = "list")]
+    Ls {
+        /// Emit structured JSON.
+        #[arg(long)]
         json: bool,
     },
     Rm {
@@ -874,10 +1067,13 @@ enum SlicerAction {
         #[arg(long = "ticket-out")]
         ticket_out: Option<PathBuf>,
     },
-    List {
-        #[arg(long, hide = true)]
+    #[command(name = "ls", alias = "list")]
+    Ls {
+        /// Override the slicer API base URL.
+        #[arg(long)]
         base_url: Option<String>,
-        #[arg(long, hide = true)]
+        /// Emit structured JSON.
+        #[arg(long)]
         json: bool,
     },
     Rm {
@@ -887,28 +1083,47 @@ enum SlicerAction {
     },
 }
 
+fn env_flag(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
 impl Cli {
     #[allow(clippy::too_many_lines)]
     fn into_command(self) -> Command {
         let log_verbose = self.log_verbose;
         match self.command {
-            TopLevel::Init { force, role } => Command::Init { force, role },
+            TopLevel::Init { force, role, quiet } => Command::Init {
+                force,
+                role,
+                quiet: quiet || env_flag("PORTL_QUIET"),
+            },
             TopLevel::Doctor { fix, yes, json } => Command::Doctor {
                 fix,
                 yes,
                 verbose: log_verbose > 0,
-                json,
+                json: json || env_flag("PORTL_JSON"),
+                quiet: env_flag("PORTL_QUIET"),
             },
             TopLevel::Status {
-                peer,
+                target,
                 relay,
                 json,
                 watch,
+                count,
+                timeout,
             } => Command::Status {
-                peer,
+                target,
                 relay,
-                json,
+                json: json || env_flag("PORTL_JSON"),
                 watch,
+                count,
+                timeout,
             },
             TopLevel::Shell { peer, cwd, user } => Command::Shell { peer, cwd, user },
             TopLevel::Exec {
@@ -928,8 +1143,8 @@ impl Cli {
                 action: PeerAction::Ls { json, active },
             } => Command::PeerLs { json, active },
             TopLevel::Peer {
-                action: PeerAction::Unlink { label },
-            } => Command::PeerUnlink { label },
+                action: PeerAction::Rm { label },
+            } => Command::PeerRm { label },
             TopLevel::Peer {
                 action:
                     PeerAction::AddUnsafeRaw {
@@ -948,28 +1163,52 @@ impl Cli {
                 outbound,
                 yes,
             },
-            TopLevel::Peer {
-                action:
-                    PeerAction::Invite {
-                        ttl,
-                        for_label,
-                        list,
-                        revoke,
-                        json,
-                    },
-            } => Command::PeerInvite {
+            TopLevel::Invite {
+                action: None,
+                initiator,
                 ttl,
                 for_label,
-                list,
-                revoke,
                 json,
+                yes,
+            } => Command::InviteIssue {
+                initiator: initiator.unwrap_or(InitiatorMode::Mutual),
+                ttl,
+                for_label,
+                json: json || env_flag("PORTL_JSON"),
+                yes,
             },
-            TopLevel::Peer {
-                action: PeerAction::Pair { code },
-            } => Command::PeerPair { code },
-            TopLevel::Peer {
-                action: PeerAction::Accept { code },
-            } => Command::PeerAccept { code },
+            TopLevel::Invite {
+                action:
+                    Some(InviteAction::Issue {
+                        initiator,
+                        ttl,
+                        for_label,
+                        json,
+                        yes,
+                    }),
+                ..
+            } => Command::InviteIssue {
+                initiator,
+                ttl,
+                for_label,
+                json: json || env_flag("PORTL_JSON"),
+                yes,
+            },
+            TopLevel::Invite {
+                action: Some(InviteAction::Ls { json }),
+                ..
+            } => Command::InviteLs {
+                json: json || env_flag("PORTL_JSON"),
+            },
+            TopLevel::Invite {
+                action: Some(InviteAction::Rm { prefix }),
+                ..
+            } => Command::InviteRm { prefix },
+            TopLevel::Invite {
+                action: Some(InviteAction::Accept { code, yes }),
+                ..
+            }
+            | TopLevel::Accept { code, yes } => Command::Accept { code, yes },
             TopLevel::Ticket {
                 action:
                     TicketAction::Issue {
@@ -979,16 +1218,20 @@ impl Cli {
                         from,
                         print,
                         endpoint,
-                        list_caps,
                     },
             } => Command::TicketIssue {
-                caps,
+                caps: Some(caps),
                 ttl,
                 to,
                 from,
                 print,
                 endpoint,
-                list_caps,
+            },
+            TopLevel::Ticket {
+                action: TicketAction::Caps { cap, json },
+            } => Command::TicketCaps {
+                cap,
+                json: json || env_flag("PORTL_JSON"),
             },
             TopLevel::Ticket {
                 action: TicketAction::Save { label, ticket },
@@ -1003,17 +1246,29 @@ impl Cli {
                 action: TicketAction::Prune,
             } => Command::TicketPrune,
             TopLevel::Ticket {
-                action: TicketAction::Revoke { id, list, publish },
-            } => Command::TicketRevoke { id, list, publish },
+                action: TicketAction::Revoke { id, action },
+            } => Command::TicketRevoke {
+                id,
+                action: action.map(|action| match action {
+                    RevokeSubcommand::Ls { json } => RevokeAction::Ls {
+                        json: json || env_flag("PORTL_JSON"),
+                    },
+                    RevokeSubcommand::Publish { id, yes } => RevokeAction::Publish { id, yes },
+                }),
+            },
             TopLevel::Whoami { eid, json } => Command::Whoami { eid, json },
             TopLevel::Config { action } => Command::Config {
                 action: match action {
-                    ConfigSub::Show => commands::config::ConfigAction::Show,
-                    ConfigSub::Path => commands::config::ConfigAction::Path,
-                    ConfigSub::Default => commands::config::ConfigAction::Default,
-                    ConfigSub::Validate { path } => {
-                        commands::config::ConfigAction::Validate { path }
-                    }
+                    ConfigSub::Show { json } => ConfigAction::Show {
+                        json: json || env_flag("PORTL_JSON"),
+                    },
+                    ConfigSub::Path => ConfigAction::Path,
+                    ConfigSub::Template => ConfigAction::Template,
+                    ConfigSub::Validate { path, stdin, json } => ConfigAction::Validate {
+                        path,
+                        stdin,
+                        json: json || env_flag("PORTL_JSON"),
+                    },
                 },
             },
             TopLevel::Install {
@@ -1071,7 +1326,7 @@ impl Cli {
                 action: DockerAction::Detach { container },
             } => Command::DockerDetach { container },
             TopLevel::Docker {
-                action: DockerAction::List { json },
+                action: DockerAction::Ls { json },
             } => Command::DockerList { json },
             TopLevel::Docker {
                 action:
@@ -1124,12 +1379,14 @@ impl Cli {
                 ticket_out,
             },
             TopLevel::Slicer {
-                action: SlicerAction::List { base_url, json },
+                action: SlicerAction::Ls { base_url, json },
             } => Command::SlicerList { base_url, json },
             TopLevel::Slicer {
                 action: SlicerAction::Rm { name, base_url },
             } => Command::SlicerRm { name, base_url },
             TopLevel::Gateway { upstream_url } => Command::Gateway { upstream_url },
+            TopLevel::Completions { shell } => Command::Completions { shell },
+            TopLevel::Man { out_dir, section } => Command::Man { out_dir, section },
         }
     }
 }

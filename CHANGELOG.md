@@ -5,29 +5,57 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.3.6 — 2026-04-24
+
+CLI ergonomics patch release implementing spec 190.
+
+### Added
+
+- Added top-level `portl invite` / `portl accept` Model A pairing.
+  Invites now encode the inviter-chosen relationship shape with
+  `--initiator mutual|me|them`, and stale `peer invite/pair/accept`
+  surfaces are removed.
+- Added CLI ergonomics surfaces from spec 190: `config template`,
+  `config show --json`, `config validate --path/--stdin/--json`,
+  `ticket caps`, split `ticket revoke ls/publish`, `docker ls` and
+  `slicer ls` aliases, shell completions, man-page generation, and
+  `init --quiet` / `PORTL_QUIET` / `PORTL_JSON` support.
+- Added `docs/ENV.md` and `docs/EXIT_CODES.md` for stabilized
+  environment-variable and exit-code contracts.
+
+### Changed
+
+- Top-level and command help now use clearer target language, the
+  peer/invite/ticket relationship map, and more clap-level flag
+  conflicts for invalid combinations.
+- `portl status <target>` now reports the stored peer relationship
+  shape when the target resolves to a peer-store row.
+- Usage errors now exit with code 2, including invalid `PORTL_JSON`
+  and `PORTL_QUIET` boolean values.
+
 ## 0.3.5 — 2026-04-25
-+
-+CLI discovery and pairing observability patch release.
-+
-+### Fixed
-+
-+- `portl peer pair` now uses the same configurable client endpoint
-+  binding as ticket-backed operations, including configured relay,
-+  DNS, Pkarr, and mDNS discovery. This removes a drift that could
-+  leave pairing stuck until the iroh dial timed out while ticket
-+  operations worked.
-+
-+### Added
-+
-+- Added global `-v` / `--verbose` and `--log <FILTER>` CLI logging
-+  controls for diagnostics on peer, ticket, status, shell, exec,
-+  TCP, UDP, docker, slicer, install, and gateway operations.
-+- `PORTL_LOG` is now honored as the documented RUST_LOG-style filter
-+  for CLI, agent, and gateway diagnostics.
-+- Added targeted pair and ticket handshake diagnostics for endpoint
-+  binding, discovery, dial, stream, response, and peer-store stages.
-+
-+## 0.3.4.2 — 2026-04-25
+
+CLI discovery and pairing observability patch release.
+
+### Fixed
+
+- `portl peer pair` now uses the same configurable client endpoint
+  binding as ticket-backed operations, including configured relay,
+  DNS, Pkarr, and mDNS discovery. This removes a drift that could
+  leave pairing stuck until the iroh dial timed out while ticket
+  operations worked.
+
+### Added
+
+- Added global `-v` / `--verbose` and `--log <FILTER>` CLI logging
+  controls for diagnostics on peer, ticket, status, shell, exec,
+  TCP, UDP, docker, slicer, install, and gateway operations.
+- `PORTL_LOG` is now honored as the documented RUST_LOG-style filter
+  for CLI, agent, and gateway diagnostics.
+- Added targeted pair and ticket handshake diagnostics for endpoint
+  binding, discovery, dial, stream, response, and peer-store stages.
+
+## 0.3.4.2 — 2026-04-25
 
 Formatting-only patch release. No behavioural changes.
 

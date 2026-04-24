@@ -520,7 +520,7 @@ async fn spawn_relay_if_enabled(
 
 /// Re-read `peers.json` every 500ms and swap the in-memory
 /// `TrustRoots` set. This is what makes `portl peer add-unsafe-raw`
-/// / `portl peer unlink` take effect on the running agent without
+/// / `portl peer rm` take effect on the running agent without
 /// requiring a restart. Parallels `spawn_revocation_reload_task`.
 fn spawn_peer_store_reload_task(
     state: Arc<AgentState>,

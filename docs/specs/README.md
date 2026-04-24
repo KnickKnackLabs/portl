@@ -73,6 +73,11 @@ prose still use `node_id`. Treat them as synonymous.
 | 140 | `140-v0.2-operability.md` | **v0.2.0 design spec.** Live reference for the shipped CLI/config/runtime surface; supersedes parts of 060/080/090 on ship. |
 | 150 | `150-v0.1.1-safety-net.md` | **v0.1.1 design spec.** Three non-breaking runtime-stability items shipped ahead of v0.2. |
 | 160 | `160-v0.1.2-alias-isolation.md` | **v0.1.2 design spec.** Forensic experiment: isolate rusqlite removal to test the macOS release-mode crash hypothesis. |
+| 165 | `165-v0.3.2-observability.md` | **v0.3.2 design spec.** Targeted diagnostics and observability polish for peer/ticket/status/connect operations. |
+| 170 | `170-v0.3.3-relay.md` | **v0.3.3 design spec.** Relay configuration, diagnostics, and reachability improvements. |
+| 180 | `180-v0.3.4-peer-pairing.md` | **Historical shipped spec.** Peer pairing via invite/pair/accept; superseded by the CLI vocabulary direction in `190`. |
+| 190 | `190-cli-ergonomics.md` | **Draft.** CLI friction-reduction target: help text, examples, actionable errors, command grouping, completions, selected surface cleanup. |
+| 200 | `200-persistent-sessions.md` | **Draft.** Persistent terminal sessions via a provider interface, with zmx first and Docker/Slicer provisioning hooks. |
 
 ## Specs vs plans — where does what go
 

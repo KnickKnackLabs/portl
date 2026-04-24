@@ -1,4 +1,4 @@
-//! `portl peer unlink <label>` — drop a peer by label. Takes effect
+//! `portl peer rm <label>` — drop a peer by label. Takes effect
 //! within ~500ms on the running agent (peer-store reload task polls
 //! the file). Errors if the label is unknown so typos are caught.
 

@@ -1,29 +1,18 @@
 //! `portl/pair/v1` — peer-pairing handshake.
 //!
-//! Dialed by `portl peer pair <code>` and `portl peer accept
-//! <code>` against the issuing agent. After TLS auth succeeds,
+//! Dialed by `portl accept <code>` against the issuing agent. After TLS auth succeeds,
 //! caller sends `PairRequest` with the nonce from the invite
 //! code; server validates + mutates its peer store + replies
 //! with `PairResponse`. Both sides end up with matching entries.
 //!
-//! v0.3.4 ships `PairMode { Pair, Accept }`:
-//! - `Pair`: both sides become mutually trusted
-//!   (`accepts_from_them = true`, `they_accept_from_me = true`).
-//! - `Accept`: caller becomes inbound-only on server; server
-//!   becomes outbound-only on caller.
+//! v0.3.6 carries the inviter-chosen `InitiatorMode` from the
+//! invite code. The server verifies it against its pending invite
+//! before mutating either peer store.
 
+use portl_core::pair_code::InitiatorMode;
 use serde::{Deserialize, Serialize};
 
 pub const ALPN_PAIR_V1: &[u8] = b"portl/pair/v1";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PairMode {
-    /// Mutual trust; both sides can initiate.
-    Pair,
-    /// One-way: caller gains inbound privilege on server, server
-    /// gains outbound privilege on caller.
-    Accept,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairRequest {
@@ -33,7 +22,8 @@ pub struct PairRequest {
     /// The 16-byte nonce from the invite code. Must match a
     /// pending invite on the server side.
     pub nonce: [u8; 16],
-    pub mode: PairMode,
+    /// Inviter-chosen relationship shape from the invite code.
+    pub initiator: InitiatorMode,
     /// Caller's preferred relay URL, if any. Advisory; server may
     /// ignore and prefer its own configured relays.
     pub caller_relay_hint: Option<String>,
@@ -67,7 +57,7 @@ pub struct PairResponse {
     pub responder_relay_hint: Option<String>,
     /// The label the server assigned to the caller. Useful when
     /// the caller sent `caller_label: None` and wants to surface
-    /// the server-chosen label in `peer pair`'s output.
+    /// the server-chosen label in `accept` output.
     pub responder_chosen_label: Option<String>,
     /// The server's own label (usually "self" or its hostname).
     /// Caller uses this as a hint when labeling the server locally.
@@ -76,14 +66,16 @@ pub struct PairResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{PairMode, PairRequest, PairResponse, PairResult};
+    use portl_core::pair_code::InitiatorMode;
+
+    use super::{PairRequest, PairResponse, PairResult};
 
     #[test]
     fn request_roundtrips_via_postcard() {
         let req = PairRequest {
             version: 1,
             nonce: [7u8; 16],
-            mode: PairMode::Pair,
+            initiator: InitiatorMode::Me,
             caller_relay_hint: Some("https://relay.example/".to_owned()),
             caller_label: Some("friend-laptop".to_owned()),
         };

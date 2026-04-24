@@ -295,6 +295,8 @@ do_install() {
     fi
 
     ensure_in_path
+    install_man_pages_best_effort
+    install_completions_best_effort
 
     # init identity on fresh machines
     if [ "$SKIP_INIT" -ne 1 ]; then
@@ -364,6 +366,63 @@ download_and_place() {
         run install -m 0755 "$INSTALL_DIR/portl" "$INSTALL_DIR/$sub"
     done
     ok "installed ${VER} at ${INSTALL_DIR}/portl"
+}
+
+install_prefix() {
+    case "$INSTALL_DIR" in
+        */bin) printf '%s\n' "${INSTALL_DIR%/bin}" ;;
+        *)     dirname "$INSTALL_DIR" ;;
+    esac
+}
+
+install_man_pages_best_effort() {
+    [ "${PORTL_INSTALL_MAN:-1}" = "0" ] && return 0
+    local man_dir
+    man_dir="$(install_prefix)/share/man/man1"
+    [ -d "$man_dir" ] || return 0
+    [ -w "$man_dir" ] || return 0
+    if [ "$DRY_RUN" -eq 1 ]; then
+        run "$INSTALL_DIR/portl" man --out-dir "$man_dir"
+        return 0
+    fi
+    "$INSTALL_DIR/portl" man --out-dir "$man_dir" >/dev/null 2>&1 || true
+}
+
+install_completion_file() {
+    local shell_name="$1" target="$2" dir
+    dir="$(dirname "$target")"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        run mkdir -p "$dir"
+        log "\$ $INSTALL_DIR/portl completions $shell_name > $target"
+        return 0
+    fi
+    mkdir -p "$dir" >/dev/null 2>&1 || return 0
+    [ -w "$dir" ] || return 0
+    "$INSTALL_DIR/portl" completions "$shell_name" >"$target" 2>/dev/null || true
+}
+
+install_completions_best_effort() {
+    [ "${PORTL_INSTALL_COMPLETIONS:-1}" = "0" ] && return 0
+    local shell_name base
+    shell_name="$(basename "${SHELL:-}")"
+    if [ -z "$shell_name" ] && has ps; then
+        shell_name="$(ps -p "${PPID:-0}" -o comm= 2>/dev/null | awk 'NR==1 {print $1}')"
+        shell_name="$(basename "$shell_name")"
+    fi
+    case "$shell_name" in
+        bash)
+            base="${XDG_DATA_HOME:-${HOME:-/root}/.local/share}"
+            install_completion_file bash "$base/bash-completion/completions/portl"
+            ;;
+        zsh)
+            base="${XDG_DATA_HOME:-${HOME:-/root}/.local/share}"
+            install_completion_file zsh "$base/zsh/site-functions/_portl"
+            ;;
+        fish)
+            base="${XDG_CONFIG_HOME:-${HOME:-/root}/.config}"
+            install_completion_file fish "$base/fish/completions/portl.fish"
+            ;;
+    esac
 }
 
 # --- service management -----------------------------------------------
