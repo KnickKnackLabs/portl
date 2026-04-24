@@ -159,7 +159,11 @@ impl ConnectionRegistry {
 /// the connection has no non-closed paths (shouldn't happen while
 /// the Drop guard is alive, but handled defensively).
 fn classify_path_and_rtt(conn: &Connection) -> (PathKind, Option<u64>) {
-    let paths: Vec<PathInfo> = conn.paths().into_iter().filter(|p| !p.is_closed()).collect();
+    let paths: Vec<PathInfo> = conn
+        .paths()
+        .into_iter()
+        .filter(|p| !p.is_closed())
+        .collect();
     if paths.is_empty() {
         return (PathKind::Unknown, None);
     }

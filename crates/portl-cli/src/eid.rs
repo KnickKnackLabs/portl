@@ -136,10 +136,7 @@ fn parse_full_hex(hex_str: &str) -> Result<EndpointId> {
     EndpointId::from_bytes(&bytes).context("invalid endpoint id")
 }
 
-fn known_eids(
-    peer_store: Option<&PeerStore>,
-    ticket_store: Option<&TicketStore>,
-) -> Vec<String> {
+fn known_eids(peer_store: Option<&PeerStore>, ticket_store: Option<&TicketStore>) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(ps) = peer_store {
         for e in ps.iter() {

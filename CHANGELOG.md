@@ -5,6 +5,18 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.3.4.2 — 2026-04-25
+
+Formatting-only patch release. No behavioural changes.
+
+### CI
+
+- `rustfmt` applied to `crates/portl-agent/src/conn_registry.rs`
+  (wrap chained `conn.paths().into_iter().filter(...).collect()`)
+  and `crates/portl-cli/src/eid.rs` (collapse `known_eids`
+  signature). Unblocks `cargo fmt --all -- --check` in CI after
+  v0.3.4.1.
+
 ## 0.3.4.1 — 2026-04-24
 
 Observability correctness + CLI resolution unification. The
