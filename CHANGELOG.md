@@ -5,7 +5,29 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
-## 0.3.4.2 — 2026-04-25
+## 0.3.5 — 2026-04-25
++
++CLI discovery and pairing observability patch release.
++
++### Fixed
++
++- `portl peer pair` now uses the same configurable client endpoint
++  binding as ticket-backed operations, including configured relay,
++  DNS, Pkarr, and mDNS discovery. This removes a drift that could
++  leave pairing stuck until the iroh dial timed out while ticket
++  operations worked.
++
++### Added
++
++- Added global `-v` / `--verbose` and `--log <FILTER>` CLI logging
++  controls for diagnostics on peer, ticket, status, shell, exec,
++  TCP, UDP, docker, slicer, install, and gateway operations.
++- `PORTL_LOG` is now honored as the documented RUST_LOG-style filter
++  for CLI, agent, and gateway diagnostics.
++- Added targeted pair and ticket handshake diagnostics for endpoint
++  binding, discovery, dial, stream, response, and peer-store stages.
++
++## 0.3.4.2 — 2026-04-25
 
 Formatting-only patch release. No behavioural changes.
 

@@ -22,7 +22,7 @@ use iroh::endpoint::Connection;
 use portl_core::pair_store::PairStore;
 use portl_core::peer_store::{PeerEntry, PeerOrigin, PeerStore};
 use portl_proto::pair_v1::{PairMode, PairRequest, PairResponse, PairResult};
-use tracing::{info, instrument};
+use tracing::{debug, info, instrument};
 
 use crate::AgentState;
 use crate::stream_io::read_postcard_prefix;
@@ -40,8 +40,10 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
     let (request, _buffered): (PairRequest, _) = read_postcard_prefix(recv, MAX_PAIR_REQ_BYTES)
         .await
         .context("read PairRequest")?;
+    debug!(mode = ?request.mode, nonce = %short_nonce(&request.nonce), "received pair request");
 
     let response = handle_pair(&state, caller_eid, &request)?;
+    debug!(result = ?response.result, "sending pair response");
 
     let bytes = postcard::to_stdvec(&response).context("encode PairResponse")?;
     let len_prefix: u32 = bytes
@@ -94,6 +96,13 @@ pub(crate) fn handle_pair(
     let mut pair_store = PairStore::load(&pair_path)
         .with_context(|| format!("load pair store at {}", pair_path.display()))?;
     let nonce_hex = hex::encode(request.nonce);
+    debug!(
+        pair_store = %pair_path.display(),
+        peers_store = %peers_path.display(),
+        nonce = %short_nonce(&request.nonce),
+        mode = ?request.mode,
+        "handling pair request"
+    );
     let Some(invite) = pair_store.find_by_nonce(&nonce_hex).cloned() else {
         return Ok(PairResponse {
             version: 1,
@@ -220,6 +229,11 @@ fn relay_hint_for_response(state: &AgentState) -> Option<String> {
         .map(|h| format!("https://{h}/"))
         .or_else(|| guard.https_addr.as_ref().map(|a| format!("https://{a}/")))
         .or_else(|| guard.http_addr.as_ref().map(|a| format!("http://{a}/")))
+}
+
+fn short_nonce(nonce: &[u8; 16]) -> String {
+    let hex = hex::encode(nonce);
+    hex[..12.min(hex.len())].to_owned()
 }
 
 fn responder_self_label(state: &AgentState) -> Option<String> {

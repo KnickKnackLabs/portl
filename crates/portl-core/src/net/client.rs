@@ -51,11 +51,16 @@ pub async fn open_ticket_v1(
     // only a tiny bit of first-dial latency in exchange for not
     // crashing the CLI. Drop this workaround once we move to an
     // iroh release that fixes the `online()` drop path.
+    tracing::debug!(
+        endpoint = %hex::encode(ticket.addr.id.as_bytes()),
+        "connecting ticket/v1"
+    );
     let connection = endpoint
         .inner()
         .connect(ticket.addr.clone(), portl_alpn::ALPN_TICKET_V1)
         .await
         .context("connect ticket/v1")?;
+    tracing::debug!(remote = %connection.remote_id().fmt_short(), "connected ticket/v1");
     let (mut send, mut recv) = connection.open_bi().await.context("open ticket stream")?;
 
     let client_nonce = rand::random::<[u8; 16]>();
@@ -80,8 +85,10 @@ pub async fn open_ticket_v1(
     send.write_all(&offer_bytes).await.context("write offer")?;
     send.finish().context("finish offer")?;
 
+    tracing::debug!(offer_bytes = offer_bytes.len(), "sent ticket offer");
     let ack_bytes = recv.read_to_end(MAX_ACK_BYTES).await.context("read ack")?;
     let ack: TicketAck = postcard::from_bytes(&ack_bytes).context("decode ticket ack")?;
+    tracing::debug!(ok = ack.ok, reason = ?ack.reason, "received ticket ack");
     if !ack.ok {
         return Err(TicketHandshakeError { reason: ack.reason }.into());
     }

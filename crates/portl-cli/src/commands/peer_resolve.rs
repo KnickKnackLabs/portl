@@ -113,9 +113,7 @@ pub(crate) async fn connect_peer(peer: &str, caps: Capabilities) -> Result<Conne
 }
 
 pub(crate) async fn bind_client_endpoint(identity: &Identity) -> Result<iroh::Endpoint> {
-    portl_agent::endpoint::bind(&portl_agent::AgentConfig::default(), identity)
-        .await
-        .context("bind client endpoint")
+    crate::client_endpoint::bind_client_endpoint(identity).await
 }
 
 pub(crate) async fn connect_peer_with_endpoint(

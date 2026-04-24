@@ -58,6 +58,47 @@ fn empty_argv_is_rejected() {
 }
 
 #[test]
+fn global_verbose_flags_do_not_change_command_shape() {
+    let cmd = parse(argv(&["portl", "-vv", "status"])).expect("parse -vv status");
+    assert_eq!(
+        cmd,
+        Command::Status {
+            peer: None,
+            relay: false,
+            json: false,
+            watch: None,
+        }
+    );
+
+    let cmd = parse(argv(&[
+        "portl",
+        "--log",
+        "portl_cli=debug,iroh=info",
+        "peer",
+        "pair",
+        "PORTLINV-AAAA",
+    ]))
+    .expect("parse --log peer pair");
+    assert_eq!(
+        cmd,
+        Command::PeerPair {
+            code: "PORTLINV-AAAA".to_owned(),
+        }
+    );
+
+    let cmd = parse(argv(&["portl", "doctor", "--verbose"])).expect("parse doctor --verbose");
+    assert_eq!(
+        cmd,
+        Command::Doctor {
+            fix: false,
+            yes: false,
+            verbose: true,
+            json: false,
+        }
+    );
+}
+
+#[test]
 fn shell_exec_tcp_and_udp_subcommands_parse() {
     let shell = parse(argv(&[
         "portl",

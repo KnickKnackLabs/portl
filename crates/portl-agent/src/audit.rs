@@ -31,8 +31,9 @@ pub(crate) fn init() {
             quinn=warn,quinn_proto=warn,quinn_udp=warn,\
             rustls=warn,h2=warn,hickory_proto=warn,hickory_resolver=warn,\
             pkarr=warn,mainline=warn,portmapper=warn,netwatch=warn";
+        let filter = filter_directive(default_filter);
         let env_filter =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+            EnvFilter::try_new(&filter).unwrap_or_else(|_| EnvFilter::new(default_filter));
 
         #[cfg(target_os = "linux")]
         {
@@ -50,6 +51,12 @@ pub(crate) fn init() {
             .with(tracing_subscriber::fmt::layer())
             .try_init();
     });
+}
+
+fn filter_directive(default_filter: &str) -> String {
+    std::env::var("PORTL_LOG")
+        .or_else(|_| std::env::var("RUST_LOG"))
+        .unwrap_or_else(|_| default_filter.to_owned())
 }
 
 pub(crate) fn ticket_accepted(session: &Session) {
@@ -142,6 +149,41 @@ pub(crate) fn sync_shell_exit_records() {
     {
         let file = file.lock().expect("shell exit audit file mutex");
         let _ = file.sync_all();
+    }
+}
+
+#[cfg(test)]
+#[allow(unsafe_code)]
+mod tests {
+    use std::ffi::OsString;
+    use std::sync::{LazyLock, Mutex};
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    #[test]
+    fn portl_log_takes_precedence_over_rust_log() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let old_portl = std::env::var_os("PORTL_LOG");
+        let old_rust = std::env::var_os("RUST_LOG");
+        unsafe {
+            std::env::set_var("PORTL_LOG", "portl_agent=debug");
+            std::env::set_var("RUST_LOG", "portl_agent=trace");
+        }
+
+        assert_eq!(super::filter_directive("warn"), "portl_agent=debug");
+
+        restore_env("PORTL_LOG", old_portl);
+        restore_env("RUST_LOG", old_rust);
+    }
+
+    fn restore_env(name: &str, value: Option<OsString>) {
+        unsafe {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
     }
 }
 

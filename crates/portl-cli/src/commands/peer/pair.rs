@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use iroh::EndpointAddr;
-use iroh_base::{EndpointId, SecretKey};
+use iroh_base::EndpointId;
 use portl_core::id::{Identity, store};
 use portl_core::pair_code::InviteCode;
 use portl_core::peer_store::{PeerEntry, PeerOrigin, PeerStore};
@@ -33,7 +33,10 @@ pub fn run(code: &str, mode: PairMode) -> Result<ExitCode> {
 async fn run_async(invite: &InviteCode, mode: PairMode) -> Result<ExitCode> {
     let identity = store::load(&store::default_path()).context("load local identity")?;
     let our_eid_hex = hex::encode(identity.verifying_key());
-    let endpoint = bind_client_endpoint(&identity).await?;
+    let client_cfg = crate::client_endpoint::load_client_config()?;
+    let caller_relay_hint = crate::client_endpoint::preferred_relay_hint(&client_cfg);
+    let endpoint =
+        crate::client_endpoint::bind_client_endpoint_with_config(&identity, &client_cfg).await?;
 
     // Dial the inviter's endpoint_id directly. Relay hint from the
     // invite code (if any) gives us a fallback when direct + DNS fail.
@@ -51,6 +54,12 @@ async fn run_async(invite: &InviteCode, mode: PairMode) -> Result<ExitCode> {
         }
     }
 
+    tracing::info!(
+        inviter = %crate::eid::format_short_bytes(&invite.inviter_eid),
+        invite_relay_hint = invite.relay_hint.as_deref().unwrap_or(""),
+        caller_relay_hint = caller_relay_hint.as_deref().unwrap_or(""),
+        "dialing pair inviter"
+    );
     println!("dialing inviter...");
     let connection = endpoint
         .connect(dial_target, ALPN_PAIR_V1)
@@ -66,7 +75,7 @@ async fn run_async(invite: &InviteCode, mode: PairMode) -> Result<ExitCode> {
         version: 1,
         nonce: invite.nonce,
         mode,
-        caller_relay_hint: None, // TODO(v0.3.4.1): read from local relay config
+        caller_relay_hint,
         caller_label: None,
     };
     let body = postcard::to_stdvec(&request).context("encode PairRequest")?;
@@ -79,6 +88,7 @@ async fn run_async(invite: &InviteCode, mode: PairMode) -> Result<ExitCode> {
     framed.extend_from_slice(&body);
     send.write_all(&framed).await.context("write PairRequest")?;
     send.finish().ok();
+    tracing::debug!(request_bytes = body.len(), mode = ?mode, "sent pair request");
 
     // Read the 4-byte length-prefixed PairResponse.
     let mut len_buf = [0u8; 4];
@@ -94,26 +104,12 @@ async fn run_async(invite: &InviteCode, mode: PairMode) -> Result<ExitCode> {
         .await
         .context("read PairResponse body")?;
     let response: PairResponse = postcard::from_bytes(&body).context("decode PairResponse")?;
+    tracing::debug!(result = ?response.result, "received pair response");
 
     connection.close(0u32.into(), b"pair complete");
     endpoint.close().await;
 
     apply_response(&identity, invite, &our_eid_hex, mode, &response)
-}
-
-async fn bind_client_endpoint(identity: &Identity) -> Result<iroh::Endpoint> {
-    use iroh::address_lookup::{DnsAddressLookup, PkarrResolver};
-    use iroh::endpoint::presets;
-
-    let mut builder = iroh::Endpoint::builder(presets::Minimal)
-        .secret_key(SecretKey::from_bytes(&identity.signing_key().to_bytes()))
-        .alpns(vec![ALPN_PAIR_V1.to_vec()])
-        .address_lookup(DnsAddressLookup::n0_dns())
-        .address_lookup(PkarrResolver::n0_dns());
-    // Ephemeral client bind; let the OS pick a port.
-    let bind: std::net::SocketAddr = "[::]:0".parse().expect("valid bind addr literal");
-    builder = builder.bind_addr(bind)?;
-    builder.bind().await.map_err(Into::into)
 }
 
 fn apply_response(
@@ -160,6 +156,12 @@ fn apply_response(
                 })
                 .context("insert paired peer locally")?;
             peers.save(&peers_path).context("save peer store")?;
+            tracing::info!(
+                label = %label,
+                mode = ?mode,
+                peer_store = %peers_path.display(),
+                "saved paired peer locally"
+            );
             let relay_note = response
                 .responder_relay_hint
                 .as_deref()

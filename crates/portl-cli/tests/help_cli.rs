@@ -51,7 +51,7 @@ fn top_level_help_snapshots_match() {
             &["--help"][..],
             r#"portl CLI — multicall surface for `portl`, `portl-agent`, and `portl-gateway`.
 
-Usage: portl <COMMAND>
+Usage: portl [OPTIONS] <COMMAND>
 
 Commands:
   init     Create identity, run doctor, and print next steps
@@ -73,8 +73,10 @@ Commands:
   help     Print this message or the help of the given subcommand(s)
 
 Options:
-  -h, --help     Print help
-  -V, --version  Print version
+  -v, --verbose...    Increase logging; in doctor, also show passing checks
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+  -h, --help          Print help
+  -V, --version       Print version
 "#,
         ),
         (
@@ -84,9 +86,11 @@ Options:
 Usage: portl init [OPTIONS]
 
 Options:
-      --force        
-      --role <ROLE>  [possible values: operator, agent]
-  -h, --help         Print help
+      --force         
+  -v, --verbose...    Increase logging; in doctor, also show passing checks
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+      --role <ROLE>   [possible values: operator, agent]
+  -h, --help          Print help
 "#,
         ),
         (
@@ -96,12 +100,13 @@ Options:
 Usage: portl doctor [OPTIONS]
 
 Options:
-      --fix      Attempt to auto-remediate warnings where possible. Currently handles duplicate
-                 launchd / systemd services (bootout + rm the wrong lane)
-      --yes      Skip confirmation prompts. Required in non-TTY contexts when --fix is set
-      --verbose  Show every check, including passing ones. Default hides `ok` rows
-      --json     Emit structured JSON instead of the human-readable table
-  -h, --help     Print help
+      --fix           Attempt to auto-remediate warnings where possible. Currently handles duplicate
+                      launchd / systemd services (bootout + rm the wrong lane)
+  -v, --verbose...    Increase logging; in doctor, also show passing checks
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+      --yes           Skip confirmation prompts. Required in non-TTY contexts when --fix is set
+      --json          Emit structured JSON instead of the human-readable table
+  -h, --help          Print help
 "#,
         ),
         (
@@ -115,7 +120,9 @@ Arguments:
 
 Options:
       --relay         Force the handshake over the peer's relay path. Requires <peer>
+  -v, --verbose...    Increase logging; in doctor, also show passing checks
       --json          Emit JSON instead of human-readable output
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
       --watch <SECS>  Re-render every N seconds (min 1, max 3600). Incompatible with --json
   -h, --help          Print help
 "#,
@@ -130,9 +137,11 @@ Arguments:
   <PEER>  
 
 Options:
-      --cwd <CWD>    
-      --user <USER>  
-  -h, --help         Print help
+      --cwd <CWD>     
+  -v, --verbose...    Increase logging; in doctor, also show passing checks
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+      --user <USER>   
+  -h, --help          Print help
 "#,
         ),
         (
@@ -146,44 +155,50 @@ Arguments:
   <ARGV>...  
 
 Options:
-      --cwd <CWD>    
-      --user <USER>  
-  -h, --help         Print help
+      --cwd <CWD>     
+  -v, --verbose...    Increase logging; in doctor, also show passing checks
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+      --user <USER>   
+  -h, --help          Print help
 "#,
         ),
         (
             &["tcp", "--help"][..],
             r#"Set up one or more local TCP forwards
 
-Usage: portl tcp -L <LOCAL> <PEER>
+Usage: portl tcp [OPTIONS] -L <LOCAL> <PEER>
 
 Arguments:
   <PEER>  
 
 Options:
-  -L <LOCAL>  
-  -h, --help  Print help
+  -L <LOCAL>          
+  -v, --verbose...    Increase logging; in doctor, also show passing checks
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+  -h, --help          Print help
 "#,
         ),
         (
             &["udp", "--help"][..],
             r#"Set up one or more local UDP forwards
 
-Usage: portl udp -L <LOCAL> <PEER>
+Usage: portl udp [OPTIONS] -L <LOCAL> <PEER>
 
 Arguments:
   <PEER>  
 
 Options:
-  -L <LOCAL>  
-  -h, --help  Print help
+  -L <LOCAL>          
+  -v, --verbose...    Increase logging; in doctor, also show passing checks
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+  -h, --help          Print help
 "#,
         ),
         (
             &["peer", "--help"][..],
             r#"Manage peer trust (the filesystem-backed `peers.json` store)
 
-Usage: portl peer <COMMAND>
+Usage: portl peer [OPTIONS] <COMMAND>
 
 Commands:
   ls              List stored peers
@@ -198,14 +213,16 @@ Commands:
   help            Print this message or the help of the given subcommand(s)
 
 Options:
-  -h, --help  Print help
+  -v, --verbose...    Increase logging; in doctor, also show passing checks
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+  -h, --help          Print help
 "#,
         ),
         (
             &["ticket", "--help"][..],
             r#"Manage saved tickets (outbound credentials)
 
-Usage: portl ticket <COMMAND>
+Usage: portl ticket [OPTIONS] <COMMAND>
 
 Commands:
   issue   Mint a new ticket signed by the local identity
@@ -217,7 +234,9 @@ Commands:
   help    Print this message or the help of the given subcommand(s)
 
 Options:
-  -h, --help  Print help
+  -v, --verbose...    Increase logging; in doctor, also show passing checks
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+  -h, --help          Print help
 "#,
         ),
         (
@@ -249,6 +268,12 @@ Options:
           
           [default: 30d]
 
+  -v, --verbose...
+          Increase logging; in doctor, also show passing checks
+
+      --log <FILTER>
+          RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+
       --to <TO>
           Restrict this ticket to a specific caller `endpoint_id` (64-hex). Omit for a bearer ticket
           usable by anyone who has the string
@@ -277,9 +302,11 @@ Arguments:
   [ID]  
 
 Options:
-      --list     
-      --publish  
-  -h, --help     Print help
+      --list          
+  -v, --verbose...    Increase logging; in doctor, also show passing checks
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+      --publish       
+  -h, --help          Print help
 "#,
         ),
         (
@@ -289,9 +316,11 @@ Options:
 Usage: portl whoami [OPTIONS]
 
 Options:
-      --eid   Print only the 64-char `endpoint_id` hex (script-friendly)
-      --json  Emit structured JSON. Ignored when --eid is set
-  -h, --help  Print help
+      --eid           Print only the 64-char `endpoint_id` hex (script-friendly)
+  -v, --verbose...    Increase logging; in doctor, also show passing checks
+      --json          Emit structured JSON. Ignored when --eid is set
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+  -h, --help          Print help
 "#,
         ),
         (
@@ -305,6 +334,8 @@ Arguments:
 
 Options:
       --apply            
+  -v, --verbose...       Increase logging; in doctor, also show passing checks
+      --log <FILTER>     RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
       --yes              
       --detect           
       --dry-run          
@@ -316,7 +347,7 @@ Options:
             &["docker", "--help"][..],
             r#"Docker target management
 
-Usage: portl docker <COMMAND>
+Usage: portl docker [OPTIONS] <COMMAND>
 
 Commands:
   run     
@@ -328,14 +359,16 @@ Commands:
   help    Print this message or the help of the given subcommand(s)
 
 Options:
-  -h, --help  Print help
+  -v, --verbose...    Increase logging; in doctor, also show passing checks
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+  -h, --help          Print help
 "#,
         ),
         (
             &["slicer", "--help"][..],
             r#"Slicer target management
 
-Usage: portl slicer <COMMAND>
+Usage: portl slicer [OPTIONS] <COMMAND>
 
 Commands:
   run   
@@ -344,20 +377,24 @@ Commands:
   help  Print this message or the help of the given subcommand(s)
 
 Options:
-  -h, --help  Print help
+  -v, --verbose...    Increase logging; in doctor, also show passing checks
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+  -h, --help          Print help
 "#,
         ),
         (
             &["gateway", "--help"][..],
             r#"Run the slicer HTTP bridge against an upstream API
 
-Usage: portl gateway <UPSTREAM_URL>
+Usage: portl gateway [OPTIONS] <UPSTREAM_URL>
 
 Arguments:
   <UPSTREAM_URL>  
 
 Options:
-  -h, --help  Print help
+  -v, --verbose...    Increase logging; in doctor, also show passing checks
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+  -h, --help          Print help
 "#,
         ),
     ];

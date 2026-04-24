@@ -168,10 +168,7 @@ fn run_with_identity_path_mode(
     let identity_path = resolve_identity_path(identity_path);
     runtime.block_on(async move {
         let identity = store::load(&identity_path).context("load local identity")?;
-        let raw_endpoint =
-            portl_agent::endpoint::bind(&portl_agent::AgentConfig::default(), &identity)
-                .await
-                .context("bind client endpoint")?;
+        let raw_endpoint = crate::client_endpoint::bind_client_endpoint(&identity).await?;
         run_with_endpoint(peer, identity, raw_endpoint, relay).await
     })
 }

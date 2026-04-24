@@ -9,8 +9,10 @@
 
 mod agent_ipc;
 mod alias_store;
+mod client_endpoint;
 mod commands;
 mod eid;
+mod logging;
 mod release_binary;
 
 pub use commands::init::InitRole;
@@ -303,6 +305,8 @@ pub fn run(argv: Vec<OsString>) -> ExitCode {
         }
     };
 
+    logging::init(cli.log_verbose, cli.log.as_deref());
+
     match dispatch(cli.into_command()) {
         Ok(code) => code,
         Err(err) => {
@@ -513,6 +517,12 @@ const PORTL_ABOUT: &str =
 #[derive(Parser, Debug)]
 #[command(name = "portl", bin_name = "portl", version, about = PORTL_ABOUT, long_about = None)]
 struct Cli {
+    /// Increase logging; in doctor, also show passing checks.
+    #[arg(id = "log-verbose", short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
+    log_verbose: u8,
+    /// RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG.
+    #[arg(long = "log", global = true, value_name = "FILTER")]
+    log: Option<String>,
     #[command(subcommand)]
     command: TopLevel,
 }
@@ -539,9 +549,6 @@ enum TopLevel {
         /// Skip confirmation prompts. Required in non-TTY contexts when --fix is set.
         #[arg(long)]
         yes: bool,
-        /// Show every check, including passing ones. Default hides `ok` rows.
-        #[arg(long)]
-        verbose: bool,
         /// Emit structured JSON instead of the human-readable table.
         #[arg(long)]
         json: bool,
@@ -883,17 +890,13 @@ enum SlicerAction {
 impl Cli {
     #[allow(clippy::too_many_lines)]
     fn into_command(self) -> Command {
+        let log_verbose = self.log_verbose;
         match self.command {
             TopLevel::Init { force, role } => Command::Init { force, role },
-            TopLevel::Doctor {
+            TopLevel::Doctor { fix, yes, json } => Command::Doctor {
                 fix,
                 yes,
-                verbose,
-                json,
-            } => Command::Doctor {
-                fix,
-                yes,
-                verbose,
+                verbose: log_verbose > 0,
                 json,
             },
             TopLevel::Status {
