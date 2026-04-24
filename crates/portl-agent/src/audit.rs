@@ -152,41 +152,6 @@ pub(crate) fn sync_shell_exit_records() {
     }
 }
 
-#[cfg(test)]
-#[allow(unsafe_code)]
-mod tests {
-    use std::ffi::OsString;
-    use std::sync::{LazyLock, Mutex};
-
-    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    #[test]
-    fn portl_log_takes_precedence_over_rust_log() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        let old_portl = std::env::var_os("PORTL_LOG");
-        let old_rust = std::env::var_os("RUST_LOG");
-        unsafe {
-            std::env::set_var("PORTL_LOG", "portl_agent=debug");
-            std::env::set_var("RUST_LOG", "portl_agent=trace");
-        }
-
-        assert_eq!(super::filter_directive("warn"), "portl_agent=debug");
-
-        restore_env("PORTL_LOG", old_portl);
-        restore_env("RUST_LOG", old_rust);
-    }
-
-    fn restore_env(name: &str, value: Option<OsString>) {
-        unsafe {
-            if let Some(value) = value {
-                std::env::set_var(name, value);
-            } else {
-                std::env::remove_var(name);
-            }
-        }
-    }
-}
-
 fn init_shell_exit_audit_file() -> Option<Mutex<File>> {
     let path = std::env::var_os("PORTL_AUDIT_SHELL_EXIT_PATH").map(PathBuf::from)?;
     if let Some(parent) = path.parent() {
@@ -220,4 +185,39 @@ pub(crate) fn tcp_disconnect(session: &Session, host: &str, port: u16) {
         tcp_host = host,
         tcp_port = port,
     );
+}
+
+#[cfg(test)]
+#[allow(unsafe_code)]
+mod tests {
+    use std::ffi::OsString;
+    use std::sync::{LazyLock, Mutex};
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    #[test]
+    fn portl_log_takes_precedence_over_rust_log() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let old_portl = std::env::var_os("PORTL_LOG");
+        let old_rust = std::env::var_os("RUST_LOG");
+        unsafe {
+            std::env::set_var("PORTL_LOG", "portl_agent=debug");
+            std::env::set_var("RUST_LOG", "portl_agent=trace");
+        }
+
+        assert_eq!(super::filter_directive("warn"), "portl_agent=debug");
+
+        restore_env("PORTL_LOG", old_portl);
+        restore_env("RUST_LOG", old_rust);
+    }
+
+    fn restore_env(name: &str, value: Option<OsString>) {
+        unsafe {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
+    }
 }

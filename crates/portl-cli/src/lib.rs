@@ -520,7 +520,7 @@ struct Cli {
     /// Increase logging; in doctor, also show passing checks.
     #[arg(id = "log-verbose", short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
     log_verbose: u8,
-    /// RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG.
+    /// RUST_LOG-style tracing filter. Overrides -v and `PORTL_LOG`.
     #[arg(long = "log", global = true, value_name = "FILTER")]
     log: Option<String>,
     #[command(subcommand)]

@@ -74,7 +74,7 @@ Commands:
 
 Options:
   -v, --verbose...    Increase logging; in doctor, also show passing checks
-      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and `PORTL_LOG`
   -h, --help          Print help
   -V, --version       Print version
 "#,
@@ -88,7 +88,7 @@ Usage: portl init [OPTIONS]
 Options:
       --force         
   -v, --verbose...    Increase logging; in doctor, also show passing checks
-      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and `PORTL_LOG`
       --role <ROLE>   [possible values: operator, agent]
   -h, --help          Print help
 "#,
@@ -103,7 +103,7 @@ Options:
       --fix           Attempt to auto-remediate warnings where possible. Currently handles duplicate
                       launchd / systemd services (bootout + rm the wrong lane)
   -v, --verbose...    Increase logging; in doctor, also show passing checks
-      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and `PORTL_LOG`
       --yes           Skip confirmation prompts. Required in non-TTY contexts when --fix is set
       --json          Emit structured JSON instead of the human-readable table
   -h, --help          Print help
@@ -122,7 +122,7 @@ Options:
       --relay         Force the handshake over the peer's relay path. Requires <peer>
   -v, --verbose...    Increase logging; in doctor, also show passing checks
       --json          Emit JSON instead of human-readable output
-      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and `PORTL_LOG`
       --watch <SECS>  Re-render every N seconds (min 1, max 3600). Incompatible with --json
   -h, --help          Print help
 "#,
@@ -139,7 +139,7 @@ Arguments:
 Options:
       --cwd <CWD>     
   -v, --verbose...    Increase logging; in doctor, also show passing checks
-      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and `PORTL_LOG`
       --user <USER>   
   -h, --help          Print help
 "#,
@@ -157,7 +157,7 @@ Arguments:
 Options:
       --cwd <CWD>     
   -v, --verbose...    Increase logging; in doctor, also show passing checks
-      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and `PORTL_LOG`
       --user <USER>   
   -h, --help          Print help
 "#,
@@ -174,7 +174,7 @@ Arguments:
 Options:
   -L <LOCAL>          
   -v, --verbose...    Increase logging; in doctor, also show passing checks
-      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and `PORTL_LOG`
   -h, --help          Print help
 "#,
         ),
@@ -190,7 +190,7 @@ Arguments:
 Options:
   -L <LOCAL>          
   -v, --verbose...    Increase logging; in doctor, also show passing checks
-      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and `PORTL_LOG`
   -h, --help          Print help
 "#,
         ),
@@ -214,7 +214,7 @@ Commands:
 
 Options:
   -v, --verbose...    Increase logging; in doctor, also show passing checks
-      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and `PORTL_LOG`
   -h, --help          Print help
 "#,
         ),
@@ -235,7 +235,7 @@ Commands:
 
 Options:
   -v, --verbose...    Increase logging; in doctor, also show passing checks
-      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and `PORTL_LOG`
   -h, --help          Print help
 "#,
         ),
@@ -272,7 +272,7 @@ Options:
           Increase logging; in doctor, also show passing checks
 
       --log <FILTER>
-          RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+          RUST_LOG-style tracing filter. Overrides -v and `PORTL_LOG`
 
       --to <TO>
           Restrict this ticket to a specific caller `endpoint_id` (64-hex). Omit for a bearer ticket
@@ -304,7 +304,7 @@ Arguments:
 Options:
       --list          
   -v, --verbose...    Increase logging; in doctor, also show passing checks
-      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and `PORTL_LOG`
       --publish       
   -h, --help          Print help
 "#,
@@ -319,7 +319,7 @@ Options:
       --eid           Print only the 64-char `endpoint_id` hex (script-friendly)
   -v, --verbose...    Increase logging; in doctor, also show passing checks
       --json          Emit structured JSON. Ignored when --eid is set
-      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and `PORTL_LOG`
   -h, --help          Print help
 "#,
         ),
@@ -335,7 +335,7 @@ Arguments:
 Options:
       --apply            
   -v, --verbose...       Increase logging; in doctor, also show passing checks
-      --log <FILTER>     RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+      --log <FILTER>     RUST_LOG-style tracing filter. Overrides -v and `PORTL_LOG`
       --yes              
       --detect           
       --dry-run          
@@ -360,7 +360,7 @@ Commands:
 
 Options:
   -v, --verbose...    Increase logging; in doctor, also show passing checks
-      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and `PORTL_LOG`
   -h, --help          Print help
 "#,
         ),
@@ -378,7 +378,7 @@ Commands:
 
 Options:
   -v, --verbose...    Increase logging; in doctor, also show passing checks
-      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and `PORTL_LOG`
   -h, --help          Print help
 "#,
         ),
@@ -393,7 +393,7 @@ Arguments:
 
 Options:
   -v, --verbose...    Increase logging; in doctor, also show passing checks
-      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and PORTL_LOG
+      --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and `PORTL_LOG`
   -h, --help          Print help
 "#,
         ),
