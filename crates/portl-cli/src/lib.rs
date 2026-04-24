@@ -18,6 +18,7 @@ mod release_binary;
 pub use commands::config::ConfigAction;
 pub use commands::init::InitRole;
 pub use commands::install::InstallTarget;
+pub use commands::session::SessionHistoryFormat;
 pub use commands::status::run_with_identity_path as run_status_with_identity_path;
 pub use commands::status::run_with_identity_path_and_endpoint as run_status_with_identity_path_and_endpoint;
 
@@ -79,6 +80,40 @@ pub enum Command {
         peer: String,
         cwd: Option<String>,
         user: Option<String>,
+    },
+    SessionProviders {
+        target: String,
+        json: bool,
+    },
+    SessionAttach {
+        target: String,
+        session: Option<String>,
+        provider: Option<String>,
+        user: Option<String>,
+        cwd: Option<String>,
+        argv: Vec<String>,
+    },
+    SessionLs {
+        target: String,
+        provider: Option<String>,
+        json: bool,
+    },
+    SessionRun {
+        target: String,
+        session: Option<String>,
+        provider: Option<String>,
+        argv: Vec<String>,
+    },
+    SessionHistory {
+        target: String,
+        session: Option<String>,
+        provider: Option<String>,
+        format: SessionHistoryFormat,
+    },
+    SessionKill {
+        target: String,
+        session: Option<String>,
+        provider: Option<String>,
     },
     Exec {
         peer: String,
@@ -179,11 +214,13 @@ pub enum Command {
         volume: Vec<String>,
         network: Option<String>,
         user: Option<String>,
+        session_provider: Option<String>,
     },
     DockerAttach {
         container: String,
         from_binary: Option<PathBuf>,
         from_release: Option<String>,
+        session_provider: Option<String>,
     },
     DockerDetach {
         container: String,
@@ -204,6 +241,7 @@ pub enum Command {
         init_shim: bool,
         from_binary: Option<PathBuf>,
         from_release: Option<String>,
+        session_provider: Option<String>,
     },
     SlicerRun {
         image: String,
@@ -212,6 +250,7 @@ pub enum Command {
         ram_gb: Option<u16>,
         tags: Vec<String>,
         ticket_out: Option<PathBuf>,
+        session_provider: Option<String>,
     },
     SlicerList {
         base_url: Option<String>,
@@ -412,6 +451,44 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
         Command::Shell { peer, cwd, user } => {
             commands::shell::run(&peer, cwd.as_deref(), user.as_deref())
         }
+        Command::SessionProviders { target, json } => commands::session::providers(&target, json),
+        Command::SessionAttach {
+            target,
+            session,
+            provider,
+            user,
+            cwd,
+            argv,
+        } => commands::session::attach(
+            &target,
+            session.as_deref(),
+            provider.as_deref(),
+            user.as_deref(),
+            cwd.as_deref(),
+            &argv,
+        ),
+        Command::SessionLs {
+            target,
+            provider,
+            json,
+        } => commands::session::ls(&target, provider.as_deref(), json),
+        Command::SessionRun {
+            target,
+            session,
+            provider,
+            argv,
+        } => commands::session::run(&target, session.as_deref(), provider.as_deref(), &argv),
+        Command::SessionHistory {
+            target,
+            session,
+            provider,
+            format,
+        } => commands::session::history(&target, session.as_deref(), provider.as_deref(), format),
+        Command::SessionKill {
+            target,
+            session,
+            provider,
+        } => commands::session::kill(&target, session.as_deref(), provider.as_deref()),
         Command::Exec {
             peer,
             cwd,
@@ -496,6 +573,7 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             volume,
             network,
             user,
+            session_provider,
         } => commands::docker::run(
             &image,
             name.as_deref(),
@@ -506,12 +584,19 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             &volume,
             network.as_deref(),
             user.as_deref(),
+            session_provider.as_deref(),
         ),
         Command::DockerAttach {
             container,
             from_binary,
             from_release,
-        } => commands::docker::attach(&container, from_binary.as_deref(), from_release.as_deref()),
+            session_provider,
+        } => commands::docker::attach(
+            &container,
+            from_binary.as_deref(),
+            from_release.as_deref(),
+            session_provider.as_deref(),
+        ),
         Command::DockerDetach { container } => commands::docker::detach(&container),
         Command::DockerList { json } => commands::docker::list(json),
         Command::DockerRm {
@@ -527,6 +612,7 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             init_shim,
             from_binary,
             from_release,
+            session_provider,
         } => commands::docker::bake(
             &base_image,
             output.as_deref(),
@@ -535,6 +621,7 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             init_shim,
             from_binary.as_deref(),
             from_release.as_deref(),
+            session_provider.as_deref(),
         ),
         Command::SlicerRun {
             image,
@@ -543,6 +630,7 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             ram_gb,
             tags,
             ticket_out,
+            session_provider,
         } => commands::slicer::run(
             &image,
             base_url.as_deref(),
@@ -550,6 +638,7 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             ram_gb,
             &tags,
             ticket_out.as_deref(),
+            session_provider.as_deref(),
         ),
         Command::SlicerList { base_url, json } => commands::slicer::list(base_url.as_deref(), json),
         Command::SlicerRm { name, base_url } => commands::slicer::rm(&name, base_url.as_deref()),
@@ -673,8 +762,14 @@ enum TopLevel {
         #[arg(long)]
         user: Option<String>,
     },
+    /// Manage persistent terminal sessions.
+    #[command(next_help_heading = "Connect", display_order = 120)]
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
     /// Run a remote command without a PTY.
-    #[command(display_order = 120)]
+    #[command(display_order = 130)]
     Exec {
         #[arg(help = TARGET_HELP)]
         peer: String,
@@ -686,7 +781,7 @@ enum TopLevel {
         argv: Vec<String>,
     },
     /// Set up one or more local TCP forwards.
-    #[command(display_order = 130)]
+    #[command(display_order = 140)]
     Tcp {
         /// Local forward spec: `[LOCAL_HOST:]LOCAL_PORT:REMOTE_HOST:REMOTE_PORT`.
         #[arg(short = 'L', required = true)]
@@ -695,7 +790,7 @@ enum TopLevel {
         peer: String,
     },
     /// Set up one or more local UDP forwards.
-    #[command(display_order = 140)]
+    #[command(display_order = 150)]
     Udp {
         /// Local forward spec: `[LOCAL_HOST:]LOCAL_PORT:REMOTE_HOST:REMOTE_PORT`.
         #[arg(short = 'L', required = true)]
@@ -813,6 +908,71 @@ enum TopLevel {
         /// Man section for generated pages.
         #[arg(long, default_value = "1")]
         section: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SessionAction {
+    /// Show available persistent-session providers on a target.
+    Providers {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Attach to a persistent terminal session, creating it when supported.
+    Attach {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+        /// Session name. Defaults to the target label, or `default` for raw targets.
+        session: Option<String>,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        user: Option<String>,
+        #[arg(long)]
+        cwd: Option<String>,
+        #[arg(last = true)]
+        argv: Vec<String>,
+    },
+    /// List provider sessions on a target.
+    Ls {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+        #[arg(long)]
+        provider: Option<String>,
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a command in a provider session.
+    Run {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+        session: Option<String>,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
+    },
+    /// Print provider history for a session.
+    History {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+        session: Option<String>,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long, value_enum, default_value = "plain")]
+        format: SessionHistoryFormat,
+    },
+    /// Kill a provider session.
+    Kill {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+        session: Option<String>,
+        #[arg(long)]
+        provider: Option<String>,
     },
 }
 
@@ -1011,6 +1171,9 @@ enum DockerAction {
         network: Option<String>,
         #[arg(long)]
         user: Option<String>,
+        /// Configure a persistent-session provider inside the target.
+        #[arg(long = "session-provider", value_parser = ["zmx"])]
+        session_provider: Option<String>,
     },
     Attach {
         container: String,
@@ -1018,6 +1181,9 @@ enum DockerAction {
         from_binary: Option<PathBuf>,
         #[arg(long = "from-release", conflicts_with = "from_binary")]
         from_release: Option<String>,
+        /// Configure a persistent-session provider inside the target.
+        #[arg(long = "session-provider", value_parser = ["zmx"])]
+        session_provider: Option<String>,
     },
     Detach {
         container: String,
@@ -1049,6 +1215,9 @@ enum DockerAction {
         from_binary: Option<PathBuf>,
         #[arg(long = "from-release", conflicts_with = "from_binary")]
         from_release: Option<String>,
+        /// Require/configure a persistent-session provider in the baked image.
+        #[arg(long = "session-provider", value_parser = ["zmx"])]
+        session_provider: Option<String>,
     },
 }
 
@@ -1066,6 +1235,9 @@ enum SlicerAction {
         tags: Vec<String>,
         #[arg(long = "ticket-out")]
         ticket_out: Option<PathBuf>,
+        /// Configure a persistent-session provider in VM userdata.
+        #[arg(long = "session-provider", value_parser = ["zmx"])]
+        session_provider: Option<String>,
     },
     #[command(name = "ls", alias = "list")]
     Ls {
@@ -1126,6 +1298,67 @@ impl Cli {
                 timeout,
             },
             TopLevel::Shell { peer, cwd, user } => Command::Shell { peer, cwd, user },
+            TopLevel::Session { action } => match action {
+                SessionAction::Providers { target, json } => Command::SessionProviders {
+                    target,
+                    json: json || env_flag("PORTL_JSON"),
+                },
+                SessionAction::Attach {
+                    target,
+                    session,
+                    provider,
+                    user,
+                    cwd,
+                    argv,
+                } => Command::SessionAttach {
+                    target,
+                    session,
+                    provider,
+                    user,
+                    cwd,
+                    argv,
+                },
+                SessionAction::Ls {
+                    target,
+                    provider,
+                    json,
+                } => Command::SessionLs {
+                    target,
+                    provider,
+                    json: json || env_flag("PORTL_JSON"),
+                },
+                SessionAction::Run {
+                    target,
+                    session,
+                    provider,
+                    argv,
+                } => Command::SessionRun {
+                    target,
+                    session,
+                    provider,
+                    argv,
+                },
+                SessionAction::History {
+                    target,
+                    session,
+                    provider,
+                    format,
+                } => Command::SessionHistory {
+                    target,
+                    session,
+                    provider,
+                    format,
+                },
+                SessionAction::Kill {
+                    target,
+                    session,
+                    provider,
+                } => Command::SessionKill {
+                    target,
+                    session,
+                    provider,
+                },
+            },
             TopLevel::Exec {
                 peer,
                 cwd,
@@ -1298,6 +1531,7 @@ impl Cli {
                         volume,
                         network,
                         user,
+                        session_provider,
                     },
             } => Command::DockerRun {
                 image,
@@ -1309,6 +1543,7 @@ impl Cli {
                 volume,
                 network,
                 user,
+                session_provider,
             },
             TopLevel::Docker {
                 action:
@@ -1316,11 +1551,13 @@ impl Cli {
                         container,
                         from_binary,
                         from_release,
+                        session_provider,
                     },
             } => Command::DockerAttach {
                 container,
                 from_binary,
                 from_release,
+                session_provider,
             },
             TopLevel::Docker {
                 action: DockerAction::Detach { container },
@@ -1350,6 +1587,7 @@ impl Cli {
                         init_shim,
                         from_binary,
                         from_release,
+                        session_provider,
                     },
             } => Command::DockerBake {
                 base_image,
@@ -1359,6 +1597,7 @@ impl Cli {
                 init_shim,
                 from_binary,
                 from_release,
+                session_provider,
             },
             TopLevel::Slicer {
                 action:
@@ -1369,6 +1608,7 @@ impl Cli {
                         ram_gb,
                         tags,
                         ticket_out,
+                        session_provider,
                     },
             } => Command::SlicerRun {
                 image,
@@ -1377,6 +1617,7 @@ impl Cli {
                 ram_gb,
                 tags,
                 ticket_out,
+                session_provider,
             },
             TopLevel::Slicer {
                 action: SlicerAction::Ls { base_url, json },

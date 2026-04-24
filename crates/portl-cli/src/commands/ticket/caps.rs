@@ -62,6 +62,18 @@ fn entries() -> Vec<CapEntry<'static>> {
             examples: vec!["portl ticket issue shell --ttl 10m"],
         },
         CapEntry {
+            name: "exec",
+            summary: "Non-PTY exec access only; does not grant shell or persistent sessions.",
+            argument_grammar: None,
+            examples: vec!["portl ticket issue exec --ttl 10m"],
+        },
+        CapEntry {
+            name: "session",
+            summary: "Persistent-session preset. v0.4.0 encodes this with shell PTY caps; dedicated SessionCaps are deferred.",
+            argument_grammar: None,
+            examples: vec!["portl ticket issue session --ttl 1d"],
+        },
+        CapEntry {
             name: "meta:ping",
             summary: "Respond to liveness pings.",
             argument_grammar: None,
@@ -87,6 +99,12 @@ fn entries() -> Vec<CapEntry<'static>> {
             summary: "UDP port forward.",
             argument_grammar: Some("udp:<host_glob>:<port>[-<port_max>]"),
             examples: vec!["portl ticket issue 'udp:*:5353' --ttl 1h"],
+        },
+        CapEntry {
+            name: "dev",
+            summary: "Development preset; alias for all capabilities in v0.4.0.",
+            argument_grammar: None,
+            examples: vec!["portl ticket issue dev --ttl 7d"],
         },
         CapEntry {
             name: "all",

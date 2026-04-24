@@ -17,6 +17,8 @@ const AGENT_ENV_VARS: &[&str] = &[
     "PORTL_REVOCATIONS_PATH",
     "PORTL_RATE_LIMIT",
     "PORTL_UDP_SESSION_LINGER_SECS",
+    "PORTL_SESSION_PROVIDER",
+    "PORTL_SESSION_PROVIDER_PATH",
     "PORTL_MODE",
 ];
 
@@ -25,6 +27,7 @@ pub struct UserdataContext<'a> {
     pub portl_release_url: &'a str,
     pub relay_list: &'a [String],
     pub operator_pubkey: &'a str,
+    pub session_provider: Option<&'a str>,
 }
 
 pub fn render(context: &UserdataContext<'_>) -> Result<String> {
@@ -33,6 +36,12 @@ pub fn render(context: &UserdataContext<'_>) -> Result<String> {
     validate_safe("operator_pubkey", context.operator_pubkey)?;
     if let Some(relay) = context.relay_list.first() {
         validate_safe("relay", relay)?;
+    }
+    if let Some(provider) = context.session_provider {
+        validate_safe("session_provider", provider)?;
+        if provider != "zmx" {
+            bail!("unsupported session provider '{provider}' (supported: zmx)");
+        }
     }
 
     let mut rendered = TEMPLATE.to_owned();
@@ -44,6 +53,14 @@ pub fn render(context: &UserdataContext<'_>) -> Result<String> {
         ),
         ("{{DISCOVERY}}", discovery_value(context.relay_list)),
         ("{{OPERATOR_PUBKEY}}", context.operator_pubkey.to_owned()),
+        (
+            "{{SESSION_PROVIDER_CHECK}}",
+            session_provider_check(context.session_provider),
+        ),
+        (
+            "{{SESSION_PROVIDER_ENV}}",
+            session_provider_env(context.session_provider),
+        ),
     ] {
         rendered = rendered.replace(needle, &replacement);
     }
@@ -68,6 +85,20 @@ fn validate_safe(name: &str, value: &str) -> Result<()> {
 
 fn discovery_value(_relay_list: &[String]) -> String {
     "dns,pkarr,local,relay".to_owned()
+}
+
+fn session_provider_check(provider: Option<&str>) -> String {
+    match provider {
+        Some("zmx") => "if ! command -v zmx >/dev/null 2>&1; then\n  echo 'zmx is not installed; use a zmx-enabled Slicer image before requesting --session-provider zmx' >&2\n  exit 127\nfi".to_owned(),
+        _ => String::new(),
+    }
+}
+
+fn session_provider_env(provider: Option<&str>) -> String {
+    match provider {
+        Some("zmx") => "PORTL_SESSION_PROVIDER=zmx".to_owned(),
+        _ => String::new(),
+    }
 }
 
 fn extract_agent_env(rendered: &str) -> Result<&str> {
@@ -147,6 +178,7 @@ mod tests {
             portl_release_url: "example.invalid/releases",
             relay_list: &["https://relay.example.invalid".to_owned()],
             operator_pubkey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            session_provider: None,
         })
         .expect("render userdata");
 
@@ -164,9 +196,28 @@ mod tests {
             portl_release_url: "example.invalid/releases",
             relay_list: &[],
             operator_pubkey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            session_provider: None,
         })
         .expect_err("unsafe shell substitution must be rejected");
         assert!(err.to_string().contains("unsafe character"));
+    }
+
+    #[test]
+    fn renders_session_provider_env() {
+        let rendered = render(&UserdataContext {
+            secret_name: "portl-demo",
+            portl_release_url: "example.invalid/releases",
+            relay_list: &[],
+            operator_pubkey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            session_provider: Some("zmx"),
+        })
+        .expect("render userdata");
+
+        assert!(rendered.contains("command -v zmx"));
+        assert!(rendered.contains("PORTL_SESSION_PROVIDER=zmx"));
+        let agent_env = extract_agent_env(&rendered).expect("extract agent env");
+        let config = config_from_agent_env(agent_env).expect("parse rendered env");
+        assert_eq!(config.session_provider.as_deref(), Some("zmx"));
     }
 
     #[test]
@@ -176,6 +227,7 @@ mod tests {
             portl_release_url: "example.invalid/releases",
             relay_list: &[],
             operator_pubkey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            session_provider: None,
         })
         .expect("render userdata");
         let agent_env = extract_agent_env(&rendered).expect("extract agent env");

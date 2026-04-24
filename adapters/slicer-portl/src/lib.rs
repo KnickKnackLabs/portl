@@ -26,6 +26,8 @@ pub struct SlicerProvisionParams {
     pub operator_pubkey: String,
     pub portl_release_url: String,
     #[serde(default)]
+    pub session_provider: Option<String>,
+    #[serde(default)]
     pub auth_token: Option<String>,
 }
 
@@ -85,6 +87,7 @@ impl Bootstrapper for SlicerBootstrapper {
             portl_release_url: &params.portl_release_url,
             relay_list: &params.relay_list,
             operator_pubkey: &params.operator_pubkey,
+            session_provider: params.session_provider.as_deref(),
         })?;
         let vm = self
             .client
@@ -141,6 +144,11 @@ fn validate_spec(spec: &ProvisionSpec, params: &SlicerProvisionParams) -> Result
     }
     if params.portl_release_url.trim().is_empty() {
         bail!("slicer portl_release_url must not be empty");
+    }
+    if let Some(provider) = params.session_provider.as_deref()
+        && provider != "zmx"
+    {
+        bail!("unsupported slicer session_provider '{provider}' (supported: zmx)");
     }
     Ok(())
 }

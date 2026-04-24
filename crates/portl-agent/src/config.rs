@@ -28,6 +28,8 @@ const AGENT_ENV_VARS: &[&str] = &[
     "PORTL_REVOCATIONS_MAX_BYTES",
     "PORTL_RATE_LIMIT",
     "PORTL_UDP_SESSION_LINGER_SECS",
+    "PORTL_SESSION_PROVIDER",
+    "PORTL_SESSION_PROVIDER_PATH",
     "PORTL_MODE",
     "PORTL_RELAY_ENABLE",
     "PORTL_RELAY_BIND",
@@ -64,6 +66,12 @@ pub struct AgentConfig {
     pub udp_session_linger_secs: Option<u64>,
     pub metrics_enabled: Option<bool>,
     pub metrics_socket_path: Option<PathBuf>,
+    /// Optional preferred target-side persistent-session provider.
+    /// The first v0.4 slice supports `zmx`.
+    pub session_provider: Option<String>,
+    /// Optional absolute path to the target-side persistent-session provider CLI.
+    /// The first v0.4 slice treats this as a zmx path when set.
+    pub session_provider_path: Option<PathBuf>,
     /// Optional in-process relay server. `None` = disabled
     /// (the default). See `PORTL_RELAY_ENABLE` + related vars.
     pub relay_server: Option<RelayServerConfig>,
@@ -97,6 +105,7 @@ impl AgentConfig {
         Self::build(Some(&file))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn build(file: Option<&PortlConfig>) -> Result<Self> {
         let identity_secret = env_string("PORTL_IDENTITY_SECRET_HEX")
             .and_then(|value| value.map(|value| parse_secret_hex(&value)).transpose())?;
@@ -191,6 +200,12 @@ impl AgentConfig {
             .map(|value| parse_bool_env("PORTL_METRICS", &value))
             .transpose()?
             .unwrap_or(persistent);
+        let session_provider = env_string("PORTL_SESSION_PROVIDER")?
+            .or_else(|| file.and_then(|f| f.agent.session_provider.clone()))
+            .map(|value| parse_session_provider(&value))
+            .transpose()?;
+        let session_provider_path = env_path("PORTL_SESSION_PROVIDER_PATH")
+            .or_else(|| file.and_then(|f| f.agent.session_provider_path.clone()));
         let mode = env_string("PORTL_MODE")?
             .map(|value| parse_listener_mode(&value))
             .transpose()?
@@ -213,6 +228,8 @@ impl AgentConfig {
             udp_session_linger_secs: Some(udp_session_linger_secs),
             metrics_enabled: Some(metrics_enabled),
             metrics_socket_path: Some(home.join("metrics.sock")),
+            session_provider,
+            session_provider_path,
             relay_server,
         })
     }
@@ -493,6 +510,13 @@ fn parse_rate_limit(value: &str) -> Result<RateLimitConfig> {
         rps: rps.context("PORTL_RATE_LIMIT requires rps=<n>")?,
         burst: burst.context("PORTL_RATE_LIMIT requires burst=<n>")?,
     })
+}
+
+fn parse_session_provider(value: &str) -> Result<String> {
+    match value.trim() {
+        "zmx" => Ok("zmx".to_owned()),
+        other => bail!("unsupported PORTL_SESSION_PROVIDER '{other}' (supported: zmx)"),
+    }
 }
 
 fn parse_bool_env(name: &str, value: &str) -> Result<bool> {

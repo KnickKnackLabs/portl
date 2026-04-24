@@ -23,6 +23,11 @@ schema = 1
 # rules.
 # listen_addr = "[::]:0"
 
+# Preferred persistent-session provider. v0.4 supports zmx via the
+# target-side `zmx` CLI; manual hosts must install it explicitly.
+# session_provider = "zmx"
+# session_provider_path = "/usr/local/bin/zmx"
+
 [agent.discovery]
 # How peers find us (publish) and how we find them (resolve).
 # Setting all four to false is valid for in-process / loopback tests.

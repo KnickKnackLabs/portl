@@ -10,7 +10,7 @@ use portl_core::id::Identity;
 use portl_core::ticket::hash::ticket_id;
 use portl_core::ticket::mint::mint_root;
 
-use crate::alias_store::AliasStore;
+use crate::alias_store::{AliasStore, SessionProviderInstall};
 use crate::commands::mint_root::{parse_caps, parse_ttl};
 use crate::commands::peer_resolve::{ResolveOpts, bind_client_endpoint, resolve_peer};
 use crate::release_binary;
@@ -34,7 +34,7 @@ pub(super) async fn orchestrate_run<D: DockerOps, H: HostOps>(
     runtime: &RunRuntimeSpec,
     operator: &Identity,
 ) -> Result<InjectionOutcome> {
-    let plan = prepare_injection_plan(operator)?;
+    let plan = prepare_injection_plan(operator, runtime.session_provider.as_deref())?;
     let labels = HashMap::from([
         ("portl.adapter".to_owned(), ADAPTER_NAME.to_owned()),
         ("portl.endpoint_id".to_owned(), plan.endpoint_id_hex.clone()),
@@ -54,6 +54,7 @@ pub(super) async fn attach_existing<D: DockerOps, H: HostOps>(
     container: &str,
     binary_source: &BinarySource,
     operator: &Identity,
+    session_provider: Option<&str>,
 ) -> Result<InjectionOutcome> {
     let snapshot = docker.inspect_container(container).await?;
     if !snapshot.running {
@@ -62,7 +63,7 @@ pub(super) async fn attach_existing<D: DockerOps, H: HostOps>(
             snapshot.name
         );
     }
-    let plan = prepare_injection_plan(operator)?;
+    let plan = prepare_injection_plan(operator, session_provider)?;
     inject_container(docker, host, snapshot, binary_source, operator, plan).await
 }
 
@@ -83,7 +84,8 @@ pub(super) async fn inject_container<D: DockerOps, H: HostOps>(
     let binary = resolve_binary_path(host, binary_source, &container)?;
     let (binary_path, binary_path_preexisted) =
         copy_binary_with_fallback(docker, &binary, &container.id).await?;
-    let exec_env = injected_agent_env(&plan.identity, operator);
+    let session_provider_install = configure_session_provider(docker, &container.id, &plan).await?;
+    let exec_env = injected_agent_env(&plan.identity, operator, session_provider_install.as_ref());
     let exec_id = docker
         .create_exec(
             &container.id,
@@ -99,6 +101,7 @@ pub(super) async fn inject_container<D: DockerOps, H: HostOps>(
         binary_path_preexisted,
         exec_id,
         plan,
+        session_provider_install,
     })
 }
 
@@ -189,7 +192,15 @@ pub(super) async fn finalize_connectable_ticket(
     }
 }
 
-pub(super) fn prepare_injection_plan(operator: &Identity) -> Result<InjectionPlan> {
+pub(super) fn prepare_injection_plan(
+    operator: &Identity,
+    session_provider: Option<&str>,
+) -> Result<InjectionPlan> {
+    let session_provider = match session_provider {
+        None => None,
+        Some("zmx") => Some("zmx".to_owned()),
+        Some(other) => bail!("unsupported session provider '{other}' (supported: zmx)"),
+    };
     let identity = Identity::new();
     let caps = parse_caps(DEFAULT_AGENT_CAPS)?;
     let ttl_secs = parse_ttl(DEFAULT_TTL)?;
@@ -215,6 +226,63 @@ pub(super) fn prepare_injection_plan(operator: &Identity) -> Result<InjectionPla
         ticket,
         caps,
         ttl_secs,
+        session_provider,
+    })
+}
+
+pub(super) async fn configure_session_provider<D: DockerOps>(
+    docker: &D,
+    container: &str,
+    plan: &InjectionPlan,
+) -> Result<Option<SessionProviderInstall>> {
+    let Some(provider) = plan.session_provider.as_deref() else {
+        return Ok(None);
+    };
+    match provider {
+        "zmx" => configure_zmx_provider(docker, container).await.map(Some),
+        other => bail!("unsupported session provider '{other}' (supported: zmx)"),
+    }
+}
+
+async fn configure_zmx_provider<D: DockerOps>(
+    docker: &D,
+    container: &str,
+) -> Result<SessionProviderInstall> {
+    let target_path = PathBuf::from("/usr/local/bin/zmx");
+    if let Some(source) = std::env::var_os("PORTL_ZMX_BINARY") {
+        let source = PathBuf::from(source);
+        docker
+            .copy_file(&source, container, &target_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "copy zmx provider binary {} into container {container}",
+                    source.display()
+                )
+            })?;
+        return Ok(SessionProviderInstall {
+            provider: "zmx".to_owned(),
+            version: None,
+            path: Some(target_path),
+            installed_by_portl: true,
+        });
+    }
+
+    docker
+        .run_command(
+            container,
+            vec![
+                "/bin/sh".to_owned(),
+                "-lc".to_owned(),
+                "command -v zmx >/dev/null 2>&1 || { echo 'zmx is not installed; set PORTL_ZMX_BINARY or use a zmx-enabled image' >&2; exit 127; }".to_owned(),
+            ],
+        )
+        .await?;
+    Ok(SessionProviderInstall {
+        provider: "zmx".to_owned(),
+        version: None,
+        path: None,
+        installed_by_portl: false,
     })
 }
 
@@ -351,8 +419,12 @@ pub(super) async fn copy_binary_with_fallback<D: DockerOps>(
     )
 }
 
-pub(super) fn injected_agent_env(identity: &Identity, operator: &Identity) -> Vec<String> {
-    vec![
+pub(super) fn injected_agent_env(
+    identity: &Identity,
+    operator: &Identity,
+    session_provider_install: Option<&SessionProviderInstall>,
+) -> Vec<String> {
+    let mut env = vec![
         format!(
             "PORTL_IDENTITY_SECRET_HEX={}",
             hex::encode(identity.signing_key().to_bytes())
@@ -363,7 +435,14 @@ pub(super) fn injected_agent_env(identity: &Identity, operator: &Identity) -> Ve
         ),
         "PORTL_DISCOVERY=dns,pkarr,local,relay".to_owned(),
         "PORTL_METRICS=0".to_owned(),
-    ]
+    ];
+    if let Some(install) = session_provider_install {
+        env.push(format!("PORTL_SESSION_PROVIDER={}", install.provider));
+        if let Some(path) = install.path.as_ref() {
+            env.push(format!("PORTL_SESSION_PROVIDER_PATH={}", path.display()));
+        }
+    }
+    env
 }
 
 pub(super) async fn wait_for_agent_start<D: DockerOps>(
@@ -411,6 +490,7 @@ pub(super) async fn watch_container_restarts<D: DockerOps, H: HostOps>(
     container: &str,
     binary_source: &BinarySource,
     operator: &Identity,
+    session_provider: Option<&str>,
 ) -> Result<()> {
     let mut events = docker.container_events(container);
     let mut needs_reinject = false;
@@ -424,7 +504,7 @@ pub(super) async fn watch_container_restarts<D: DockerOps, H: HostOps>(
                 Some(Ok(ContainerEvent { action })) => match action.as_str() {
                     "die" => needs_reinject = true,
                     "start" if needs_reinject => {
-                        match attach_existing(docker, host, container, binary_source, operator).await {
+                        match attach_existing(docker, host, container, binary_source, operator, session_provider).await {
                             Ok(outcome) => {
                                 save_injected_alias(&outcome)?;
                                 println!("{}", outcome.plan.ticket.serialize());

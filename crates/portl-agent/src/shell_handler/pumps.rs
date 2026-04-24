@@ -12,7 +12,7 @@ use crate::stream_io::BufferedRecv;
 use super::shutdown::send_signal;
 use super::{IO_CHUNK, MAX_RESIZE_BYTES, MAX_SIGNAL_BYTES};
 
-pub(super) async fn pump_stdin(mut recv: BufferedRecv, process: Arc<ShellProcess>) -> Result<()> {
+pub(crate) async fn pump_stdin(mut recv: BufferedRecv, process: Arc<ShellProcess>) -> Result<()> {
     let mut buf = vec![0_u8; IO_CHUNK];
     loop {
         let read = recv.read(&mut buf).await.context("read shell stdin")?;
@@ -28,7 +28,7 @@ pub(super) async fn pump_stdin(mut recv: BufferedRecv, process: Arc<ShellProcess
     }
 }
 
-pub(super) async fn pump_output(
+pub(crate) async fn pump_output(
     mut send: SendStream,
     rx: &tokio::sync::Mutex<Option<mpsc::Receiver<Vec<u8>>>>,
 ) -> Result<()> {
@@ -40,7 +40,7 @@ pub(super) async fn pump_output(
     Ok(())
 }
 
-pub(super) async fn pump_signals(mut recv: BufferedRecv, process: &ShellProcess) -> Result<()> {
+pub(crate) async fn pump_signals(mut recv: BufferedRecv, process: &ShellProcess) -> Result<()> {
     while let Some(frame) = recv
         .read_frame::<portl_proto::shell_v1::SignalFrame>(MAX_SIGNAL_BYTES)
         .await?
@@ -50,7 +50,7 @@ pub(super) async fn pump_signals(mut recv: BufferedRecv, process: &ShellProcess)
     Ok(())
 }
 
-pub(super) async fn pump_resizes(mut recv: BufferedRecv, process: &ShellProcess) -> Result<()> {
+pub(crate) async fn pump_resizes(mut recv: BufferedRecv, process: &ShellProcess) -> Result<()> {
     while let Some(frame) = recv
         .read_frame::<portl_proto::shell_v1::ResizeFrame>(MAX_RESIZE_BYTES)
         .await?
@@ -90,7 +90,7 @@ pub(super) fn resize_pty(master: &impl AsRawFd, rows: u16, cols: u16) -> std::io
     Ok(())
 }
 
-pub(super) async fn pump_exit(mut send: SendStream, process: &ShellProcess) -> Result<()> {
+pub(crate) async fn pump_exit(mut send: SendStream, process: &ShellProcess) -> Result<()> {
     let initial = *process
         .exit_code
         .lock()

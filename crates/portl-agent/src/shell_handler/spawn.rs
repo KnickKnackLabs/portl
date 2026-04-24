@@ -24,7 +24,7 @@ use super::reject::SpawnReject;
 use super::shutdown::process_group_signal_target_from_pid;
 use super::user::{RequestedUser, install_exec_user_switch};
 
-pub(super) fn spawn_process(
+pub(crate) fn spawn_process(
     session: &Session,
     req: &portl_proto::shell_v1::ShellReq,
     requested_user: Option<&RequestedUser>,
@@ -188,18 +188,27 @@ fn spawn_pty_process(
         ws_ypixel: 0,
     };
 
-    let shell_program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
+    let (program, argv): (String, Vec<String>) = req.argv.as_ref().map_or_else(
+        || {
+            (
+                std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned()),
+                vec!["-l".to_owned()],
+            )
+        },
+        |requested| {
+            let mut args = requested.clone();
+            let program = args.remove(0);
+            (program, args)
+        },
+    );
     let env = effective_env(shell_caps(&session.caps), req, requested_user);
-    let argv: Vec<String> = vec!["-l".to_owned()];
 
-    let (master, mut child) =
-        spawn_pty_blocking(&shell_program, &argv, winsize, env, req.cwd.as_deref()).map_err(
-            |err| {
-                SpawnReject::pty_allocation_failed(portl_proto::shell_v1::ShellReason::SpawnFailed(
-                    err.to_string(),
-                ))
-            },
-        )?;
+    let (master, mut child) = spawn_pty_blocking(&program, &argv, winsize, env, req.cwd.as_deref())
+        .map_err(|err| {
+            SpawnReject::pty_allocation_failed(portl_proto::shell_v1::ShellReason::SpawnFailed(
+                err.to_string(),
+            ))
+        })?;
 
     let pid = child.id().ok_or_else(|| {
         SpawnReject::pty_allocation_failed(portl_proto::shell_v1::ShellReason::SpawnFailed(

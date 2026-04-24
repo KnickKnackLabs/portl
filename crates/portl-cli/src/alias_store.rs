@@ -42,11 +42,23 @@ pub struct StoredSpec {
     pub group_name: Option<String>,
     pub base_url: Option<String>,
     #[serde(default)]
+    pub session_provider: Option<String>,
+    #[serde(default)]
+    pub session_provider_install: Option<SessionProviderInstall>,
+    #[serde(default)]
     pub docker_exec_id: Option<String>,
     #[serde(default)]
     pub docker_injected_binary_path: Option<PathBuf>,
     #[serde(default)]
     pub docker_injected_binary_preexisted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionProviderInstall {
+    pub provider: String,
+    pub version: Option<String>,
+    pub path: Option<PathBuf>,
+    pub installed_by_portl: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -396,6 +408,8 @@ mod tests {
             ticket_file_path,
             group_name: Some("sbox".to_owned()),
             base_url: Some("http://127.0.0.1:8080".to_owned()),
+            session_provider: None,
+            session_provider_install: None,
             docker_exec_id: None,
             docker_injected_binary_path: None,
             docker_injected_binary_preexisted: false,
@@ -412,6 +426,8 @@ mod tests {
             ticket_file_path: None,
             group_name: None,
             base_url: None,
+            session_provider: None,
+            session_provider_install: None,
             docker_exec_id: None,
             docker_injected_binary_path: None,
             docker_injected_binary_preexisted: false,

@@ -16,8 +16,11 @@ if ! command -v portl >/dev/null 2>&1; then
 fi
 ln -sf /usr/local/bin/portl /usr/local/bin/portl-agent
 
+{{SESSION_PROVIDER_CHECK}}
+
 cat > /etc/portl/agent.env <<'ENV'
 PORTL_HOME=/var/lib/portl
 PORTL_TRUST_ROOTS={{OPERATOR_PUBKEY}}
 PORTL_DISCOVERY={{DISCOVERY}}
+{{SESSION_PROVIDER_ENV}}
 ENV

@@ -26,6 +26,7 @@ pub mod rate_limit;
 pub mod relay;
 pub mod revocations;
 pub mod session;
+pub(crate) mod session_handler;
 pub mod shell_handler;
 pub mod shell_registry;
 pub mod status_schema;
@@ -45,7 +46,7 @@ pub use revocations::{RevocationRecord, RevocationSet};
 /// Listener mode serves every wire-level ALPN. Gateway mode is
 /// strictly a master-ticket-backed HTTP forwarder (see
 /// `src/gateway.rs`), so only `meta/v1` and `tcp/v1` streams are
-/// dispatched; `shell/v1` and `udp/v1` are closed at dispatch time.
+/// dispatched; `shell/v1`, `session/v1`, and `udp/v1` are closed at dispatch time.
 pub(crate) fn alpn_allowed_in_mode(mode: &AgentMode, alpn: &str) -> Result<(), &'static str> {
     match mode {
         AgentMode::Listener => Ok(()),
@@ -78,6 +79,7 @@ mod mode_dispatch_tests {
         for alpn in [
             String::from_utf8_lossy(portl_proto::meta_v1::ALPN_META_V1),
             String::from_utf8_lossy(portl_proto::shell_v1::ALPN_SHELL_V1),
+            String::from_utf8_lossy(portl_proto::session_v1::ALPN_SESSION_V1),
             String::from_utf8_lossy(portl_proto::tcp_v1::ALPN_TCP_V1),
             String::from_utf8_lossy(portl_proto::udp_v1::ALPN_UDP_V1),
         ] {
@@ -107,6 +109,12 @@ mod mode_dispatch_tests {
             String::from_utf8_lossy(portl_proto::shell_v1::ALPN_SHELL_V1).as_ref(),
         )
         .expect_err("shell/v1 must be rejected in gateway mode");
+        assert!(err.contains("gateway mode only serves"));
+        let err = alpn_allowed_in_mode(
+            &gateway(),
+            String::from_utf8_lossy(portl_proto::session_v1::ALPN_SESSION_V1).as_ref(),
+        )
+        .expect_err("session/v1 must be rejected in gateway mode");
         assert!(err.contains("gateway mode only serves"));
         let err = alpn_allowed_in_mode(
             &gateway(),
@@ -151,6 +159,8 @@ pub(crate) struct AgentState {
     pub home: PathBuf,
     /// Absolute path of `metrics.sock`; surfaced via `/status`.
     pub metrics_socket: PathBuf,
+    /// Optional target-side zmx CLI path for the first persistent-session provider.
+    pub session_provider_path: Option<PathBuf>,
     /// Agent process start time as unix seconds. For `up_since` fields.
     pub started_at_unix: u64,
     /// Snapshot of the embedded-relay status for `/status/relay`.
@@ -273,6 +283,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
             .metrics_socket_path
             .clone()
             .unwrap_or_else(metrics::default_socket_path),
+        session_provider_path: cfg.session_provider_path.clone(),
         started_at_unix: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())

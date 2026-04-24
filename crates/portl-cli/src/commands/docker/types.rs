@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use portl_core::id::Identity;
 use portl_core::ticket::schema::PortlTicket;
 
+use crate::alias_store::SessionProviderInstall;
+
 #[derive(Clone)]
 pub(super) struct InjectionPlan {
     pub(super) identity: Identity,
@@ -12,6 +14,7 @@ pub(super) struct InjectionPlan {
     pub(super) endpoint_id_hex: String,
     pub(super) holder: [u8; 32],
     pub(super) root_ticket_id: [u8; 16],
+    pub(super) session_provider: Option<String>,
 }
 
 #[derive(Clone)]
@@ -21,6 +24,7 @@ pub(super) struct InjectionOutcome {
     pub(super) binary_path_preexisted: bool,
     pub(super) exec_id: String,
     pub(super) plan: InjectionPlan,
+    pub(super) session_provider_install: Option<SessionProviderInstall>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +59,7 @@ pub(super) struct RunRuntimeSpec {
     pub(super) volume: Vec<String>,
     pub(super) network: Option<String>,
     pub(super) user: Option<String>,
+    pub(super) session_provider: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -37,6 +37,8 @@ environment variable, then the built-in default.
 | `PORTL_RATE_LIMIT` | Per-peer rate limit. |
 | `PORTL_METRICS` | Metrics endpoint toggle. |
 | `PORTL_MODE` | Agent run mode. |
+| `PORTL_SESSION_PROVIDER` | Preferred target-side persistent-session provider. v0.4.0 supports `zmx`. Used by managed targets and `portl.toml`; manual hosts must install providers explicitly. |
+| `PORTL_SESSION_PROVIDER_PATH` | Target-side persistent-session provider CLI path. The v0.4.0 slice treats this as a `zmx` path; otherwise the agent discovers `zmx` with `command -v zmx`. |
 
 ## Internal and test-only variables
 
@@ -44,6 +46,7 @@ These names are implementation plumbing. They are intentionally not
 shown in user-facing help, may change without notice, and should only
 be set by portl itself or by portl's test harness.
 
+- `PORTL_ZMX_BINARY` — local path used by `portl docker run --session-provider zmx` and `portl docker bake --session-provider zmx` to copy a zmx binary into managed Docker targets.
 - `PORTL_IDENTITY_KEY`
 - `PORTL_IDENTITY_SECRET_HEX`
 - `PORTL_AUDIT_SHELL_EXIT_PATH`

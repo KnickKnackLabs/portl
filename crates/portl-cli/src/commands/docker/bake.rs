@@ -116,6 +116,7 @@ pub(super) struct BakeContext {
     pub(super) wrapper: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn bake_with<O: BakeOps>(
     ops: &O,
     base_image: &str,
@@ -124,6 +125,7 @@ pub(super) fn bake_with<O: BakeOps>(
     push: bool,
     init_shim: bool,
     binary_source: &BinarySource,
+    session_provider: Option<&str>,
 ) -> Result<()> {
     if push && tag.is_none() {
         bail!("`--push` requires `--tag <image>`");
@@ -132,9 +134,11 @@ pub(super) fn bake_with<O: BakeOps>(
         bail!("choose either `--output DIR` or `--tag <image>` for `portl docker bake`");
     }
 
+    validate_session_provider(session_provider)?;
     let metadata = ops.inspect_image(base_image)?;
     let binary = resolve_bake_binary(ops, binary_source, &metadata, base_image)?;
-    let context = render_bake_context(base_image, Some(&metadata), init_shim)?;
+    let zmx_binary = resolve_zmx_binary(session_provider);
+    let context = render_bake_context(base_image, Some(&metadata), init_shim, session_provider)?;
 
     let owned_output;
     let context_dir = if let Some(output) = output {
@@ -143,7 +147,7 @@ pub(super) fn bake_with<O: BakeOps>(
         owned_output = temp_bake_dir()?;
         owned_output
     };
-    write_bake_context(&context_dir, &context, &binary)?;
+    write_bake_context(&context_dir, &context, &binary, zmx_binary.as_deref())?;
 
     if let Some(tag) = tag {
         ops.build_image(&context_dir, tag)?;
@@ -159,11 +163,13 @@ pub(super) fn render_bake_context(
     base_image: &str,
     metadata: Option<&ImageMetadata>,
     init_shim: bool,
+    session_provider: Option<&str>,
 ) -> Result<BakeContext> {
+    let provider_dockerfile = session_provider_dockerfile(session_provider)?;
     if !init_shim {
         return Ok(BakeContext {
             dockerfile: format!(
-                "FROM {base_image}\nCOPY portl-agent /usr/local/bin/portl-agent\nRUN chmod +x /usr/local/bin/portl-agent\n"
+                "FROM {base_image}\nCOPY portl-agent /usr/local/bin/portl-agent\nRUN chmod +x /usr/local/bin/portl-agent\n{provider_dockerfile}"
             ),
             wrapper: None,
         });
@@ -172,7 +178,7 @@ pub(super) fn render_bake_context(
     let metadata = metadata.ok_or_else(|| anyhow!("init shim requires image metadata"))?;
     let wrapper = render_init_shim(metadata);
     let mut dockerfile = format!(
-        "FROM {base_image}\nCOPY portl-agent /usr/local/bin/portl-agent\nCOPY portl-init-shim /usr/local/bin/portl-init-shim\nRUN chmod +x /usr/local/bin/portl-agent /usr/local/bin/portl-init-shim\nENTRYPOINT [\"/usr/local/bin/portl-init-shim\"]\n"
+        "FROM {base_image}\nCOPY portl-agent /usr/local/bin/portl-agent\nCOPY portl-init-shim /usr/local/bin/portl-init-shim\nRUN chmod +x /usr/local/bin/portl-agent /usr/local/bin/portl-init-shim\n{provider_dockerfile}ENTRYPOINT [\"/usr/local/bin/portl-init-shim\"]\n"
     );
     if !metadata.cmd.is_empty() {
         writeln!(dockerfile, "CMD {}", serde_json::to_string(&metadata.cmd)?)
@@ -183,6 +189,35 @@ pub(super) fn render_bake_context(
         dockerfile,
         wrapper: Some(wrapper),
     })
+}
+
+fn validate_session_provider(session_provider: Option<&str>) -> Result<()> {
+    match session_provider {
+        None | Some("zmx") => Ok(()),
+        Some(other) => bail!("unsupported session provider '{other}' (supported: zmx)"),
+    }
+}
+
+fn resolve_zmx_binary(session_provider: Option<&str>) -> Option<PathBuf> {
+    if session_provider != Some("zmx") {
+        return None;
+    }
+    std::env::var_os("PORTL_ZMX_BINARY").map(PathBuf::from)
+}
+
+fn session_provider_dockerfile(session_provider: Option<&str>) -> Result<String> {
+    match session_provider {
+        None => Ok(String::new()),
+        Some("zmx") if std::env::var_os("PORTL_ZMX_BINARY").is_some() => Ok(
+            "COPY zmx /usr/local/bin/zmx\nRUN chmod +x /usr/local/bin/zmx\nENV PORTL_SESSION_PROVIDER=zmx PORTL_SESSION_PROVIDER_PATH=/usr/local/bin/zmx\n"
+                .to_owned(),
+        ),
+        Some("zmx") => Ok(
+            "RUN command -v zmx >/dev/null 2>&1 || { echo 'zmx is not installed; set PORTL_ZMX_BINARY or use a zmx-enabled base image' >&2; exit 127; }\nENV PORTL_SESSION_PROVIDER=zmx\n"
+                .to_owned(),
+        ),
+        Some(other) => bail!("unsupported session provider '{other}' (supported: zmx)"),
+    }
 }
 
 pub(super) fn render_init_shim(metadata: &ImageMetadata) -> String {
@@ -247,6 +282,7 @@ pub(super) fn write_bake_context(
     context_dir: &Path,
     context: &BakeContext,
     binary: &Path,
+    zmx_binary: Option<&Path>,
 ) -> Result<()> {
     fs::create_dir_all(context_dir)
         .with_context(|| format!("create bake context {}", context_dir.display()))?;
@@ -259,6 +295,15 @@ pub(super) fn write_bake_context(
             context_dir.join("portl-agent").display()
         )
     })?;
+    if let Some(zmx_binary) = zmx_binary {
+        fs::copy(zmx_binary, context_dir.join("zmx")).with_context(|| {
+            format!(
+                "copy {} into {}",
+                zmx_binary.display(),
+                context_dir.join("zmx").display()
+            )
+        })?;
+    }
     if let Some(wrapper) = &context.wrapper {
         fs::write(context_dir.join("portl-init-shim"), wrapper)
             .with_context(|| format!("write {}", context_dir.join("portl-init-shim").display()))?;

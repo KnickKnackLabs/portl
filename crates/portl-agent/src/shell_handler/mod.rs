@@ -16,11 +16,11 @@ use crate::stream_io::BufferedRecv;
 mod env;
 mod exec_capture;
 mod pty_master;
-mod pumps;
+pub(crate) mod pumps;
 mod reject;
 mod shutdown;
-mod spawn;
-mod user;
+pub(crate) mod spawn;
+pub(crate) mod user;
 
 pub use exec_capture::ExecCapture;
 #[cfg(unix)]

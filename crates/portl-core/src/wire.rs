@@ -1,5 +1,6 @@
 //! Shared wire types for portl protocols.
 
+pub mod session;
 pub mod shell;
 pub mod tcp;
 pub mod udp;

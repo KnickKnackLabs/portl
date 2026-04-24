@@ -83,6 +83,7 @@ pub fn run(
     volume: &[String],
     network: Option<&str>,
     user: Option<&str>,
+    session_provider: Option<&str>,
 ) -> Result<ExitCode> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
@@ -95,6 +96,7 @@ pub fn run(
             volume: volume.to_vec(),
             network: network.map(str::to_owned),
             user: user.map(str::to_owned),
+            session_provider: session_provider.map(str::to_owned),
         };
         let mut outcome = orchestrate_run(
             &docker,
@@ -116,6 +118,7 @@ pub fn run(
                 &outcome.container.id,
                 &binary_source,
                 &operator,
+                session_provider,
             )
             .await?;
         }
@@ -127,6 +130,7 @@ pub fn attach(
     container: &str,
     from_binary: Option<&Path>,
     from_release: Option<&str>,
+    session_provider: Option<&str>,
 ) -> Result<ExitCode> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
@@ -134,8 +138,15 @@ pub fn attach(
         let docker = RealDockerOps::connect()?;
         let host = RealHostOps;
         let binary_source = resolve_binary_source(from_binary, from_release)?;
-        let mut outcome =
-            attach_existing(&docker, &host, container, &binary_source, &operator).await?;
+        let mut outcome = attach_existing(
+            &docker,
+            &host,
+            container,
+            &binary_source,
+            &operator,
+            session_provider,
+        )
+        .await?;
         finalize_connectable_ticket(&operator, &mut outcome.plan).await?;
         save_injected_alias(&outcome)?;
         println!("{}", outcome.plan.ticket.serialize());
@@ -152,6 +163,7 @@ pub fn detach(container: &str) -> Result<ExitCode> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn bake(
     base_image: &str,
     output: Option<&Path>,
@@ -160,6 +172,7 @@ pub fn bake(
     init_shim: bool,
     from_binary: Option<&Path>,
     from_release: Option<&str>,
+    session_provider: Option<&str>,
 ) -> Result<ExitCode> {
     let ops = RealBakeOps;
     let binary_source = resolve_binary_source(from_binary, from_release)?;
@@ -171,6 +184,7 @@ pub fn bake(
         push,
         init_shim,
         &binary_source,
+        session_provider,
     )?;
     Ok(ExitCode::SUCCESS)
 }
@@ -186,11 +200,13 @@ pub fn list(json_output: bool) -> Result<ExitCode> {
             .into_iter()
             .map(|handle| (handle.container_id, handle.network))
             .collect::<HashMap<_, _>>();
-        let aliases = AliasStore::default().list()?;
+        let store = AliasStore::default();
+        let aliases = store.list()?;
         let rows = aliases
             .into_iter()
             .map(|alias| {
                 let bootstrapper = bootstrapper.clone();
+                let spec = store.get_spec(&alias.name).ok().flatten();
                 let network = listed_handles
                     .get(&alias.container_id)
                     .cloned()
@@ -205,6 +221,7 @@ pub fn list(json_output: bool) -> Result<ExitCode> {
                         "image": alias.image,
                         "network": network,
                         "status": format!("{status:?}"),
+                        "session_provider": spec.as_ref().and_then(|spec| spec.session_provider.clone()),
                     }))
                 }
             })
@@ -633,6 +650,7 @@ mod tests {
             volume: vec!["/host:/container:ro".to_owned()],
             network: Some("demo-net".to_owned()),
             user: Some("1000:1000".to_owned()),
+            session_provider: Some("zmx".to_owned()),
         };
 
         orchestrate_run(
@@ -752,6 +770,7 @@ mod tests {
             &stopped.name,
             &BinarySource::CurrentExecutable,
             &operator(),
+            None,
         )
         .await
         .err()
@@ -783,6 +802,8 @@ mod tests {
                     ticket_file_path: None,
                     group_name: None,
                     base_url: None,
+                    session_provider: None,
+                    session_provider_install: None,
                     docker_exec_id: Some("exec-1".to_owned()),
                     docker_injected_binary_path: Some(PathBuf::from(INJECTION_PATHS[1])),
                     docker_injected_binary_preexisted: false,
@@ -843,6 +864,8 @@ mod tests {
                     ticket_file_path: None,
                     group_name: None,
                     base_url: None,
+                    session_provider: None,
+                    session_provider_install: None,
                     docker_exec_id: Some("exec-1".to_owned()),
                     docker_injected_binary_path: Some(PathBuf::from(INJECTION_PATHS[1])),
                     docker_injected_binary_preexisted: true,
@@ -887,6 +910,7 @@ mod tests {
             false,
             false,
             &BinarySource::CurrentExecutable,
+            None,
         )
         .expect("bake output");
 
@@ -923,6 +947,7 @@ mod tests {
             false,
             true,
             &BinarySource::CurrentExecutable,
+            None,
         )
         .expect("bake init shim");
 
@@ -936,6 +961,34 @@ mod tests {
                 "/usr/local/bin/portl-agent & exec '/usr/local/bin/app' '--serve' \"$@\""
             )
         );
+    }
+
+    #[test]
+    fn bake_session_provider_zmx_sets_agent_env() {
+        let dir = tempdir().expect("tempdir");
+        let output = dir.path().join("bake");
+        let binary = dir.path().join("portl");
+        fs::write(&binary, b"portl").expect("write binary");
+        let ops = MockBakeOps {
+            current_exe: binary,
+            ..MockBakeOps::default()
+        };
+
+        bake_with(
+            &ops,
+            "alpine:3.20",
+            Some(&output),
+            None,
+            false,
+            false,
+            &BinarySource::CurrentExecutable,
+            Some("zmx"),
+        )
+        .expect("bake zmx provider output");
+
+        let dockerfile = fs::read_to_string(output.join("Dockerfile")).expect("read Dockerfile");
+        assert!(dockerfile.contains("PORTL_SESSION_PROVIDER=zmx"));
+        assert!(dockerfile.contains("command -v zmx"));
     }
 
     #[test]
@@ -956,6 +1009,7 @@ mod tests {
             false,
             false,
             &BinarySource::CurrentExecutable,
+            None,
         )
         .expect("bake tag mode");
 

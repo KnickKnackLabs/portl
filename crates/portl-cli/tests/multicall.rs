@@ -232,6 +232,7 @@ fn docker_surface_subcommands_parse() {
             volume: vec![],
             network: None,
             user: None,
+            session_provider: None,
         }
     );
 
@@ -256,6 +257,7 @@ fn docker_surface_subcommands_parse() {
             init_shim: true,
             from_binary: None,
             from_release: None,
+            session_provider: None,
         }
     );
 }

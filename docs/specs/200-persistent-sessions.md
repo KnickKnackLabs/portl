@@ -1,10 +1,12 @@
 # 200 — Persistent Sessions and Providers
 
-> Status: **draft**. This is the target design for persistent
-> terminal sessions in portl. It is intentionally not tied to a
-> particular release number, but the surface is large enough to be a
-> minor-version feature. Implementation plans live under `docs/plans/`
-> once this spec is accepted.
+> Status: **implemented in v0.4.0 as an MVP slice**. The shipped
+> implementation adds `portl/session/v1`, top-level `portl session`,
+> zmx CLI bridging, raw discovery fallback, Docker/Slicer provider
+> hints, and ShellCaps-based authorization with session-vocabulary
+> errors. Dedicated `SessionCaps`, richer provider-native APIs, and
+> additional providers remain future work described by this target
+> design.
 
 ## 1. Summary
 

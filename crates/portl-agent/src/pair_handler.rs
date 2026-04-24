@@ -328,6 +328,7 @@ mod tests {
             discovery: DiscoveryConfig::default(),
             home: peers_path.parent().unwrap_or(peers_path).to_path_buf(),
             metrics_socket: std::env::temp_dir().join("portl-pair-test.sock"),
+            session_provider_path: None,
             started_at_unix: 0,
             relay_status: RwLock::new(crate::relay::RelayStatus::disabled()),
         }

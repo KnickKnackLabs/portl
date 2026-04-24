@@ -84,9 +84,13 @@ pub(crate) fn parse_caps(spec: &str) -> Result<Capabilities> {
 
     for entry in spec.split(',').filter(|entry| !entry.is_empty()) {
         match entry {
-            "shell" => {
+            "shell" | "session" => {
                 shell = Some(default_shell_caps());
             }
+            "exec" => {
+                shell = Some(exec_shell_caps());
+            }
+            "dev" => return Ok(all_caps()),
             "meta:ping" => {
                 meta.get_or_insert(MetaCaps {
                     ping: false,
@@ -105,7 +109,7 @@ pub(crate) fn parse_caps(spec: &str) -> Result<Capabilities> {
             _ if entry.starts_with("udp:") => udp.push(parse_port_rule(&entry[4..])?),
             _ => bail!(
                 "unsupported cap '{entry}'\n\
-                 valid caps: shell, meta:ping, meta:info, \
+                 valid caps: shell, exec, session, dev, meta:ping, meta:info, \
                  tcp:<host>:<port>[-<port>], udp:<host>:<port>[-<port>], all\n\
                  run `portl ticket caps` for the full reference"
             ),
@@ -149,6 +153,18 @@ ticket. Use `all` as a wildcard only for dev / self-trust.
       Full shell access — PTY allowed, exec allowed, no env filter.
       Grants `portl shell <target>` and `portl exec <target> <cmd>`.
 
+  exec
+      Non-PTY exec access only. Grants `portl exec <target> -- <cmd>`;
+      does not grant `portl shell` or persistent sessions.
+
+  session
+      Persistent-session access for v0.4.0. Encoded as shell PTY/exec
+      caps today; user-facing denials use session vocabulary. Dedicated
+      SessionCaps are deferred.
+
+  dev
+      Alias for `all`: shell + exec + session plus TCP/UDP/meta conveniences.
+
   meta:ping
       Respond to liveness pings. Pairs well with uptime monitoring;
       does NOT expose identity or version.
@@ -176,6 +192,8 @@ ticket. Use `all` as a wildcard only for dev / self-trust.
 Examples:
 
   portl ticket issue shell --ttl 10m
+  portl ticket issue session --ttl 1d
+  portl ticket issue exec --ttl 10m
   portl ticket issue 'shell,tcp:*:8080' --ttl 1h
   portl ticket issue 'tcp:127.0.0.1:6000-6100' --ttl 30m
   portl ticket issue 'meta:ping,meta:info' --ttl 30d
@@ -187,7 +205,7 @@ Examples:
 /// Abbreviated reference for error messages (keeps the failure
 /// output narrow).
 pub(crate) fn caps_reference_short() -> String {
-    "valid caps: shell | meta:ping | meta:info | tcp:<host>:<range> | udp:<host>:<range> | all\n\
+    "valid caps: shell | exec | session | dev | meta:ping | meta:info | tcp:<host>:<range> | udp:<host>:<range> | all\n\
      full reference: portl ticket caps"
         .to_owned()
 }
@@ -218,6 +236,16 @@ fn all_caps() -> Capabilities {
 fn default_shell_caps() -> ShellCaps {
     ShellCaps {
         pty_allowed: true,
+        exec_allowed: true,
+        user_allowlist: None,
+        command_allowlist: None,
+        env_policy: EnvPolicy::Deny,
+    }
+}
+
+fn exec_shell_caps() -> ShellCaps {
+    ShellCaps {
+        pty_allowed: false,
         exec_allowed: true,
         user_allowlist: None,
         command_allowlist: None,

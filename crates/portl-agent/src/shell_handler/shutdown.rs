@@ -328,8 +328,7 @@ pub(super) mod tests {
             .expect("wait task join")
             .expect("wait status");
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_process_gone(background_pid);
+        assert_process_gone(background_pid).await;
         let _ = std::fs::remove_file(pid_file);
     }
 
@@ -520,8 +519,28 @@ pub(super) mod tests {
     }
 
     #[cfg(unix)]
-    fn assert_process_gone(pid: i32) {
+    async fn assert_process_gone(pid: i32) {
+        for _ in 0..50 {
+            if !process_exists(pid) || process_is_zombie(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert!(!process_exists(pid), "pid {pid} should not be alive");
+    }
+
+    #[cfg(all(unix, target_os = "linux"))]
+    fn process_is_zombie(pid: i32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| stat.rsplit_once(") ").map(|(_, rest)| rest.to_owned()))
+            .and_then(|rest| rest.split_whitespace().next().map(str::to_owned))
+            .is_some_and(|state| state == "Z")
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn process_is_zombie(_pid: i32) -> bool {
+        false
     }
 
     #[cfg(unix)]

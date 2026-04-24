@@ -71,8 +71,13 @@ portl init
 # Spin up an ephemeral container + mint a ticket:
 portl docker run alpine:3.20 --name demo
 
-# Open a shell:
+# Run an exact-argv, non-PTY command:
 portl exec demo -- echo "it works"
+
+# Persistent terminal sessions are available on zmx-enabled targets:
+#   PORTL_ZMX_BINARY=/path/to/zmx portl docker run alpine:3.20 --name dev --session-provider zmx
+#   portl session providers dev
+#   portl session attach dev
 
 # Forward a TCP port (local 18080 -> container 80):
 portl tcp demo -L 127.0.0.1:18080:127.0.0.1:80
@@ -108,7 +113,8 @@ for 30 days; delegate variants narrow further.
 
 - `portl/ticket/v1` — ticket handshake + session setup.
 - `portl/meta/v1` — ping, info, `PublishRevocations`.
-- `portl/shell/v1` — PTY or exec with 6 sub-streams per session.
+- `portl/shell/v1` — one-shot PTY shell or exact-argv exec with 6 sub-streams per session.
+- `portl/session/v1` — persistent terminal sessions via target-side providers such as zmx.
 - `portl/tcp/v1` — one stream per forwarded TCP connection.
 - `portl/udp/v1` — QUIC-datagram UDP with 60 s session linger for
   roaming-aware apps like mosh.
@@ -120,7 +126,9 @@ Full wire spec at
 
 - **`docker-portl`** — provisions an ephemeral container with the
   `portl` multicall binary and an injected per-container ed25519
-  secret. Works against `dockerd` or OrbStack. See
+  secret. Works against `dockerd` or OrbStack. Add `--session-provider zmx`
+  to require/configure persistent sessions; set `PORTL_ZMX_BINARY` to copy
+  a zmx binary into arbitrary images. See
   [`docs/specs/140-v0.2-operability.md`](docs/specs/140-v0.2-operability.md).
 - **`slicer-portl`** — provisions a Slicer VM with a systemd
   `portl-agent.service`, plus a gateway mode for bridging the Slicer

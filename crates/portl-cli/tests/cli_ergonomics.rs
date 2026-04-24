@@ -143,6 +143,88 @@ fn invite_accept_surface_matches_spec() {
 }
 
 #[test]
+fn session_surface_matches_spec() {
+    assert_eq!(
+        parse_args(&["session", "providers", "dev", "--json"]).expect("parse"),
+        ParsedCommand::SessionProviders {
+            target: "dev".to_owned(),
+            json: true,
+        }
+    );
+    assert_eq!(
+        parse_args(&[
+            "session",
+            "attach",
+            "dev",
+            "frontend",
+            "--provider",
+            "zmx",
+            "--user",
+            "root",
+            "--cwd",
+            "/work",
+            "--",
+            "zellij",
+            "a",
+        ])
+        .expect("parse"),
+        ParsedCommand::SessionAttach {
+            target: "dev".to_owned(),
+            session: Some("frontend".to_owned()),
+            provider: Some("zmx".to_owned()),
+            user: Some("root".to_owned()),
+            cwd: Some("/work".to_owned()),
+            argv: vec!["zellij".to_owned(), "a".to_owned()],
+        }
+    );
+    assert_eq!(
+        parse_args(&["session", "ls", "dev", "--provider", "zmx"]).expect("parse"),
+        ParsedCommand::SessionLs {
+            target: "dev".to_owned(),
+            provider: Some("zmx".to_owned()),
+            json: false,
+        }
+    );
+    assert_eq!(
+        parse_args(&["session", "run", "dev", "frontend", "--", "make", "test"]).expect("parse"),
+        ParsedCommand::SessionRun {
+            target: "dev".to_owned(),
+            session: Some("frontend".to_owned()),
+            provider: None,
+            argv: vec!["make".to_owned(), "test".to_owned()],
+        }
+    );
+    assert_eq!(
+        parse_args(&["session", "history", "dev", "frontend", "--format", "plain"]).expect("parse"),
+        ParsedCommand::SessionHistory {
+            target: "dev".to_owned(),
+            session: Some("frontend".to_owned()),
+            provider: None,
+            format: portl_cli::SessionHistoryFormat::Plain,
+        }
+    );
+    let unsupported_history = ProcessCommand::cargo_bin("portl")
+        .expect("cargo bin")
+        .args(["session", "history", "dev", "frontend", "--format", "html"])
+        .output()
+        .expect("run unsupported history format");
+    assert!(!unsupported_history.status.success());
+    let stderr = String::from_utf8_lossy(&unsupported_history.stderr);
+    assert!(
+        stderr.contains("history format 'html' is not supported"),
+        "{stderr}"
+    );
+    assert_eq!(
+        parse_args(&["session", "kill", "dev", "frontend", "--provider", "zmx"]).expect("parse"),
+        ParsedCommand::SessionKill {
+            target: "dev".to_owned(),
+            session: Some("frontend".to_owned()),
+            provider: Some("zmx".to_owned()),
+        }
+    );
+}
+
+#[test]
 fn accept_and_ticket_save_teach_wrong_prefix() {
     let accept = ProcessCommand::cargo_bin("portl")
         .expect("cargo bin")

@@ -104,6 +104,42 @@ pub(crate) fn shell_reject(session: &Session, reason: &'static str) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn session_event(
+    session: &Session,
+    event_name: &'static str,
+    provider: Option<&str>,
+    session_name: Option<&str>,
+    operation: &'static str,
+    user: Option<&str>,
+    cwd: Option<&str>,
+    argv: Option<&Vec<String>>,
+) {
+    tracing::event!(
+        Level::INFO,
+        event = event_name,
+        caller_endpoint_id = %hex::encode(session.caller_endpoint_id),
+        ticket_id = %hex::encode(session.ticket_id),
+        provider = provider.unwrap_or(""),
+        session_name = session_name.unwrap_or(""),
+        operation,
+        session_user = user.unwrap_or(""),
+        session_cwd = cwd.unwrap_or(""),
+        session_argv0 = argv.and_then(|argv| argv.first()).map_or("", String::as_str),
+    );
+}
+
+pub(crate) fn session_reject(session: &Session, operation: &'static str, reason: &str) {
+    tracing::event!(
+        Level::INFO,
+        event = "audit.session_reject",
+        caller_endpoint_id = %hex::encode(session.caller_endpoint_id),
+        ticket_id = %hex::encode(session.ticket_id),
+        operation,
+        reason,
+    );
+}
+
 pub(crate) fn shell_exit_raw(
     ticket_id: [u8; 16],
     caller_endpoint_id: [u8; 32],

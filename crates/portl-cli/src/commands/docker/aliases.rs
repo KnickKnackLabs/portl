@@ -98,6 +98,8 @@ pub(super) fn save_injected_alias(outcome: &InjectionOutcome) -> Result<()> {
             ticket_file_path: Some(ticket_path),
             group_name: None,
             base_url: None,
+            session_provider: outcome.plan.session_provider.clone(),
+            session_provider_install: outcome.session_provider_install.clone(),
             docker_exec_id: Some(outcome.exec_id.clone()),
             docker_injected_binary_path: Some(outcome.binary_path.clone()),
             docker_injected_binary_preexisted: outcome.binary_path_preexisted,

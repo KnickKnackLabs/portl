@@ -37,8 +37,17 @@ pub fn run(
     ram_gb: Option<u16>,
     tags: &[String],
     ticket_out: Option<&Path>,
+    session_provider: Option<&str>,
 ) -> Result<ExitCode> {
-    vm_add(image, base_url, cpus, ram_gb, tags, ticket_out)
+    vm_add(
+        image,
+        base_url,
+        cpus,
+        ram_gb,
+        tags,
+        ticket_out,
+        session_provider,
+    )
 }
 
 pub fn list(base_url: Option<&str>, json_output: bool) -> Result<ExitCode> {
@@ -47,6 +56,14 @@ pub fn list(base_url: Option<&str>, json_output: bool) -> Result<ExitCode> {
 
 pub fn rm(name: &str, base_url: Option<&str>) -> Result<ExitCode> {
     vm_delete(name, base_url)
+}
+
+fn validate_session_provider(provider: Option<&str>) -> Result<Option<String>> {
+    match provider {
+        None => Ok(None),
+        Some("zmx") => Ok(Some("zmx".to_owned())),
+        Some(other) => bail!("unsupported session provider '{other}' (supported: zmx)"),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -79,6 +96,7 @@ pub fn vm_add(
     ram_gb: Option<u16>,
     tags: &[String],
     ticket_out: Option<&Path>,
+    session_provider: Option<&str>,
 ) -> Result<ExitCode> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
@@ -87,6 +105,7 @@ pub fn vm_add(
             .iter()
             .map(|tag| parse_tag(tag))
             .collect::<Result<Vec<_>>>()?;
+        let session_provider = validate_session_provider(session_provider)?;
         let client = client_for(base_url, &operator).await?;
         let bootstrapper = SlicerBootstrapper::new(client.client.clone());
         let provision = ProvisionSpec {
@@ -101,6 +120,7 @@ pub fn vm_add(
                 operator_pubkey: hex::encode(operator.verifying_key()),
                 portl_release_url: "github.com/KnickKnackLabs/portl/releases/download/latest"
                     .to_owned(),
+                session_provider: session_provider.clone(),
                 auth_token: None,
             })?,
             labels: Vec::new(),
@@ -152,6 +172,15 @@ pub fn vm_add(
                 ticket_file_path: Some(ticket_path.clone()),
                 group_name: Some(group.to_owned()),
                 base_url: Some(client.original_base_url.clone()),
+                session_provider: session_provider.clone(),
+                session_provider_install: session_provider.as_ref().map(|provider| {
+                    crate::alias_store::SessionProviderInstall {
+                        provider: provider.clone(),
+                        version: None,
+                        path: None,
+                        installed_by_portl: false,
+                    }
+                }),
                 docker_exec_id: None,
                 docker_injected_binary_path: None,
                 docker_injected_binary_preexisted: false,

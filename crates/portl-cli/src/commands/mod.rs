@@ -10,6 +10,7 @@ pub mod peer;
 pub mod peer_resolve;
 pub mod revocations;
 pub mod revoke;
+pub mod session;
 pub mod shell;
 pub mod slicer;
 pub mod status;

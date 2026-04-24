@@ -5,6 +5,38 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.4.0 — 2026-04-24
+
+Persistent sessions minor release implementing spec 200's v0.4.0 MVP.
+
+### Added
+
+- Added distinct `portl/session/v1` protocol and proto re-export for
+  persistent terminal sessions without overloading `shell` or `exec`.
+- Added top-level `portl session` with `providers`, `attach`, `ls`,
+  `run`, `history`, and `kill` subcommands.
+- Added a zmx-first target-side provider bridge using the `zmx` CLI,
+  plus raw discovery fallback metadata for targets without persistent
+  providers.
+- Added fake-zmx protocol/provider tests and in-process session E2E
+  coverage for provider discovery, list, run, history, attach, and
+  session-vocabulary authorization failures.
+- Added `PORTL_SESSION_PROVIDER` and `PORTL_SESSION_PROVIDER_PATH`,
+  plus Docker/Slicer `--session-provider zmx` provisioning metadata.
+- Added `session`, `exec`, and `dev` ticket capability presets. The
+  `session` preset is currently encoded with ShellCaps while dedicated
+  SessionCaps remain future work.
+
+### Changed
+
+- `portl shell`, `portl exec`, and `portl session` are now separate
+  verbs with separate transport semantics: one-shot PTY, exact-argv
+  non-PTY, and persistent provider-backed terminal workspace.
+- Docker bake/run/attach and Slicer userdata can advertise or install
+  zmx for managed targets; manual hosts are not silently mutated.
+- Persistent-session denials use session vocabulary even though v0.4.0
+  authorization is backed by existing shell PTY caps.
+
 ## 0.3.6 — 2026-04-24
 
 CLI ergonomics patch release implementing spec 190.

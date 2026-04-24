@@ -7,20 +7,20 @@ use super::reject::SpawnReject;
 
 #[cfg(unix)]
 #[derive(Debug, Clone)]
-pub(super) struct RequestedUser {
-    pub(super) uid: Uid,
-    pub(super) gid: Gid,
-    pub(super) name: String,
-    pub(super) home_dir: String,
-    pub(super) shell: String,
-    pub(super) switch_required: bool,
+pub(crate) struct RequestedUser {
+    pub(crate) uid: Uid,
+    pub(crate) gid: Gid,
+    pub(crate) name: String,
+    pub(crate) home_dir: String,
+    pub(crate) shell: String,
+    pub(crate) switch_required: bool,
 }
 
 #[cfg(not(unix))]
 #[derive(Debug, Clone)]
-pub(super) struct RequestedUser;
+pub(crate) struct RequestedUser;
 
-pub(super) fn resolve_requested_user(
+pub(crate) fn resolve_requested_user(
     user: Option<&str>,
 ) -> Result<Option<RequestedUser>, SpawnReject> {
     #[cfg(unix)]
