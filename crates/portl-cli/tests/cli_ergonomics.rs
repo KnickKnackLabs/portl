@@ -10,6 +10,20 @@ fn parse_args(cli_args: &[&str]) -> Result<ParsedCommand, ParseError> {
     parse(argv)
 }
 
+fn help_output(args: &[&str]) -> String {
+    let output = ProcessCommand::cargo_bin("portl")
+        .expect("cargo bin")
+        .args(args)
+        .output()
+        .expect("run portl help");
+    assert!(
+        output.status.success(),
+        "expected success for {args:?}, stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("utf8 stdout")
+}
+
 fn assert_clap_error(args: &[&str], needles: &[&str]) {
     let err = parse_args(args).expect_err("expected clap parse error");
     let ParseError::Clap(err) = err else {
@@ -18,6 +32,43 @@ fn assert_clap_error(args: &[&str], needles: &[&str]) {
     let text = err.to_string();
     for needle in needles {
         assert!(text.contains(needle), "missing {needle:?} in {text}");
+    }
+}
+
+#[test]
+fn connect_commands_use_target_metavars() {
+    for (args, usage) in [
+        (
+            &["shell", "--help"][..],
+            "Usage: portl shell [OPTIONS] <TARGET>",
+        ),
+        (
+            &["exec", "--help"][..],
+            "Usage: portl exec [OPTIONS] <TARGET> -- <ARGV>...",
+        ),
+        (
+            &["tcp", "--help"][..],
+            "Usage: portl tcp [OPTIONS] -L <LOCAL> <TARGET>",
+        ),
+        (
+            &["udp", "--help"][..],
+            "Usage: portl udp [OPTIONS] -L <LOCAL> <TARGET>",
+        ),
+        (
+            &["status", "--help"][..],
+            "Usage: portl status [OPTIONS] [TARGET]",
+        ),
+        (
+            &["session", "attach", "--help"][..],
+            "Usage: portl session attach [OPTIONS] <TARGET> [SESSION] [-- <ARGV>...]",
+        ),
+    ] {
+        let help = help_output(args);
+        assert!(help.contains(usage), "missing {usage:?}\n{help}");
+        assert!(
+            !help.contains("<PEER>") && !help.contains("[PEER]"),
+            "connection help should use TARGET, not PEER\n{help}"
+        );
     }
 }
 

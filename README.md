@@ -3,194 +3,265 @@
 > **p**eer-to-peer **o**verlay for **r**emote **t**argets with
 > **l**imited capability tickets
 
-Decentralized, capability-ticket-based overlay for reaching remote
-targets (VMs, containers, hosts, devices) over a p2p substrate. Built on
-[iroh](https://iroh.computer) — no mandatory control plane, no central
-account system. Peer discovery uses iroh's built-in DNS, Pkarr, mDNS,
-and (opt-in) Mainline DHT services.
+Portl lets you share a machine, VM, or container over a peer-to-peer
+transport without opening inbound ports or relying on a central account
+system. The main workflow is a **persistent terminal session**: start a
+named workspace on a target, detach, and let another device or
+collaborator attach to the same workspace later.
+
+Portl is built on [iroh](https://iroh.computer). Discovery uses iroh's
+DNS, Pkarr, mDNS, and optional Mainline DHT support; relay fallback is
+used for NAT traversal when direct paths are unavailable.
 
 ## Status
 
-**v0.2.0** — operability release. The operator flow is now `portl init`
-followed by `portl docker run <image>` or `portl slicer run <image>`.
-Runtime orchestration, install targets, local revocation propagation,
-and the collapsed CLI surface are all in place.
+**v0.5.0** — session-control provider release. Portl has persistent
+terminal sessions via `portl/session/v1`, provider discovery, zmx-control
+support, and tmux `-CC` compatibility. The current CLI vocabulary is:
+
+```text
+target   = something Portl can dial: peer label, adapter alias, ticket, or endpoint_id
+peer     = a saved trust-store entry from `portl peer ls`
+ticket   = a bounded permission token
+session  = a named persistent terminal workspace on a target
+provider = how the target keeps sessions alive, currently zmx or tmux
+```
+
+Run `portl --help` for the grouped command map.
 
 ## Install
 
-### One-liner (recommended)
+### One-liner
 
 ```bash
-# client-only (just the CLI binaries)
+# client-only CLI binaries
 curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash
 
-# install + enable the portl-agent service (launchd on macOS, systemd on Linux)
+# share this machine too: install + enable portl-agent
 curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash -s -- --agent
 
 # pin a version
-curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash -s -- --version 0.3.0
+curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash -s -- --version 0.5.0
 
-# toggle back to client-only (removes service, keeps binaries + identity)
+# toggle back to client-only; keeps binaries + identity
 curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash -s -- --client-only --yes
 
-# fully uninstall (keeps $PORTL_HOME)
+# fully uninstall; keeps $PORTL_HOME
 curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash -s -- --uninstall --yes
 ```
 
-The installer is idempotent — re-run it any time to upgrade, switch
-between client-only and agent modes, or pin a specific version.
-Works in Docker containers (service install is auto-skipped).
-Supports darwin arm64 / x86_64 and linux-musl arm64 / x86_64.
+The installer is idempotent. Re-run it to upgrade, switch between
+client-only and agent modes, or pin a specific version. Release
+artifacts cover macOS and Linux on arm64 / x86_64.
 
-### From a package manager
+### Package managers and source
 
 ```bash
 # mise
-mise use -g github:KnickKnackLabs/portl@0.3.0
-# (mise only shims `portl`; if you want the agent, run `install.sh --agent`
-#  afterwards or symlink `portl-agent` into ~/.local/bin manually)
+mise use -g github:KnickKnackLabs/portl@0.5.0
+# mise only shims `portl`; run install.sh --agent if this machine should be shared.
 
 # cargo
 cargo install --git https://github.com/KnickKnackLabs/portl --locked portl
-```
 
-### From source
-
-```bash
+# source checkout
 git clone https://github.com/KnickKnackLabs/portl
 cd portl
 cargo install --path crates/portl-cli
 ```
 
-## Quickstart (Docker adapter)
+## Quickstart: share this machine
+
+On the machine you want to share:
 
 ```bash
-# One-time setup (created automatically by install.sh if run for the first time):
+# Install the daemon if you did not use install.sh --agent.
+portl install --apply --yes
+
+# Create your local identity and run diagnostics.
 portl init
-
-# Spin up an ephemeral container + mint a ticket:
-portl docker run alpine:3.20 --name demo
-
-# Run an exact-argv, non-PTY command:
-portl exec demo -- echo "it works"
-
-# Persistent terminal sessions are available on zmx-enabled targets:
-#   PORTL_ZMX_BINARY=/path/to/zmx portl docker run alpine:3.20 --name dev --session-provider zmx
-#   portl session providers dev
-#   portl session attach dev
-
-# Forward a TCP port (local 18080 -> container 80):
-portl tcp demo -L 127.0.0.1:18080:127.0.0.1:80
-
-# Forward UDP (mosh-roaming-aware):
-portl udp demo -L 60000:127.0.0.1:60000
-
-# Diagnostics:
 portl doctor
 
-# Tear down:
+# Optional local checks for persistent-session providers.
+tmux -V              # compatibility provider
+zmx control --probe  # optimized provider, when zmx is installed
+```
+
+For persistent sessions, install at least one provider on the shared
+machine:
+
+- **tmux** works as the compatibility provider via `tmux -CC`.
+- **zmx** is the optimized provider when its `zmx-control/v1` path is
+  available.
+
+After another device has a peer label or ticket for this machine, it can
+ask Portl which providers are available:
+
+```bash
+portl session providers <shared-machine-label>
+```
+
+If no persistent provider is available, `portl shell` and `portl exec`
+still work, but `portl session attach` will not provide a reconnectable
+workspace.
+
+### Pair another device or collaborator
+
+On the shared machine:
+
+```bash
+portl invite --ttl 1h --for shared-box
+```
+
+On the other device:
+
+```bash
+portl accept PORTLINV-...
+portl session attach shared-box pair
+```
+
+The session name (`pair` above) is the rendezvous point. Anyone with
+permission to the target can attach to the same named session:
+
+```bash
+portl session attach shared-box pair
+```
+
+Detach by closing the local terminal; the provider session stays alive.
+Destroy it explicitly when finished:
+
+```bash
+portl session ls shared-box
+portl session kill shared-box pair
+```
+
+### Share with a ticket instead of pairing
+
+For short-lived access, mint a bounded ticket on the shared machine:
+
+```bash
+portl ticket issue session --ttl 2h
+```
+
+Send the printed `portl...` ticket string. The recipient can attach
+directly:
+
+```bash
+portl session attach 'portl...' pair
+```
+
+Or save it under a local label first:
+
+```bash
+portl ticket save shared-box 'portl...'
+portl session attach shared-box pair
+```
+
+Use `portl ticket issue dev --ttl 2h` for a broader development ticket
+that also includes shell, exec, TCP/UDP, and metadata conveniences.
+
+## Quickstart: Docker target
+
+Docker and Slicer adapters create target aliases that use the same
+`<TARGET>` argument as peers and tickets.
+
+```bash
+portl init
+
+# Spin up a container target and save its ticket under the alias `demo`.
+portl docker run alpine:3.20 --name demo
+
+# One-shot commands.
+portl exec demo -- echo "it works"
+portl shell demo
+
+# Persistent session, when the target has zmx or tmux.
+portl session providers demo
+portl session attach demo dev
+
+# TCP / UDP forwards.
+portl tcp demo -L 127.0.0.1:18080:127.0.0.1:80
+portl udp demo -L 60000:127.0.0.1:60000
+
 portl docker rm demo --force
 ```
 
-From `portl docker run` to a working shell is typically under 3
-seconds on a warm image; 10 seconds on first pull.
-
-## Ticket model
-
-Every remote session is gated by a postcard-encoded
-`portl` ticket (see
-[`docs/specs/030-tickets.md`](docs/specs/030-tickets.md)). Tickets
-are ed25519-signed, narrow-by-construction, and support up to 8 hops
-of delegation. The in-session pipeline does postcard canonical-form
-enforcement, strict `verify_strict` signature check, re-encode
-invariant, revocation lookup, and `SKEW_TOLERANCE = ±60s` time-window
-enforcement before any protocol stream is dispatched.
-
-A typical ticket grants "shell + tcp on 127.0.0.1 + udp on 127.0.0.1"
-for 30 days; delegate variants narrow further.
-
-## Protocols (v0.1)
-
-- `portl/ticket/v1` — ticket handshake + session setup.
-- `portl/meta/v1` — ping, info, `PublishRevocations`.
-- `portl/shell/v1` — one-shot PTY shell or exact-argv exec with 6 sub-streams per session.
-- `portl/session/v1` — persistent terminal sessions via target-side providers such as zmx.
-- `portl/tcp/v1` — one stream per forwarded TCP connection.
-- `portl/udp/v1` — QUIC-datagram UDP with 60 s session linger for
-  roaming-aware apps like mosh.
-
-Full wire spec at
-[`docs/specs/040-protocols.md`](docs/specs/040-protocols.md).
-
-## Adapters
-
-- **`docker-portl`** — provisions an ephemeral container with the
-  `portl` multicall binary and an injected per-container ed25519
-  secret. Works against `dockerd` or OrbStack. Add `--session-provider zmx`
-  to require/configure persistent sessions; set `PORTL_ZMX_BINARY` to copy
-  a zmx binary into arbitrary images. See
-  [`docs/specs/140-v0.2-operability.md`](docs/specs/140-v0.2-operability.md).
-- **`slicer-portl`** — provisions a Slicer VM with a systemd
-  `portl-agent.service`, plus a gateway mode for bridging the Slicer
-  HTTP API via master tickets. See
-  [`docs/specs/065-slicer.md`](docs/specs/065-slicer.md).
-
-## Metrics + diagnostics
-
-The running agent exposes OpenMetrics on a local unix socket at
-`$PORTL_HOME/metrics.sock` (mode 0600). Scrape with:
+To require zmx provisioning for a Docker target:
 
 ```bash
-curl --unix-socket $PORTL_HOME/metrics.sock http://metrics/
+PORTL_ZMX_BINARY=/path/to/zmx \
+  portl docker run alpine:3.20 --name dev --session-provider zmx
 ```
 
-Counters cover ticket accept/reject rates (with reason labels)
-and stream opens per ALPN.
+## CLI map
 
-`portl doctor` runs a local diagnostic sweep: wall-clock sanity,
-identity file + permissions, UDP ephemeral bind, and ticket-expiry
-scan across the alias store.
+Top-level help is grouped by task:
 
-## Operator install
-
-Release artifacts are published for four targets on every tag:
-
-- `x86_64-unknown-linux-musl`
-- `aarch64-unknown-linux-musl`
-- `x86_64-apple-darwin`
-- `aarch64-apple-darwin`
-
-Linux builds are fully statically linked (musl), so a single
-`portl` binary drops into Alpine, distroless, BusyBox, CentOS 7 and
-every modern glibc distro without additional runtime dependencies.
-macOS builds link only against always-present system frameworks.
-
-Install from a tag:
-
-```sh
-VER=v0.2.0
-TARGET=x86_64-unknown-linux-musl      # pick your target
-curl -L -o portl.tar.zst \
-  https://github.com/KnickKnackLabs/portl/releases/download/$VER/portl-$VER-$TARGET.tar.zst
-tar --zstd -xf portl.tar.zst
-sudo install -m 0755 portl-$VER-$TARGET/portl /usr/local/bin/portl
-sudo ln -sf portl /usr/local/bin/portl-agent
+```text
+Setup        init, doctor, install, config, whoami
+Trust        peer, invite
+Pairing      accept
+Connect      status, shell, session, exec, tcp, udp
+Permissions  ticket
+Integrations docker, slicer, gateway
+Utility      completions, man, help
 ```
 
-Tarballs are `zstd -19` compressed (~7 MiB each). Any `tar` built on
-top of GNU tar 1.31+ or bsdtar with libarchive can extract them; if
-you see `unrecognized option --zstd`, install the `zstd` package.
+Connection commands use `<TARGET>` because they accept any value that
+resolves through Portl's connection cascade: inline ticket, peer label,
+saved ticket, adapter alias, then endpoint id. Commands under
+`portl peer ...` use peer vocabulary because they operate on the local
+peer store specifically.
 
-Use `portl install dockerfile --output ./portl-image`
-to emit a service Dockerfile and matching `portl-agent` binary for
-container-only deployments.
+## Protocols
+
+- `portl/ticket/v1` — ticket handshake and capability validation.
+- `portl/meta/v1` — ping, info, and revocation publication.
+- `portl/shell/v1` — one-shot PTY shell and exact-argv exec.
+- `portl/session/v1` — persistent terminal sessions via providers.
+- `portl/tcp/v1` — one stream per forwarded TCP connection.
+- `portl/udp/v1` — QUIC-datagram UDP with session linger for roaming
+  clients such as mosh.
+
+Full wire details live in [`docs/specs/040-protocols.md`](docs/specs/040-protocols.md),
+with the shipped persistent-session baseline in
+[`docs/specs/200-persistent-sessions.md`](docs/specs/200-persistent-sessions.md)
+and the v0.5.0 control-provider work in
+[`docs/specs/210-session-control-lanes.md`](docs/specs/210-session-control-lanes.md).
+
+## Adapters and providers
+
+- **Docker** — `portl docker run/attach` provisions a container target
+  with a `portl-agent` and saved alias.
+- **Slicer** — `portl slicer run` provisions a Slicer VM and can route
+  through `portl-gateway`.
+- **zmx** — optimized persistent-session provider when
+  `zmx-control/v1` is available; falls back to legacy attach behavior
+  where needed.
+- **tmux** — compatibility persistent-session provider via PTY-backed
+  `tmux -CC`.
+
+## Diagnostics
+
+```bash
+portl doctor
+portl status
+portl status <TARGET>
+portl session providers <TARGET>
+```
+
+The agent exposes OpenMetrics on `$PORTL_HOME/metrics.sock` when the
+local service is running:
+
+```bash
+curl --unix-socket "$PORTL_HOME/metrics.sock" http://metrics/
+```
 
 ## Design docs
 
-Everything under [`docs/specs/`](docs/specs/). Start with
-[`docs/specs/README.md`](docs/specs/README.md) for the full reading
-order; the numbered prefixes (`010`, `020`, `030`, ...) encode the
-intended traversal.
+Start with [`docs/specs/README.md`](docs/specs/README.md). The numbered
+specs are a mix of live design references and historical release records;
+the index marks which is which.
 
 ## Contributing
 

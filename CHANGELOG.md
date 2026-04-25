@@ -5,6 +5,24 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Changed
+
+- Top-level `portl --help` now renders the command tree in the logical
+  groups from spec 190: Setup, Trust, Pairing, Connect, Permissions,
+  Integrations, and Utility.
+- CLI connection help now consistently uses `<TARGET>` for arguments
+  resolved through the shared target cascade; `<PEER>` remains reserved
+  for peer-store management commands.
+- Refreshed the root README and specs index around the v0.5.0
+  session-sharing workflow and shipped spec statuses.
+- The default CLI log filter keeps dependency transport warnings quiet
+  while preserving Portl warnings and dependency errors.
+
+### Fixed
+
+- CLI commands now close client iroh endpoints on success, timeout, and
+  connection failure paths to avoid noisy ungraceful-drop diagnostics.
+
 ## 0.5.0 — 2026-04-25
 
 Session-control release implementing spec 210's first optimized

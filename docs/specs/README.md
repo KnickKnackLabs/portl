@@ -76,9 +76,9 @@ prose still use `node_id`. Treat them as synonymous.
 | 165 | `165-v0.3.2-observability.md` | **v0.3.2 design spec.** Targeted diagnostics and observability polish for peer/ticket/status/connect operations. |
 | 170 | `170-v0.3.3-relay.md` | **v0.3.3 design spec.** Relay configuration, diagnostics, and reachability improvements. |
 | 180 | `180-v0.3.4-peer-pairing.md` | **Historical shipped spec.** Peer pairing via invite/pair/accept; superseded by the CLI vocabulary direction in `190`. |
-| 190 | `190-cli-ergonomics.md` | **Draft.** CLI friction-reduction target: help text, examples, actionable errors, command grouping, completions, selected surface cleanup. |
-| 200 | `200-persistent-sessions.md` | **Draft / v0.4.0 baseline.** Persistent terminal sessions via a provider interface, with zmx first and Docker/Slicer provisioning hooks. |
-| 210 | `210-session-control-lanes.md` | **Draft.** Follow-on design for viewport-aware session control, provider tiers, and iroh lane scheduling. |
+| 190 | `190-cli-ergonomics.md` | **Implemented in v0.3.6.** CLI friction-reduction release: help text, examples, actionable errors, command grouping, completions, selected surface cleanup. |
+| 200 | `200-persistent-sessions.md` | **Baseline shipped in v0.4.0.** Persistent terminal sessions via a provider interface, with zmx first and Docker/Slicer provisioning hooks. |
+| 210 | `210-session-control-lanes.md` | **v0.5.0 implementation slice shipped.** zmx-control and tmux `-CC` provider tiers landed; broader viewport/lane scheduling remains follow-on. |
 
 ## Specs vs plans — where does what go
 
@@ -144,25 +144,35 @@ are adapters"). That temptation trades one renumbering crisis
 - **Discovery is iroh's.** DNS, Pkarr, and Local (mDNS) are all on by
   default; peers on the same LAN find each other with zero
   infrastructure. DHT is opt-in.
-- **Protocols are ALPNs.** `shell/v1`, `tcp/v1`, `udp/v1` ship at v0.1;
-  `fs/v1` is v0.2; `vpn/v1` is a feature-gated stretch. Each a small,
-  separately-reviewable module.
-- **Bootstrap is pluggable.** Docker is the M4 reference
-  `Bootstrapper`; slicer lands at M5. Others (cloud-init, nixos,
-  k8s, manual) follow the same pattern.
-- **One multicall ELF, three entrypoints.** `portl` is the operator
+- **Protocols are ALPNs.** `ticket/v1`, `meta/v1`, `shell/v1`,
+  `session/v1`, `tcp/v1`, and `udp/v1` are small, separately
+  reviewable protocol modules.
+- **Sessions are named workspaces.** A command like
+  `portl session attach <TARGET> <SESSION>` reconnects to
+  provider-backed terminal state. zmx-control is the optimized path;
+  tmux `-CC` is the compatibility path.
+- **Bootstrap is pluggable.** Docker and Slicer create target aliases;
+  manual hosts can run the same agent and provider tools.
+- **One multicall binary, three entrypoints.** `portl` is the operator
   CLI; `portl-agent` is the daemon entrypoint; `portl-gateway` is
   the gateway daemon entrypoint.
 
 ## Reading order
 
-If you only read three documents, read **010-goals**, **020-architecture**,
-and **100-walkthroughs**. The rest fills in the shapes.
+For the current user-facing surface, read **190-cli-ergonomics**,
+**200-persistent-sessions**, and **210-session-control-lanes** after the
+root `README.md`. These capture the modern `<TARGET>` vocabulary,
+persistent-session model, and provider-tier work.
+
+For architectural background, read **010-goals**, **020-architecture**,
+and **030-tickets**. **100-walkthroughs** is still useful, but some early
+flows use historical v0.1 command names; compare with `portl --help` and
+the v0.2+ release specs.
 
 If you care about the long-range transport story (WebRTC, Loom/AWDL,
 running over Tailscale, SSH-as-transport), the artifact reading is
 **future/140-transport-abstraction** and **future/150-loom-analysis** —
-both deferred from v0.1. For v0.1's one-data-plane-with-pluggable-
-discovery story, **020-architecture** and **090-config** are the truth.
+both deferred from v0.1.
 
-If you're reviewing: the live decision points are in **130-open-questions**.
+Historical decision logs such as **120-roadmap** and
+**130-open-questions** are provenance, not the active roadmap.

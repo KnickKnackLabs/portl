@@ -45,6 +45,58 @@ fn cli_help_lists_expected_top_level_commands() {
 }
 
 #[test]
+fn top_level_help_uses_logical_command_groups() {
+    let help = help_output(&["--help"]);
+    for heading in [
+        "Setup:",
+        "Trust:",
+        "Pairing:",
+        "Connect:",
+        "Permissions:",
+        "Integrations:",
+        "Utility:",
+    ] {
+        assert!(
+            help.contains(heading),
+            "missing heading {heading:?}\n{help}"
+        );
+    }
+
+    for ordered in [
+        &[
+            "Setup:",
+            "  init",
+            "  doctor",
+            "  install",
+            "  config",
+            "  whoami",
+        ][..],
+        &["Trust:", "  peer", "  invite"],
+        &["Pairing:", "  accept"],
+        &[
+            "Connect:",
+            "  status",
+            "  shell",
+            "  session",
+            "  exec",
+            "  tcp",
+            "  udp",
+        ],
+        &["Permissions:", "  ticket"],
+        &["Integrations:", "  docker", "  slicer", "  gateway"],
+        &["Utility:", "  completions", "  man", "  help"],
+    ] {
+        let mut cursor = 0;
+        for needle in ordered {
+            let found = help[cursor..]
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing ordered item {needle:?}\n{help}"));
+            cursor += found + needle.len();
+        }
+    }
+}
+
+#[test]
 fn invite_accept_help_matches_model_a_surface() {
     let top = help_output(&["--help"]);
     assert!(top.contains("invite"), "{top}");

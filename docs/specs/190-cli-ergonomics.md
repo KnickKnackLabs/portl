@@ -1,10 +1,10 @@
 # 190 — CLI Ergonomics: Friction Reduction
 
-> Status: **draft, first pass**. Drafted after a full CLI audit
-> and a three-reviewer roundtable. Intended to be iterated on
-> section-by-section. Release-slotting is tracked separately in
-> the roadmap; this spec describes the target surface, not a
-> release.
+> Status: **implemented in v0.3.6**. Drafted after a full CLI
+> audit and a three-reviewer roundtable; landed as the CLI
+> ergonomics patch release. A post-v0.5.0 follow-up aligned the
+> older connect-command metavars with the `<TARGET>` terminology
+> chosen in §8.
 
 ## 1. Summary
 
