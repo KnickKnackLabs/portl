@@ -79,7 +79,7 @@ pub(super) async fn pty_master_task(
 }
 
 #[cfg(unix)]
-pub(super) async fn read_pty_chunk(
+pub(crate) async fn read_pty_chunk(
     master: &AsyncFd<OwnedFd>,
     buf: &mut [u8],
 ) -> std::io::Result<Option<Vec<u8>>> {
@@ -97,7 +97,7 @@ pub(super) async fn read_pty_chunk(
 }
 
 #[cfg(unix)]
-pub(super) async fn write_pty_all(
+pub(crate) async fn write_pty_all(
     master: &AsyncFd<OwnedFd>,
     mut bytes: &[u8],
 ) -> std::io::Result<()> {
@@ -123,7 +123,7 @@ pub(super) async fn write_pty_all(
 }
 
 #[cfg(unix)]
-pub(super) fn set_nonblocking(fd: &OwnedFd) -> std::io::Result<()> {
+pub(crate) fn set_nonblocking(fd: &OwnedFd) -> std::io::Result<()> {
     let flags =
         nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFL).map_err(std::io::Error::from)?;
     let flags = nix::fcntl::OFlag::from_bits_truncate(flags) | nix::fcntl::OFlag::O_NONBLOCK;

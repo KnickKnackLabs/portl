@@ -310,7 +310,7 @@ fn spawn_pty_process(
 /// `ioctl(TIOCSCTTY)`, and inherits the supplied environment exactly
 /// (the current process's env is cleared first).
 #[cfg(unix)]
-fn spawn_pty_blocking(
+pub(crate) fn spawn_pty_blocking(
     program: &str,
     argv: &[String],
     size: nix::libc::winsize,

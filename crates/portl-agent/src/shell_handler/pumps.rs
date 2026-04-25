@@ -45,7 +45,15 @@ pub(crate) async fn pump_signals(mut recv: BufferedRecv, process: &ShellProcess)
         .read_frame::<portl_proto::shell_v1::SignalFrame>(MAX_SIGNAL_BYTES)
         .await?
     {
-        send_signal(process.signal_target, frame.sig);
+        if process.signal_target.is_some() {
+            send_signal(process.signal_target, frame.sig);
+        } else if frame.sig == 2 {
+            process
+                .stdin_tx
+                .send(StdinMessage::Data(vec![0x03]))
+                .await
+                .context("forward signal as terminal interrupt byte")?;
+        }
     }
     Ok(())
 }

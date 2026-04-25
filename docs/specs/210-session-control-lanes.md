@@ -1,12 +1,13 @@
 # 210 — Remote Session Control, Provider Tiers, and Iroh Lanes
 
-> Status: **draft**. This is follow-on design work for the persistent
+> Status: **v0.5.0 implementation slice complete; broader scheduler work
+> remains follow-on**. This is follow-on design work for the persistent
 > session foundation shipped in v0.4.0 and specified in
 > `200-persistent-sessions.md`. That foundation adds `portl session`,
 > `portl/session/v1`, provider discovery, and the initial zmx CLI
 > bridge. This spec describes the next layer: viewport-aware session
-> control, provider capability tiers, and an iroh-native lane scheduler
-> for responsive remote terminal sharing.
+> control, provider capability tiers, and an iroh-native priority
+> scheduler for responsive remote terminal sharing.
 
 ## 1. Summary
 
@@ -30,7 +31,7 @@ their native concepts into Portl concepts:
 | Provider | Native shape | Portl mapping |
 | --- | --- | --- |
 | zmx control | one persistent PTY with ghostty-vt state | one session, one surface |
-| tmux `-CC` | sessions/windows/panes/control events | panes become surfaces |
+| tmux control mode (`-C`/`-CC`) | sessions/windows/panes/control events | panes become surfaces |
 | Zellij | sessions/tabs/panes/render subscriptions | panes become surfaces |
 | native | Portl-owned session manager | direct implementation |
 
@@ -38,7 +39,9 @@ The first optimized provider should be a zmx control-mode fork or
 branch, because zmx already keeps terminal state with `ghostty-vt` and
 has the simplest one-session/one-surface model. The first compatibility
 provider should be tmux `-CC`, because it is the most mature existing
-external control protocol. Zellij is promising for rich workspace
+external control protocol. Portl uses PTY-backed `tmux -CC` and decodes
+its DCS-wrapped control stream; plain `tmux -C` remains useful for
+non-terminal automation and local debugging. Zellij is promising for rich workspace
 support but should remain experimental until its external/headless API
 is stable enough. Kitty is valuable protocol and UX inspiration, but it
 is not a good persistent-session provider today.
@@ -121,7 +124,19 @@ optimized provider can expose above that bridge.
 
 ## 6. Portl session-control model
 
-The model is provider-neutral and surface-oriented.
+The model is provider-neutral and surface-oriented, but the v1 contract
+should stay intentionally small. The first optimized slice proves four
+things only:
+
+1. attach can show the active viewport before history,
+2. user interaction stays responsive while lower-priority data moves,
+3. providers can expose one selected terminal surface through a common
+   model,
+4. optimized control can fall back to the v0.4.0 PTY bridge.
+
+Full collaborative sharing, provider-independent terminal diffs,
+native resume, arbitrary multipane UI, and rich telemetry are future
+extensions. They should not shape the minimum wire/API surface.
 
 ### 6.1 Session
 
@@ -139,8 +154,11 @@ struct SessionRef {
 }
 ```
 
-`generation` is optional provider state used to detect stale client
-caches after a provider restart, kill/recreate, or incompatible upgrade.
+`SessionRef` is stable identity. `generation` is optional provider state
+used to detect stale client caches after a provider restart,
+kill/recreate, or incompatible upgrade. Generation-aware resume is not
+required for v1; when unavailable, reconnect requests a fresh viewport
+snapshot.
 
 ### 6.2 Surface
 
@@ -153,17 +171,43 @@ Examples:
 - Zellij: a pane,
 - native: a Portl-managed PTY surface.
 
-Use `surface_id` rather than `pane_id` in Portl APIs:
+Use `surface_id` rather than `pane_id` in Portl APIs. Separate stable
+identity from mutable state so high-frequency output frames do not
+repeat provider names, session names, titles, or dimensions:
 
 ```rust
+struct SurfaceId(u32);
+
 struct SurfaceRef {
     session: SessionRef,
-    surface_id: String,
+    surface_id: SurfaceId,
+}
+
+struct SurfaceCreated {
+    surface: SurfaceRef,
+    provider_surface_ref: String,
     title: Option<String>,
     rows: u16,
     cols: u16,
 }
+
+struct SurfaceResized {
+    surface: SurfaceRef,
+    rows: u16,
+    cols: u16,
+}
+
+struct SurfaceRenamed {
+    surface: SurfaceRef,
+    title: String,
+}
 ```
+
+`rows` and `cols` describe the provider's current rendered surface size,
+not every client's local terminal size. For v1, interactive attach
+controls one selected surface. zmx selects its only surface; tmux and
+Zellij adapters should select the provider's active/focused pane first.
+Full multipane layout presentation is future UI work.
 
 ### 6.3 Events
 
@@ -172,13 +216,14 @@ Provider adapters emit events into a common model:
 ```rust
 enum SessionEvent {
     ProviderReady(ProviderReady),
-    SurfaceCreated(SurfaceRef),
+    SurfaceCreated(SurfaceCreated),
+    SurfaceResized(SurfaceResized),
+    SurfaceRenamed(SurfaceRenamed),
     SurfaceClosed(SurfaceRef),
     SurfaceFocused(SurfaceRef),
     ViewportSnapshot(ViewportSnapshot),
     LiveOutput(LiveOutput),
     HistoryChunk(HistoryChunk),
-    FlowControl(FlowControlEvent),
     ProviderError(ProviderError),
 }
 ```
@@ -187,20 +232,20 @@ Important payloads:
 
 ```rust
 struct ViewportSnapshot {
-    surface: SurfaceRef,
-    seq: Option<u64>,
+    surface_id: SurfaceId,
+    seq: u64,
     encoding: TerminalEncoding,
     bytes: Vec<u8>,
 }
 
 struct LiveOutput {
-    surface: SurfaceRef,
-    seq: Option<u64>,
+    surface_id: SurfaceId,
+    seq: u64,
     bytes: Vec<u8>,
 }
 
 struct HistoryChunk {
-    surface: SurfaceRef,
+    surface_id: SurfaceId,
     request_id: u64,
     index: u64,
     final_chunk: bool,
@@ -209,8 +254,11 @@ struct HistoryChunk {
 }
 ```
 
-`seq` is optional because not every provider can produce a reliable
-surface sequence initially. Optimized providers should implement it.
+`seq` is per surface. A provider may supply native sequence numbers, but
+Portl adapters should synthesize monotonically increasing per-surface
+sequence numbers when the provider cannot. Synthesized sequence numbers
+preserve event ordering inside Portl; they do not imply provider-native
+resume support.
 
 ### 6.4 Commands
 
@@ -219,64 +267,68 @@ Clients send commands into the same model:
 ```rust
 enum SessionCommand {
     Attach(AttachRequest),
-    Input { surface: SurfaceRef, bytes: Vec<u8> },
-    Paste { surface: SurfaceRef, bytes: Vec<u8> },
-    Cancel { surface: SurfaceRef, kind: CancelKind },
-    Resize { surface: SurfaceRef, rows: u16, cols: u16 },
-    RequestViewport { surface: SurfaceRef },
+    Input { surface_id: SurfaceId, bytes: Vec<u8> },
+    Paste { surface_id: SurfaceId, bytes: Vec<u8> },
+    Cancel { surface_id: SurfaceId, kind: CancelKind },
+    Resize { surface_id: SurfaceId, rows: u16, cols: u16 },
+    RequestViewport { surface_id: SurfaceId },
     RequestHistory(HistoryRequest),
-    Pause { surface: SurfaceRef, lane: LaneKind },
-    Resume { surface: SurfaceRef, lane: LaneKind },
     Detach { session: SessionRef },
 }
 ```
 
-`Cancel` should not be modeled only as input byte `0x03`. Providers may
-map it to Ctrl-C, SIGINT, a process-group signal, or a provider-native
-interrupt, depending on capability and policy.
+`Paste` remains separate from `Input` only when paste policy matters,
+for example bracketed paste, paste-size limits, or audit decisions. An
+implementation may encode paste as input bytes after policy checks.
 
-## 7. Iroh lane scheduler
+`Cancel` is a semantic command. The v1 minimum behavior is priority
+delivery of the terminal interrupt byte, usually Ctrl-C (`0x03`).
+Providers may advertise stronger native cancellation, such as SIGINT to
+the foreground process group, as an optional feature.
 
-### 7.1 Lanes
+## 7. Iroh priority scheduler
 
-The session transport should be lane-aware even when a provider is not.
+### 7.1 Priority classes
 
-Suggested lanes:
+The session transport should be priority-aware even when a provider is
+not. v1 should expose a small number of scheduling classes rather than a
+large fixed stream topology:
 
-| Lane | Direction | Priority | Contents |
-| --- | --- | ---: | --- |
-| control | both | highest | hello, attach ack, errors, detach, caps |
-| input | client → target | highest | keystrokes, paste metadata, priority input |
-| cancel | client → target | highest | interrupt, suspend, kill request |
-| resize | client → target | highest | latest-wins terminal geometry |
-| viewport | target → client | high | active viewport snapshot / refresh |
-| live | target → client | normal/high | live output or provider updates |
-| history | target → client | low | scrollback/history chunks |
-| telemetry | both | low/lossy | RTT hints, presence, typing state, pointer hints |
+| Class | Priority | Contents |
+| --- | ---: | --- |
+| critical | highest | hello, attach ack, errors, detach, input, cancel, resize |
+| render | high | active viewport snapshots and live output |
+| bulk | low | scrollback, history, artifacts, large backfills |
+| hints | lossy / opportunistic | RTT hints, presence, typing state, pointer hints, speculative resize hints |
 
 The implementation may use separate QUIC streams, stream preambles, or
-multiple connections for some lanes. The invariant is semantic: urgent
-commands are not queued behind bulk data by Portl.
+multiple connections behind these classes. It may also subdivide them
+internally for metrics or provider adapters. The invariant is semantic:
+critical commands are not queued behind render or bulk data by Portl.
 
 ### 7.2 Scheduling policy
 
 Application scheduling is required even with QUIC. Streams share
 congestion control and local socket buffers. Portl should therefore:
 
-- always service input/cancel/resize before history,
+- always service critical work before render and bulk work,
 - coalesce resize to the latest value,
 - send viewport snapshots before history backfill,
-- pause history when live output or input is active,
-- bound per-lane queues,
+- pause or slow bulk history when render output or input is active,
+- bound per-class queues,
 - drop/coalesce stale viewport updates for slow observers,
-- use credit-based transfer for history,
+- make history transfer demand-driven and chunked,
 - avoid writing large history bursts into QUIC faster than the client
   can consume them.
 
+Credit-based history flow control is an important follow-on feature, but
+the v1 zmx-control prototype may start with bounded chunks and explicit
+request cancellation rather than a full credit protocol.
+
 ### 7.3 Datagrams
 
-iroh/QUIC datagrams are useful for lossy/latest-wins hints, not
-authoritative terminal state.
+iroh/QUIC datagrams fit the `hints` class. They are useful for
+lossy/latest-wins hints, not authoritative terminal state.
 
 Good datagram candidates:
 
@@ -301,9 +353,12 @@ interactive latency, Portl may open a separate iroh connection for bulk
 lanes. This is not an MVP requirement; start with app-level scheduling
 on one connection and measure.
 
-## 8. Provider tiers
+## 8. Provider tiers and features
 
-Provider discovery should report a tier and explicit capabilities.
+Provider discovery should report a descriptive tier and explicit feature
+flags. Behavior is feature-driven: tier labels explain the broad shape,
+but clients should check individual features before using optional
+semantics.
 
 ### 8.1 Tier 1 — PTY bridge
 
@@ -332,7 +387,7 @@ The provider exposes structured control events and commands.
 Examples:
 
 - zmx control mode,
-- tmux `-CC`,
+- tmux control mode (`-C`/`-CC`),
 - future Zellij headless/control API.
 
 Capabilities:
@@ -346,28 +401,30 @@ Capabilities:
 - provider events/errors,
 - optional flow control.
 
-Tier 2 providers are enough to map into Portl's lane scheduler.
+Tier 2 providers are enough to map into Portl's priority scheduler.
 
-### 8.3 Tier 3 — scheduler-native provider
+### 8.3 Optional advanced control features
 
-The provider is designed around Portl's session-control semantics.
+Avoid treating the ideal native provider as a required third tier before
+real providers need it. Instead, express advanced behavior as optional
+features on top of Tier 2:
 
-Examples:
+- `adapter_sequence.v1` — Portl adapter emits per-surface sequence
+  numbers.
+- `provider_resume.v1` — provider can resume from a previous sequence or
+  generation.
+- `history_chunks.v1` — provider can return bounded history chunks.
+- `history_credit.v1` — provider supports credit-based history transfer.
+- `native_cancel.v1` — provider can interrupt without merely injecting
+  Ctrl-C bytes.
+- `slow_client_coalesce.v1` — provider can replace stale updates with a
+  fresh viewport snapshot for lagging observers.
+- `multi_role_share.v1` — provider can distinguish driver/observer roles
+  internally.
 
-- future native Portl provider,
-- advanced `portl-zmx`,
-- upstream provider with explicit Portl-compatible session-control.
-
-Capabilities:
-
-- sequence-numbered viewport/live output,
-- chunked history with cursors and credits,
-- explicit priority input/cancel,
-- slow-client coalescing,
-- latest-snapshot recovery,
-- multi-client roles,
-- resumable attach from sequence or generation,
-- path-aware scheduling hints.
+A future native Portl provider may make many of these features baseline,
+but the first zmx-control and tmux control-mode adapters should not be forced to
+implement all of them.
 
 ### 8.4 Provider report shape
 
@@ -379,20 +436,25 @@ Extend provider discovery conceptually:
   "available": true,
   "tier": "control",
   "path": "/usr/local/bin/zmx",
+  "features": [
+    "viewport_snapshot.v1",
+    "live_output.v1",
+    "history_request.v1",
+    "history_chunks.v1",
+    "priority_input.v1",
+    "adapter_sequence.v1"
+  ],
   "capabilities": {
     "persistent": true,
     "multi_attach": true,
-    "viewport_snapshot": true,
-    "live_output": true,
-    "history_chunks": true,
-    "priority_input": true,
-    "cancel": true,
-    "resize": true,
-    "sequence_resume": false,
     "direct_human_attach": true
   }
 }
 ```
+
+Keep existing boolean capability fields where they are already part of
+`portl/session/v1`; add feature strings for session-control extensions
+so new optional behavior does not become an ever-growing boolean matrix.
 
 ## 9. zmx-control provider
 
@@ -414,22 +476,42 @@ zmx already computes as structured events.
 
 ### 9.2 Fork/control-mode approach
 
-The practical next step is a small `portl-zmx` branch or fork designed
-to be upstreamable. It should add a headless/control command such as:
+The practical next step is a small zmx branch or fork designed to be
+upstreamable. It should add a provider-owned, Portl-agnostic
+headless/control command:
 
 ```bash
-zmx control --protocol portl-v1 <session>
+zmx control <session>
+zmx control --protocol v1 <session>
+zmx control --protocol zmx-control/v1 <session>
+zmx control --protocol zmx-control/v1 --rows 40 --cols 120 <session>
+```
+
+`zmx control <session>` should default to the current stable control
+protocol, initially `zmx-control/v1`. The short `v1` spelling is a CLI
+convenience; the handshake should report the canonical protocol id
+`zmx-control/v1`. Automation clients may pass initial `--rows` and
+`--cols` so zmx can emit the first viewport snapshot at the requested
+surface size even when stdout is a pipe. Portl should invoke the explicit
+canonical protocol in production so a future zmx default does not
+silently change behavior:
+
+```bash
+zmx control --protocol zmx-control/v1 --rows <rows> --cols <cols> <session>
 ```
 
 Portl should treat this process protocol as the supported integration
 surface, rather than depending long-term on zmx's current private Unix
-socket IPC.
+socket IPC. The external process frame should be stable and explicit:
+one `u8` tag, one little-endian `u32` payload length, then the payload.
+It should not expose padding or ABI details from zmx's private
+`ipc.Header` struct.
 
 Layering:
 
 ```text
 portl-agent
-  <-> zmx control --protocol portl-v1
+  <-> zmx control --protocol zmx-control/v1 --rows <rows> --cols <cols>
     <-> zmx private per-session socket
       <-> zmx daemon / PTY / ghostty-vt
 ```
@@ -445,9 +527,14 @@ Additive changes only:
 2. add version/capability handshake;
 3. add viewport snapshot response;
 4. separate live output from restore output;
-5. add sequence numbers;
-6. add chunked history responses;
-7. add explicit cancel / priority input semantics.
+5. emit adapter or provider sequence numbers for viewport/live events;
+6. add bounded history responses, with chunking as soon as practical;
+7. route priority interrupt input ahead of bulk/provider backfill.
+
+The v1 minimum cancel behavior is priority delivery of the terminal
+interrupt byte, usually Ctrl-C. Stronger provider-native interruption,
+such as SIGINT to the foreground process group, should be advertised as
+`native_cancel.v1` rather than assumed.
 
 Do not change vanilla `zmx attach`, existing tag numbers, socket naming,
 or direct provider usability.
@@ -478,12 +565,16 @@ bridge:
 zmx found, control protocol unavailable; using PTY bridge
 ```
 
-## 10. tmux `-CC` provider
+## 10. tmux control-mode provider
 
 ### 10.1 Role
 
-tmux `-CC` is the best compatibility control provider. It is mature,
-documented, and already designed for external terminal UI clients.
+tmux control mode is the best compatibility control provider. It is
+mature, documented, and already designed for external terminal UI
+clients. Portl uses PTY-backed `tmux -CC` for the compatibility adapter
+and strips the DCS control wrapper before parsing tmux control events.
+Plain `tmux -C` remains useful for non-terminal automation and local
+adapter debugging.
 
 Useful primitives:
 
@@ -520,13 +611,13 @@ tmux is mature but not Portl-native:
   snapshot event,
 - cancel is usually key injection, not an explicit provider interrupt.
 
-Do not make zmx speak tmux `-CC`. Instead, implement a tmux adapter that
-maps real tmux control mode into Portl events.
+Do not make zmx speak tmux control mode. Instead, implement a tmux
+adapter that maps real tmux control mode into Portl events.
 
 ## 11. Zellij provider
 
 Zellij is promising but should be experimental after zmx-control and
-tmux `-CC`.
+tmux control mode.
 
 Relevant capabilities:
 
@@ -597,22 +688,23 @@ Do not build a Kitty provider in the first session-control phase.
 Optimized providers and Portl's scheduler should treat slow clients as
 normal.
 
-Policy:
+V1 policy:
 
-- input/cancel/resize queues are tiny and high priority,
-- history transfer is credit-based,
+- critical queues are tiny and high priority,
+- history/backfill is chunked and demand-driven,
 - viewport updates may be coalesced for observers,
-- stale live-output chunks may be replaced by a fresh viewport snapshot
-  when a client falls too far behind,
 - active driver traffic should not be slowed by read-only observers,
-- provider adapters should bound memory per client/lane.
+- provider adapters should bound memory per client/priority class.
 
-For Tier 2 providers that cannot coalesce internally, Portl should still
-avoid writing low-priority data while high-priority data is pending.
+Future advanced providers may replace stale live-output chunks with a
+fresh viewport snapshot when a client falls too far behind, or implement
+credit-based history transfer. For Tier 2 providers that cannot coalesce
+internally, Portl should still avoid writing bulk data while critical or
+render data is pending.
 
 ## 14. Resume and sequence numbers
 
-Tier 3 providers should support resume:
+Advanced control providers may support resume:
 
 ```text
 client reconnects with { session, surface, generation, last_seq }
@@ -621,26 +713,25 @@ provider either:
   - sends a fresh ViewportSnapshot with a new seq
 ```
 
-Tier 2 providers may lack this. Portl should handle missing resume by
-requesting a fresh viewport snapshot or provider-native capture.
+Most v1 control providers may lack this. Portl should handle missing
+resume by requesting a fresh viewport snapshot or provider-native
+capture.
 
 Sequence numbers are per surface, not global across all sessions.
 
 ## 15. Sharing roles
 
-The model should allow multiple client roles:
+V1 needs only two roles:
 
 | Role | Capabilities |
 | --- | --- |
 | driver | input, cancel, resize, viewport/live/history |
 | observer | viewport/live/history, no input |
-| navigator | observer plus pointer/annotation hints |
-| agent | viewport/live/history summaries, optional controlled input |
-| history-only | history requests only |
 
-Ticket caps should eventually distinguish these roles. Initial
-implementations may gate all attach/share behavior through existing
-session attach permission.
+Future roles may include navigator, agent, and history-only consumers,
+but they should not shape the first control protocol. Ticket caps should
+eventually distinguish roles. Initial implementations may gate all
+attach/share behavior through existing session attach permission.
 
 ## 16. Security and authorization
 
@@ -672,20 +763,22 @@ the target; Portl carries remote access over iroh.
 
 ### Phase 2 — zmx-control prototype
 
-- Create a zmx fork/branch with `zmx control --protocol portl-v1`.
+- Create a zmx fork/branch with `zmx control --protocol zmx-control/v1`.
+  Automation clients may also pass `--rows` and `--cols` before the
+  session name.
 - Add active viewport serialization without changing vanilla attach.
 - Emit viewport snapshot and live output separately.
 - Integrate Portl provider fallback: control if available, CLI bridge
   otherwise.
 
-### Phase 3 — Portl lane scheduler
+### Phase 3 — Portl priority scheduler
 
-- Add lane-aware attach plumbing.
-- Prioritize control/input/cancel/resize.
-- Backfill history on a low-priority lane.
+- Add priority-aware attach plumbing.
+- Prioritize critical work over render and bulk work.
+- Backfill history as bulk work.
 - Add queue bounds and resize coalescing.
 
-### Phase 4 — tmux `-CC` adapter
+### Phase 4 — tmux control-mode adapter
 
 - Implement tmux control-mode provider adapter.
 - Map panes to surfaces.
@@ -706,6 +799,8 @@ the target; Portl carries remote access over iroh.
 
 ## 18. Acceptance criteria
 
+### 18.1 First optimized slice — zmx-control
+
 The first optimized slice is accepted when:
 
 1. Provider discovery distinguishes PTY-bridge and control providers.
@@ -713,27 +808,42 @@ The first optimized slice is accepted when:
    `zmx attach`.
 3. Portl falls back to the v0.4.0 zmx CLI bridge when control is
    unavailable.
-4. Input and resize remain responsive while history backfill is active.
+4. Critical work, especially input, interrupt, and resize, is handled
+   ahead of history/backfill work.
 5. History transfer is separated from live output at Portl's scheduler
    boundary.
-6. A tmux `-CC` adapter can map at least one tmux pane to a Portl
-   surface with live output and visible-pane capture.
-7. Errors and provider reports expose missing capabilities clearly.
-8. Existing `portl exec` and one-shot `portl shell` behavior is
+6. Errors and provider reports expose missing features clearly.
+7. Existing `portl exec` and one-shot `portl shell` behavior is
    unchanged.
+
+The scheduler should have a measurable responsiveness target before
+implementation starts, for example p95 local input forwarding under
+history backfill stays within one network RTT plus a small processing
+budget. The exact number belongs in the implementation plan after a
+benchmark harness exists.
+
+### 18.2 Second optimized slice — tmux control mode
+
+The tmux compatibility slice is accepted when:
+
+1. A tmux control-mode adapter maps at least one tmux pane to a Portl surface.
+2. tmux `%output` or `%extended-output` maps to `LiveOutput`.
+3. `capture-pane` visible output maps to `ViewportSnapshot`.
+4. Basic input, resize, and Ctrl-C interrupt work for the selected pane.
+5. Missing tmux capabilities produce clear provider-feature errors.
 
 ## 19. Open questions
 
-1. Should the first zmx-control protocol be named `portl-v1`,
-   `zmx-control/v1`, or something upstream-neutral?
-2. Should Portl maintain a temporary `portl-zmx` fork, or keep all zmx
+1. Should the first zmx-control protocol use the exact canonical id
+   `zmx-control/v1`, or should upstream choose a different neutral name?
+2. Should Portl maintain a temporary zmx fork, or keep all zmx
    work on a branch intended for immediate upstream submission?
 3. How much history should be fetched automatically on attach before the
    user scrolls?
 4. Should large history/artifact transfer use a separate iroh connection
    or only app-level scheduling on one connection?
-5. What is the minimum useful cancel semantic: Ctrl-C injection,
-   priority queue insertion, queue clearing, or SIGINT to process group?
+5. Should zmx-control add `native_cancel.v1` in the first prototype, or
+   is priority Ctrl-C delivery enough until scheduler behavior is proven?
 6. Should read-only observers receive raw live output, coalesced
    viewport snapshots, or both?
 7. When should a native Portl provider be reconsidered?

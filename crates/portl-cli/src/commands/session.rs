@@ -42,7 +42,7 @@ pub fn providers(target: &str, json: bool) -> Result<ExitCode> {
         if json {
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
-            println!("PROVIDER  AVAILABLE  DEFAULT  NOTES");
+            println!("PROVIDER  AVAILABLE  DEFAULT  TIER      FEATURES  NOTES");
             for provider in &report.providers {
                 let available = if provider.available { "yes" } else { "no" };
                 let default = if report.default_provider.as_deref() == Some(provider.name.as_str())
@@ -51,11 +51,19 @@ pub fn providers(target: &str, json: bool) -> Result<ExitCode> {
                 } else {
                     "no"
                 };
+                let tier = provider.tier.as_deref().unwrap_or("-");
+                let features = if provider.features.is_empty() {
+                    "-".to_owned()
+                } else {
+                    provider.features.join(",")
+                };
                 println!(
-                    "{:<8}  {:<9}  {:<7}  {}",
+                    "{:<8}  {:<9}  {:<7}  {:<8}  {:<8}  {}",
                     provider.name,
                     available,
                     default,
+                    tier,
+                    features,
                     provider.notes.as_deref().unwrap_or("")
                 );
             }

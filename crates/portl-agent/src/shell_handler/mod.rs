@@ -15,7 +15,7 @@ use crate::stream_io::BufferedRecv;
 
 mod env;
 mod exec_capture;
-mod pty_master;
+pub(crate) mod pty_master;
 pub(crate) mod pumps;
 mod reject;
 mod shutdown;

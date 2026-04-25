@@ -5,6 +5,33 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.5.0 — 2026-04-25
+
+Session-control release implementing spec 210's first optimized
+provider slices.
+
+### Added
+
+- Added zmx-control discovery and attach support using the upstreamable
+  `zmx-control/v1` process protocol, including explicit 5-byte frames,
+  initial viewport sizing, command-on-attach argv forwarding, bounded
+  frame handling, and fallback to the v0.4.0 `zmx attach` bridge.
+- Added tmux `-CC` control-mode provider support for provider discovery,
+  session listing, history capture, kill, and PTY-backed attach via tmux
+  control events while preserving the public `portl/session/v1` attach
+  streams.
+- Added provider tiers and feature strings to session provider reports,
+  and surfaced them in `portl session providers` output.
+
+### Changed
+
+- `portl session attach` now prefers optimized zmx-control when the
+  target zmx advertises `zmx-control/v1`; requested users continue to
+  use the legacy bridge so existing user-switch semantics are preserved.
+- The zmx and tmux optimized adapters map input, resize, and interrupt
+  semantics through provider-native control paths instead of a human PTY
+  attach whenever possible.
+
 ## 0.4.0 — 2026-04-24
 
 Persistent sessions minor release implementing spec 200's v0.4.0 MVP.

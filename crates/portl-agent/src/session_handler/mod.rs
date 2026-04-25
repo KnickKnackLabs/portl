@@ -7,19 +7,25 @@ use portl_proto::session_v1::{
     ALPN_SESSION_V1, SessionAck, SessionFirstFrame, SessionOp, SessionReason, SessionReq,
     SessionStreamKind, SessionSubTail,
 };
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::Child;
+use tokio::sync::{mpsc, watch};
 
 use crate::caps_enforce::shell_permits;
 use crate::session::Session;
 use crate::shell_handler::pumps::{pump_exit, pump_output, pump_resizes, pump_signals, pump_stdin};
 use crate::shell_handler::spawn::spawn_process;
 use crate::shell_handler::user::resolve_requested_user;
+use crate::shell_registry::{PtyCommand, ShellProcess, StdinMessage};
 use crate::stream_io::BufferedRecv;
 use crate::{AgentState, audit};
 
 mod provider;
+mod tmux_control;
 
 const MAX_CONTROL_BYTES: usize = 256 * 1024;
+const ZMX_CONTROL_HEADER_BYTES: usize = 5;
+const MAX_ZMX_CONTROL_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 pub(crate) async fn serve_stream(
     connection: Connection,
@@ -74,6 +80,12 @@ async fn serve_control_stream(
         return Ok(());
     }
     let zmx = provider::ZmxProvider::new(state.session_provider_path.clone());
+    let tmux_path = state.session_provider_path.clone().filter(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "tmux")
+    });
+    let tmux = provider::TmuxProvider::new(tmux_path);
     match req.op {
         SessionOp::Providers => {
             audit::session_event(
@@ -86,7 +98,7 @@ async fn serve_control_stream(
                 req.cwd.as_deref(),
                 req.argv.as_ref(),
             );
-            let providers = provider::provider_report(&zmx).await?;
+            let providers = provider::provider_report(&zmx, &tmux).await?;
             write_ack(
                 &mut send,
                 SessionAck {
@@ -105,22 +117,26 @@ async fn serve_control_stream(
             Ok(())
         }
         SessionOp::List => {
-            if let Err(reason) = ensure_zmx_selected(&zmx, req.provider.as_deref(), req.op).await {
-                write_ack(&mut send, reject(reason)).await?;
-                let _ = send.finish();
-                return Ok(());
-            }
+            let selected = match select_provider(&zmx, &tmux, req.provider.as_deref(), req.op).await
+            {
+                Ok(selected) => selected,
+                Err(reason) => {
+                    write_ack(&mut send, reject(reason)).await?;
+                    let _ = send.finish();
+                    return Ok(());
+                }
+            };
             audit::session_event(
                 &session,
                 "audit.session_providers",
-                Some("zmx"),
+                Some(selected.name()),
                 None,
                 "list",
                 req.user.as_deref(),
                 req.cwd.as_deref(),
                 req.argv.as_ref(),
             );
-            let sessions = match zmx.list().await {
+            let sessions = match selected.list(&zmx, &tmux).await {
                 Ok(sessions) => sessions,
                 Err(err) => {
                     audit::session_reject(&session, "list", "provider_command_failed");
@@ -133,16 +149,20 @@ async fn serve_control_stream(
                     return Ok(());
                 }
             };
-            write_ack(&mut send, ok_with_sessions(sessions)).await?;
+            write_ack(&mut send, ok_with_sessions(selected.name(), sessions)).await?;
             let _ = send.finish();
             Ok(())
         }
         SessionOp::Run => {
-            if let Err(reason) = ensure_zmx_selected(&zmx, req.provider.as_deref(), req.op).await {
-                write_ack(&mut send, reject(reason)).await?;
-                let _ = send.finish();
-                return Ok(());
-            }
+            let selected = match select_provider(&zmx, &tmux, req.provider.as_deref(), req.op).await
+            {
+                Ok(selected) => selected,
+                Err(reason) => {
+                    write_ack(&mut send, reject(reason)).await?;
+                    let _ = send.finish();
+                    return Ok(());
+                }
+            };
             let Some(name) = req.session_name.as_deref() else {
                 write_ack(&mut send, reject(SessionReason::MissingSessionName)).await?;
                 let _ = send.finish();
@@ -156,14 +176,14 @@ async fn serve_control_stream(
             audit::session_event(
                 &session,
                 "audit.session_run",
-                Some("zmx"),
+                Some(selected.name()),
                 Some(name),
                 "run",
                 req.user.as_deref(),
                 req.cwd.as_deref(),
                 req.argv.as_ref(),
             );
-            let run = match zmx.run(name, argv).await {
+            let run = match selected.run(&zmx, name, argv).await {
                 Ok(run) => run,
                 Err(err) => {
                     audit::session_reject(&session, "run", "provider_command_failed");
@@ -176,16 +196,20 @@ async fn serve_control_stream(
                     return Ok(());
                 }
             };
-            write_ack(&mut send, ok_with_run(run)).await?;
+            write_ack(&mut send, ok_with_run(selected.name(), run)).await?;
             let _ = send.finish();
             Ok(())
         }
         SessionOp::History => {
-            if let Err(reason) = ensure_zmx_selected(&zmx, req.provider.as_deref(), req.op).await {
-                write_ack(&mut send, reject(reason)).await?;
-                let _ = send.finish();
-                return Ok(());
-            }
+            let selected = match select_provider(&zmx, &tmux, req.provider.as_deref(), req.op).await
+            {
+                Ok(selected) => selected,
+                Err(reason) => {
+                    write_ack(&mut send, reject(reason)).await?;
+                    let _ = send.finish();
+                    return Ok(());
+                }
+            };
             let Some(name) = req.session_name.as_deref() else {
                 write_ack(&mut send, reject(SessionReason::MissingSessionName)).await?;
                 let _ = send.finish();
@@ -194,14 +218,14 @@ async fn serve_control_stream(
             audit::session_event(
                 &session,
                 "audit.session_history",
-                Some("zmx"),
+                Some(selected.name()),
                 Some(name),
                 "history",
                 req.user.as_deref(),
                 req.cwd.as_deref(),
                 req.argv.as_ref(),
             );
-            let output = match zmx.history(name).await {
+            let output = match selected.history(&zmx, &tmux, name).await {
                 Ok(output) => output,
                 Err(err) => {
                     audit::session_reject(&session, "history", "provider_command_failed");
@@ -214,16 +238,20 @@ async fn serve_control_stream(
                     return Ok(());
                 }
             };
-            write_ack(&mut send, ok_with_output(output)).await?;
+            write_ack(&mut send, ok_with_output(selected.name(), output)).await?;
             let _ = send.finish();
             Ok(())
         }
         SessionOp::Kill => {
-            if let Err(reason) = ensure_zmx_selected(&zmx, req.provider.as_deref(), req.op).await {
-                write_ack(&mut send, reject(reason)).await?;
-                let _ = send.finish();
-                return Ok(());
-            }
+            let selected = match select_provider(&zmx, &tmux, req.provider.as_deref(), req.op).await
+            {
+                Ok(selected) => selected,
+                Err(reason) => {
+                    write_ack(&mut send, reject(reason)).await?;
+                    let _ = send.finish();
+                    return Ok(());
+                }
+            };
             let Some(name) = req.session_name.as_deref() else {
                 write_ack(&mut send, reject(SessionReason::MissingSessionName)).await?;
                 let _ = send.finish();
@@ -232,14 +260,14 @@ async fn serve_control_stream(
             audit::session_event(
                 &session,
                 "audit.session_kill",
-                Some("zmx"),
+                Some(selected.name()),
                 Some(name),
                 "kill",
                 req.user.as_deref(),
                 req.cwd.as_deref(),
                 req.argv.as_ref(),
             );
-            if let Err(err) = zmx.kill(name).await {
+            if let Err(err) = selected.kill(&zmx, &tmux, name).await {
                 audit::session_reject(&session, "kill", "provider_command_failed");
                 write_ack(
                     &mut send,
@@ -249,11 +277,11 @@ async fn serve_control_stream(
                 let _ = send.finish();
                 return Ok(());
             }
-            write_ack(&mut send, ok_empty()).await?;
+            write_ack(&mut send, ok_empty(selected.name())).await?;
             let _ = send.finish();
             Ok(())
         }
-        SessionOp::Attach => serve_attach(session, state, send, recv, req, zmx).await,
+        SessionOp::Attach => serve_attach(session, state, send, recv, req, zmx, tmux).await,
     }
 }
 
@@ -265,12 +293,16 @@ async fn serve_attach(
     mut recv: BufferedRecv,
     req: SessionReq,
     zmx: provider::ZmxProvider,
+    tmux: provider::TmuxProvider,
 ) -> Result<()> {
-    if let Err(reason) = ensure_zmx_selected(&zmx, req.provider.as_deref(), req.op).await {
-        write_ack(&mut send, reject(reason)).await?;
-        let _ = send.finish();
-        return Ok(());
-    }
+    let selected = match select_provider(&zmx, &tmux, req.provider.as_deref(), req.op).await {
+        Ok(selected) => selected,
+        Err(reason) => {
+            write_ack(&mut send, reject(reason)).await?;
+            let _ = send.finish();
+            return Ok(());
+        }
+    };
     let Some(name) = req.session_name.as_deref() else {
         write_ack(&mut send, reject(SessionReason::MissingSessionName)).await?;
         let _ = send.finish();
@@ -294,13 +326,35 @@ async fn serve_attach(
     audit::session_event(
         &session,
         "audit.session_attach",
-        Some("zmx"),
+        Some(selected.name()),
         Some(name),
         "attach",
         req.user.as_deref(),
         req.cwd.as_deref(),
         req.argv.as_ref(),
     );
+    if selected == SelectedProvider::Tmux {
+        if req.user.is_some() {
+            write_ack(
+                &mut send,
+                reject(SessionReason::CapabilityUnsupported {
+                    provider: "tmux".to_owned(),
+                    capability: "user".to_owned(),
+                }),
+            )
+            .await?;
+            let _ = send.finish();
+            return Ok(());
+        }
+        let name = name.to_owned();
+        return serve_tmux_control_attach(session, state, send, recv, req, tmux, &name).await;
+    }
+
+    if req.user.is_none() && zmx.control_available().await? {
+        let name = name.to_owned();
+        return serve_control_attach(session, state, send, recv, req, zmx, &name).await;
+    }
+
     let provider_argv = zmx.attach_argv(name, req.argv.as_deref())?;
     let shell_req = portl_proto::shell_v1::ShellReq {
         preamble: portl_proto::wire::StreamPreamble {
@@ -368,6 +422,425 @@ async fn serve_attach(
     }
 }
 
+async fn serve_control_attach(
+    session: Session,
+    state: Arc<AgentState>,
+    mut send: SendStream,
+    mut recv: BufferedRecv,
+    req: SessionReq,
+    zmx: provider::ZmxProvider,
+    name: &str,
+) -> Result<()> {
+    let session_id = rand::random::<[u8; 16]>();
+    let audit_session_id = hex::encode(session_id);
+    let process = match spawn_zmx_control_process(
+        &session,
+        &zmx,
+        name,
+        req.cwd.as_deref(),
+        req.pty.as_ref(),
+        req.argv.as_deref(),
+        &audit_session_id,
+    ) {
+        Ok(process) => process,
+        Err(err) => {
+            write_ack(
+                &mut send,
+                reject(SessionReason::SpawnFailed(err.to_string())),
+            )
+            .await?;
+            let _ = send.finish();
+            return Ok(());
+        }
+    };
+    process.set_started_at(Instant::now());
+    state
+        .shell_registry
+        .insert(session_id, Arc::clone(&process));
+    let _guard = SessionRegistryGuard {
+        state: Arc::clone(&state),
+        session_id,
+    };
+    write_ack(
+        &mut send,
+        SessionAck {
+            ok: true,
+            reason: None,
+            session_id: Some(session_id),
+            provider: Some("zmx".to_owned()),
+            providers: None,
+            sessions: None,
+            run: None,
+            output: None,
+        },
+    )
+    .await?;
+    let mut control_buffer = [0_u8; 1024];
+    loop {
+        let read = recv
+            .read(&mut control_buffer)
+            .await
+            .context("read session control")?;
+        if read == 0 {
+            let _ = send.finish();
+            return Ok(());
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn serve_tmux_control_attach(
+    session: Session,
+    state: Arc<AgentState>,
+    mut send: SendStream,
+    mut recv: BufferedRecv,
+    req: SessionReq,
+    tmux: provider::TmuxProvider,
+    name: &str,
+) -> Result<()> {
+    let session_id = rand::random::<[u8; 16]>();
+    let audit_session_id = hex::encode(session_id);
+    let process = match spawn_tmux_control_process(
+        &session,
+        &tmux,
+        name,
+        req.cwd.as_deref(),
+        req.pty.as_ref(),
+        req.argv.as_deref(),
+        &audit_session_id,
+    ) {
+        Ok(process) => process,
+        Err(err) => {
+            write_ack(
+                &mut send,
+                reject(SessionReason::SpawnFailed(err.to_string())),
+            )
+            .await?;
+            let _ = send.finish();
+            return Ok(());
+        }
+    };
+    process.set_started_at(Instant::now());
+    state
+        .shell_registry
+        .insert(session_id, Arc::clone(&process));
+    let _guard = SessionRegistryGuard {
+        state: Arc::clone(&state),
+        session_id,
+    };
+    write_ack(
+        &mut send,
+        SessionAck {
+            ok: true,
+            reason: None,
+            session_id: Some(session_id),
+            provider: Some("tmux".to_owned()),
+            providers: None,
+            sessions: None,
+            run: None,
+            output: None,
+        },
+    )
+    .await?;
+    let mut control_buffer = [0_u8; 1024];
+    loop {
+        let read = recv
+            .read(&mut control_buffer)
+            .await
+            .context("read session control")?;
+        if read == 0 {
+            let _ = send.finish();
+            return Ok(());
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn spawn_tmux_control_process(
+    session: &Session,
+    tmux: &provider::TmuxProvider,
+    name: &str,
+    cwd: Option<&str>,
+    pty: Option<&portl_proto::shell_v1::PtyCfg>,
+    argv: Option<&[String]>,
+    audit_session_id: &str,
+) -> Result<Arc<ShellProcess>> {
+    use std::sync::Mutex;
+
+    let spawn = tmux.control_spawn_config(name, cwd, pty, argv)?;
+    let pty_cfg = pty.ok_or_else(|| anyhow!("tmux -CC attach requires pty dimensions"))?;
+    let winsize = nix::libc::winsize {
+        ws_row: pty_cfg.rows,
+        ws_col: pty_cfg.cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let program = spawn
+        .program
+        .to_str()
+        .ok_or_else(|| anyhow!("tmux path is not valid UTF-8"))?;
+    let (master, child) = crate::shell_handler::spawn::spawn_pty_blocking(
+        program,
+        &spawn.args,
+        winsize,
+        spawn.env,
+        None,
+    )
+    .context("spawn tmux -CC control pty")?;
+    let pid = child.id().ok_or_else(|| anyhow!("missing child pid"))?;
+
+    let (stdin_tx, stdin_rx) = mpsc::channel(32);
+    let (pty_tx, pty_rx) = mpsc::unbounded_channel();
+    let (stdout_tx, stdout_rx) = mpsc::channel(32);
+    let (stderr_tx, stderr_rx) = mpsc::channel(32);
+    let exit_code = Arc::new(Mutex::new(None));
+    let (exit_tx, _) = watch::channel(None);
+
+    tokio::spawn(async move {
+        if let Err(err) =
+            tmux_control::pump_tmux_cc_pty(master, stdout_tx, stderr_tx, stdin_rx, pty_rx).await
+        {
+            tracing::debug!(%err, "tmux -CC pty task ended with error");
+        }
+    });
+
+    let exit_code_wait = Arc::clone(&exit_code);
+    let exit_tx_wait = exit_tx.clone();
+    let ticket_id = session.ticket_id;
+    let caller_endpoint_id = session.caller_endpoint_id;
+    let audit_session_id = audit_session_id.to_owned();
+    let started_at = Arc::new(Mutex::new(None::<Instant>));
+    let started_at_wait = Arc::clone(&started_at);
+    tokio::spawn(async move {
+        wait_zmx_control_child(
+            child,
+            pid,
+            ticket_id,
+            caller_endpoint_id,
+            audit_session_id,
+            exit_code_wait,
+            exit_tx_wait,
+            started_at_wait,
+        )
+        .await;
+    });
+
+    Ok(Arc::new(ShellProcess {
+        pid,
+        stdin_tx,
+        stdout_rx: tokio::sync::Mutex::new(Some(stdout_rx)),
+        stderr_rx: tokio::sync::Mutex::new(Some(stderr_rx)),
+        exit_code,
+        exit_tx,
+        signal_target: None,
+        pty_tx: Some(pty_tx),
+        started_at,
+    }))
+}
+
+#[allow(clippy::too_many_lines)]
+fn spawn_zmx_control_process(
+    session: &Session,
+    zmx: &provider::ZmxProvider,
+    name: &str,
+    cwd: Option<&str>,
+    pty: Option<&portl_proto::shell_v1::PtyCfg>,
+    argv: Option<&[String]>,
+    audit_session_id: &str,
+) -> Result<Arc<ShellProcess>> {
+    use std::sync::Mutex;
+
+    let mut command = zmx.control_command(name, cwd, pty, argv)?;
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().context("spawn zmx control")?;
+    let pid = child.id().ok_or_else(|| anyhow!("missing child pid"))?;
+    let mut stdin = child.stdin.take().context("missing zmx-control stdin")?;
+    let mut stdout = child.stdout.take().context("missing zmx-control stdout")?;
+    let mut stderr = child.stderr.take().context("missing zmx-control stderr")?;
+
+    let (stdin_tx, mut stdin_rx) = mpsc::channel(32);
+    let (pty_tx, mut pty_rx) = mpsc::unbounded_channel();
+    let (stdout_tx, stdout_rx) = mpsc::channel(32);
+    let (stderr_tx, stderr_rx) = mpsc::channel(32);
+    let exit_code = Arc::new(Mutex::new(None));
+    let (exit_tx, _) = watch::channel(None);
+
+    #[allow(clippy::unused_async)]
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                Some(message) = stdin_rx.recv() => {
+                    let close = matches!(message, StdinMessage::Close);
+                    let write = match message {
+                        StdinMessage::Data(data) => write_control_frame(&mut stdin, 0, &data).await,
+                        StdinMessage::Close => write_control_frame(&mut stdin, 3, &[]).await,
+                    };
+                    if write.is_err() {
+                        break;
+                    }
+                    if close {
+                        let _ = stdin.shutdown().await;
+                        break;
+                    }
+                }
+                Some(command) = pty_rx.recv() => {
+                    match command {
+                        PtyCommand::Resize { rows, cols } => {
+                            let mut payload = [0_u8; 4];
+                            payload[..2].copy_from_slice(&rows.to_le_bytes());
+                            payload[2..].copy_from_slice(&cols.to_le_bytes());
+                            if write_control_frame(&mut stdin, 2, &payload).await.is_err() {
+                                break;
+                            }
+                        }
+                        PtyCommand::Close { .. } => {
+                            let _ = write_control_frame(&mut stdin, 3, &[]).await;
+                            let _ = stdin.shutdown().await;
+                            break;
+                        }
+                    }
+                }
+                else => {
+                    let _ = write_control_frame(&mut stdin, 3, &[]).await;
+                    let _ = stdin.shutdown().await;
+                    break;
+                }
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        while let Ok(Some((tag, payload))) = read_control_frame(&mut stdout).await {
+            if tag == 1 && stdout_tx.send(payload).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        let mut buf = vec![0_u8; 16 * 1024];
+        loop {
+            match stderr.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    if stderr_tx.send(buf[..read].to_vec()).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let exit_code_wait = Arc::clone(&exit_code);
+    let exit_tx_wait = exit_tx.clone();
+    let ticket_id = session.ticket_id;
+    let caller_endpoint_id = session.caller_endpoint_id;
+    let audit_session_id = audit_session_id.to_owned();
+    let started_at = Arc::new(Mutex::new(None::<Instant>));
+    let started_at_wait = Arc::clone(&started_at);
+    tokio::spawn(async move {
+        wait_zmx_control_child(
+            child,
+            pid,
+            ticket_id,
+            caller_endpoint_id,
+            audit_session_id,
+            exit_code_wait,
+            exit_tx_wait,
+            started_at_wait,
+        )
+        .await;
+    });
+
+    Ok(Arc::new(ShellProcess {
+        pid,
+        stdin_tx,
+        stdout_rx: tokio::sync::Mutex::new(Some(stdout_rx)),
+        stderr_rx: tokio::sync::Mutex::new(Some(stderr_rx)),
+        exit_code,
+        exit_tx,
+        signal_target: None,
+        pty_tx: Some(pty_tx),
+        started_at,
+    }))
+}
+
+async fn write_control_frame(
+    writer: &mut tokio::process::ChildStdin,
+    tag: u8,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    let len = u32::try_from(payload.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "zmx-control payload exceeds u32 frame length",
+        )
+    })?;
+    writer.write_all(&[tag]).await?;
+    writer.write_all(&len.to_le_bytes()).await?;
+    writer.write_all(payload).await
+}
+
+async fn read_control_frame(
+    reader: &mut tokio::process::ChildStdout,
+) -> std::io::Result<Option<(u8, Vec<u8>)>> {
+    let mut header = [0_u8; ZMX_CONTROL_HEADER_BYTES];
+    match reader.read_exact(&mut header).await {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => return Err(err),
+    }
+    let len = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    if len > MAX_ZMX_CONTROL_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "zmx-control frame exceeds maximum payload size",
+        ));
+    }
+    let mut payload = vec![0_u8; len];
+    reader.read_exact(&mut payload).await?;
+    Ok(Some((header[0], payload)))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_zmx_control_child(
+    mut child: Child,
+    pid: u32,
+    ticket_id: [u8; 16],
+    caller_endpoint_id: [u8; 32],
+    audit_session_id: String,
+    exit_code: Arc<std::sync::Mutex<Option<i32>>>,
+    exit_tx: watch::Sender<Option<i32>>,
+    started_at: Arc<std::sync::Mutex<Option<Instant>>>,
+) {
+    let code = match child.wait().await {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(_) => 1,
+    };
+    if let Ok(mut guard) = exit_code.lock() {
+        *guard = Some(code);
+    }
+    let duration_ms = started_at
+        .lock()
+        .ok()
+        .and_then(|guard| *guard)
+        .map_or(0, |instant| {
+            u64::try_from(instant.elapsed().as_millis()).unwrap_or(u64::MAX)
+        });
+    audit::shell_exit_raw(
+        ticket_id,
+        caller_endpoint_id,
+        &audit_session_id,
+        pid,
+        code,
+        duration_ms,
+    );
+    let _ = exit_tx.send(Some(code));
+}
+
 async fn serve_substream(
     session: Session,
     state: Arc<AgentState>,
@@ -416,30 +889,126 @@ fn session_permits(session: &Session, req: &SessionReq) -> Result<(), SessionRea
     shell_permits(&session.caps, &shell_req).map_err(|_| SessionReason::CapDenied)
 }
 
-async fn ensure_zmx_selected(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectedProvider {
+    Zmx,
+    Tmux,
+}
+
+impl SelectedProvider {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Zmx => "zmx",
+            Self::Tmux => "tmux",
+        }
+    }
+
+    async fn list(
+        self,
+        zmx: &provider::ZmxProvider,
+        tmux: &provider::TmuxProvider,
+    ) -> Result<Vec<String>> {
+        match self {
+            Self::Zmx => zmx.list().await,
+            Self::Tmux => tmux.list().await,
+        }
+    }
+
+    async fn run(
+        self,
+        zmx: &provider::ZmxProvider,
+        session: &str,
+        argv: &[String],
+    ) -> Result<portl_proto::session_v1::SessionRunResult> {
+        match self {
+            Self::Zmx => zmx.run(session, argv).await,
+            Self::Tmux => bail!("tmux provider does not support run"),
+        }
+    }
+
+    async fn history(
+        self,
+        zmx: &provider::ZmxProvider,
+        tmux: &provider::TmuxProvider,
+        session: &str,
+    ) -> Result<String> {
+        match self {
+            Self::Zmx => zmx.history(session).await,
+            Self::Tmux => tmux.history(session).await,
+        }
+    }
+
+    async fn kill(
+        self,
+        zmx: &provider::ZmxProvider,
+        tmux: &provider::TmuxProvider,
+        session: &str,
+    ) -> Result<()> {
+        match self {
+            Self::Zmx => zmx.kill(session).await,
+            Self::Tmux => tmux.kill(session).await,
+        }
+    }
+}
+
+async fn select_provider(
     zmx: &provider::ZmxProvider,
+    tmux: &provider::TmuxProvider,
     requested: Option<&str>,
     op: SessionOp,
-) -> Result<(), SessionReason> {
-    if let Some(provider) = requested
-        && provider != "zmx"
-    {
-        if provider == "raw" {
-            return Err(SessionReason::CapabilityUnsupported {
+) -> Result<SelectedProvider, SessionReason> {
+    if let Some(provider) = requested {
+        return match provider {
+            "zmx" => ensure_available(zmx.probe().await, "zmx", SelectedProvider::Zmx),
+            "tmux" => {
+                if op == SessionOp::Run {
+                    Err(SessionReason::CapabilityUnsupported {
+                        provider: provider.to_owned(),
+                        capability: op_name(op).to_owned(),
+                    })
+                } else {
+                    ensure_available(tmux.probe().await, "tmux", SelectedProvider::Tmux)
+                }
+            }
+            "raw" => Err(SessionReason::CapabilityUnsupported {
                 provider: provider.to_owned(),
                 capability: op_name(op).to_owned(),
-            });
-        }
-        return Err(SessionReason::ProviderNotFound(provider.to_owned()));
+            }),
+            other => Err(SessionReason::ProviderNotFound(other.to_owned())),
+        };
     }
-    let status = zmx
+
+    let zmx_status = zmx
         .probe()
         .await
         .map_err(|err| SessionReason::InternalError(err.to_string()))?;
-    if status.available {
-        Ok(())
+    if zmx_status.available {
+        return Ok(SelectedProvider::Zmx);
+    }
+    if op == SessionOp::Run {
+        return Err(SessionReason::ProviderUnavailable("zmx".to_owned()));
+    }
+    let tmux_status = tmux
+        .probe()
+        .await
+        .map_err(|err| SessionReason::InternalError(err.to_string()))?;
+    if tmux_status.available {
+        Ok(SelectedProvider::Tmux)
     } else {
         Err(SessionReason::ProviderUnavailable("zmx".to_owned()))
+    }
+}
+
+fn ensure_available(
+    status: Result<portl_proto::session_v1::ProviderStatus>,
+    name: &str,
+    selected: SelectedProvider,
+) -> Result<SelectedProvider, SessionReason> {
+    let status = status.map_err(|err| SessionReason::InternalError(err.to_string()))?;
+    if status.available {
+        Ok(selected)
+    } else {
+        Err(SessionReason::ProviderUnavailable(name.to_owned()))
     }
 }
 
@@ -473,12 +1042,12 @@ fn reject(reason: SessionReason) -> SessionAck {
     }
 }
 
-fn ok_empty() -> SessionAck {
+fn ok_empty(provider: &str) -> SessionAck {
     SessionAck {
         ok: true,
         reason: None,
         session_id: None,
-        provider: Some("zmx".to_owned()),
+        provider: Some(provider.to_owned()),
         providers: None,
         sessions: None,
         run: None,
@@ -486,22 +1055,22 @@ fn ok_empty() -> SessionAck {
     }
 }
 
-fn ok_with_sessions(sessions: Vec<String>) -> SessionAck {
+fn ok_with_sessions(provider: &str, sessions: Vec<String>) -> SessionAck {
     SessionAck {
         sessions: Some(sessions),
-        ..ok_empty()
+        ..ok_empty(provider)
     }
 }
-fn ok_with_run(run: portl_proto::session_v1::SessionRunResult) -> SessionAck {
+fn ok_with_run(provider: &str, run: portl_proto::session_v1::SessionRunResult) -> SessionAck {
     SessionAck {
         run: Some(run),
-        ..ok_empty()
+        ..ok_empty(provider)
     }
 }
-fn ok_with_output(output: String) -> SessionAck {
+fn ok_with_output(provider: &str, output: String) -> SessionAck {
     SessionAck {
         output: Some(output),
-        ..ok_empty()
+        ..ok_empty(provider)
     }
 }
 

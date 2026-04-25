@@ -91,6 +91,138 @@ async fn session_zmx_provider_maps_core_ops_over_session_protocol() -> Result<()
 }
 
 #[tokio::test]
+async fn session_attach_prefers_zmx_control_when_probe_succeeds() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let fake_zmx = temp.path().join("zmx");
+    let log = temp.path().join("zmx.log");
+    write_fake_zmx_control(&fake_zmx, &log)?;
+
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator, Some(fake_zmx)).await?;
+    let ticket = root_ticket(&operator, server.addr(), shell_caps(true));
+
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let providers = portl_core::net::open_session_providers(&connection, &session).await?;
+    let zmx = providers
+        .providers
+        .iter()
+        .find(|provider| provider.name == "zmx")
+        .context("missing zmx provider")?;
+    assert_eq!(zmx.tier.as_deref(), Some("control"));
+    assert!(zmx.features.contains(&"live_output.v1".to_owned()));
+
+    let mut attach = open_session_attach(
+        &connection,
+        &session,
+        None,
+        "dev".to_owned(),
+        Some(vec!["echo".to_owned(), "from-control".to_owned()]),
+        None,
+        None,
+        PtyCfg {
+            term: "xterm-256color".to_owned(),
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await?;
+    attach.close_stdin()?;
+    let mut attached = Vec::new();
+    AsyncReadExt::read_to_end(&mut attach.stdout, &mut attached).await?;
+    assert_eq!(String::from_utf8_lossy(&attached), "control:dev\n");
+    assert_eq!(attach.wait_exit().await?, 0);
+
+    let calls = fs::read_to_string(log)?;
+    assert!(calls.contains("control\n--protocol\nzmx-control/v1\n--probe\n"));
+    assert!(calls.contains(
+        "control\n--protocol\nzmx-control/v1\n--rows\n24\n--cols\n80\ndev\necho\nfrom-control\n"
+    ));
+    assert!(!calls.contains("attach\ndev\n"));
+
+    shutdown(connection, client, server, agent).await
+}
+
+#[tokio::test]
+async fn session_tmux_provider_attaches_with_control_mode() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let fake_tmux = temp.path().join("tmux");
+    let log = temp.path().join("tmux.log");
+    write_fake_tmux_control(&fake_tmux, &log)?;
+
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator, Some(fake_tmux)).await?;
+    let ticket = root_ticket(&operator, server.addr(), shell_caps(true));
+
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let providers = portl_core::net::open_session_providers(&connection, &session).await?;
+    assert_eq!(providers.default_provider.as_deref(), Some("tmux"));
+    assert!(
+        providers
+            .providers
+            .iter()
+            .any(|p| p.name == "tmux" && p.available)
+    );
+
+    let listed = open_session_list(&connection, &session, Some("tmux".to_owned())).await?;
+    assert_eq!(listed, vec!["dev".to_owned(), "frontend".to_owned()]);
+
+    let history = open_session_history(
+        &connection,
+        &session,
+        Some("tmux".to_owned()),
+        "dev".to_owned(),
+    )
+    .await?;
+    assert_eq!(history.trim(), "history:dev");
+
+    let mut attach = open_session_attach(
+        &connection,
+        &session,
+        Some("tmux".to_owned()),
+        "dev".to_owned(),
+        Some(vec!["top".to_owned()]),
+        None,
+        None,
+        PtyCfg {
+            term: "xterm-256color".to_owned(),
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await?;
+    attach.stdin.write_all(b"A\x03").await?;
+    attach.resize(100, 40).await?;
+    for _ in 0..50 {
+        if fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("stdin:resize-window -x 100 -y 40\n")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    attach.close_stdin()?;
+    let mut attached = Vec::new();
+    AsyncReadExt::read_to_end(&mut attach.stdout, &mut attached).await?;
+    assert!(
+        String::from_utf8_lossy(&attached).contains("tmux:dev"),
+        "tmux attach output was {:?}",
+        String::from_utf8_lossy(&attached)
+    );
+    assert_eq!(attach.wait_exit().await?, 0);
+
+    let calls = fs::read_to_string(log)?;
+    assert!(calls.contains("-CC\nnew-session\n-A\n-s\ndev\n-x\n80\n-y\n24\ntop\n"));
+    assert!(calls.contains("stdin:send-keys -H 41 03\n"));
+    assert!(calls.contains("stdin:refresh-client -C 100,40\n"));
+    assert!(calls.contains("stdin:resize-window -x 100 -y 40\n"));
+
+    shutdown(connection, client, server, agent).await
+}
+
+#[tokio::test]
 async fn session_provider_command_failure_returns_session_ack() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let fake_zmx = temp.path().join("zmx");
@@ -192,6 +324,80 @@ case "$1" in
   list) echo "list exploded" >&2; exit 77 ;;
 esac
 "#,
+    )?;
+    let mut perms = fs::metadata(path)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+fn write_fake_tmux_control(path: &std::path::Path, log: &std::path::Path) -> Result<()> {
+    fs::write(
+        path,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$@" >> "{}"
+case "$1" in
+  -V) echo "tmux 3.6" ;;
+  list-sessions) printf 'dev\nfrontend\n' ;;
+  capture-pane) echo "history:$9" ;;
+  kill-session) echo "killed:$3" ;;
+  -CC)
+    printf '\033P1000p%%output %%1 tmux:dev\\\\012\r\n'
+    while IFS= read -r line; do
+      printf 'stdin:%s\n' "$line" >> "{}"
+      [ "$line" = "detach-client" ] && exit 0
+    done
+    ;;
+  *) echo "not zmx" >&2; exit 64 ;;
+esac
+"#,
+            log.display(),
+            log.display()
+        ),
+    )?;
+    let mut perms = fs::metadata(path)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+fn write_fake_zmx_control(path: &std::path::Path, log: &std::path::Path) -> Result<()> {
+    fs::write(
+        path,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$@" >> "{}"
+if [ "$1" = "control" ] && [ "$2" = "--protocol" ] && [ "$3" = "zmx-control/v1" ] && [ "$4" = "--probe" ]; then
+  printf 'protocol=zmx-control/v1\n'
+  printf 'tier=control\n'
+  printf 'features=viewport_snapshot.v1,live_output.v1,priority_input.v1,adapter_sequence.v1\n'
+  exit 0
+fi
+if [ "$1" = "control" ] && [ "$2" = "--protocol" ] && [ "$3" = "zmx-control/v1" ]; then
+  if [ "$4" = "--rows" ] && [ "$6" = "--cols" ]; then
+    session="$8"
+  else
+    session="$4"
+  fi
+  case "$session" in
+    dev) printf '\001\014\000\000\000control:dev\n' ;;
+    *) exit 65 ;;
+  esac
+  exit 0
+fi
+case "$1" in
+  version) echo "zmx 0.0.fake" ;;
+  list) printf 'dev\nfrontend\n' ;;
+  run) session="$2"; shift 2; echo "run:${{session}}:$*" ;;
+  history) echo "history:$2" ;;
+  kill) echo "killed:$2" ;;
+  attach) session="$2"; shift 2; echo "attach:${{session}}:$*" ;;
+  *) echo "unknown:$1" >&2; exit 64 ;;
+esac
+"#,
+            log.display()
+        ),
     )?;
     let mut perms = fs::metadata(path)?.permissions();
     perms.set_mode(0o755);

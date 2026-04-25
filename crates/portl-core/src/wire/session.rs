@@ -90,6 +90,24 @@ impl ProviderCapabilities {
             exact_argv_spawn: false,
         }
     }
+
+    #[must_use]
+    pub const fn tmux() -> Self {
+        Self {
+            persistent: true,
+            multi_attach: true,
+            create_on_attach: true,
+            attach_command: true,
+            run: false,
+            detached_run: false,
+            history: true,
+            tail: false,
+            kill: true,
+            terminal_state_restore: true,
+            external_direct_attach: false,
+            exact_argv_spawn: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +117,10 @@ pub struct ProviderStatus {
     pub path: Option<String>,
     pub notes: Option<String>,
     pub capabilities: ProviderCapabilities,
+    #[serde(default)]
+    pub tier: Option<String>,
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,6 +231,8 @@ mod tests {
                     path: Some("/usr/bin/zmx".to_owned()),
                     notes: None,
                     capabilities: ProviderCapabilities::zmx(),
+                    tier: Some("control".to_owned()),
+                    features: vec!["live_output.v1".to_owned()],
                 }],
             }),
             sessions: Some(vec!["dev".to_owned()]),
