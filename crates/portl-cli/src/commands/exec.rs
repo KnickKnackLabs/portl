@@ -10,7 +10,7 @@ use portl_core::ticket::schema::{Capabilities, EnvPolicy, ShellCaps};
 use tokio::io::{AsyncWriteExt, copy};
 use tracing::debug;
 
-use crate::commands::peer_resolve::connect_peer;
+use crate::commands::peer_resolve::{close_connected, connect_peer};
 
 pub fn run(peer: &str, cwd: Option<&str>, user: Option<&str>, argv: &[String]) -> Result<ExitCode> {
     let runtime = tokio::runtime::Runtime::new()?;
@@ -63,13 +63,7 @@ pub fn run(peer: &str, cwd: Option<&str>, user: Option<&str>, argv: &[String]) -
         }
         await_output_task(stdout_task, "stdout").await?;
         await_output_task(stderr_task, "stderr").await?;
-        connected.connection.close(0u32.into(), b"exec complete");
-        if tokio::time::timeout(Duration::from_millis(250), connected.endpoint.close())
-            .await
-            .is_err()
-        {
-            debug!("timed out closing exec endpoint");
-        }
+        close_connected(connected, b"exec complete").await;
         Ok(exit_code_from_i32(code))
     });
     runtime.shutdown_background();

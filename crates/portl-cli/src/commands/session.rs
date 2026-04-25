@@ -15,7 +15,7 @@ use portl_core::ticket::schema::{Capabilities, EnvPolicy, ShellCaps};
 use tokio::io::{AsyncWriteExt, copy};
 use tracing::debug;
 
-use crate::commands::peer_resolve::connect_peer;
+use crate::commands::peer_resolve::{close_connected, connect_peer};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SessionHistoryFormat {
@@ -68,7 +68,7 @@ pub fn providers(target: &str, json: bool) -> Result<ExitCode> {
                 );
             }
         }
-        close_connected(connected).await;
+        close_connected(connected, b"session complete").await;
         Ok(ExitCode::SUCCESS)
     });
     runtime.shutdown_background();
@@ -92,7 +92,7 @@ pub fn ls(target: &str, provider: Option<&str>, json: bool) -> Result<ExitCode> 
                 println!("{session}");
             }
         }
-        close_connected(connected).await;
+        close_connected(connected, b"session complete").await;
         Ok(ExitCode::SUCCESS)
     });
     runtime.shutdown_background();
@@ -118,7 +118,7 @@ pub fn run(
         .await?;
         print!("{}", run.stdout);
         eprint!("{}", run.stderr);
-        close_connected(connected).await;
+        close_connected(connected, b"session complete").await;
         Ok(exit_code_from_i32(run.code))
     });
     runtime.shutdown_background();
@@ -148,7 +148,7 @@ pub fn history(
         )
         .await?;
         print!("{output}");
-        close_connected(connected).await;
+        close_connected(connected, b"session complete").await;
         Ok(ExitCode::SUCCESS)
     });
     runtime.shutdown_background();
@@ -166,7 +166,7 @@ pub fn kill(target: &str, session: Option<&str>, provider: Option<&str>) -> Resu
             default_session_name(target, session),
         )
         .await?;
-        close_connected(connected).await;
+        close_connected(connected, b"session complete").await;
         Ok(ExitCode::SUCCESS)
     });
     runtime.shutdown_background();
@@ -204,7 +204,7 @@ pub fn attach(
         )
         .await?;
         let code = bridge_attach(session, cols, rows).await?;
-        close_connected(connected).await;
+        close_connected(connected, b"session complete").await;
         Ok(exit_code_from_i32(code))
     });
     runtime.shutdown_background();
@@ -312,16 +312,6 @@ fn default_session_name(target: &str, session: Option<&str>) -> String {
 fn looks_like_raw_target(target: &str) -> bool {
     target.starts_with("portl")
         || (target.len() == 64 && target.chars().all(|c| c.is_ascii_hexdigit()))
-}
-
-async fn close_connected(connected: crate::commands::peer_resolve::ConnectedPeer) {
-    connected.connection.close(0u32.into(), b"session complete");
-    if tokio::time::timeout(Duration::from_millis(250), connected.endpoint.close())
-        .await
-        .is_err()
-    {
-        debug!("timed out closing session endpoint");
-    }
 }
 
 fn exit_code_from_i32(code: i32) -> ExitCode {

@@ -21,7 +21,7 @@
 //!    ticket against that endpoint.
 //! 6. Otherwise: hard error listing possible sources.
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::address_lookup::AddressLookupFailed;
@@ -36,6 +36,7 @@ use portl_core::peer_store::PeerStore;
 use portl_core::ticket::mint::mint_root;
 use portl_core::ticket::schema::{Capabilities, PortlTicket};
 use portl_core::ticket_store::TicketStore;
+use tracing::debug;
 
 use crate::alias_store::AliasStore;
 
@@ -109,7 +110,27 @@ pub(crate) async fn connect_peer(peer: &str, caps: Capabilities) -> Result<Conne
     let identity_path = resolve_identity_path(None);
     let identity = store::load(&identity_path).context("load local identity")?;
     let endpoint = bind_client_endpoint(&identity).await?;
-    connect_peer_with_endpoint(peer, caps, &identity, &endpoint).await
+    match connect_peer_with_endpoint(peer, caps, &identity, &endpoint).await {
+        Ok(connected) => Ok(connected),
+        Err(err) => {
+            close_client_endpoint(endpoint, "connect failure").await;
+            Err(err)
+        }
+    }
+}
+
+pub(crate) async fn close_connected(connected: ConnectedPeer, reason: &'static [u8]) {
+    connected.connection.close(0u32.into(), reason);
+    close_client_endpoint(connected.endpoint, "connected peer").await;
+}
+
+pub(crate) async fn close_client_endpoint(endpoint: iroh::Endpoint, context: &'static str) {
+    if tokio::time::timeout(Duration::from_secs(5), endpoint.close())
+        .await
+        .is_err()
+    {
+        debug!(context, "timed out closing CLI endpoint");
+    }
 }
 
 pub(crate) async fn bind_client_endpoint(identity: &Identity) -> Result<iroh::Endpoint> {

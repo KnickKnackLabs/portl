@@ -14,7 +14,7 @@ use portl_proto::meta_v1::{MetaReq, MetaResp};
 use portl_proto::wire::StreamPreamble;
 use serde::{Deserialize, Serialize};
 
-use crate::commands::peer_resolve::{ResolveOpts, resolve_peer};
+use crate::commands::peer_resolve::{ResolveOpts, close_client_endpoint, resolve_peer};
 
 pub fn run(
     target: Option<&str>,
@@ -251,12 +251,13 @@ fn run_with_identity_path_mode_timeout(
     runtime.block_on(async move {
         let identity = store::load(&identity_path).context("load local identity")?;
         let raw_endpoint = crate::client_endpoint::bind_client_endpoint(&identity).await?;
-        tokio::time::timeout(
+        let outcome = tokio::time::timeout(
             timeout,
-            run_with_endpoint(peer, identity, raw_endpoint, relay),
+            run_with_endpoint(peer, identity, raw_endpoint.clone(), relay),
         )
-        .await
-        .with_context(|| format!("timeout after {}", humantime::format_duration(timeout)))?
+        .await;
+        close_client_endpoint(raw_endpoint, "status command").await;
+        outcome.with_context(|| format!("timeout after {}", humantime::format_duration(timeout)))?
     })
 }
 
@@ -308,7 +309,7 @@ async fn run_with_endpoint(
     );
 
     connection.close(0u32.into(), b"status complete");
-    raw_endpoint.close().await;
+    close_client_endpoint(raw_endpoint, "status command").await;
     Ok(ExitCode::SUCCESS)
 }
 
