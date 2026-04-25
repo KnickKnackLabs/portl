@@ -5,6 +5,16 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.5.2 — 2026-04-26
+
+### Added
+
+- Added executable `mise` release tasks for preparing, verifying,
+  drafting changelog notes for, and tagging Portl releases.
+- Added a project release skill that guides future agent-assisted
+  releases through changelog review, version bumps, verification, CI
+  checks, and tag publication.
+
 ## 0.5.1 — 2026-04-26
 
 CLI cleanup patch release after the v0.5.0 session-control release.
