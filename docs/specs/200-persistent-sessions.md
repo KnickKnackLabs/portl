@@ -1,23 +1,27 @@
 # 200 — Persistent Sessions and Providers
 
-> Status: **implemented in v0.4.0 as an MVP slice**. The shipped
-> implementation adds `portl/session/v1`, top-level `portl session`,
-> zmx CLI bridging, raw discovery fallback, Docker/Slicer provider
-> hints, and ShellCaps-based authorization with session-vocabulary
-> errors. Dedicated `SessionCaps`, richer provider-native APIs, and
-> additional providers remain future work described by this target
-> design.
+> Status: **baseline shipped in v0.4.0**. This document now records the
+> implemented persistent-sessions baseline and preserves target-design
+> intent where useful. v0.4.0 shipped `portl/session/v1`, top-level
+> `portl session`, zmx CLI bridging, raw discovery metadata,
+> Docker/Slicer `--session-provider zmx` provisioning, ticket presets,
+> and ShellCaps-backed authorization with session-vocabulary errors.
+> Dedicated `SessionCaps`, additional providers, provider-native APIs,
+> and viewport-aware/session-control lanes are follow-on work. The
+> viewport/session-control follow-on belongs in
+> `docs/specs/210-session-control-lanes.md`.
 
 ## 1. Summary
 
-portl currently has two terminal-adjacent primitives:
+As of v0.4.0, portl has three terminal-adjacent primitives. Before this
+release it had two:
 
 - `portl shell <target>` opens a one-shot remote PTY and dies when the
   client disconnects.
 - `portl exec <target> -- <argv>...` runs a non-PTY command with
   separate stdin/stdout/stderr and script-friendly exit-code behavior.
 
-This spec adds a third primitive:
+v0.4.0 added the third primitive:
 
 - `portl session ...` manages persistent terminal workspaces on a
   target.
@@ -31,12 +35,16 @@ session = persistent terminal workspace
 provider = how the target keeps the session alive
 ```
 
-The first provider is `zmx`, because it already solves the hard human
+The shipped provider is `zmx`, because it already solves the hard human
 terminal problems: attach/detach, multiple clients, history, and
 terminal-state restoration via Ghostty's virtual terminal machinery.
 The portl design must not become zmx-specific: `tmux`, `zellij`, and a
 future native provider remain possible providers behind the same
 capability-gated interface.
+
+Viewport-aware attach behavior, explicit session-control lanes, and
+richer active-session control are intentionally outside this baseline;
+track that work in `docs/specs/210-session-control-lanes.md`.
 
 Adapters such as Docker and Slicer may provision session providers so
 portl-managed targets work out of the box. The `session` command itself
@@ -144,23 +152,24 @@ default.
 ### 4.4 Provider
 
 A provider is the target-side mechanism that keeps terminal sessions
-alive. Initial providers:
+alive. Implemented and planned providers:
 
-| Provider | Role |
-| --- | --- |
-| `raw` | Current one-shot PTY behavior; non-persistent fallback. |
-| `zmx` | First persistent provider. Uses zmx commands on the target. |
-| `tmux` | Future external multiplexer provider. |
-| `zellij` | Future external multiplexer provider. |
-| `native` | Future portl-owned persistent manager, likely backed by libghostty-vt bindings if terminal-state restoration is required. |
+| Provider | v0.4.0 status | Role |
+| --- | --- | --- |
+| `zmx` | implemented | First persistent provider. Uses zmx commands on the target. |
+| `raw` | discovery-only metadata | Current one-shot PTY behavior; advertised so the user can see that no persistent provider is available, but not used as a silent fallback for persistent operations. |
+| `tmux` | future | External multiplexer provider. |
+| `zellij` | future | External multiplexer provider. |
+| `native` | future | Portl-owned persistent manager, likely backed by libghostty-vt bindings if terminal-state restoration is required. |
 
-Provider support is capability-discovered, not assumed.
+Provider support is capability-discovered, not assumed. v0.4.0 reports
+`zmx` and `raw`; it does not report `tmux`, `zellij`, or `native` yet.
 
 ## 5. CLI surface
 
 ### 5.1 New command group
 
-Add a top-level command group:
+v0.4.0 adds a top-level command group:
 
 ```text
 portl session <subcommand>
@@ -171,7 +180,7 @@ This command lives in the **Connect** help group from
 **Permissions** namespace; `session` is the user-facing terminal
 workspace namespace.
 
-Initial subcommands:
+Shipped v0.4.0 subcommands:
 
 ```bash
 portl session attach <target> [session] [--provider PROVIDER] [--user USER] [--cwd CWD] [-- <cmd>...]
@@ -183,7 +192,9 @@ portl session kill <target> [session] [--provider PROVIDER]
 ```
 
 `attach` is the primary happy-path command. It attaches to the named
-session, creating it if the provider supports create-on-attach.
+session, creating it if the provider supports create-on-attach. The CLI
+exposes `--format plain|vt|html` for `history`, but v0.4.0 accepts only
+`plain`; `vt` and `html` fail locally before opening a session request.
 
 Examples:
 
@@ -216,18 +227,25 @@ injection.
 
 ### 5.3 Provider selection
 
-Provider selection is deterministic:
+v0.4.0 provider selection is intentionally narrower than the full
+target design:
 
-1. If `--provider` is set, use that provider or return an actionable
-   error.
-2. Else if alias metadata names a preferred provider, use it if
-   available.
-3. Else if remote agent config names a preferred provider, use it if
-   available.
-4. Else choose the best available provider by default order:
-   `zmx`, `tmux`, `zellij`, `native`, `raw`.
-5. If the requested operation requires persistence and only `raw` is
-   available, error rather than silently opening a non-persistent shell.
+1. If `--provider zmx` is set, the target must have zmx available.
+2. If `--provider raw` is set for a persistent operation, the request
+   fails with a provider capability error.
+3. If any other `--provider` is set, the request fails as unsupported
+   by the target.
+4. If `--provider` is omitted, the target-side handler selects zmx when
+   zmx is available. If zmx is unavailable, persistent operations fail
+   rather than silently opening a non-persistent shell.
+5. `portl session providers` always returns discovery metadata and may
+   report `raw` as available even when no persistent provider exists.
+
+Alias metadata and `PORTL_SESSION_PROVIDER` are recorded/validated for
+adapter provisioning, but the v0.4.0 session command does not yet use
+alias metadata to choose among multiple providers. There is only one
+persistent provider implementation, and `PORTL_SESSION_PROVIDER_PATH`
+only influences where the target-side zmx CLI is found.
 
 ### 5.4 Provider discovery
 
@@ -237,8 +255,6 @@ capabilities:
 ```text
 PROVIDER  AVAILABLE  DEFAULT  NOTES
 zmx       yes        yes      /usr/local/bin/zmx
-tmux      no         no       not found
-zellij    no         no       not found
 raw       yes        no       one-shot PTY fallback
 ```
 
@@ -246,20 +262,46 @@ JSON shape:
 
 ```json
 {
-  "target": "dev",
   "default_provider": "zmx",
   "providers": [
     {
       "name": "zmx",
       "available": true,
       "path": "/usr/local/bin/zmx",
+      "notes": "zmx 0.1.0",
       "capabilities": {
         "persistent": true,
         "multi_attach": true,
-        "history": true,
+        "create_on_attach": true,
+        "attach_command": true,
         "run": true,
+        "detached_run": false,
+        "history": true,
+        "tail": false,
+        "kill": true,
         "terminal_state_restore": true,
-        "external_direct_attach": true
+        "external_direct_attach": true,
+        "exact_argv_spawn": false
+      }
+    },
+    {
+      "name": "raw",
+      "available": true,
+      "path": null,
+      "notes": "one-shot PTY fallback",
+      "capabilities": {
+        "persistent": false,
+        "multi_attach": false,
+        "create_on_attach": false,
+        "attach_command": false,
+        "run": false,
+        "detached_run": false,
+        "history": false,
+        "tail": false,
+        "kill": false,
+        "terminal_state_restore": false,
+        "external_direct_attach": false,
+        "exact_argv_spawn": false
       }
     }
   ]
@@ -268,8 +310,10 @@ JSON shape:
 
 ## 6. Provider interface
 
-The internal provider abstraction is intentionally small and
-capability-based.
+The provider interface is intentionally small and capability-based. In
+v0.4.0, the code implements this as a concrete `ZmxProvider` helper plus
+wire-level `ProviderCapabilities`; the trait below remains the
+multi-provider target shape rather than shipped Rust API.
 
 Conceptual Rust shape:
 
@@ -310,7 +354,8 @@ Do not normalize away real provider differences. If a provider does not
 support history, `portl session history` returns a clear provider
 capability error. If a provider's `run` is shell injection rather than
 exact argv, document it and keep `portl exec` as the exact-argv
-primitive.
+primitive. The v0.4.0 zmx bridge sets `exact_argv_spawn = false` for
+this reason.
 
 ## 7. zmx provider
 
@@ -319,11 +364,11 @@ primitive.
 The first zmx implementation shells out to the target-side `zmx` CLI.
 This gives a fast vertical slice and preserves direct zmx usability.
 
-Initial mapping:
+v0.4.0 mapping:
 
 | portl operation | zmx command |
 | --- | --- |
-| `providers` | `command -v zmx`, `zmx version` |
+| `providers` | resolve explicit `PORTL_SESSION_PROVIDER_PATH` or search `/usr/local/bin`, `/usr/bin`, `/bin`; then `zmx version` |
 | `attach <session>` | `zmx attach <session>` |
 | `attach <session> -- <cmd>...` | `zmx attach <session> <cmd>...` |
 | `ls` | `zmx list` |
@@ -331,19 +376,23 @@ Initial mapping:
 | `history <session>` | `zmx history <session>` |
 | `kill <session>` | `zmx kill <session>` |
 
-Later, portl may speak zmx's Unix-socket IPC directly for richer
-status and errors. That is an optimization, not the first design.
+The provider command environment is cleared and rebuilt with a safe
+`PATH` so provider subprocesses do not inherit portl secrets such as
+identity material. Later, portl may speak zmx's Unix-socket IPC directly
+for richer status and errors. That remains future work.
 
 ### 7.2 Direct zmx use
 
-Do not hide zmx. If portl attaches to a zmx-backed session, the CLI may
-print a pre-raw-mode hint:
+Do not hide zmx. When portl attaches to a zmx-backed session, the
+v0.4.0 CLI prints a small pre-raw-mode hint:
 
 ```text
-portl: using alias "dev" (docker)
-portl: using session provider zmx
-portl: attaching to session "dev" as root
+portl: using session provider target default
+portl: attaching to session "dev"
 ```
+
+When `--provider zmx` is supplied, the first line names `zmx` instead of
+`target default`.
 
 Where appropriate, setup commands can also print:
 
@@ -356,17 +405,21 @@ the user opts into a prefix.
 
 ## 8. Ticket and capability model
 
-### 8.1 MVP gate
+### 8.1 v0.4.0 gate
 
-The first implementation may gate session operations with existing
-`ShellCaps`:
+The shipped v0.4.0 implementation gates all session operations with
+existing `ShellCaps`:
 
 - attach/create require PTY shell permission,
 - run through provider requires PTY shell permission,
-- provider command execution is still subject to env/user policy where
-  possible.
+- interactive attach is spawned through the existing shell handler and
+  honors its user/cwd checks,
+- non-interactive provider operations (`providers`, `ls`, `run`,
+  `history`, `kill`) run the zmx CLI with a sanitized provider
+  environment; they do not yet have dedicated per-operation session
+  caps or provider-specific user/cwd switching.
 
-However, user-facing errors should already use session vocabulary:
+User-facing errors already use session vocabulary:
 
 ```text
 ticket does not allow persistent sessions
@@ -404,25 +457,26 @@ opening an interactive PTY.
 
 ### 8.3 Presets
 
-Ticket UX should offer friendly presets:
+Ticket UX offers friendly presets:
 
 ```bash
-portl ticket issue --caps session --ttl 1d
-portl ticket issue --caps shell --ttl 1d
-portl ticket issue --caps exec --ttl 1d
-portl ticket issue --caps dev --ttl 7d
+portl ticket issue session --ttl 1d
+portl ticket issue shell --ttl 1d
+portl ticket issue exec --ttl 1d
+portl ticket issue dev --ttl 7d
 ```
 
-Suggested meanings:
+v0.4.0 meanings:
 
 | Preset | Meaning |
 | --- | --- |
-| `shell` | one-shot PTY shell only |
-| `exec` | non-PTY exec only |
-| `session` | persistent session attach/create/run/history, no kill by default |
-| `dev` | shell + exec + session + localhost TCP/UDP conveniences |
+| `shell` | full shell access in the current grammar: PTY shell plus exec |
+| `exec` | non-PTY exec only; does not grant shell/session |
+| `session` | persistent-session preset encoded as full ShellCaps in v0.4.0, so it is not isolated from `shell` until dedicated SessionCaps exist |
+| `dev` | alias for `all` in v0.4.0 |
 
-Advanced cap syntax can follow later. Presets are the onboarding path.
+Advanced session-specific cap syntax can follow later. Presets are the
+onboarding path.
 
 ## 9. Enforcement layers
 
@@ -460,14 +514,18 @@ time window, chain, holder proof, revocation, and requested caps.
 
 ### 9.4 Session protocol handler
 
-The target-side `session` handler enforces:
+The target-side `session` handler enforces the v0.4.0 baseline:
 
-- operation allowed by ticket caps,
-- provider allowed by ticket caps,
-- user allowed by ticket caps,
-- session name allowed by ticket caps,
-- provider is available,
-- provider supports the requested operation.
+- session access via existing `ShellCaps`, including user/cwd policy as
+  interpreted by shell authorization,
+- requested provider is either omitted or `zmx`,
+- `raw` is discovery-only and reports unsupported persistent
+  capabilities,
+- zmx is available before persistent operations run,
+- required operation inputs exist, such as session name and run argv.
+
+Dedicated provider allowlists, session-name allowlists, per-operation
+session caps, and multi-provider capability dispatch are future work.
 
 ### 9.5 Provider
 
@@ -477,7 +535,7 @@ not replace portl authorization.
 
 ## 10. Wire protocol direction
 
-Add a separate ALPN rather than overloading `portl/shell/v1`:
+v0.4.0 adds a separate ALPN rather than overloading `portl/shell/v1`:
 
 ```text
 portl/session/v1
@@ -518,9 +576,11 @@ stream bridging.
 
 ## 11. Docker and Slicer integration
 
-Adapters provision targets. They can also make providers available and
-record expected provider metadata. `portl session` remains
-target-neutral.
+Adapters provision targets. v0.4.0 Docker and Slicer surfaces accept
+`--session-provider zmx`, can make zmx available for managed targets,
+and record provider metadata in `aliases.json`. `portl session` remains
+target-neutral and confirms provider availability with the target-side
+agent.
 
 ### 11.1 Docker bake
 
@@ -532,8 +592,10 @@ portl docker run ubuntu-portl-zmx --name dev
 portl session attach dev
 ```
 
-The generated image includes `portl-agent`, `zmx`, and default provider
-env/config.
+The generated image includes `portl-agent` and provider env/config. If
+`PORTL_ZMX_BINARY` is set, the bake context copies that zmx binary to
+`/usr/local/bin/zmx` and sets `PORTL_SESSION_PROVIDER_PATH`; otherwise
+the Dockerfile requires the base image to already provide `zmx`.
 
 ### 11.2 Docker runtime injection
 
@@ -544,9 +606,10 @@ portl docker run ubuntu:24.04 --name dev --session-provider zmx
 portl docker attach existing --session-provider zmx
 ```
 
-The adapter copies a target-appropriate zmx binary alongside
-`portl-agent`, records provider metadata in `aliases.json`, and sets
-agent/provider env where possible.
+The adapter copies a target-appropriate zmx binary when
+`PORTL_ZMX_BINARY` is set; otherwise it verifies that `zmx` already
+exists in the container. It records provider metadata in `aliases.json`
+and sets agent/provider env where possible.
 
 This path is convenient but less deterministic than bake: minimal
 images, cross-architecture binaries, glibc/musl compatibility, and
@@ -554,15 +617,16 @@ restricted networks may all matter.
 
 ### 11.3 Slicer
 
-Slicer should support provider installation in userdata:
+Slicer supports provider installation metadata in userdata:
 
 ```bash
 portl slicer run dev-image --session-provider zmx
 portl session attach <vm-alias>
 ```
 
-The userdata installs portl, installs zmx when requested, and writes a
-provider default into `/etc/portl/agent.env` or future config.
+The userdata request carries `session_provider: "zmx"` when requested,
+and the local alias metadata records the provider. The exact target-side
+installation behavior is owned by the Slicer adapter/userdata path.
 
 ### 11.4 Manual hosts
 
@@ -587,7 +651,7 @@ but it must be explicit and auditable.
 
 ## 12. Alias and config metadata
 
-Alias metadata may record provider expectations:
+Alias metadata records provider expectations in v0.4.0:
 
 ```rust
 pub struct StoredSpec {
@@ -604,14 +668,19 @@ pub struct SessionProviderInstall {
 }
 ```
 
-Agent config/env may eventually include:
+Agent config/env includes:
 
 ```text
 PORTL_SESSION_PROVIDER=zmx
 PORTL_SESSION_PROVIDER_PATH=/usr/local/bin/zmx
-PORTL_SESSION_DIR=/var/lib/portl/sessions
 ```
 
+A future native/session-manager provider may add state-directory config
+such as `PORTL_SESSION_DIR`, but v0.4.0 does not implement it.
+
+`PORTL_SESSION_PROVIDER` is parsed/validated as `zmx` but is not yet a
+multi-provider selection mechanism. `PORTL_SESSION_PROVIDER_PATH` is the
+path the zmx bridge uses before falling back to safe-path discovery.
 Provider-specific env must preserve direct-provider usability. For zmx,
 be careful with `ZMX_DIR`: a private portl-owned socket directory is
 good for Docker isolation but may make direct `zmx attach` harder on
@@ -648,40 +717,49 @@ or provider policy rather than surprising users.
 
 ## 14. Audit
 
-Add audit events distinct from existing `shell_start` / `shell_exit`:
+v0.4.0 adds audit events distinct from existing `shell_start` /
+`shell_exit` for the shipped operations, and the target model leaves
+room for future lifecycle events:
 
 ```text
 audit.session_providers
 audit.session_attach
-audit.session_detach
-audit.session_create
+audit.session_detach     # future explicit lifecycle/control event
+audit.session_create     # future explicit lifecycle/control event
 audit.session_run
 audit.session_history
 audit.session_kill
 audit.session_reject
 ```
 
-Common fields:
+Implemented common fields:
 
 ```text
 ticket_id
 caller_endpoint_id
-target_endpoint_id
 provider
 session_name
 operation
-user
-cwd
-argv0
+session_user
+session_cwd
+session_argv0
 reason
 ```
+
+`target_endpoint_id` and richer lifecycle state can be added later if
+needed.
 
 Preserve the current audit principle: do not log secrets or full argv
 vectors by default.
 
 ## 15. Error messages
 
-Errors must teach the model.
+Errors must teach the model. v0.4.0 implements session-vocabulary
+client errors for capability denial, unsupported providers,
+unavailable zmx, unsupported raw capabilities, missing session names,
+missing run argv, provider spawn failure, and internal errors. The more
+context-rich examples below remain the target UX direction for follow-on
+polish.
 
 Unknown target:
 
@@ -752,8 +830,8 @@ This command needs:
 
 ## 16. Top-level help impact
 
-Once `session` exists, the help grouping should treat `ticket` as
-advanced permissions and `session` as a connection verb:
+With `session` shipped, the help grouping treats `ticket` as advanced
+permissions and `session` as a connection verb:
 
 ```text
 Setup
@@ -783,46 +861,57 @@ Connect to a target:
 
 ## 17. Phased rollout
 
-### Phase 1 — UX and protocol skeleton
+### Phase 1 — UX and protocol skeleton (shipped in v0.4.0)
 
-- Add `portl session` command surface.
-- Add `portl/session/v1` request/response structs.
-- Add provider discovery.
-- Implement `raw` provider as a non-persistent fallback for discovery
-  only, not as silent fallback for persistent commands.
+- Added `portl session` command surface.
+- Added `portl/session/v1` request/response structs.
+- Added provider discovery.
+- Implemented `raw` provider metadata as a non-persistent fallback for
+  discovery only, not as silent fallback for persistent commands.
 
-### Phase 2 — zmx vertical slice
+### Phase 2 — zmx vertical slice (shipped in v0.4.0)
 
-- Implement zmx provider via external CLI.
-- Support `attach`, `providers`, `ls`, `run`, `history`, and `kill`.
-- Gate with existing shell caps initially while preserving session
-  vocabulary in errors.
-- Add audit events.
+- Implemented zmx provider via external CLI.
+- Supported `attach`, `providers`, `ls`, `run`, `history`, and `kill`.
+- Gated with existing shell caps while preserving session vocabulary in
+  errors.
+- Added audit events.
 
-### Phase 3 — adapter provisioning
+### Phase 3 — adapter provisioning (baseline shipped in v0.4.0)
 
-- Add `--session-provider zmx` to Docker run/attach/bake.
-- Add `--session-provider zmx` to Slicer run/userdata.
-- Store provider metadata in alias specs.
+- Added `--session-provider zmx` to Docker run/attach/bake.
+- Added `--session-provider zmx` to Slicer run/userdata.
+- Stored provider metadata in alias specs.
 - Surface provider status in `status`, `docker ls`, or `slicer ls`
-  once the discovery flow is stable.
+  once the discovery flow is stable. v0.4.0 records Docker/Slicer alias
+  metadata and includes Docker `session_provider` in JSON listing, but
+  broad status/list surfacing remains follow-on.
 
-### Phase 4 — explicit session caps
+### Phase 4 — explicit session caps (future)
 
 - Add `SessionCaps` to ticket schema.
-- Add friendly cap presets.
+- Move the friendly `session` preset from ShellCaps encoding to
+  dedicated SessionCaps semantics.
 - Update resolver/requested caps for every session operation.
 
-### Phase 5 — additional providers
+### Phase 5 — additional providers (future)
 
 - Add tmux provider if command mapping is reliable.
 - Add zellij provider after an API spike.
 - Consider native provider only if external providers cannot satisfy
   core use cases.
 
+### Phase 6 — session-control lanes (future, spec 210)
+
+- Define viewport-aware attach/control behavior in
+  `docs/specs/210-session-control-lanes.md`.
+- Define any explicit control lanes for resize, detach, tail/follow,
+  active attach state, or richer provider-native status there rather
+  than expanding this baseline spec.
+
 ## 18. Acceptance criteria
 
-The first complete feature slice is accepted when:
+The v0.4.0 baseline feature slice is accepted when:
 
 1. `portl session providers <target>` works for a target with and
    without zmx.
@@ -837,26 +926,34 @@ The first complete feature slice is accepted when:
    ergonomic improvements.
 7. Docker or Slicer can provision a target with zmx such that the next
    command is `portl session attach <alias>`.
-8. Errors name the relevant target source, permission, provider, and
-   next command.
+8. Errors use persistent-session vocabulary for permission, provider,
+   missing-input, and provider-spawn failures. Naming every target
+   source and next command remains follow-on polish.
 9. Audit records distinguish session operations from one-shot shell
    operations.
 
-## 19. Open questions
+These criteria are satisfied for the baseline shipped in v0.4.0, with
+criterion 8 intentionally scoped to the implemented error vocabulary.
 
-1. Should `portl session attach <target>` require zmx/persistence, or
-   may it attach through `raw` with an explicit warning? This spec
-   recommends erroring when persistence was requested and only `raw` is
-   available.
-2. Should zmx session names be prefixed by default on Docker/Slicer
-   targets, e.g. `portl-dev`, or should direct human names win? This
-   spec recommends human names, with opt-in prefixing later.
-3. Should `session.run` be included in the friendly `session` ticket
-   preset? zmx supports it, but it is shell injection rather than
-   exact-argv execution. This spec recommends including it but making
-   docs point users to `exec` for exact argv.
-4. How much provider installation should `portl session install-provider`
-   eventually support on manual hosts? This spec keeps manual mutation
-   explicit and out of the MVP.
-5. Should Slicer default to zmx once the provider path is proven? This
-   spec allows that as a later adapter policy, not a protocol rule.
+## 19. Resolved baseline decisions and follow-on questions
+
+Resolved in v0.4.0:
+
+1. `portl session attach <target>` requires a persistent provider;
+   `raw` is discovery-only and is not a silent fallback.
+2. Default session names remain human-readable: target label/alias when
+   available, otherwise `default` for inline tickets and raw endpoint
+   ids.
+3. The friendly `session` ticket preset exists and is encoded as
+   ShellCaps until dedicated SessionCaps are added.
+4. Manual hosts are not silently mutated; missing zmx errors direct the
+   user toward `portl shell` or explicit zmx installation.
+
+Still future:
+
+1. How much provider installation should `portl session install-provider`
+   eventually support on manual hosts?
+2. Should Slicer default to zmx once the provider path is proven?
+3. Which viewport-aware/session-control behaviors belong in the next
+   layer? Answer in `docs/specs/210-session-control-lanes.md`, not in
+   this baseline spec.

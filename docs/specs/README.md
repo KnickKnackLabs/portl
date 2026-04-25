@@ -77,7 +77,8 @@ prose still use `node_id`. Treat them as synonymous.
 | 170 | `170-v0.3.3-relay.md` | **v0.3.3 design spec.** Relay configuration, diagnostics, and reachability improvements. |
 | 180 | `180-v0.3.4-peer-pairing.md` | **Historical shipped spec.** Peer pairing via invite/pair/accept; superseded by the CLI vocabulary direction in `190`. |
 | 190 | `190-cli-ergonomics.md` | **Draft.** CLI friction-reduction target: help text, examples, actionable errors, command grouping, completions, selected surface cleanup. |
-| 200 | `200-persistent-sessions.md` | **Draft.** Persistent terminal sessions via a provider interface, with zmx first and Docker/Slicer provisioning hooks. |
+| 200 | `200-persistent-sessions.md` | **Draft / v0.4.0 baseline.** Persistent terminal sessions via a provider interface, with zmx first and Docker/Slicer provisioning hooks. |
+| 210 | `210-session-control-lanes.md` | **Draft.** Follow-on design for viewport-aware session control, provider tiers, and iroh lane scheduling. |
 
 ## Specs vs plans — where does what go
 
