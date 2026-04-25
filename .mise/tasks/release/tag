@@ -1,0 +1,65 @@
+#!/usr/bin/env -S uv run --script
+#MISE description="Create and push an annotated Portl release tag"
+# /// script
+# requires-python = ">=3.11"
+# ///
+from __future__ import annotations
+
+import argparse
+import re
+import subprocess
+from pathlib import Path
+
+VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+def out(cmd: list[str]) -> str:
+    return subprocess.check_output(cmd, text=True).strip()
+
+
+def run(cmd: list[str]) -> None:
+    print("$", " ".join(cmd))
+    subprocess.run(cmd, check=True)
+
+
+def require_clean() -> None:
+    status = out(["git", "status", "--porcelain"])
+    if status:
+        raise SystemExit("Working tree must be clean before tagging:\n" + status)
+
+
+def tag_exists(tag: str) -> bool:
+    return subprocess.run(["git", "rev-parse", "-q", "--verify", f"refs/tags/{tag}"], capture_output=True).returncode == 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Tag a Portl release")
+    parser.add_argument("version")
+    parser.add_argument("--no-push", action="store_true")
+    parser.add_argument("--allow-unpushed", action="store_true")
+    args = parser.parse_args()
+    if not VERSION_RE.match(args.version):
+        raise SystemExit(f"Invalid version {args.version!r}; expected X.Y.Z")
+    tag = f"v{args.version}"
+    require_clean()
+    if tag_exists(tag):
+        raise SystemExit(f"local tag {tag} already exists")
+    subprocess.run(["git", "fetch", "origin", "--tags", "--quiet"], check=True)
+    if tag_exists(tag):
+        raise SystemExit(f"remote tag {tag} already exists")
+    head = out(["git", "rev-parse", "HEAD"])
+    upstream = out(["git", "rev-parse", "@{u}"])
+    if head != upstream and not args.allow_unpushed:
+        raise SystemExit("HEAD is not pushed to its upstream; push main first or pass --allow-unpushed")
+    changelog = Path("CHANGELOG.md").read_text()
+    if not re.search(rf"(?m)^##\s+{re.escape(args.version)}\s+—\s+", changelog):
+        raise SystemExit(f"CHANGELOG.md missing release section for {args.version}")
+    run(["git", "tag", "-a", tag, "-m", tag])
+    if not args.no_push:
+        run(["git", "push", "origin", tag])
+    print(f"created {tag} at {head}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

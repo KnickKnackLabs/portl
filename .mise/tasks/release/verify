@@ -1,0 +1,104 @@
+#!/usr/bin/env -S uv run --script
+#MISE description="Verify Portl release metadata and optionally run release checks"
+# /// script
+# requires-python = ">=3.11"
+# ///
+from __future__ import annotations
+
+import argparse
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+FIRST_PARTY = {
+    "docker-portl",
+    "manual-portl",
+    "portl-agent",
+    "portl-cli",
+    "portl-core",
+    "portl-proto",
+    "slicer-portl",
+}
+VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+def run(cmd: list[str], *, capture: bool = False) -> subprocess.CompletedProcess[str]:
+    print("$", " ".join(cmd))
+    return subprocess.run(cmd, text=True, capture_output=capture, check=True)
+
+
+def repo_root() -> Path:
+    return Path(subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip())
+
+
+def workspace_version(root: Path) -> str:
+    text = (root / "Cargo.toml").read_text()
+    match = re.search(r"(?m)^version\s*=\s*\"(\d+\.\d+\.\d+)\"", text)
+    if not match:
+        raise SystemExit("Could not find workspace version")
+    return match.group(1)
+
+
+def first_party_lock_versions(root: Path) -> dict[str, str]:
+    lock = (root / "Cargo.lock").read_text()
+    versions: dict[str, str] = {}
+    for block in lock.split("\n\n"):
+        name = re.search(r'(?m)^name = "([^"]+)"', block)
+        version = re.search(r'(?m)^version = "([^"]+)"', block)
+        if name and version and name.group(1) in FIRST_PARTY:
+            versions[name.group(1)] = version.group(1)
+    return versions
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise SystemExit(message)
+
+
+def verify_metadata(root: Path, version: str, allow_existing_tag: bool) -> None:
+    require(workspace_version(root) == version, f"workspace version is not {version}")
+    for name, found in sorted(first_party_lock_versions(root).items()):
+        require(found == version, f"Cargo.lock {name} is {found}, expected {version}")
+    changelog = (root / "CHANGELOG.md").read_text()
+    heading = re.search(rf"(?m)^##\s+{re.escape(version)}\s+—\s+\d{{4}}-\d{{2}}-\d{{2}}$", changelog)
+    require(bool(heading), f"CHANGELOG.md missing dated {version} heading")
+    section = re.search(
+        rf"(?ms)^##\s+{re.escape(version)}\s+—\s+\d{{4}}-\d{{2}}-\d{{2}}\n(?P<body>.*?)(?=^##\s+)",
+        changelog,
+    )
+    require(bool(section and section.group("body").strip()), f"CHANGELOG.md {version} section is empty")
+    readme = (root / "README.md").read_text()
+    for needle in [f"--version {version}", f"KnickKnackLabs/portl@{version}"]:
+        require(needle in readme, f"README.md missing {needle}")
+    local_tag = subprocess.run(["git", "rev-parse", "-q", "--verify", f"refs/tags/v{version}"], capture_output=True)
+    if not allow_existing_tag:
+        require(local_tag.returncode != 0, f"local tag v{version} already exists")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Verify a Portl release")
+    parser.add_argument("version")
+    parser.add_argument("--full", action="store_true", help="Run focused tests and clippy")
+    parser.add_argument("--skip-command-checks", action="store_true")
+    parser.add_argument("--allow-existing-tag", action="store_true")
+    args = parser.parse_args()
+    if not VERSION_RE.match(args.version):
+        raise SystemExit(f"Invalid version {args.version!r}; expected X.Y.Z")
+    root = repo_root()
+    verify_metadata(root, args.version, args.allow_existing_tag)
+    if not args.skip_command_checks:
+        run(["cargo", "fmt", "--check"])
+        run(["git", "diff", "--check"])
+        version = subprocess.check_output(["cargo", "run", "-q", "--bin", "portl", "--", "--version"], text=True).strip()
+        require(version == f"portl {args.version}", f"portl --version printed {version!r}")
+        if args.full:
+            run(["cargo", "test", "-p", "portl-cli", "--test", "help_cli"])
+            run(["cargo", "test", "-p", "portl-cli", "--lib"])
+            run(["cargo", "clippy", "-p", "portl-cli", "--all-targets", "--", "-D", "warnings"])
+    print(f"release metadata verified for v{args.version}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

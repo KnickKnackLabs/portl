@@ -1,0 +1,156 @@
+#!/usr/bin/env -S uv run --script
+#MISE description="Prepare a Portl release: bump versions, finalize changelog, refresh lockfile"
+# /// script
+# requires-python = ">=3.11"
+# ///
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+FIRST_PARTY = {
+    "docker-portl",
+    "manual-portl",
+    "portl-agent",
+    "portl-cli",
+    "portl-core",
+    "portl-proto",
+    "slicer-portl",
+}
+MANIFESTS = [
+    "Cargo.toml",
+    "crates/portl-agent/Cargo.toml",
+    "crates/portl-cli/Cargo.toml",
+    "crates/portl-core/Cargo.toml",
+    "crates/portl-proto/Cargo.toml",
+    "adapters/docker-portl/Cargo.toml",
+    "adapters/slicer-portl/Cargo.toml",
+    "adapters/manual-portl/Cargo.toml",
+]
+VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+def run(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, text=True, capture_output=True, check=check)
+
+
+def repo_root() -> Path:
+    try:
+        return Path(run(["git", "rev-parse", "--show-toplevel"]).stdout.strip())
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit("release:prep must run inside a git checkout") from exc
+
+
+def require_clean(root: Path, allow_dirty: bool) -> None:
+    if allow_dirty:
+        return
+    status = run(["git", "status", "--porcelain"], check=True).stdout.strip()
+    if status:
+        raise SystemExit(
+            "Working tree is dirty. Commit/stash first, or rerun with --allow-dirty.\n"
+            + status
+        )
+
+
+def workspace_version(root: Path) -> str:
+    text = (root / "Cargo.toml").read_text()
+    match = re.search(r"(?m)^version\s*=\s*\"(\d+\.\d+\.\d+)\"", text)
+    if not match:
+        raise SystemExit("Could not find [workspace.package] version in Cargo.toml")
+    return match.group(1)
+
+
+def replace_all(path: Path, old: str, new: str) -> bool:
+    text = path.read_text()
+    updated = text.replace(old, new)
+    if updated == text:
+        return False
+    path.write_text(updated)
+    return True
+
+
+def update_versions(root: Path, old: str, new: str) -> list[str]:
+    changed: list[str] = []
+    for rel in MANIFESTS:
+        path = root / rel
+        if replace_all(path, f'version = "{old}"', f'version = "{new}"'):
+            changed.append(rel)
+        if rel == "Cargo.toml" and replace_all(
+            path, f'version      = "{old}"', f'version      = "{new}"'
+        ):
+            changed.append(rel)
+    readme = root / "README.md"
+    before = readme.read_text()
+    text = before
+    text = text.replace(f"**v{old}**", f"**v{new}**")
+    text = text.replace(f"--version {old}", f"--version {new}")
+    text = text.replace(f"KnickKnackLabs/portl@{old}", f"KnickKnackLabs/portl@{new}")
+    if text != before:
+        readme.write_text(text)
+        changed.append("README.md")
+    return sorted(set(changed))
+
+
+def finalize_changelog(root: Path, version: str, date: str, allow_empty: bool) -> str:
+    path = root / "CHANGELOG.md"
+    text = path.read_text()
+    heading = f"## {version} — {date}"
+    if heading in text:
+        return f"CHANGELOG.md already contains {heading}"
+    if re.search(rf"(?m)^##\s+{re.escape(version)}\s+—\s+", text):
+        return f"CHANGELOG.md already contains a {version} release heading"
+    match = re.search(r"(?ms)^## Unreleased\n(?P<body>.*?)(?=^## \d+\.\d+\.\d+\s+—\s+)", text)
+    if not match:
+        raise SystemExit("CHANGELOG.md must contain `## Unreleased` before release sections")
+    body = match.group("body").strip()
+    if not body and not allow_empty:
+        raise SystemExit(
+            "CHANGELOG.md has no Unreleased entries. Add notes, run "
+            "`mise run release:changelog:draft -- VERSION`, or pass --allow-empty-changelog."
+        )
+    release_body = body or "No user-facing changes."
+    replacement = f"## Unreleased\n\n{heading}\n\n{release_body}\n\n"
+    updated = text[: match.start()] + replacement + text[match.end() :]
+    path.write_text(updated)
+    return f"finalized {heading}"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Prepare a Portl release")
+    parser.add_argument("version", help="SemVer patch/minor/major version, e.g. 0.5.2")
+    parser.add_argument("--date", default=dt.date.today().isoformat())
+    parser.add_argument("--allow-dirty", action="store_true")
+    parser.add_argument("--allow-empty-changelog", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    if not VERSION_RE.match(args.version):
+        raise SystemExit(f"Invalid version {args.version!r}; expected X.Y.Z")
+    root = repo_root()
+    require_clean(root, args.allow_dirty or args.dry_run)
+    old = workspace_version(root)
+    if old == args.version:
+        raise SystemExit(f"Workspace is already at {args.version}")
+
+    print(f"Preparing Portl release {old} -> {args.version}")
+    if args.dry_run:
+        print("dry-run: would update manifests, README examples, CHANGELOG.md, and Cargo.lock")
+        return 0
+
+    changed = update_versions(root, old, args.version)
+    changelog_msg = finalize_changelog(root, args.version, args.date, args.allow_empty_changelog)
+    run(["cargo", "metadata", "--format-version", "1"], check=True)
+    print("updated:")
+    for rel in changed + ["CHANGELOG.md", "Cargo.lock"]:
+        print(f"  {rel}")
+    print(changelog_msg)
+    print(f"Next: mise run release:verify -- {args.version}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

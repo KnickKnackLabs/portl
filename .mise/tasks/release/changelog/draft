@@ -1,0 +1,96 @@
+#!/usr/bin/env -S uv run --script
+#MISE description="Draft Portl changelog notes from commits since the last release tag"
+# /// script
+# requires-python = ">=3.11"
+# ///
+from __future__ import annotations
+
+import argparse
+import re
+import subprocess
+from pathlib import Path
+from urllib.parse import urlparse
+
+
+def out(cmd: list[str]) -> str:
+    return subprocess.check_output(cmd, text=True).strip()
+
+
+def last_tag() -> str:
+    return out(["git", "describe", "--tags", "--abbrev=0"])
+
+
+def github_base_url() -> str | None:
+    try:
+        remote = out(["git", "remote", "get-url", "origin"])
+    except subprocess.CalledProcessError:
+        return None
+    if remote.startswith("git@") and ":" in remote:
+        host, repo = remote.removeprefix("git@").split(":", 1)
+        if host.startswith("github"):
+            return f"https://github.com/{repo.removesuffix('.git')}"
+    parsed = urlparse(remote)
+    if parsed.netloc == "github.com":
+        return f"https://github.com{parsed.path.removesuffix('.git')}"
+    return None
+
+
+def classify(subject: str) -> str:
+    lowered = subject.lower()
+    if lowered.startswith(("fix", "quiet", "close", "prevent", "avoid")):
+        return "Fixed"
+    if lowered.startswith(("add", "implement", "introduce")):
+        return "Added"
+    return "Changed"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Draft changelog notes")
+    parser.add_argument("version")
+    parser.add_argument("--since", default=None, help="Tag or revision to diff from")
+    parser.add_argument("--output", default=None)
+    args = parser.parse_args()
+    since = args.since or last_tag()
+    log = out(["git", "log", "--format=%H%x09%h%x09%s", f"{since}..HEAD"])
+    base_url = github_base_url()
+    groups: dict[str, list[str]] = {"Added": [], "Changed": [], "Fixed": []}
+    for line in [line.strip() for line in log.splitlines() if line.strip()]:
+        full_hash, short_hash, subject = line.split("\t", 2)
+        if subject.lower().startswith("release v"):
+            continue
+        if base_url:
+            ref = f"[{short_hash}]({base_url}/commit/{full_hash})"
+        else:
+            ref = f"`{short_hash}`"
+        groups[classify(subject)].append(f"{subject} ({ref})")
+    body = [
+        f"# Changelog draft for {args.version}",
+        "",
+        f"Source: `{since}..HEAD`",
+    ]
+    if base_url:
+        body.append(f"Compare: {base_url}/compare/{since}...HEAD")
+    body.extend(
+        [
+            "",
+            "Rewrite these raw commit subjects into user-facing release notes before copying into CHANGELOG.md.",
+            "Merge related commits, remove implementation-only noise, and keep commit links only when they help reviewers trace ambiguous entries.",
+            "",
+        ]
+    )
+    for heading in ["Added", "Changed", "Fixed"]:
+        if groups[heading]:
+            body.extend([f"### {heading}", ""])
+            body.extend(f"- {subject}" for subject in groups[heading])
+            body.append("")
+    if all(not items for items in groups.values()):
+        body.extend(["No non-release commits found.", ""])
+    output = Path(args.output or f"scratch/release-v{args.version}-changelog-draft.md")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("\n".join(body))
+    print(output)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
