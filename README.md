@@ -15,9 +15,10 @@ used for NAT traversal when direct paths are unavailable.
 
 ## Status
 
-**v0.5.0** — session-control provider release. Portl has persistent
-terminal sessions via `portl/session/v1`, provider discovery, zmx-control
-support, and tmux `-CC` compatibility. The current CLI vocabulary is:
+**v0.5.1** — CLI cleanup patch after the session-control provider
+release. Portl has persistent terminal sessions via `portl/session/v1`,
+provider discovery, zmx-control support, and tmux `-CC` compatibility.
+The current CLI vocabulary is:
 
 ```text
 target   = something Portl can dial: peer label, adapter alias, ticket, or endpoint_id
@@ -41,7 +42,7 @@ curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.s
 curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash -s -- --agent
 
 # pin a version
-curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash -s -- --version 0.5.0
+curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash -s -- --version 0.5.1
 
 # toggle back to client-only; keeps binaries + identity
 curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash -s -- --client-only --yes
@@ -58,7 +59,7 @@ artifacts cover macOS and Linux on arm64 / x86_64.
 
 ```bash
 # mise
-mise use -g github:KnickKnackLabs/portl@0.5.0
+mise use -g github:KnickKnackLabs/portl@0.5.1
 # mise only shims `portl`; run install.sh --agent if this machine should be shared.
 
 # cargo

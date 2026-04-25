@@ -5,6 +5,10 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.5.1 — 2026-04-26
+
+CLI cleanup patch release after the v0.5.0 session-control release.
+
 ### Changed
 
 - Top-level `portl --help` now renders the command tree in the logical
