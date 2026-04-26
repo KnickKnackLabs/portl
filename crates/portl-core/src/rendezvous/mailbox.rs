@@ -212,6 +212,39 @@ impl<'a, T: MailboxTransport + Send> MailboxClient<'a, T> {
         }
     }
 
+    /// Await the per-command universal `ack` that the mailbox server sends in
+    /// reply to every C->S message. `Error` frames are surfaced; any other
+    /// frame at this point is unexpected (the server replies to commands
+    /// before broadcasting derived `message`s).
+    async fn await_command_accepted(&mut self) -> Result<(), MailboxError> {
+        match self.transport.recv().await? {
+            ServerMessage::Ack { .. } => Ok(()),
+            ServerMessage::Error { error } => Err(MailboxError::Server(error)),
+            other => Err(MailboxError::Unexpected(format!(
+                "expected ack, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Await the `closed` direct response to a `close` command, tolerating an
+    /// intervening universal `ack` (the server emits ack for every C->S
+    /// message and then the named `closed` response per the mailbox
+    /// protocol).
+    async fn await_closed(&mut self) -> Result<(), MailboxError> {
+        loop {
+            match self.transport.recv().await? {
+                ServerMessage::Ack { .. } => {}
+                ServerMessage::Closed { .. } => return Ok(()),
+                ServerMessage::Error { error } => return Err(MailboxError::Server(error)),
+                other => {
+                    return Err(MailboxError::Unexpected(format!(
+                        "expected closed, got {other:?}"
+                    )))
+                }
+            }
+        }
+    }
+
     async fn await_welcome(&mut self) -> Result<(), MailboxError> {
         match self.recv_meaningful().await? {
             ServerMessage::Welcome { .. } => Ok(()),
@@ -272,6 +305,11 @@ impl<'a, T: MailboxTransport + Send> MailboxClient<'a, T> {
                 mailbox: mailbox.clone(),
             })
             .await?;
+        // The protocol summary lists `open` as having no named response, but
+        // every C->S command still draws the universal `ack` (or an `error`
+        // if the open is rejected, e.g. mailbox already closed). Block on it
+        // so callers don't proceed against a server that refused the open.
+        self.await_command_accepted().await?;
         self.mailbox = Some(mailbox.clone());
         Ok(MailboxSetup { nameplate, mailbox })
     }
@@ -282,7 +320,11 @@ impl<'a, T: MailboxTransport + Send> MailboxClient<'a, T> {
         phase: impl Into<String>,
         body: &[u8],
     ) -> Result<(), MailboxError> {
-        self.transport.send(ClientMessage::add(phase, body)).await
+        self.transport.send(ClientMessage::add(phase, body)).await?;
+        // `add` does not have a named direct response, but the server emits
+        // the universal `ack` for every C->S frame and an `error` if it
+        // rejected the add (e.g. mailbox not opened on this side).
+        self.await_command_accepted().await
     }
 
     /// Wait for a phase message from the peer, ignoring own-side echoes
@@ -290,7 +332,6 @@ impl<'a, T: MailboxTransport + Send> MailboxClient<'a, T> {
     pub async fn recv_phase_from_peer(
         &mut self,
         expected_phase: &str,
-        own_side: &str,
     ) -> Result<PhaseMessage, MailboxError> {
         loop {
             match self.recv_meaningful().await? {
@@ -300,7 +341,7 @@ impl<'a, T: MailboxTransport + Send> MailboxClient<'a, T> {
                     body,
                     id,
                 } => {
-                    if side == own_side {
+                    if side == self.side {
                         continue;
                     }
                     if phase != expected_phase {
@@ -326,7 +367,8 @@ impl<'a, T: MailboxTransport + Send> MailboxClient<'a, T> {
 
     /// Send a happy close frame.
     pub async fn close_happy(&mut self) -> Result<(), MailboxError> {
-        self.transport.send(ClientMessage::close_happy()).await
+        self.transport.send(ClientMessage::close_happy()).await?;
+        self.await_closed().await
     }
 
     /// Send a scary close frame with the supplied reason.
@@ -336,7 +378,8 @@ impl<'a, T: MailboxTransport + Send> MailboxClient<'a, T> {
                 mailbox: None,
                 mood: Some(format!("scary: {reason}")),
             })
-            .await
+            .await?;
+        self.await_closed().await
     }
 }
 
@@ -446,6 +489,9 @@ mod tests {
             ServerMessage::Claimed {
                 mailbox: "mailbox-1".to_owned(),
             },
+            ServerMessage::Ack {
+                id: "open".to_owned(),
+            },
         ]);
 
         let setup = MailboxClient::new("portl.exchange.v1", "side-a", &mut transport)
@@ -455,10 +501,10 @@ mod tests {
 
         assert_eq!(setup.nameplate, "2");
         assert_eq!(setup.mailbox, "mailbox-1");
-        assert!(transport.sent_types().contains(&"bind".to_owned()));
-        assert!(transport.sent_types().contains(&"allocate".to_owned()));
-        assert!(transport.sent_types().contains(&"claim".to_owned()));
-        assert!(transport.sent_types().contains(&"open".to_owned()));
+        assert_eq!(
+            transport.sent_types(),
+            vec!["bind", "allocate", "claim", "open"],
+        );
     }
 
     #[tokio::test]
@@ -470,6 +516,9 @@ mod tests {
             ServerMessage::Claimed {
                 mailbox: "mailbox-1".to_owned(),
             },
+            ServerMessage::Ack {
+                id: "open".to_owned(),
+            },
         ]);
 
         let setup = MailboxClient::new("portl.exchange.v1", "side-b", &mut transport)
@@ -479,6 +528,7 @@ mod tests {
 
         assert_eq!(setup.nameplate, "2");
         assert_eq!(setup.mailbox, "mailbox-1");
+        assert_eq!(transport.sent_types(), vec!["bind", "claim", "open"]);
     }
 
     #[tokio::test]
@@ -518,6 +568,9 @@ mod tests {
             ServerMessage::Claimed {
                 mailbox: "mailbox-1".to_owned(),
             },
+            ServerMessage::Ack {
+                id: "open".to_owned(),
+            },
         ]);
 
         let setup = MailboxClient::new("portl.exchange.v1", "side-b", &mut transport)
@@ -548,7 +601,7 @@ mod tests {
         ]);
 
         let mut client = MailboxClient::new("portl.exchange.v1", "me", &mut transport);
-        let msg = client.recv_phase_from_peer("pake", "me").await.unwrap();
+        let msg = client.recv_phase_from_peer("pake").await.unwrap();
         assert_eq!(msg.side, "peer");
         assert_eq!(msg.phase, "pake");
         assert_eq!(msg.body, b"hello");
@@ -557,7 +610,9 @@ mod tests {
 
     #[tokio::test]
     async fn close_happy_sends_close_frame() {
-        let mut transport = ScriptedMailboxTransport::new(vec![]);
+        let mut transport = ScriptedMailboxTransport::new(vec![ServerMessage::Closed {
+            mood: None,
+        }]);
         let mut client = MailboxClient::new("portl.exchange.v1", "side-a", &mut transport);
         client.close_happy().await.unwrap();
         let sent = transport.sent();
@@ -573,7 +628,10 @@ mod tests {
 
     #[tokio::test]
     async fn close_scary_sends_scary_mood() {
-        let mut transport = ScriptedMailboxTransport::new(vec![]);
+        let mut transport = ScriptedMailboxTransport::new(vec![
+            ServerMessage::Ack { id: "close".into() },
+            ServerMessage::Closed { mood: None },
+        ]);
         let mut client = MailboxClient::new("portl.exchange.v1", "side-a", &mut transport);
         client.close_scary("mismatch").await.unwrap();
         match &transport.sent()[0] {
@@ -582,6 +640,100 @@ mod tests {
                 assert!(m.contains("mismatch"));
             }
             other => panic!("expected scary close, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn open_surfaces_server_error_after_claim() {
+        let mut transport = ScriptedMailboxTransport::new(vec![
+            ServerMessage::Welcome {
+                welcome: serde_json::json!({}),
+            },
+            ServerMessage::Claimed {
+                mailbox: "mailbox-1".to_owned(),
+            },
+            ServerMessage::Error {
+                error: "mailbox already closed".to_owned(),
+            },
+        ]);
+
+        let err = MailboxClient::new("portl.exchange.v1", "side-b", &mut transport)
+            .claim_and_open("2")
+            .await
+            .unwrap_err();
+        match err {
+            MailboxError::Server(msg) => assert_eq!(msg, "mailbox already closed"),
+            other => panic!("expected Server error, got {other:?}"),
+        }
+        assert_eq!(transport.sent_types(), vec!["bind", "claim", "open"]);
+    }
+
+    #[tokio::test]
+    async fn send_phase_awaits_ack_and_records_add() {
+        let mut transport = ScriptedMailboxTransport::new(vec![ServerMessage::Ack {
+            id: "add".into(),
+        }]);
+        let mut client = MailboxClient::new("portl.exchange.v1", "side-a", &mut transport);
+        client.send_phase("pake", b"hi").await.unwrap();
+        assert_eq!(transport.sent_types(), vec!["add"]);
+        match &transport.sent()[0] {
+            ClientMessage::Add { phase, body } => {
+                assert_eq!(phase, "pake");
+                assert_eq!(body.as_bytes(), b"hi");
+            }
+            other => panic!("expected add, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_phase_surfaces_server_error_after_add() {
+        let mut transport = ScriptedMailboxTransport::new(vec![ServerMessage::Error {
+            error: "mailbox not open".to_owned(),
+        }]);
+        let mut client = MailboxClient::new("portl.exchange.v1", "side-a", &mut transport);
+        let err = client.send_phase("pake", b"hi").await.unwrap_err();
+        match err {
+            MailboxError::Server(msg) => assert_eq!(msg, "mailbox not open"),
+            other => panic!("expected Server error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn close_happy_awaits_closed_response() {
+        let mut transport = ScriptedMailboxTransport::new(vec![
+            ServerMessage::Ack { id: "close".into() },
+            ServerMessage::Closed {
+                mood: Some("happy".into()),
+            },
+        ]);
+        let mut client = MailboxClient::new("portl.exchange.v1", "side-a", &mut transport);
+        client.close_happy().await.unwrap();
+        assert_eq!(transport.sent_types(), vec!["close"]);
+    }
+
+    #[tokio::test]
+    async fn close_happy_surfaces_server_error() {
+        let mut transport = ScriptedMailboxTransport::new(vec![ServerMessage::Error {
+            error: "no mailbox open".to_owned(),
+        }]);
+        let mut client = MailboxClient::new("portl.exchange.v1", "side-a", &mut transport);
+        let err = client.close_happy().await.unwrap_err();
+        match err {
+            MailboxError::Server(msg) => assert_eq!(msg, "no mailbox open"),
+            other => panic!("expected Server error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn close_scary_surfaces_server_error() {
+        let mut transport = ScriptedMailboxTransport::new(vec![ServerMessage::Error {
+            error: "no mailbox open".to_owned(),
+        }]);
+        let mut client = MailboxClient::new("portl.exchange.v1", "side-a", &mut transport);
+        let err = client.close_scary("oops").await.unwrap_err();
+        match err {
+            MailboxError::Server(msg) => assert_eq!(msg, "no mailbox open"),
+            other => panic!("expected Server error, got {other:?}"),
         }
     }
 
