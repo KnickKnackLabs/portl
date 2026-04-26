@@ -650,20 +650,48 @@ The scratch POC showed Magic Wormhole can exchange a full long Iroh
 gossip bootstrap ticket locally and cross-machine. For Portl, the
 transported payload should be `PortlExchangeEnvelopeV1`.
 
-The `magic-wormhole` Rust crate exposes the needed core APIs with
-default features disabled:
+The `magic-wormhole` Rust workspace has two crates:
 
-```toml
-magic-wormhole = { version = "0.8", default-features = false }
+- `magic-wormhole`: the library crate;
+- `magic-wormhole-cli`: the CLI crate.
+
+There is no smaller published `magic-wormhole-core` crate. The library
+crate is still usable for Portl's short-code exchange layer because its
+core API is public:
+
+```rust
+use magic_wormhole::{AppConfig, AppID, Code, MailboxConnection, Wormhole};
 ```
 
-This uses the rendezvous mailbox, SPAKE2/PAKE, key derivation, and
-encrypted peer messages without the file-transfer/transit/forwarding
-features. Before making it a required production dependency, review:
+With default features disabled, the library exposes the mailbox, PAKE,
+key derivation, encrypted peer-message send/receive, code parsing, and
+wordlist code generation without compiling the file-transfer, transit, or
+port-forwarding modules:
+
+```toml
+magic-wormhole = { version = "0.7", default-features = false }
+```
+
+Do not use `magic-wormhole = "0.8"` while Portl is pinned to Rust 1.89:
+`magic-wormhole 0.8.0` declares `rust-version = "1.92"`. Version 0.7.0
+declares `rust-version = "1.75"` and `cargo +1.89.0 check -p
+magic-wormhole --no-default-features` succeeds. If Portl later raises its
+MSRV past 1.92, re-evaluate 0.8.
+
+Even with `default-features = false`, this is not a zero-cost dependency.
+The core rendezvous layer still brings WebSocket/runtime/crypto support
+such as `async-tungstenite`, `async-std` in 0.7, `crypto_secretbox`,
+`spake2`, `hkdf`, `sha-1`, `sha2`, `rand`, `url`, and `serde_json`.
+That footprint is acceptable for a prototype or optional feature, but it
+should be measured before enabling by default.
+
+Before making it a required production dependency, review:
 
 - EUPL-1.2 license compatibility with Portl's MIT license;
 - dependency footprint and async-runtime integration;
-- public relay availability and self-hosted relay options.
+- public relay availability and self-hosted relay options;
+- whether a feature-gated backend or external helper process is safer
+  until the license question is settled.
 
 If license or production-suitability concerns block the dependency,
 keep the same envelope and backend abstraction and implement a Portl
@@ -1049,8 +1077,9 @@ portl session app-dev@alice-laptop
 ### Phase 4 — CLI-hosted short-code backend
 
 - Add process-agnostic rendezvous backend abstraction.
-- Add Magic Wormhole backend behind an optional feature or after license
-  review.
+- Add Magic Wormhole backend behind an optional feature and after license
+  review; while Portl is on Rust 1.89, use `magic-wormhole 0.7` with
+  `default-features = false`, not 0.8.
 - Add provider-agnostic `PORTL-S-*` user-visible codes.
 - Add `portl accept` generic dispatcher.
 - Keep sender-side offers alive in the invoking CLI and clearly print
@@ -1082,6 +1111,9 @@ portl session app-dev@alice-laptop
 
 1. **Magic Wormhole dependency policy:** Is EUPL-1.2 acceptable for a
    default Portl dependency, or should it remain optional/prototype-only?
+   If approved, should Portl pin `magic-wormhole 0.7` until the project
+   raises its MSRV beyond 1.92, or should Magic Wormhole remain a
+   separate helper/backend during the Rust-version gap?
 2. **Default direct-address privacy:** Should offline tokens include direct
    IP addresses by default, or only relay URLs unless explicitly requested?
 3. **Generated name style:** Which wordlist/slug format should `portl
