@@ -157,10 +157,7 @@ pub enum ServerMessage {
         mood: Option<String>,
     },
     /// Server ack of a prior C->S message; `id` echoes the client's `id`.
-    Ack {
-        #[serde(default)]
-        id: String,
-    },
+    Ack { id: String },
     Message {
         side: String,
         phase: String,
@@ -299,6 +296,12 @@ mod tests {
             ServerMessage::Ack { id } => assert_eq!(id, "req-1"),
             other => panic!("expected ack, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn server_ack_requires_id() {
+        let result = serde_json::from_str::<ServerMessage>(r#"{"type":"ack"}"#);
+        assert!(result.is_err(), "ack without id must fail to deserialize");
     }
 
     #[test]
