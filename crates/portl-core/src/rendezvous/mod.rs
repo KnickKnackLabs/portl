@@ -8,6 +8,6 @@ pub mod short_code;
 pub mod wormhole_crypto;
 pub mod ws;
 
-pub use backend::{AcceptOutcome, ExchangeOffer, OfferHandle, RendezvousBackend};
+pub use backend::{AcceptOutcome, ExchangeOffer, OfferHandle, RendezvousBackend, RendezvousError};
 pub use exchange::{PortlExchangeEnvelopeV1, SessionShareEnvelopeV1};
 pub use short_code::{ShortCode, ShortCodeParseError};

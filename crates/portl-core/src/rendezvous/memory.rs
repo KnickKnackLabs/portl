@@ -49,7 +49,9 @@ impl RendezvousBackend for MemoryRendezvousBackend {
         let code = ShortCode::generate_with_nameplate(nameplate)
             .map_err(|e| RendezvousError::Backend(e.to_string()))?;
         let key = code.display_code();
-        let expires_at = Instant::now() + Duration::from_secs(offer.rendezvous_ttl_secs);
+        let expires_at = Instant::now()
+            .checked_add(Duration::from_secs(offer.rendezvous_ttl_secs))
+            .ok_or_else(|| RendezvousError::Backend("ttl overflow".to_owned()))?;
         {
             let mut guard = self
                 .inner
@@ -75,10 +77,14 @@ impl RendezvousBackend for MemoryRendezvousBackend {
         if guard.claimed.contains(&key) {
             return Err(RendezvousError::AlreadyClaimed);
         }
-        let stored = guard.offers.remove(&key).ok_or(RendezvousError::NotFound)?;
+        let stored = guard.offers.get(&key).ok_or(RendezvousError::NotFound)?;
         if Instant::now() >= stored.expires_at {
             return Err(RendezvousError::Expired);
         }
+        let stored = guard
+            .offers
+            .remove(&key)
+            .expect("offer presence verified above");
         guard.claimed.insert(key);
         Ok(AcceptOutcome {
             envelope: stored.envelope,
@@ -140,8 +146,11 @@ mod tests {
             rendezvous_ttl_secs: 0,
         };
         let handle = backend.offer(offer).await.unwrap();
-        // Sleep briefly to ensure Instant::now() advances past expires_at.
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        // Zero-second TTL: expires_at == offer instant, so accept must see Expired
+        // without sleeping. Repeated accepts must keep returning Expired (the offer
+        // is not silently consumed on failure).
+        let err = backend.accept(handle.code()).await.unwrap_err();
+        assert!(matches!(err, RendezvousError::Expired));
         let err = backend.accept(handle.code()).await.unwrap_err();
         assert!(matches!(err, RendezvousError::Expired));
     }
