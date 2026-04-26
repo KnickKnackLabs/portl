@@ -11,12 +11,6 @@ use rand::seq::SliceRandom;
 
 const PREFIX: &str = "PORTL-S-";
 
-/// Maximum accepted length of a raw short-code input, in bytes.
-///
-/// Generated codes are far smaller; this only guards [`ShortCode::parse`]
-/// from unbounded inputs without rejecting any reasonable manual code.
-const MAX_INPUT_LEN: usize = 256;
-
 /// Canonical wordlist used by [`ShortCode::generate_with_nameplate`].
 ///
 /// Locally curated lowercase ASCII words. With 256 entries, two random
@@ -67,12 +61,9 @@ pub struct ShortCode {
 impl ShortCode {
     /// Parse a `PORTL-S-<nameplate>-<word>-<word>[-...]` string.
     pub fn parse(input: &str) -> Result<Self, ShortCodeParseError> {
-        if input.len() > MAX_INPUT_LEN {
-            return Err(ShortCodeParseError::TooLong);
-        }
         let rest = input
             .strip_prefix(PREFIX)
-            .ok_or_else(|| ShortCodeParseError::WrongPrefix)?;
+            .ok_or(ShortCodeParseError::WrongPrefix)?;
         let mut parts = rest.split('-');
         let nameplate = parts
             .next()
@@ -82,7 +73,7 @@ impl ShortCode {
         if !nameplate.chars().all(|c| c.is_ascii_digit()) {
             return Err(ShortCodeParseError::InvalidNameplate);
         }
-        let words: Vec<String> = parts.map(|s| s.to_string()).collect();
+        let words: Vec<String> = parts.map(str::to_string).collect();
         if words.len() < 2 {
             return Err(ShortCodeParseError::MissingComponents);
         }
@@ -158,9 +149,6 @@ pub enum ShortCodeParseError {
     /// Word must be lowercase ASCII letters.
     #[error("short code word must be lowercase ASCII letters: {0}")]
     InvalidWord(String),
-    /// Input exceeded the maximum allowed length.
-    #[error("short code exceeds maximum length")]
-    TooLong,
 }
 
 #[cfg(test)]
@@ -280,15 +268,6 @@ mod tests {
         // Manual passphrases need not appear in WORDLIST.
         let code = ShortCode::parse("PORTL-S-9-zzz-qqq").unwrap();
         assert_eq!(code.nameplate(), "9");
-    }
-
-    #[test]
-    fn rejects_overlong_input() {
-        let huge = format!("PORTL-S-1-{}-{}", "a".repeat(300), "b");
-        assert_eq!(
-            ShortCode::parse(&huge).unwrap_err(),
-            ShortCodeParseError::TooLong,
-        );
     }
 
     #[test]
