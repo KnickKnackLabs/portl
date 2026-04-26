@@ -7,6 +7,7 @@
 //! state machine (Task 7+).
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use async_trait::async_trait;
 
 /// Errors produced while encoding or decoding mailbox protocol frames.
 #[derive(Debug, thiserror::Error)]
@@ -17,6 +18,12 @@ pub enum MailboxError {
     /// The rendezvous server returned an `error` frame.
     #[error("rendezvous server error: {0}")]
     Server(String),
+    /// The transport surfaced an error while sending or receiving.
+    #[error("mailbox transport error: {0}")]
+    Transport(String),
+    /// The server sent a frame the client did not expect at this state.
+    #[error("unexpected mailbox frame: {0}")]
+    Unexpected(String),
 }
 
 /// Hex-encoded binary body. Serializes to/from a hex string on the wire,
@@ -131,6 +138,208 @@ impl ClientMessage {
     }
 }
 
+/// A peer phase message returned from the mailbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhaseMessage {
+    /// The peer's wire side identifier.
+    pub side: String,
+    /// Phase label, e.g. `"pake"` or `"version"`.
+    pub phase: String,
+    /// Raw body bytes (decoded from hex on the wire).
+    pub body: Vec<u8>,
+    /// Server-assigned message id, copied from the originating `add`.
+    pub id: String,
+}
+
+/// Result of opening a mailbox; carries the negotiated nameplate and
+/// mailbox identifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailboxSetup {
+    pub nameplate: String,
+    pub mailbox: String,
+}
+
+/// Transport abstraction over a single client/server frame channel.
+#[async_trait]
+pub trait MailboxTransport {
+    /// Send a single client frame.
+    async fn send(&mut self, msg: ClientMessage) -> Result<(), MailboxError>;
+    /// Receive a single server frame.
+    async fn recv(&mut self) -> Result<ServerMessage, MailboxError>;
+}
+
+/// Transport-neutral driver for the Magic Wormhole mailbox exchange.
+pub struct MailboxClient<'a, T> {
+    appid: &'a str,
+    side: &'a str,
+    transport: &'a mut T,
+    mailbox: Option<String>,
+    bound: bool,
+}
+
+impl<'a, T: MailboxTransport + Send> MailboxClient<'a, T> {
+    /// Create a new mailbox driver bound to the given appid/side.
+    pub fn new(appid: &'a str, side: &'a str, transport: &'a mut T) -> Self {
+        Self {
+            appid,
+            side,
+            transport,
+            mailbox: None,
+            bound: false,
+        }
+    }
+
+    async fn ensure_bound(&mut self) -> Result<(), MailboxError> {
+        if !self.bound {
+            self.transport
+                .send(ClientMessage::bind(self.appid, self.side))
+                .await?;
+            self.bound = true;
+        }
+        Ok(())
+    }
+
+    /// Receive the next "meaningful" frame, skipping `Ack`s and surfacing
+    /// `Error` frames as [`MailboxError::Server`].
+    async fn recv_meaningful(&mut self) -> Result<ServerMessage, MailboxError> {
+        loop {
+            let frame = self.transport.recv().await?;
+            match frame {
+                ServerMessage::Ack { .. } => {}
+                ServerMessage::Error { error } => return Err(MailboxError::Server(error)),
+                other => return Ok(other),
+            }
+        }
+    }
+
+    async fn await_welcome(&mut self) -> Result<(), MailboxError> {
+        match self.recv_meaningful().await? {
+            ServerMessage::Welcome { .. } => Ok(()),
+            other => Err(MailboxError::Unexpected(format!(
+                "expected welcome, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Allocate a fresh nameplate, claim it, and open the resulting mailbox.
+    pub async fn allocate_and_open(&mut self) -> Result<MailboxSetup, MailboxError> {
+        self.ensure_bound().await?;
+        self.await_welcome().await?;
+
+        self.transport.send(ClientMessage::Allocate).await?;
+        let nameplate = match self.recv_meaningful().await? {
+            ServerMessage::Allocated { nameplate } => nameplate,
+            other => {
+                return Err(MailboxError::Unexpected(format!(
+                    "expected allocated, got {other:?}"
+                )));
+            }
+        };
+
+        self.claim_nameplate_and_open(nameplate).await
+    }
+
+    /// Claim the supplied nameplate and open the resulting mailbox.
+    pub async fn claim_and_open(
+        &mut self,
+        nameplate: impl Into<String>,
+    ) -> Result<MailboxSetup, MailboxError> {
+        self.ensure_bound().await?;
+        self.await_welcome().await?;
+        self.claim_nameplate_and_open(nameplate.into()).await
+    }
+
+    async fn claim_nameplate_and_open(
+        &mut self,
+        nameplate: String,
+    ) -> Result<MailboxSetup, MailboxError> {
+        self.transport
+            .send(ClientMessage::Claim {
+                nameplate: nameplate.clone(),
+            })
+            .await?;
+        let mailbox = match self.recv_meaningful().await? {
+            ServerMessage::Claimed { mailbox } => mailbox,
+            other => {
+                return Err(MailboxError::Unexpected(format!(
+                    "expected claimed, got {other:?}"
+                )));
+            }
+        };
+
+        self.transport
+            .send(ClientMessage::Open {
+                mailbox: mailbox.clone(),
+            })
+            .await?;
+        self.mailbox = Some(mailbox.clone());
+        Ok(MailboxSetup { nameplate, mailbox })
+    }
+
+    /// Send a phase message body to the peer.
+    pub async fn send_phase(
+        &mut self,
+        phase: impl Into<String>,
+        body: &[u8],
+    ) -> Result<(), MailboxError> {
+        self.transport.send(ClientMessage::add(phase, body)).await
+    }
+
+    /// Wait for a phase message from the peer, ignoring own-side echoes
+    /// and skipping `Ack` frames.
+    pub async fn recv_phase_from_peer(
+        &mut self,
+        expected_phase: &str,
+        own_side: &str,
+    ) -> Result<PhaseMessage, MailboxError> {
+        loop {
+            match self.recv_meaningful().await? {
+                ServerMessage::Message {
+                    side,
+                    phase,
+                    body,
+                    id,
+                } => {
+                    if side == own_side {
+                        continue;
+                    }
+                    if phase != expected_phase {
+                        return Err(MailboxError::Unexpected(format!(
+                            "expected phase {expected_phase}, got {phase}"
+                        )));
+                    }
+                    return Ok(PhaseMessage {
+                        side,
+                        phase,
+                        body: body.into_inner(),
+                        id,
+                    });
+                }
+                other => {
+                    return Err(MailboxError::Unexpected(format!(
+                        "expected message, got {other:?}"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Send a happy close frame.
+    pub async fn close_happy(&mut self) -> Result<(), MailboxError> {
+        self.transport.send(ClientMessage::close_happy()).await
+    }
+
+    /// Send a scary close frame with the supplied reason.
+    pub async fn close_scary(&mut self, reason: &str) -> Result<(), MailboxError> {
+        self.transport
+            .send(ClientMessage::Close {
+                mailbox: None,
+                mood: Some(format!("scary: {reason}")),
+            })
+            .await
+    }
+}
+
 /// Messages the mailbox server sends back to clients.
 ///
 /// Per the server protocol, every C->S command provokes an `ack` that
@@ -173,6 +382,208 @@ pub enum ServerMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    /// Test transport that records sent client messages and replays
+    /// queued server messages in FIFO order.
+    pub(super) struct ScriptedMailboxTransport {
+        sent: Vec<ClientMessage>,
+        queued: VecDeque<ServerMessage>,
+    }
+
+    impl ScriptedMailboxTransport {
+        pub(super) fn new(queued: Vec<ServerMessage>) -> Self {
+            Self {
+                sent: Vec::new(),
+                queued: queued.into(),
+            }
+        }
+
+        pub(super) fn sent_types(&self) -> Vec<String> {
+            self.sent
+                .iter()
+                .map(|m| match m {
+                    ClientMessage::Bind { .. } => "bind",
+                    ClientMessage::Allocate => "allocate",
+                    ClientMessage::Claim { .. } => "claim",
+                    ClientMessage::Release { .. } => "release",
+                    ClientMessage::Open { .. } => "open",
+                    ClientMessage::Add { .. } => "add",
+                    ClientMessage::Close { .. } => "close",
+                })
+                .map(str::to_owned)
+                .collect()
+        }
+
+        pub(super) fn sent(&self) -> &[ClientMessage] {
+            &self.sent
+        }
+    }
+
+    #[async_trait]
+    impl MailboxTransport for ScriptedMailboxTransport {
+        async fn send(&mut self, msg: ClientMessage) -> Result<(), MailboxError> {
+            self.sent.push(msg);
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> Result<ServerMessage, MailboxError> {
+            self.queued
+                .pop_front()
+                .ok_or_else(|| MailboxError::Transport("no more queued frames".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn scripted_transport_drives_offer_setup() {
+        let mut transport = ScriptedMailboxTransport::new(vec![
+            ServerMessage::Welcome {
+                welcome: serde_json::json!({}),
+            },
+            ServerMessage::Allocated {
+                nameplate: "2".to_owned(),
+            },
+            ServerMessage::Claimed {
+                mailbox: "mailbox-1".to_owned(),
+            },
+        ]);
+
+        let setup = MailboxClient::new("portl.exchange.v1", "side-a", &mut transport)
+            .allocate_and_open()
+            .await
+            .unwrap();
+
+        assert_eq!(setup.nameplate, "2");
+        assert_eq!(setup.mailbox, "mailbox-1");
+        assert!(transport.sent_types().contains(&"bind".to_owned()));
+        assert!(transport.sent_types().contains(&"allocate".to_owned()));
+        assert!(transport.sent_types().contains(&"claim".to_owned()));
+        assert!(transport.sent_types().contains(&"open".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn scripted_transport_drives_accept_setup() {
+        let mut transport = ScriptedMailboxTransport::new(vec![
+            ServerMessage::Welcome {
+                welcome: serde_json::json!({}),
+            },
+            ServerMessage::Claimed {
+                mailbox: "mailbox-1".to_owned(),
+            },
+        ]);
+
+        let setup = MailboxClient::new("portl.exchange.v1", "side-b", &mut transport)
+            .claim_and_open("2")
+            .await
+            .unwrap();
+
+        assert_eq!(setup.nameplate, "2");
+        assert_eq!(setup.mailbox, "mailbox-1");
+    }
+
+    #[tokio::test]
+    async fn server_error_converts_to_mailbox_error() {
+        let mut transport = ScriptedMailboxTransport::new(vec![
+            ServerMessage::Welcome {
+                welcome: serde_json::json!({}),
+            },
+            ServerMessage::Error {
+                error: "bad nameplate".to_owned(),
+            },
+        ]);
+
+        let err = MailboxClient::new("portl.exchange.v1", "side-b", &mut transport)
+            .claim_and_open("2")
+            .await
+            .unwrap_err();
+
+        match err {
+            MailboxError::Server(msg) => assert_eq!(msg, "bad nameplate"),
+            other => panic!("expected Server error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ack_frames_are_skipped_during_setup() {
+        let mut transport = ScriptedMailboxTransport::new(vec![
+            ServerMessage::Ack {
+                id: "ignored".to_owned(),
+            },
+            ServerMessage::Welcome {
+                welcome: serde_json::json!({}),
+            },
+            ServerMessage::Ack {
+                id: "ignored2".to_owned(),
+            },
+            ServerMessage::Claimed {
+                mailbox: "mailbox-1".to_owned(),
+            },
+        ]);
+
+        let setup = MailboxClient::new("portl.exchange.v1", "side-b", &mut transport)
+            .claim_and_open("2")
+            .await
+            .unwrap();
+        assert_eq!(setup.mailbox, "mailbox-1");
+    }
+
+    #[tokio::test]
+    async fn recv_phase_ignores_own_side_and_returns_peer() {
+        let mut transport = ScriptedMailboxTransport::new(vec![
+            ServerMessage::Message {
+                side: "me".into(),
+                phase: "pake".into(),
+                body: HexBody::new(b"echo".to_vec()),
+                id: "1".into(),
+            },
+            ServerMessage::Ack {
+                id: "1".into(),
+            },
+            ServerMessage::Message {
+                side: "peer".into(),
+                phase: "pake".into(),
+                body: HexBody::new(b"hello".to_vec()),
+                id: "2".into(),
+            },
+        ]);
+
+        let mut client = MailboxClient::new("portl.exchange.v1", "me", &mut transport);
+        let msg = client.recv_phase_from_peer("pake", "me").await.unwrap();
+        assert_eq!(msg.side, "peer");
+        assert_eq!(msg.phase, "pake");
+        assert_eq!(msg.body, b"hello");
+        assert_eq!(msg.id, "2");
+    }
+
+    #[tokio::test]
+    async fn close_happy_sends_close_frame() {
+        let mut transport = ScriptedMailboxTransport::new(vec![]);
+        let mut client = MailboxClient::new("portl.exchange.v1", "side-a", &mut transport);
+        client.close_happy().await.unwrap();
+        let sent = transport.sent();
+        assert_eq!(sent.len(), 1);
+        match &sent[0] {
+            ClientMessage::Close { mailbox, mood } => {
+                assert!(mailbox.is_none());
+                assert_eq!(mood.as_deref(), Some("happy"));
+            }
+            other => panic!("expected close, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn close_scary_sends_scary_mood() {
+        let mut transport = ScriptedMailboxTransport::new(vec![]);
+        let mut client = MailboxClient::new("portl.exchange.v1", "side-a", &mut transport);
+        client.close_scary("mismatch").await.unwrap();
+        match &transport.sent()[0] {
+            ClientMessage::Close { mood: Some(m), .. } => {
+                assert!(m.contains("scary"));
+                assert!(m.contains("mismatch"));
+            }
+            other => panic!("expected scary close, got {other:?}"),
+        }
+    }
 
     #[test]
     fn bind_message_exact_shape() {
