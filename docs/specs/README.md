@@ -79,6 +79,7 @@ prose still use `node_id`. Treat them as synonymous.
 | 190 | `190-cli-ergonomics.md` | **Implemented in v0.3.6.** CLI friction-reduction release: help text, examples, actionable errors, command grouping, completions, selected surface cleanup. |
 | 200 | `200-persistent-sessions.md` | **Baseline shipped in v0.4.0.** Persistent terminal sessions via a provider interface, with zmx first and Docker/Slicer provisioning hooks. |
 | 210 | `210-session-control-lanes.md` | **v0.5.0 implementation slice shipped.** zmx-control and tmux `-CC` provider tiers landed; broader viewport/lane scheduling remains follow-on. |
+| 220 | `220-local-first-session-sharing.md` | **Proposed follow-on.** Local-first `portl session`, portable workspace identity, short online share codes, offline share envelopes, and generic `portl join`. |
 
 ## Specs vs plans — where does what go
 
@@ -162,7 +163,8 @@ are adapters"). That temptation trades one renumbering crisis
 For the current user-facing surface, read **190-cli-ergonomics**,
 **200-persistent-sessions**, and **210-session-control-lanes** after the
 root `README.md`. These capture the modern `<TARGET>` vocabulary,
-persistent-session model, and provider-tier work.
+persistent-session model, and provider-tier work. For the proposed
+session-first sharing UX, read **220-local-first-session-sharing** next.
 
 For architectural background, read **010-goals**, **020-architecture**,
 and **030-tickets**. **100-walkthroughs** is still useful, but some early
