@@ -46,11 +46,12 @@ Short online codes are generic Portl exchange codes:
 PORTL-S-2-nebula-involve
 ```
 
-They are provider-agnostic in the visible UX. The first backend may be
-Magic Wormhole's public rendezvous server, but backend selection belongs
-in Portl config. A future Portl mailbox or self-hosted backend should be
-able to carry the same Portl exchange envelope without changing the
-normal code shape.
+They are provider-agnostic in the visible UX. The first backend should be
+a Portl-owned Wormhole-compatible mailbox client that can use Magic
+Wormhole's public rendezvous server, but backend selection belongs in
+Portl config. A future Portl mailbox or self-hosted backend should be able
+to carry the same Portl exchange envelope without changing the normal code
+shape.
 
 Long offline tokens remain available for asynchronous copy/paste:
 
@@ -601,12 +602,12 @@ Backend selection is configuration-driven:
 
 ```toml
 [rendezvous]
-default = "magic-wormhole"
+default = "magic-wormhole-public"
 fallbacks = []
 
 [[rendezvous.backends]]
-name = "magic-wormhole"
-kind = "magic-wormhole"
+name = "magic-wormhole-public"
+kind = "wormhole-mailbox"
 url = "ws://relay.magic-wormhole.io:4000/v1"
 ```
 
@@ -615,7 +616,7 @@ Future config:
 ```toml
 [rendezvous]
 default = "portl-mailbox"
-fallbacks = ["magic-wormhole"]
+fallbacks = ["magic-wormhole-public"]
 
 [[rendezvous.backends]]
 name = "portl-mailbox"
@@ -623,8 +624,8 @@ kind = "portl-mailbox"
 url = "https://rendezvous.portl.dev"
 
 [[rendezvous.backends]]
-name = "magic-wormhole"
-kind = "magic-wormhole"
+name = "magic-wormhole-public"
+kind = "wormhole-mailbox"
 url = "ws://relay.magic-wormhole.io:4000/v1"
 compat = true
 ```
@@ -644,58 +645,126 @@ Portl mailbox ALPN/API: portl/rendezvous/v1
 Envelope schema: portl.exchange.v1
 ```
 
-### 10.1 Magic Wormhole as first backend
+### 10.1 First backend: Portl-owned Wormhole-compatible mailbox
 
-The scratch POC showed Magic Wormhole can exchange a full long Iroh
-gossip bootstrap ticket locally and cross-machine. For Portl, the
-transported payload should be `PortlExchangeEnvelopeV1`.
+The first rendezvous implementation should be a Portl-owned, MIT-licensed
+backend that is compatible with the Magic Wormhole mailbox/client protocol
+subset needed for short online exchange codes. Do **not** depend on the
+EUPL-1.2 `magic-wormhole.rs` crate in production builds.
 
-The `magic-wormhole` Rust workspace has two crates:
+The scratch POC showed that Magic Wormhole-style rendezvous can exchange a
+long bootstrap payload locally and cross-machine. For Portl, the encrypted
+application payload should be `PortlExchangeEnvelopeV1`, not Magic
+Wormhole's file-transfer protocol.
 
-- `magic-wormhole`: the library crate;
-- `magic-wormhole-cli`: the CLI crate.
+Scope the first backend to:
 
-There is no smaller published `magic-wormhole-core` crate. The library
-crate is still usable for Portl's short-code exchange layer because its
-core API is public:
-
-```rust
-use magic_wormhole::{AppConfig, AppID, Code, MailboxConnection, Wormhole};
+```text
+short code -> mailbox websocket -> SPAKE2 -> HKDF -> SecretBox ->
+encrypted PortlExchangeEnvelopeV1
 ```
 
-With default features disabled, the library exposes the mailbox, PAKE,
-key derivation, encrypted peer-message send/receive, code parsing, and
-wordlist code generation without compiling the file-transfer, transit, or
-port-forwarding modules:
+Implement only:
+
+- code parsing/generation for `PORTL-S-*` values;
+- mailbox WebSocket commands needed for allocate/claim/open/add/release;
+- SPAKE2 PAKE exchange;
+- HKDF-SHA256 phase-key derivation;
+- NaCl SecretBox-compatible small encrypted messages;
+- a Portl-specific version/app negotiation message;
+- timeout, crowded, scary, lonely, and cancellation handling.
+
+Do not implement:
+
+- file transfer;
+- transit relay;
+- port forwarding;
+- Dilation;
+- Tor support;
+- journal/resume mode;
+- generic Magic Wormhole CLI interoperability beyond the mailbox/client
+  protocol pieces Portl needs.
+
+Use the MIT-licensed Magic Wormhole protocol docs and the MIT-licensed
+Python implementation as references. Do not copy or port code from the
+EUPL-licensed Rust implementation. If Portl copies any MIT wordlist,
+constants, test vectors, or code, preserve the corresponding MIT notice.
+
+Recommended dependency plan:
 
 ```toml
-magic-wormhole = { version = "0.7", default-features = false }
+# Already in Portl's graph through iroh-relay; make it direct for the backend.
+tokio-websockets = { version = "0.13.2", features = [
+    "client",
+    "getrandom",
+    "ring",
+    "rustls-webpki-roots",
+] }
+
+# Genuinely new direct dependencies for the Wormhole-compatible subset.
+spake2 = "0.4"
+crypto_secretbox = "0.1.1"
+
+# Already in the lockfile via age, but direct because this module calls it.
+hkdf = "0.12"
 ```
 
-Do not use `magic-wormhole = "0.8"` while Portl is pinned to Rust 1.89:
-`magic-wormhole 0.8.0` declares `rust-version = "1.92"`. Version 0.7.0
-declares `rust-version = "1.75"` and `cargo +1.89.0 check -p
-magic-wormhole --no-default-features` succeeds. If Portl later raises its
-MSRV past 1.92, re-evaluate 0.8.
+Re-use existing workspace dependencies for everything else:
 
-Even with `default-features = false`, this is not a zero-cost dependency.
-The core rendezvous layer still brings WebSocket/runtime/crypto support
-such as `async-tungstenite`, `async-std` in 0.7, `crypto_secretbox`,
-`spake2`, `hkdf`, `sha-1`, `sha2`, `rand`, `url`, and `serde_json`.
-That footprint is acceptable for a prototype or optional feature, but it
-should be measured before enabling by default.
+```text
+tokio, futures-util, bytes, serde, serde_json, hex, rand, rand_core,
+sha2, base64, url, rustls, rustls-pki-types
+```
 
-Before making it a required production dependency, review:
+Avoid adding:
 
-- EUPL-1.2 license compatibility with Portl's MIT license;
-- dependency footprint and async-runtime integration;
-- public relay availability and self-hosted relay options;
-- whether a feature-gated backend or external helper process is safer
-  until the license question is settled.
+```text
+magic-wormhole, tokio-tungstenite, tungstenite, async-tungstenite,
+hashcash, native-tls, openssl, aws-lc-rs
+```
 
-If license or production-suitability concerns block the dependency,
-keep the same envelope and backend abstraction and implement a Portl
-mailbox backend instead.
+The dependency invariant for release builds is:
+
+```text
+no EUPL Rust crate
+no aws-lc-rs
+no native-tls / OpenSSL TLS stack
+TLS, when needed, stays on rustls + ring like Iroh/Portl already do
+```
+
+The candidate dependency set has been checked with `cargo-zigbuild` for:
+
+```text
+x86_64-unknown-linux-musl
+aarch64-unknown-linux-musl
+```
+
+Keep those targets in the verification plan for every implementation
+slice that touches the backend dependencies.
+
+#### `ws://` and `wss://` policy
+
+Support both `ws://` and `wss://` rendezvous URLs out of the box.
+
+`ws://` is acceptable for the current public Magic Wormhole mailbox:
+
+```text
+ws://relay.magic-wormhole.io:4000/v1
+```
+
+because the Portl exchange envelope is end-to-end encrypted above the
+mailbox using SPAKE2, HKDF, and SecretBox. The mailbox server and passive
+observers must not learn the ticket/session envelope contents.
+
+`wss://` should still be supported for compliance, defense-in-depth,
+self-hosted deployments, and future private rendezvous services. TLS
+protects AppID/nameplate metadata from passive observers and avoids
+plaintext-WebSocket review friction, even though the application payload is
+already encrypted.
+
+Do not require `wss://`: that would break compatibility with the canonical
+public Magic Wormhole relay. Prefer `wss://` for self-hosted or production
+mailboxes when available.
 
 ### 10.2 Sender-side lifecycle: CLI first, agent later
 
@@ -1077,9 +1146,15 @@ portl session app-dev@alice-laptop
 ### Phase 4 — CLI-hosted short-code backend
 
 - Add process-agnostic rendezvous backend abstraction.
-- Add Magic Wormhole backend behind an optional feature and after license
-  review; while Portl is on Rust 1.89, use `magic-wormhole 0.7` with
-  `default-features = false`, not 0.8.
+- Add Portl-owned `wormhole-mailbox` backend based on the MIT protocol
+  docs/Python implementation, not the EUPL Rust crate.
+- Reuse `tokio-websockets` from the existing Iroh dependency graph.
+- Add only the minimal new crypto crates needed for the protocol subset:
+  `spake2` and `crypto_secretbox`; add `hkdf` as a direct dependency even
+  though it is already in the lockfile.
+- Support both `ws://` and `wss://` mailbox URLs using rustls + ring and no
+  `aws-lc-rs`.
+- Verify x86_64/aarch64 Linux musl builds with `cargo-zigbuild`.
 - Add provider-agnostic `PORTL-S-*` user-visible codes.
 - Add `portl accept` generic dispatcher.
 - Keep sender-side offers alive in the invoking CLI and clearly print
@@ -1103,17 +1178,16 @@ portl session app-dev@alice-laptop
 ### Phase 7 — Metadata sync and Portl mailbox
 
 - Add optional Iroh Docs metadata sync for workspace registries.
-- Add Portl mailbox rendezvous backend if Magic Wormhole is unsuitable as
-  a default production dependency.
+- Add Portl mailbox rendezvous backend for Portl-owned infrastructure,
+  stronger product control, and possible future sender-offline semantics.
 - Seed rendezvous and metadata defaults from `portl init` / config.
 
 ## 16. Open questions
 
-1. **Magic Wormhole dependency policy:** Is EUPL-1.2 acceptable for a
-   default Portl dependency, or should it remain optional/prototype-only?
-   If approved, should Portl pin `magic-wormhole 0.7` until the project
-   raises its MSRV beyond 1.92, or should Magic Wormhole remain a
-   separate helper/backend during the Rust-version gap?
+1. **Protocol-compatibility review:** Is the first `wormhole-mailbox`
+   backend compatible enough with the public Magic Wormhole mailbox for
+   Portl-to-Portl short-code exchange, and are its protocol/security tests
+   strong enough to make it the default?
 2. **Default direct-address privacy:** Should offline tokens include direct
    IP addresses by default, or only relay URLs unless explicitly requested?
 3. **Generated name style:** Which wordlist/slug format should `portl
