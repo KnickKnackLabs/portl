@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 use thiserror::Error;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Errors produced by the Wormhole-compatible crypto helpers.
 #[derive(Debug, Error)]
@@ -35,8 +36,14 @@ pub enum WormholeCryptoError {
 }
 
 /// A 32-byte symmetric key derived from the Wormhole PAKE handshake.
-#[derive(Clone, Debug)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct WormholeKey([u8; 32]);
+
+impl std::fmt::Debug for WormholeKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("WormholeKey").field(&"<redacted>").finish()
+    }
+}
 
 impl WormholeKey {
     /// Construct a key from raw bytes.
@@ -182,5 +189,81 @@ mod tests {
         let key = WormholeKey::from_bytes([7u8; 32]);
         let encrypted = encrypt_phase_with_nonce(&key, "side-a", "1", b"hello", [9u8; 24]);
         assert!(decrypt_phase(&key, "side-a", "2", &encrypted).is_err());
+    }
+
+    #[test]
+    fn debug_redacts_key_bytes() {
+        let key = WormholeKey::from_bytes([0xABu8; 32]);
+        let s = format!("{key:?}");
+        assert!(s.contains("redacted"));
+        assert!(!s.contains("ab"));
+        assert!(!s.contains("AB"));
+    }
+
+    #[test]
+    fn start_pake_message_shape_is_pake_v1_lower_hex() {
+        let (_state, body) = start_pake("2-nebula-involve", "portl.exchange.v1");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let pake = parsed
+            .get("pake_v1")
+            .and_then(|v| v.as_str())
+            .expect("pake_v1 string field present");
+        assert!(!pake.is_empty());
+        assert_eq!(pake.len() % 2, 0, "hex must have even length");
+        assert!(pake.len() >= 32, "share should not be tiny");
+        assert!(
+            pake.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+            "expected lowercase hex, got {pake}"
+        );
+        // exactly one field
+        let obj = parsed.as_object().expect("JSON object");
+        assert_eq!(obj.len(), 1);
+    }
+
+    #[test]
+    fn finish_pake_rejects_invalid_json() {
+        let (state, _msg) = start_pake("pw", "appid");
+        let err = finish_pake(state, b"not json").unwrap_err();
+        assert!(matches!(err, WormholeCryptoError::InvalidJson(_)));
+    }
+
+    #[test]
+    fn finish_pake_rejects_invalid_hex() {
+        let (state, _msg) = start_pake("pw", "appid");
+        let body = br#"{"pake_v1":"zzzz"}"#;
+        let err = finish_pake(state, body).unwrap_err();
+        assert!(matches!(err, WormholeCryptoError::InvalidHex(_)));
+    }
+
+    #[test]
+    fn derive_key_matches_known_vector() {
+        let key = WormholeKey::from_bytes([7u8; 32]);
+        let out = derive_key(&key, b"wormhole:test");
+        let expected = "cb6bb928a5c6d955e7a38eb9d249585f3f06daf20159e4458bb2522c35261d52";
+        assert_eq!(hex::encode(out), expected);
+    }
+
+    #[test]
+    fn derive_phase_key_matches_known_vector() {
+        let key = WormholeKey::from_bytes([7u8; 32]);
+        let out = derive_phase_key(&key, "side-a", "1");
+        let expected = "2dfa0c8c62553fd3aa66079acc83e1a9dcb36a42cd1ac5d804c0a0263298f4b8";
+        assert_eq!(hex::encode(out), expected);
+    }
+
+    #[test]
+    fn encrypt_phase_with_nonce_matches_known_vector() {
+        let key = WormholeKey::from_bytes([7u8; 32]);
+        let out = encrypt_phase_with_nonce(&key, "side-a", "1", b"hello", [9u8; 24]);
+        let expected = "0909090909090909090909090909090909090909090909095d62cd3aaa797de679969a50ce3d94f99327904c69";
+        assert_eq!(hex::encode(out), expected);
+    }
+
+    #[test]
+    fn decrypt_phase_truncated_payload_returns_truncated() {
+        let key = WormholeKey::from_bytes([7u8; 32]);
+        let short = vec![0u8; 23];
+        let err = decrypt_phase(&key, "side-a", "1", &short).unwrap_err();
+        assert!(matches!(err, WormholeCryptoError::Truncated));
     }
 }
