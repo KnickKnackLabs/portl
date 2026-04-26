@@ -79,7 +79,7 @@ prose still use `node_id`. Treat them as synonymous.
 | 190 | `190-cli-ergonomics.md` | **Implemented in v0.3.6.** CLI friction-reduction release: help text, examples, actionable errors, command grouping, completions, selected surface cleanup. |
 | 200 | `200-persistent-sessions.md` | **Baseline shipped in v0.4.0.** Persistent terminal sessions via a provider interface, with zmx first and Docker/Slicer provisioning hooks. |
 | 210 | `210-session-control-lanes.md` | **v0.5.0 implementation slice shipped.** zmx-control and tmux `-CC` provider tiers landed; broader viewport/lane scheduling remains follow-on. |
-| 220 | `220-local-first-session-sharing.md` | **Proposed follow-on.** Local-first `portl session`, portable workspace identity, short online share codes, offline share envelopes, and generic `portl join`. |
+| 220 | `220-local-first-session-sharing.md` | **Proposed follow-on.** Local-first `portl session`, portable workspace identity, short online share codes, offline share envelopes, and generic `portl accept`. |
 
 ## Specs vs plans — where does what go
 

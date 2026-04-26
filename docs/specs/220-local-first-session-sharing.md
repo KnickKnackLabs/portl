@@ -25,7 +25,7 @@ sessions feel like the natural starting point:
 portl session        # create/attach a local generated workspace
 portl session dev    # create/attach local workspace "dev"
 portl session share dev
-portl join PORTL-S-2-nebula-involve
+portl accept PORTL-S-2-nebula-involve
 ```
 
 The key design move is to separate three concepts:
@@ -95,8 +95,11 @@ transporting it through a rendezvous backend.
 8. **Keep authority in Portl tickets.** Metadata and workspace identity
    never grant terminal access by themselves.
 9. **Keep rendezvous out of the hot path.** Short-code services are used
-   only for share/join setup. Later session attach uses normal Portl/Iroh
+   only for share/accept setup. Later session attach uses normal Portl/Iroh
    transport.
+10. **Make `accept` the generic receiver verb.** `join` remains useful for
+   sessions, but `accept` better describes importing a ticket, invite,
+   endpoint card, or workspace share.
 
 ## 4. Non-goals
 
@@ -247,36 +250,43 @@ portl session kill <TARGET> [SESSION] [--provider PROVIDER]
 These remain useful for direct target/provider management and for
 backward compatibility.
 
-### 6.3 Sharing and joining
+### 6.3 Sharing and accepting
 
 ```bash
 portl session share [WORKSPACE]
 portl session share [WORKSPACE] --offline
+portl accept <CODE_OR_TOKEN>
 portl session join <CODE_OR_TOKEN>
-portl join <CODE_OR_TOKEN>
 ```
 
-`portl join` is the generic newcomer command: if someone sends you a
-Portl thing, run `portl join <thing>`. It dispatches by prefix or by
-short-code rendezvous payload kind.
+`portl accept` is the generic newcomer command: if someone sends you a
+Portl thing, run `portl accept <thing>`. It dispatches by prefix or by
+short-code rendezvous payload kind, verifies what authority or metadata
+is being imported, and then saves or opens the resulting object.
 
 Inputs it should understand:
 
 ```text
-PORTL-S-*       short online exchange code
-PORTL-SHARE1-*  long offline session/workspace share
-PORTLINV-*      existing peer invite
-portl...        existing Portl ticket
-PORTL-PEER1-*   future peer/endpoint card
+PORTL-S-*        short online exchange code
+PORTL-SHARE1-*   long offline session/workspace share
+PORTLINV-*       existing peer invite
+portl...         existing Portl ticket
+PORTL-PEER1-*    future peer card
+PORTL-ENDPOINT1-* future endpoint card
 ```
 
 Specific commands can remain aliases for clarity:
 
 ```bash
-portl accept PORTLINV-...
-portl ticket save LABEL portl...
-portl session join PORTL-S-...
+portl session join PORTL-S-...   # session shares only
+portl peer accept PORTLINV-...   # peer invites only, optional alias
+portl ticket accept portl...     # tickets only, optional alias
 ```
+
+`portl join` should not be the primary generic router. It is friendly for
+live sessions, but it is awkward for tickets, peer cards, endpoint cards,
+and metadata-only shares. If added, it should be a compatibility or
+session-oriented alias, not the canonical docs command.
 
 ## 7. Exchange envelope
 
@@ -401,7 +411,7 @@ Short exchange:
 
 ```bash
 portl ticket share dev-access
-portl join PORTL-S-4-panda-lantern
+portl accept PORTL-S-4-panda-lantern
 ```
 
 Payload:
@@ -431,7 +441,7 @@ Short exchange:
 
 ```bash
 portl invite --short
-portl join PORTL-S-8-river-copper
+portl accept PORTL-S-8-river-copper
 ```
 
 First implementation can transport the existing invite code:
@@ -468,7 +478,7 @@ This can support future identity-only sharing:
 
 ```bash
 portl peer share-card
-portl join PORTL-S-6-orbit-silver
+portl accept PORTL-S-6-orbit-silver
 ```
 
 ### 9.4 Session share versus ticket
@@ -480,6 +490,101 @@ identity, friendly names, conflict handles, provider/session binding,
 display hints, optional metadata sync, and ticket chain material.
 
 Do not duplicate ticket authority in session metadata.
+
+### 9.5 Accept UX by payload kind
+
+`portl accept` should always explain what is being imported before it
+saves trust or authority. The prompt should name the payload kind, sender
+hint, target/workspace, granted access, expiry, and local name.
+
+Session share:
+
+```text
+Receiving Portl session share...
+
+From:       alice-laptop
+Workspace:  dev
+Access:     session attach
+Provider:   zmx
+Expires:    2 hours
+
+This will import a workspace named:
+
+  dev@alice-laptop
+
+Accept and connect now? [Y/n]
+```
+
+Peer invite:
+
+```text
+Peer invite detected.
+
+From:      alice-laptop
+Peer ID:   z6Mk...
+Label:     alice-laptop
+
+This will add alice-laptop to your peer store.
+It does not grant terminal access by itself.
+
+Accept invite? [Y/n]
+```
+
+Ticket share:
+
+```text
+Portl ticket share detected.
+
+From:      alice-laptop
+Target:    shared-box
+Allows:    shell, session
+Expires:   2 hours
+Label:     shared-box
+
+This will save a capability ticket locally.
+Anyone with this ticket can use the listed capabilities until it expires.
+
+Save ticket as "shared-box"? [Y/n]
+```
+
+Peer or endpoint card:
+
+```text
+Portl peer card detected.
+
+Peer:       alice-laptop
+Endpoint:   z6Mk...
+Relays:     1 relay hint
+Access:     none
+
+This will save endpoint identity and dialing hints.
+It does not grant shell, session, tcp, or udp access.
+
+Save peer card as "alice-laptop"? [Y/n]
+```
+
+Metadata-only share:
+
+```text
+Workspace metadata share detected.
+
+From:       alice-laptop
+Workspace:  dev
+Contains:   name, bindings, labels, provider hints
+Access:     metadata only
+
+This does not grant shell or session access.
+Import metadata as "dev@alice-laptop"? [Y/n]
+```
+
+For powerful or long-lived tickets, default to `N` and make the risk
+visible:
+
+```text
+Warning: this ticket grants shell, exec, session, tcp, and udp for 30 days.
+
+Save this ticket? [y/N]
+```
 
 ## 10. Short-code rendezvous
 
@@ -528,7 +633,7 @@ Do not blindly probe every possible backend. Try the configured default,
 then explicit fallbacks. Add advanced override later:
 
 ```bash
-portl join --rendezvous my-mailbox PORTL-S-...
+portl accept --rendezvous my-mailbox PORTL-S-...
 ```
 
 Internal namespacing still matters:
@@ -563,6 +668,95 @@ features. Before making it a required production dependency, review:
 If license or production-suitability concerns block the dependency,
 keep the same envelope and backend abstraction and implement a Portl
 mailbox backend instead.
+
+### 10.2 Sender-side lifecycle: CLI first, agent later
+
+The first short-code implementation should be CLI-hosted. This proves the
+exchange envelope, rendezvous backend, `portl accept` dispatcher, ticket
+validation, and session attach flow without first adding persistent
+pending-offer state to `portl-agent`.
+
+Sender UX in the first slice:
+
+```bash
+portl session share dev
+```
+
+```text
+Share this session:
+
+  PORTL-S-2-nebula-involve
+
+They can accept it with:
+
+  portl accept PORTL-S-2-nebula-involve
+
+Waiting for recipient...
+Keep this command running until they accept.
+Expires in 10 minutes.
+```
+
+If the sender exits the command before the recipient accepts, the short
+code is no longer claimable. This is acceptable for the first slice as
+long as the CLI says so plainly.
+
+The target product UX is agent-hosted pending offers:
+
+```text
+Share this session:
+
+  PORTL-S-2-nebula-involve
+
+They can accept it with:
+
+  portl accept PORTL-S-2-nebula-involve
+
+Expires in 10 minutes.
+Offer is being kept alive by portl-agent.
+
+Manage it with:
+
+  portl share ls
+  portl share cancel PORTL-S-2-nebula-involve
+```
+
+Agent-hosted offers are still **online shares**, not offline shares. The
+sender's machine and `portl-agent` must remain online until the offer is
+claimed. Offline sharing remains `PORTL-SHARE1-*`.
+
+The rendezvous abstraction should be process-agnostic so the same
+backend implementation can run in the CLI first and inside the agent
+later:
+
+```rust
+trait RendezvousBackend {
+    async fn offer(&self, offer: ExchangeOffer) -> Result<OfferHandle>;
+    async fn accept(&self, code: ShortCode) -> Result<PortlExchangeEnvelopeV1>;
+}
+```
+
+When offers move to `portl-agent`, prefer deferred ticket minting:
+
+```text
+pending_offer {
+  workspace_id: ws_...
+  allowed_capabilities: session.attach
+  max_access_ttl: 2h
+  one_time: true
+}
+```
+
+Avoid storing long-lived bearer tickets inside pending offers. The agent
+should mint a recipient-bound ticket after the recipient arrives and
+presents an endpoint identity.
+
+Future management commands:
+
+```bash
+portl share ls
+portl share status <CODE_OR_ID>
+portl share cancel <CODE_OR_ID>
+```
 
 ## 11. Security and lifecycle
 
@@ -603,8 +797,8 @@ The logical guide should start with the session-first mental model:
 1. Install Portl and initialize identity.
 2. Start a local session workspace.
 3. Keep working normally.
-4. Share the workspace when someone else needs to join.
-5. Recipient runs one `portl join` command.
+4. Share the workspace when someone else needs access.
+5. Recipient runs one `portl accept` command.
 6. Both sides can return to the workspace by name later.
 ```
 
@@ -624,7 +818,7 @@ portl session share dev
 
 # On the other machine.
 portl init
-portl join PORTL-S-2-nebula-involve
+portl accept PORTL-S-2-nebula-involve
 
 # Later, reconnect by name.
 portl session dev@alice-laptop
@@ -642,6 +836,8 @@ Explain the difference:
 
 ```text
 Short code: both sides online, easiest to read aloud, expires quickly.
+First implementation: sender keeps `portl session share` running.
+Later implementation: sender's `portl-agent` can keep the offer alive.
 Offline token: long, copyable later, contains full bootstrap/access payload.
 Peer pairing: durable relationship for repeated access.
 ```
@@ -683,7 +879,8 @@ Expected output:
 ```text
 Share code: PORTL-S-2-nebula-involve
 Expires:    10m
-Recipient:  portl join PORTL-S-2-nebula-involve
+Recipient:  portl accept PORTL-S-2-nebula-involve
+Note:       keep this command running until they accept
 ```
 
 Portl builds a session-share envelope containing:
@@ -704,10 +901,10 @@ One-time setup:
 portl init
 ```
 
-Join:
+Accept:
 
 ```bash
-portl join PORTL-S-2-nebula-involve
+portl accept PORTL-S-2-nebula-involve
 ```
 
 Expected behavior:
@@ -783,7 +980,8 @@ Expected output:
 
 ```text
 Share code: PORTL-S-6-orbit-silver
-Recipient:  portl join PORTL-S-6-orbit-silver
+Recipient:  portl accept PORTL-S-6-orbit-silver
+Note:       keep this command running until they accept
 ```
 
 The envelope contains:
@@ -801,7 +999,7 @@ The recipient does not need Docker locally. They need Portl and the code:
 
 ```bash
 portl init
-portl join PORTL-S-6-orbit-silver
+portl accept PORTL-S-6-orbit-silver
 ```
 
 Expected behavior:
@@ -848,15 +1046,24 @@ portl session app-dev@alice-laptop
 - Add `PORTL-SHARE1-*` encode/decode.
 - Add import validation for embedded tickets and endpoint consistency.
 
-### Phase 4 — Short-code backend
+### Phase 4 — CLI-hosted short-code backend
 
-- Add rendezvous backend abstraction.
+- Add process-agnostic rendezvous backend abstraction.
 - Add Magic Wormhole backend behind an optional feature or after license
   review.
 - Add provider-agnostic `PORTL-S-*` user-visible codes.
-- Add `portl join` generic dispatcher.
+- Add `portl accept` generic dispatcher.
+- Keep sender-side offers alive in the invoking CLI and clearly print
+  "keep this command running until they accept."
 
-### Phase 5 — Real session access and roles
+### Phase 5 — Agent-hosted pending offers
+
+- Add local CLI-to-agent control API for creating pending offers.
+- Add expiring one-time pending-offer state to `portl-agent`.
+- Add `portl share ls`, `portl share status`, and `portl share cancel`.
+- Defer ticket minting until a recipient arrives where possible.
+
+### Phase 6 — Real session access and roles
 
 - Mint recipient-bound session tickets during rendezvous when possible.
 - Add read-only/observer roles if provider/session-control lanes can
@@ -864,7 +1071,7 @@ portl session app-dev@alice-laptop
 - Add progress states and separate timeouts for rendezvous, envelope
   exchange, and session attach.
 
-### Phase 6 — Metadata sync and Portl mailbox
+### Phase 7 — Metadata sync and Portl mailbox
 
 - Add optional Iroh Docs metadata sync for workspace registries.
 - Add Portl mailbox rendezvous backend if Magic Wormhole is unsuitable as
