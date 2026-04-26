@@ -44,6 +44,12 @@ dashmap      = "6"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 sha2          = "0.10"
 
+# wormhole-compatible shortcode rendezvous
+tokio-websockets = { version = "0.13.2", features = ["client", "getrandom", "ring", "rustls-webpki-roots"] }
+spake2           = "0.4"
+crypto_secretbox = "0.1.1"
+hkdf             = "0.12"
+
 # encoding
 serde            = { version = "1", features = ["derive"] }
 serde-big-array  = "0.5"
