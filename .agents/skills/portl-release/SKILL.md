@@ -22,8 +22,8 @@ Portl releases combine deterministic mise tasks with agent judgment. Let scripts
 5. Run `mise run release:verify -- VERSION --full` before commit/tag unless the user explicitly requests a lighter check.
 6. Commit with subject `Release vVERSION` and a body explaining the bump.
 7. Push `main`.
-8. After CI is green or the user accepts using the release workflow gate, run `mise run release:tag -- VERSION`.
-9. Watch/report the GitHub release workflow URL and status. If `gh` is available, use `gh run list --workflow=release.yml --limit 3`; otherwise report `https://github.com/KnickKnackLabs/portl/actions`.
+8. Before tagging, verify the pushed release commit's CI with `mise run release:watch -- VERSION --ci-only`; before the tag exists this requires local `HEAD` to match upstream, and it refuses a stale existing `vVERSION` tag unless `--allow-existing-tag` is explicit. Then run `mise run release:tag -- VERSION`.
+9. After tagging, watch/report CI and release publishing with `mise run release:watch -- VERSION`. Avoid raw `gh run watch` unless debugging interactively; it repeats large job tables and annotations.
 
 ## Changelog Rules
 
@@ -41,6 +41,15 @@ Portl releases combine deterministic mise tasks with agent judgment. Let scripts
 - `mise run release:verify -- VERSION --full` — metadata checks, fmt/diff/version, focused tests, clippy. Add `--allow-existing-tag` only when auditing an already-tagged release.
 - `mise run release:changelog:draft -- VERSION [--since TAG]` — write `scratch/release-vVERSION-changelog-draft.md` with raw commit subjects, commit links, and compare link for rewrite.
 - `mise run release:tag -- VERSION` — fetch remote tags, verify HEAD is pushed upstream, re-check changelog, then create and push annotated `vVERSION` tag. Supports `--no-push` and `--allow-unpushed`.
+- `mise run release:watch -- VERSION` — low-noise watcher for the tag commit's CI run and the tag's Release run. Prints compact status only when it changes and exits nonzero on terminal failure. Use `--once`, `--ci-only`, `--release-only`, `--poll`, `--timeout`, `--json`, `--verbose`, or `--allow-existing-tag` for focused checks. Exit `124` means the workflows were still pending at timeout, not necessarily failed; `--json` is snapshot-only.
+
+## If CI or Release Fails
+
+1. Start with `mise run release:watch -- VERSION --verbose` or `gh run view RUN_ID --log-failed`; do not paste full watch transcripts into context. If `release:watch` times out, re-check with `mise run release:watch -- VERSION --once` before treating it as a failed workflow.
+2. Fix locally, then run the smallest relevant verification before `mise run release:verify -- VERSION --full`.
+3. Commit and push the fix to `main`.
+4. If the tag was pushed but `gh release view vVERSION` confirms the GitHub release was not published, move it only with explicit intent: delete/recreate or force-update local `vVERSION`, then `git push --force origin refs/tags/vVERSION`.
+5. If the GitHub release was already published, do not move the tag; cut the next patch version instead.
 
 ## Common Mistakes
 
@@ -48,3 +57,5 @@ Portl releases combine deterministic mise tasks with agent judgment. Let scripts
 - Letting a script invent final release notes without review.
 - Replacing historical spec references while bumping README current-version examples.
 - Forgetting the GitHub release workflow extracts the matching changelog section.
+- Using raw `gh run watch` by default; prefer `release:watch` to avoid repeated annotations and huge transcripts.
+- Moving a tag after the GitHub release has been published; cut a new patch release instead.

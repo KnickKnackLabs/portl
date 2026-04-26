@@ -1,0 +1,301 @@
+#!/usr/bin/env -S uv run --script
+#MISE description="Watch Portl release CI and publish workflows with low-noise output"
+#USAGE arg "version" help="Release version without leading v, e.g. 0.5.2"
+#USAGE flag "--poll <seconds>" help="Polling interval in seconds"
+#USAGE flag "--timeout <seconds>" help="Maximum seconds to wait"
+#USAGE flag "--ci-only" help="Only watch CI for the tag commit"
+#USAGE flag "--release-only" help="Only watch the release workflow for the tag"
+#USAGE flag "--once" help="Print one snapshot and exit"
+#USAGE flag "--json" help="Print one JSON snapshot and exit"
+#USAGE flag "--verbose" help="Include failed job URLs"
+#USAGE flag "--allow-existing-tag" help="Allow --ci-only to audit an existing tag that differs from HEAD"
+# /// script
+# requires-python = ">=3.11"
+# ///
+from __future__ import annotations
+
+import argparse
+import json
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from typing import Any
+
+
+SUCCESS = "success"
+TERMINAL_FAILURES = {"failure", "cancelled", "timed_out", "action_required", "startup_failure"}
+if hasattr(signal, "SIGPIPE"):
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+
+def out(cmd: list[str]) -> str:
+    try:
+        return subprocess.check_output(cmd, text=True, stderr=subprocess.PIPE).strip()
+    except FileNotFoundError as exc:
+        raise SystemExit(f"Required command not found: {cmd[0]}") from exc
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.strip() if exc.stderr else ""
+        message = f"Command failed: {' '.join(cmd)}"
+        if stderr:
+            message = f"{message}\n{stderr}"
+        raise SystemExit(message) from exc
+
+
+def gh_json(cmd: list[str]) -> Any:
+    return json.loads(out(["gh", *cmd]))
+
+
+def require_version(version: str) -> None:
+    parts = version.split(".")
+    if len(parts) != 3 or any(not part.isdigit() for part in parts):
+        raise SystemExit(f"Invalid version {version!r}; expected X.Y.Z")
+
+
+def resolve_release_sha(version: str, *, allow_head_fallback: bool, allow_existing_tag: bool) -> str:
+    tag = f"v{version}"
+    out(["git", "fetch", "origin", "--quiet"])
+    out(["git", "fetch", "origin", "--tags", "--quiet"])
+    head = out(["git", "rev-parse", "HEAD"])
+    tag_sha = ""
+    try:
+        tag_sha = out(["git", "rev-list", "-n", "1", tag])
+    except SystemExit:
+        if not allow_head_fallback:
+            raise SystemExit(f"Could not resolve tag {tag}")
+
+    if tag_sha:
+        if allow_head_fallback and tag_sha != head and not allow_existing_tag:
+            raise SystemExit(
+                f"{tag} already exists at {tag_sha[:12]}, but HEAD is {head[:12]}. "
+                "Refusing to validate a stale tag during pre-tag CI watch. "
+                "Use --allow-existing-tag to audit the existing tag, or fix the tag intentionally."
+            )
+        return tag_sha
+
+    upstream = out(["git", "rev-parse", "@{u}"])
+    if head != upstream:
+        raise SystemExit(
+            f"{tag} does not exist yet and HEAD {head[:12]} is not pushed to upstream {upstream[:12]}. "
+            "Push main before running the pre-tag CI watch."
+        )
+    print(f"{tag} does not exist yet; using pushed HEAD {head[:12]} for --ci-only pre-tag watch", file=sys.stderr)
+    return head
+
+
+def require_workflow(path: str) -> None:
+    out(["gh", "workflow", "view", path])
+
+
+@dataclass(frozen=True)
+class RunRef:
+    label: str
+    run_id: int
+    url: str
+
+
+def latest_run_for_commit(workflow: str, sha: str) -> RunRef | None:
+    runs = gh_json(
+        [
+            "run",
+            "list",
+            f"--workflow={workflow}",
+            f"--commit={sha}",
+            "--event=push",
+            "--limit=5",
+            "--json=databaseId,url,workflowName,headSha,createdAt,status,conclusion,event",
+        ]
+    )
+    runs = [run for run in runs if run.get("event") == "push"]
+    if not runs:
+        return None
+    run = runs[0]
+    return RunRef(run["workflowName"], run["databaseId"], run["url"])
+
+
+def latest_release_run(version: str, sha: str) -> RunRef | None:
+    tag = f"v{version}"
+    runs = gh_json(
+        [
+            "run",
+            "list",
+            "--workflow=release.yml",
+            f"--branch={tag}",
+            "--limit=5",
+            "--json=databaseId,url,workflowName,headSha,displayTitle,createdAt,status,conclusion",
+        ]
+    )
+    matching = [run for run in runs if run.get("headSha") == sha]
+    if not matching:
+        return None
+    run = matching[0]
+    return RunRef(run["workflowName"], run["databaseId"], run["url"])
+
+
+def run_view(run_ref: RunRef) -> dict[str, Any]:
+    view = gh_json(
+        [
+            "run",
+            "view",
+            str(run_ref.run_id),
+            "--json=databaseId,status,conclusion,url,workflowName,headSha,jobs",
+        ]
+    )
+    view["label"] = run_ref.label
+    return view
+
+
+def glyph(status: str, conclusion: str | None) -> str:
+    if status == "completed":
+        if conclusion == SUCCESS:
+            return "✓"
+        if conclusion in TERMINAL_FAILURES:
+            return "✗"
+        return "!"
+    if status in {"in_progress", "waiting", "requested"}:
+        return "*"
+    return "·"
+
+
+def summarize_run(view: dict[str, Any], *, verbose: bool) -> str:
+    label = view.get("workflowName") or view.get("label") or "workflow"
+    status = view.get("status") or "unknown"
+    conclusion = view.get("conclusion") or ""
+    run_id = view.get("databaseId")
+    url = view.get("url")
+    lines = [f"{label:<8} {run_id}  {status:<11} {conclusion or '-'}  {url}"]
+    jobs = sorted(view.get("jobs") or [], key=lambda job: job.get("name") or "")
+    for job in jobs:
+        mark = glyph(job.get("status") or "", job.get("conclusion"))
+        detail = job.get("conclusion") or job.get("status") or "unknown"
+        lines.append(f"  {mark} {job.get('name')} — {detail}")
+        if verbose and job.get("status") == "completed" and job.get("conclusion") != SUCCESS:
+            lines.append(f"      {job.get('url')}")
+    return "\n".join(lines)
+
+
+def missing_summary(label: str) -> str:
+    return f"{label:<8} pending     no workflow run found yet"
+
+
+def selected_refs(version: str, sha: str, *, ci_only: bool, release_only: bool) -> list[tuple[str, RunRef | None]]:
+    refs: list[tuple[str, RunRef | None]] = []
+    if not release_only:
+        refs.append(("CI", latest_run_for_commit("ci.yml", sha)))
+    if not ci_only:
+        refs.append(("Release", latest_release_run(version, sha)))
+    return refs
+
+
+def render_snapshot(refs: list[tuple[str, RunRef | None]], *, verbose: bool) -> tuple[str, bool, bool]:
+    sections: list[str] = []
+    all_done = True
+    any_failure = False
+    for label, ref in refs:
+        if ref is None:
+            sections.append(missing_summary(label))
+            all_done = False
+            continue
+        view = run_view(ref)
+        sections.append(summarize_run(view, verbose=verbose))
+        if view.get("status") != "completed":
+            all_done = False
+        elif view.get("conclusion") in TERMINAL_FAILURES:
+            any_failure = True
+    return "\n\n".join(sections), all_done, any_failure
+
+
+def compact_view(view: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "workflowName": view.get("workflowName"),
+        "databaseId": view.get("databaseId"),
+        "status": view.get("status"),
+        "conclusion": view.get("conclusion"),
+        "url": view.get("url"),
+        "headSha": view.get("headSha"),
+        "jobs": [
+            {
+                "name": job.get("name"),
+                "status": job.get("status"),
+                "conclusion": job.get("conclusion"),
+                "url": job.get("url"),
+            }
+            for job in sorted(view.get("jobs") or [], key=lambda job: job.get("name") or "")
+        ],
+    }
+
+
+def render_json(refs: list[tuple[str, RunRef | None]]) -> str:
+    payload: list[dict[str, Any]] = []
+    for label, ref in refs:
+        if ref is None:
+            payload.append({"label": label, "status": "missing"})
+        else:
+            payload.append(compact_view(run_view(ref)))
+    return json.dumps(payload, indent=2, sort_keys=True)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Watch Portl release CI and release workflows with compact output")
+    parser.add_argument("version", help="Release version without the leading v, e.g. 0.5.2")
+    parser.add_argument("--poll", type=int, default=15, help="Polling interval in seconds")
+    parser.add_argument("--timeout", type=int, default=3600, help="Maximum seconds to wait")
+    parser.add_argument("--ci-only", action="store_true", help="Only watch the CI workflow for the tag commit")
+    parser.add_argument("--release-only", action="store_true", help="Only watch the release workflow for the tag")
+    parser.add_argument("--once", action="store_true", help="Print one snapshot and exit")
+    parser.add_argument("--json", action="store_true", help="Print one JSON snapshot and exit")
+    parser.add_argument("--verbose", action="store_true", help="Include failed job URLs")
+    parser.add_argument("--allow-existing-tag", action="store_true", help="Allow --ci-only to audit an existing tag that differs from HEAD")
+    args = parser.parse_args()
+
+    require_version(args.version)
+    if args.ci_only and args.release_only:
+        raise SystemExit("--ci-only and --release-only are mutually exclusive")
+    if args.poll < 1:
+        raise SystemExit("--poll must be at least 1")
+    if args.timeout < 1:
+        raise SystemExit("--timeout must be at least 1")
+    if args.allow_existing_tag and not args.ci_only:
+        print("--allow-existing-tag only affects --ci-only stale-tag checks", file=sys.stderr)
+
+    if not args.release_only:
+        require_workflow("ci.yml")
+    if not args.ci_only:
+        require_workflow("release.yml")
+    sha = resolve_release_sha(
+        args.version,
+        allow_head_fallback=args.ci_only,
+        allow_existing_tag=args.allow_existing_tag,
+    )
+    start = time.monotonic()
+    previous = None
+    while True:
+        refs = selected_refs(args.version, sha, ci_only=args.ci_only, release_only=args.release_only)
+        if args.json:
+            print(render_json(refs))
+            return 0
+        snapshot, all_done, any_failure = render_snapshot(refs, verbose=args.verbose)
+        if snapshot != previous:
+            print(snapshot)
+            print(flush=True)
+            previous = snapshot
+        if any_failure:
+            print("One or more release workflows failed. Inspect failed logs with `gh run view RUN_ID --log-failed`.", file=sys.stderr)
+            return 1
+        if all_done:
+            return 0
+        if args.once:
+            return 0
+        if time.monotonic() - start > args.timeout:
+            print(f"Timed out waiting for release workflows after {args.timeout}s", file=sys.stderr)
+            return 124
+        try:
+            time.sleep(args.poll)
+        except KeyboardInterrupt:
+            print("Interrupted while watching release workflows", file=sys.stderr)
+            return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
