@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use async_trait::async_trait;
+use std::collections::VecDeque;
 
 /// Errors produced while encoding or decoding mailbox protocol frames.
 #[derive(Debug, thiserror::Error)]
@@ -175,6 +176,7 @@ pub struct MailboxClient<'a, T> {
     transport: &'a mut T,
     mailbox: Option<String>,
     bound: bool,
+    pending_messages: VecDeque<PhaseMessage>,
 }
 
 impl<'a, T: MailboxTransport + Send> MailboxClient<'a, T> {
@@ -186,6 +188,7 @@ impl<'a, T: MailboxTransport + Send> MailboxClient<'a, T> {
             transport,
             mailbox: None,
             bound: false,
+            pending_messages: VecDeque::new(),
         }
     }
 
@@ -217,12 +220,29 @@ impl<'a, T: MailboxTransport + Send> MailboxClient<'a, T> {
     /// frame at this point is unexpected (the server replies to commands
     /// before broadcasting derived `message`s).
     async fn await_command_accepted(&mut self) -> Result<(), MailboxError> {
-        match self.transport.recv().await? {
-            ServerMessage::Ack { .. } => Ok(()),
-            ServerMessage::Error { error } => Err(MailboxError::Server(error)),
-            other => Err(MailboxError::Unexpected(format!(
-                "expected ack, got {other:?}"
-            ))),
+        loop {
+            match self.transport.recv().await? {
+                ServerMessage::Ack { .. } => return Ok(()),
+                ServerMessage::Error { error } => return Err(MailboxError::Server(error)),
+                ServerMessage::Message {
+                    side,
+                    phase,
+                    body,
+                    id,
+                } => {
+                    self.pending_messages.push_back(PhaseMessage {
+                        side,
+                        phase,
+                        body: body.into_inner(),
+                        id,
+                    });
+                }
+                other => {
+                    return Err(MailboxError::Unexpected(format!(
+                        "expected ack, got {other:?}"
+                    )));
+                }
+            }
         }
     }
 
@@ -236,6 +256,19 @@ impl<'a, T: MailboxTransport + Send> MailboxClient<'a, T> {
                 ServerMessage::Ack { .. } => {}
                 ServerMessage::Closed { .. } => return Ok(()),
                 ServerMessage::Error { error } => return Err(MailboxError::Server(error)),
+                ServerMessage::Message {
+                    side,
+                    phase,
+                    body,
+                    id,
+                } => {
+                    self.pending_messages.push_back(PhaseMessage {
+                        side,
+                        phase,
+                        body: body.into_inner(),
+                        id,
+                    });
+                }
                 other => {
                     return Err(MailboxError::Unexpected(format!(
                         "expected closed, got {other:?}"
@@ -334,6 +367,18 @@ impl<'a, T: MailboxTransport + Send> MailboxClient<'a, T> {
         expected_phase: &str,
     ) -> Result<PhaseMessage, MailboxError> {
         loop {
+            if let Some(pending) = self.pending_messages.pop_front() {
+                if pending.side == self.side {
+                    continue;
+                }
+                if pending.phase != expected_phase {
+                    return Err(MailboxError::Unexpected(format!(
+                        "expected phase {expected_phase}, got {}",
+                        pending.phase
+                    )));
+                }
+                return Ok(pending);
+            }
             match self.recv_meaningful().await? {
                 ServerMessage::Message {
                     side,
@@ -944,5 +989,72 @@ mod tests {
             }
             other => panic!("unexpected message: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn send_phase_buffers_peer_message_before_ack() {
+        let mut transport = ScriptedMailboxTransport::new(vec![
+            ServerMessage::Message {
+                side: "peer".into(),
+                phase: "pake".into(),
+                body: HexBody::new(b"hello".to_vec()),
+                id: "m1".into(),
+            },
+            ServerMessage::Ack { id: "add".into() },
+        ]);
+        let mut client = MailboxClient::new("portl.exchange.v1", "me", &mut transport);
+        client.send_phase("pake", b"hi").await.unwrap();
+        let msg = client.recv_phase_from_peer("pake").await.unwrap();
+        assert_eq!(msg.side, "peer");
+        assert_eq!(msg.body, b"hello");
+        assert_eq!(msg.id, "m1");
+    }
+
+    #[tokio::test]
+    async fn close_happy_buffers_peer_message_before_closed() {
+        let mut transport = ScriptedMailboxTransport::new(vec![
+            ServerMessage::Ack { id: "close".into() },
+            ServerMessage::Message {
+                side: "peer".into(),
+                phase: "version".into(),
+                body: HexBody::new(b"v".to_vec()),
+                id: "m2".into(),
+            },
+            ServerMessage::Closed {
+                mood: Some("happy".into()),
+            },
+        ]);
+        let mut client = MailboxClient::new("portl.exchange.v1", "me", &mut transport);
+        client.close_happy().await.unwrap();
+        let msg = client.recv_phase_from_peer("version").await.unwrap();
+        assert_eq!(msg.side, "peer");
+        assert_eq!(msg.body, b"v");
+        assert_eq!(msg.id, "m2");
+    }
+
+    #[tokio::test]
+    async fn recv_phase_skips_buffered_own_side_message() {
+        // First, stash an own-side message via send_phase racing with an Ack.
+        let mut transport = ScriptedMailboxTransport::new(vec![
+            ServerMessage::Message {
+                side: "me".into(),
+                phase: "pake".into(),
+                body: HexBody::new(b"echo".to_vec()),
+                id: "self".into(),
+            },
+            ServerMessage::Ack { id: "add".into() },
+            // Then a real peer message via the live transport.
+            ServerMessage::Message {
+                side: "peer".into(),
+                phase: "pake".into(),
+                body: HexBody::new(b"hello".to_vec()),
+                id: "m3".into(),
+            },
+        ]);
+        let mut client = MailboxClient::new("portl.exchange.v1", "me", &mut transport);
+        client.send_phase("pake", b"hi").await.unwrap();
+        let msg = client.recv_phase_from_peer("pake").await.unwrap();
+        assert_eq!(msg.side, "peer");
+        assert_eq!(msg.id, "m3");
     }
 }
