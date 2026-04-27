@@ -239,16 +239,23 @@ fn label_in_use(peers: &PeerStore, label: &str) -> bool {
 }
 
 fn relay_hint_for_response(state: &AgentState) -> Option<String> {
-    let guard = state.relay_status.read().ok()?;
-    if !guard.enabled {
-        return None;
-    }
-    guard
-        .hostname
-        .as_ref()
-        .map(|h| format!("https://{h}/"))
-        .or_else(|| guard.https_addr.as_ref().map(|a| format!("https://{a}/")))
-        .or_else(|| guard.http_addr.as_ref().map(|a| format!("http://{a}/")))
+    state
+        .discovery
+        .relays
+        .first()
+        .map(ToString::to_string)
+        .or_else(|| {
+            let guard = state.relay_status.read().ok()?;
+            if !guard.enabled {
+                return None;
+            }
+            guard
+                .hostname
+                .as_ref()
+                .map(|h| format!("https://{h}/"))
+                .or_else(|| guard.https_addr.as_ref().map(|a| format!("https://{a}/")))
+                .or_else(|| guard.http_addr.as_ref().map(|a| format!("http://{a}/")))
+        })
 }
 
 fn short_nonce(nonce: &[u8; 16]) -> String {
@@ -480,6 +487,20 @@ mod tests {
         client.inner().close().await;
         server.inner().close().await;
         server_task.await.unwrap();
+    }
+
+    #[test]
+    fn pair_response_relay_hint_prefers_discovery_relay() {
+        let tmp = tempdir().unwrap();
+        let peers_path = tmp.path().join("peers.json");
+        seed_self(&peers_path);
+        let mut state = make_state(&peers_path);
+        state.discovery.relays = vec!["https://relay.example/".parse().unwrap()];
+
+        assert_eq!(
+            relay_hint_for_response(&state).as_deref(),
+            Some("https://relay.example/")
+        );
     }
 
     #[test]

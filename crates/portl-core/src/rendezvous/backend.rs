@@ -174,6 +174,13 @@ where
     let _ = client.close_scary(reason).await;
 }
 
+async fn best_effort_close_happy<T>(client: &mut MailboxClient<'_, T>)
+where
+    T: MailboxTransport + Send,
+{
+    let _ = client.close_happy().await;
+}
+
 /// Run the offerer side of the PAKE handshake on an already opened
 /// mailbox and read the recipient's hello.
 ///
@@ -238,7 +245,7 @@ where
     let side = client.side().to_owned();
     let cipher = encrypt_phase(key, &side, "1", &envelope_json);
     client.send_phase("1", &cipher).await?;
-    client.close_happy().await?;
+    best_effort_close_happy(client).await;
     Ok(())
 }
 
@@ -320,7 +327,7 @@ where
         }
     };
 
-    client.close_happy().await?;
+    best_effort_close_happy(&mut client).await;
     Ok(AcceptOutcome { envelope })
 }
 
@@ -493,6 +500,49 @@ mod tests {
         .expect("happy-path exchange completes within timeout");
         s_res.expect("sender flow completes");
         let accepted = r_res.expect("receiver flow completes");
+        assert_eq!(accepted.envelope, envelope);
+    }
+
+    struct CloseFailsTransport {
+        inner: PairedMailboxTransport,
+    }
+
+    #[async_trait]
+    impl MailboxTransport for CloseFailsTransport {
+        async fn send(&mut self, msg: ClientMessage) -> Result<(), MailboxError> {
+            if matches!(msg, ClientMessage::Close { .. }) {
+                return Err(MailboxError::Transport("websocket stream closed".into()));
+            }
+            self.inner.send(msg).await
+        }
+
+        async fn recv(&mut self) -> Result<ServerMessage, MailboxError> {
+            self.inner.recv().await
+        }
+    }
+
+    #[tokio::test]
+    async fn accept_succeeds_when_happy_close_fails_after_envelope() {
+        let mailbox = SharedMailboxFixture::default();
+        let code = ShortCode::parse("PORTL-S-2-nebula-involve").unwrap();
+        let envelope = fixture_envelope();
+
+        let mut sender_t = mailbox.sender_transport();
+        let mut receiver_t = CloseFailsTransport {
+            inner: mailbox.receiver_transport(),
+        };
+
+        let sender_fut = offer_over_mailbox(&mut sender_t, code.clone(), envelope.clone());
+        let receiver_fut =
+            accept_over_mailbox(&mut receiver_t, code, RecipientHelloV1::anonymous());
+
+        let (s_res, r_res) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(sender_fut, receiver_fut)
+        })
+        .await
+        .expect("exchange completes within timeout");
+        s_res.expect("sender flow completes");
+        let accepted = r_res.expect("receiver keeps envelope despite close cleanup failure");
         assert_eq!(accepted.envelope, envelope);
     }
 

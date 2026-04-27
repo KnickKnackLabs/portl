@@ -5,6 +5,15 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Fixed
+
+- Fixed `portl accept PORTL-S-…` session-share imports that could receive
+  the share successfully but still fail with a websocket-close error during
+  the final rendezvous cleanup.
+- Pairing responses now advertise the agent's configured discovery relay,
+  so a newly paired peer can dial back using the stored relay hint instead
+  of depending on ambient address discovery.
+
 ## 0.6.2 — 2026-04-28
 
 ### Changed
