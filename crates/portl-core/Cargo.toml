@@ -65,10 +65,11 @@ http             = { workspace = true }
 [dev-dependencies]
 portl-core = { version = "0.5.2", path = ".", features = ["test-util"] }
 tokio      = { workspace = true }
+tokio-websockets = { workspace = true, features = ["server"] }
 proptest   = { workspace = true }
 criterion  = { workspace = true }
- tempfile           = { workspace = true }
- tracing-subscriber = { workspace = true }
+tempfile           = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [[bench]]
 name = "mint_verify"
