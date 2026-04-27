@@ -107,10 +107,10 @@ pub struct WsMailboxTransport {
 impl WsMailboxTransport {
     /// Connect to the given `ws://` or `wss://` URL.
     pub async fn connect(url: &str) -> Result<Self, RendezvousError> {
-        let uri = http::Uri::from_str(url)
+        let mailbox_uri = http::Uri::from_str(url)
             .map_err(|e| RendezvousError::Backend(format!("invalid mailbox uri: {e}")))?;
         let limits = Limits::default().max_payload_len(Some(MAX_WS_PAYLOAD_LEN));
-        let (stream, _resp) = ClientBuilder::from_uri(uri)
+        let (stream, _resp) = ClientBuilder::from_uri(mailbox_uri)
             .limits(limits)
             .connect()
             .await
