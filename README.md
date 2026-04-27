@@ -136,6 +136,29 @@ portl session ls shared-box
 portl session kill shared-box pair
 ```
 
+### Share a session with a short code
+
+When the recipient should get short-lived session access without a full
+pairing, keep a sender command running and send them the printed
+`PORTL-S-*` code:
+
+```bash
+portl session share shared-box pair --label shared-box --ttl 10m --access-ttl 2h
+# prints PORTL-S-...
+```
+
+On the recipient machine:
+
+```bash
+portl accept PORTL-S-...
+portl session attach pair@shared-box pair
+```
+
+`portl accept` saves the imported access as a local ticket label. Pass
+`--label <name>` while accepting if the suggested label conflicts. The
+sender stays online only for the rendezvous; the saved ticket controls
+how long access remains valid.
+
 ### Share with a ticket instead of pairing
 
 For short-lived access, mint a bounded ticket on the shared machine:

@@ -1,6 +1,9 @@
 # 220 — Local-First Sessions, Workspace Sharing, and Short Codes
 
-> Status: **proposed follow-on** after `210-session-control-lanes.md`.
+> Status: **partially implemented** — the first `PORTL-S-*` online
+> session-share slice is implemented on the shortcode rendezvous branch;
+> local-first workspace registry, offline `PORTL-SHARE1-*` tokens, and
+> agent-hosted pending offers remain follow-on work.
 > This spec revisits the session ergonomics shipped in v0.4.0/v0.5.0
 > and designs a local-first workflow where `portl session` is the
 > default way to start a reusable terminal workspace, then share it
@@ -52,6 +55,14 @@ Wormhole's public rendezvous server, but backend selection belongs in
 Portl config. A future Portl mailbox or self-hosted backend should be able
 to carry the same Portl exchange envelope without changing the normal code
 shape.
+
+The first shippable slice implements CLI-hosted `PORTL-S-*` exchange:
+`portl session share <TARGET> [SESSION]` keeps the sender process online,
+prints a short code, and `portl accept <CODE>` imports the resulting
+session share as a saved ticket label until the local workspace registry
+lands. Recipient-bound tickets are required whenever the accepter
+advertises an endpoint id; bearer fallback is sender-explicit and
+short-lived.
 
 Long offline tokens remain available for asynchronous copy/paste:
 
@@ -1192,9 +1203,11 @@ portl session app-dev@alice-laptop
    IP addresses by default, or only relay URLs unless explicitly requested?
 3. **Generated name style:** Which wordlist/slug format should `portl
    session` use when no name is provided?
-4. **Recipient-bound first slice:** Should initial short-code sharing wait
-   to mint a `to`-bound ticket after rendezvous, or ship bearer tickets
-   with short access TTL first?
+4. **Recipient-bound first slice:** Resolved for the first implementation:
+   short online accept sends a recipient endpoint id, sender-side share
+   mints a `to`-bound ticket by default, and import rejects unbound
+   tickets when recipient identity was advertised. Bearer fallback remains
+   explicit on the sender and capped.
 5. **`portl session ls` split:** Should local workspace listing become the
    default `portl session ls`, moving provider listing to `portl session
    provider ls <TARGET>`, or should a new `portl workspace ls` exist?

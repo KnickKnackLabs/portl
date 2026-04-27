@@ -5,6 +5,23 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Added
+
+- Added `PORTL-S-*` short online session sharing: `portl session share`
+  hosts a one-shot rendezvous, prints a short code, mints a
+  recipient-bound session ticket when the accepter advertises an
+  endpoint id, and `portl accept` imports the share as a saved ticket
+  label.
+- Added a minimal Wormhole-compatible rendezvous client using
+  `tokio-websockets`, SPAKE2, HKDF, and SecretBox without depending on
+  the EUPL `magic-wormhole` crate.
+
+### Changed
+
+- `portl accept <THING>` is now the generic receiver for pairing invites,
+  short online session shares, future offline share tokens, and ticket
+  guidance.
+
 ## 0.5.2 — 2026-04-26
 
 ### Added
