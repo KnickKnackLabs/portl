@@ -69,7 +69,7 @@ def verify_metadata(root: Path, version: str, allow_existing_tag: bool) -> None:
     )
     require(bool(section and section.group("body").strip()), f"CHANGELOG.md {version} section is empty")
     readme = (root / "README.md").read_text()
-    for needle in [f"--version {version}", f"KnickKnackLabs/portl@{version}"]:
+    for needle in [f"PORTL_VERSION={version}", f"KnickKnackLabs/portl@{version}"]:
         require(needle in readme, f"README.md missing {needle}")
     local_tag = subprocess.run(["git", "rev-parse", "-q", "--verify", f"refs/tags/v{version}"], capture_output=True)
     if not allow_existing_tag:

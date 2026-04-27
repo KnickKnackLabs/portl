@@ -5,6 +5,8 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.6.1 — 2026-04-27
+
 ### Changed
 
 - Simplified installer examples around readable multiline curl commands

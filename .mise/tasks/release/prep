@@ -88,6 +88,7 @@ def update_versions(root: Path, old: str, new: str) -> list[str]:
     text = before
     text = text.replace(f"**v{old}**", f"**v{new}**")
     text = text.replace(f"--version {old}", f"--version {new}")
+    text = text.replace(f"PORTL_VERSION={old}", f"PORTL_VERSION={new}")
     text = text.replace(f"KnickKnackLabs/portl@{old}", f"KnickKnackLabs/portl@{new}")
     if text != before:
         readme.write_text(text)
