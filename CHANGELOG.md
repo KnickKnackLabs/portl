@@ -5,6 +5,8 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.6.3 — 2026-04-28
+
 ### Fixed
 
 - Fixed `portl accept PORTL-S-…` session-share imports that could receive
