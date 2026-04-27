@@ -25,6 +25,14 @@ pub enum MailboxError {
     /// The server sent a frame the client did not expect at this state.
     #[error("unexpected mailbox frame: {0}")]
     Unexpected(String),
+    /// The peer or server closed the mailbox while we were waiting for a
+    /// phase message. Surfaced to callers so a wrong-code or peer abort
+    /// produces a deterministic error rather than an indefinite wait.
+    #[error("mailbox closed while waiting for peer (mood={mood:?})")]
+    Closed {
+        /// Optional mood echoed by the server.
+        mood: Option<String>,
+    },
 }
 
 /// Hex-encoded binary body. Serializes to/from a hex string on the wire,
@@ -179,6 +187,11 @@ pub struct MailboxClient<'a, T> {
     pending_messages: VecDeque<PhaseMessage>,
 }
 
+/// Maximum number of buffered peer phase messages while we wait for an
+/// expected command response. Exceeding this is treated as a transport-
+/// level error rather than allowing unbounded growth.
+const MAX_PENDING_MESSAGES: usize = 64;
+
 impl<'a, T: MailboxTransport + Send> MailboxClient<'a, T> {
     /// Create a new mailbox driver bound to the given appid/side.
     pub fn new(appid: &'a str, side: &'a str, transport: &'a mut T) -> Self {
@@ -190,6 +203,16 @@ impl<'a, T: MailboxTransport + Send> MailboxClient<'a, T> {
             bound: false,
             pending_messages: VecDeque::new(),
         }
+    }
+
+    fn buffer_pending(&mut self, msg: PhaseMessage) -> Result<(), MailboxError> {
+        if self.pending_messages.len() >= MAX_PENDING_MESSAGES {
+            return Err(MailboxError::Unexpected(format!(
+                "pending phase buffer exceeded cap of {MAX_PENDING_MESSAGES}"
+            )));
+        }
+        self.pending_messages.push_back(msg);
+        Ok(())
     }
 
     async fn ensure_bound(&mut self) -> Result<(), MailboxError> {
@@ -228,12 +251,12 @@ impl<'a, T: MailboxTransport + Send> MailboxClient<'a, T> {
                     body,
                     id,
                 } => {
-                    self.pending_messages.push_back(PhaseMessage {
+                    self.buffer_pending(PhaseMessage {
                         side,
                         phase,
                         body: body.into_inner(),
                         id,
-                    });
+                    })?;
                 }
                 other => return Ok(other),
             }
@@ -255,12 +278,12 @@ impl<'a, T: MailboxTransport + Send> MailboxClient<'a, T> {
                     body,
                     id,
                 } => {
-                    self.pending_messages.push_back(PhaseMessage {
+                    self.buffer_pending(PhaseMessage {
                         side,
                         phase,
                         body: body.into_inner(),
                         id,
-                    });
+                    })?;
                 }
                 other => {
                     return Err(MailboxError::Unexpected(format!(
@@ -287,12 +310,12 @@ impl<'a, T: MailboxTransport + Send> MailboxClient<'a, T> {
                     body,
                     id,
                 } => {
-                    self.pending_messages.push_back(PhaseMessage {
+                    self.buffer_pending(PhaseMessage {
                         side,
                         phase,
                         body: body.into_inner(),
                         id,
-                    });
+                    })?;
                 }
                 other => {
                     return Err(MailboxError::Unexpected(format!(
@@ -425,6 +448,9 @@ impl<'a, T: MailboxTransport + Send> MailboxClient<'a, T> {
                         body: body.into_inner(),
                         id,
                     });
+                }
+                ServerMessage::Closed { mood } => {
+                    return Err(MailboxError::Closed { mood });
                 }
                 other => {
                     return Err(MailboxError::Unexpected(format!(
@@ -1081,5 +1107,43 @@ mod tests {
         let msg = client.recv_phase_from_peer("pake").await.unwrap();
         assert_eq!(msg.side, "peer");
         assert_eq!(msg.id, "m3");
+    }
+
+    #[tokio::test]
+    async fn recv_phase_surfaces_closed_as_error() {
+        let mut transport = ScriptedMailboxTransport::new(vec![ServerMessage::Closed {
+            mood: Some("scary: peer aborted".into()),
+        }]);
+        let mut client = MailboxClient::new("portl.exchange.v1", "me", &mut transport);
+        let err = client.recv_phase_from_peer("1").await.unwrap_err();
+        match err {
+            MailboxError::Closed { mood } => {
+                assert_eq!(mood.as_deref(), Some("scary: peer aborted"));
+            }
+            other => panic!("expected Closed error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_messages_cap_is_enforced() {
+        let mut frames: Vec<ServerMessage> = (0..=MAX_PENDING_MESSAGES)
+            .map(|i| ServerMessage::Message {
+                side: "peer".into(),
+                phase: "pake".into(),
+                body: HexBody::new(format!("m{i}").into_bytes()),
+                id: format!("id-{i}"),
+            })
+            .collect();
+        // Followed by the ack we are nominally awaiting.
+        frames.push(ServerMessage::Ack { id: "add".into() });
+        let mut transport = ScriptedMailboxTransport::new(frames);
+        let mut client = MailboxClient::new("portl.exchange.v1", "me", &mut transport);
+        let err = client.send_phase("pake", b"hi").await.unwrap_err();
+        match err {
+            MailboxError::Unexpected(msg) => {
+                assert!(msg.contains("pending phase buffer"), "got: {msg}");
+            }
+            other => panic!("expected Unexpected, got {other:?}"),
+        }
     }
 }

@@ -108,6 +108,49 @@ impl RecipientHelloV1 {
             label_hint: None,
         }
     }
+
+    /// Validate self-consistency of a recipient hello before it is sent
+    /// or trusted on receive.
+    ///
+    /// * `schema` must equal [`PORTL_RECIPIENT_HELLO_SCHEMA_V1`].
+    /// * `endpoint_id_hex`, when present, must be 64 ASCII hex chars
+    ///   decoding to exactly 32 bytes.
+    /// * `label_hint`, when present, is bounded to 128 bytes to keep
+    ///   the wire payload small.
+    pub fn validate(&self) -> Result<(), RendezvousError> {
+        if self.schema != PORTL_RECIPIENT_HELLO_SCHEMA_V1 {
+            return Err(RendezvousError::InvalidPayload(format!(
+                "unexpected hello schema {:?}",
+                self.schema
+            )));
+        }
+        if let Some(hexed) = self.endpoint_id_hex.as_deref() {
+            if hexed.len() != 64 {
+                return Err(RendezvousError::InvalidPayload(format!(
+                    "endpoint_id_hex must be 64 chars, got {}",
+                    hexed.len()
+                )));
+            }
+            let decoded = hex::decode(hexed).map_err(|e| {
+                RendezvousError::InvalidPayload(format!("endpoint_id_hex not valid hex: {e}"))
+            })?;
+            if decoded.len() != 32 {
+                return Err(RendezvousError::InvalidPayload(format!(
+                    "endpoint_id_hex must decode to 32 bytes, got {}",
+                    decoded.len()
+                )));
+            }
+        }
+        if let Some(label) = self.label_hint.as_deref()
+            && label.len() > 128
+        {
+            return Err(RendezvousError::InvalidPayload(format!(
+                "label_hint exceeds 128 bytes ({} bytes)",
+                label.len()
+            )));
+        }
+        Ok(())
+    }
 }
 
 fn random_side() -> String {
@@ -116,12 +159,28 @@ fn random_side() -> String {
     hex::encode(bytes)
 }
 
+/// Try to send a `scary` close on `client`, ignoring any error. Used to
+/// signal the peer that we are aborting so they observe a deterministic
+/// `Closed` instead of an indefinite wait.
+async fn best_effort_close_scary<T>(client: &mut MailboxClient<'_, T>, reason: &str)
+where
+    T: MailboxTransport + Send,
+{
+    let _ = client.close_scary(reason).await;
+}
+
 /// Run the offerer side of a one-shot encrypted exchange over `transport`.
 ///
 /// The function claims the supplied short code's nameplate, performs a
 /// SPAKE2 handshake bound to [`PORTL_EXCHANGE_APPID_V1`], waits for the
 /// recipient's encrypted hello on phase `"0"`, then sends the
 /// `envelope` JSON encrypted on phase `"1"`.
+///
+/// Note: `code` here is assumed to be an already-established
+/// `PORTL-S-*` short code (nameplate + password). Allocation/display of
+/// fresh codes is the responsibility of the higher-level
+/// [`RendezvousBackend`] (Task 9). This entry point is the
+/// transport-level encrypted exchange only.
 pub async fn offer_over_mailbox<T>(
     transport: &mut T,
     code: ShortCode,
@@ -141,9 +200,24 @@ where
     let key = finish_pake(state, &peer_pake.body)?;
 
     let hello_msg = client.recv_phase_from_peer("0").await?;
-    let hello_plain = decrypt_phase(&key, &hello_msg.side, "0", &hello_msg.body)?;
-    let _hello: RecipientHelloV1 = serde_json::from_slice(&hello_plain)
-        .map_err(|e| RendezvousError::InvalidPayload(e.to_string()))?;
+    let hello_plain = match decrypt_phase(&key, &hello_msg.side, "0", &hello_msg.body) {
+        Ok(plain) => plain,
+        Err(e) => {
+            best_effort_close_scary(&mut client, "hello decrypt failed").await;
+            return Err(e.into());
+        }
+    };
+    let hello: RecipientHelloV1 = match serde_json::from_slice(&hello_plain) {
+        Ok(h) => h,
+        Err(e) => {
+            best_effort_close_scary(&mut client, "hello deserialize failed").await;
+            return Err(RendezvousError::InvalidPayload(e.to_string()));
+        }
+    };
+    if let Err(e) = hello.validate() {
+        best_effort_close_scary(&mut client, "hello validation failed").await;
+        return Err(e);
+    }
 
     let envelope_json = serde_json::to_vec(&envelope)
         .map_err(|e| RendezvousError::InvalidPayload(e.to_string()))?;
@@ -167,6 +241,7 @@ pub async fn accept_over_mailbox<T>(
 where
     T: MailboxTransport + Send,
 {
+    hello.validate()?;
     let side = random_side();
     let mut client = MailboxClient::new(PORTL_EXCHANGE_APPID_V1, &side, transport);
     client.claim_and_open(code.nameplate().to_owned()).await?;
@@ -183,9 +258,20 @@ where
     client.send_phase("0", &hello_cipher).await?;
 
     let env_msg = client.recv_phase_from_peer("1").await?;
-    let env_plain = decrypt_phase(&key, &env_msg.side, "1", &env_msg.body)?;
-    let envelope: PortlExchangeEnvelopeV1 = serde_json::from_slice(&env_plain)
-        .map_err(|e| RendezvousError::InvalidPayload(e.to_string()))?;
+    let env_plain = match decrypt_phase(&key, &env_msg.side, "1", &env_msg.body) {
+        Ok(plain) => plain,
+        Err(e) => {
+            best_effort_close_scary(&mut client, "envelope decrypt failed").await;
+            return Err(e.into());
+        }
+    };
+    let envelope: PortlExchangeEnvelopeV1 = match serde_json::from_slice(&env_plain) {
+        Ok(env) => env,
+        Err(e) => {
+            best_effort_close_scary(&mut client, "envelope deserialize failed").await;
+            return Err(RendezvousError::InvalidPayload(e.to_string()));
+        }
+    };
 
     client.close_happy().await?;
     Ok(AcceptOutcome { envelope })
@@ -275,6 +361,12 @@ mod tests {
                         .send(ServerMessage::Ack { id: "close".into() });
                     let _ = self
                         .incoming_tx
+                        .send(ServerMessage::Closed { mood: None });
+                    // Mirror to the peer so the partner observes a
+                    // deterministic mailbox close instead of waiting
+                    // forever on a phase that will never arrive.
+                    let _ = self
+                        .peer_tx
                         .send(ServerMessage::Closed { mood: None });
                 }
             }
@@ -381,19 +473,137 @@ mod tests {
             RecipientHelloV1::anonymous(),
         );
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
+        let (s_res, r_res) = tokio::time::timeout(
+            Duration::from_secs(5),
             async { tokio::join!(sender_fut, receiver_fut) },
         )
-        .await;
-        if let Ok((s_res, r_res)) = result {
-            assert!(s_res.is_err(), "sender must not succeed with wrong code");
-            assert!(r_res.is_err(), "receiver must not import garbage envelope");
+        .await
+        .expect("wrong-code flow must complete within bounded timeout");
+        assert!(
+            s_res.is_err() || r_res.is_err(),
+            "at least one side must produce a deterministic error"
+        );
+        assert!(
+            r_res.is_err(),
+            "receiver must not import garbage envelope, got {:?}",
+            r_res.as_ref().map(|_| "Ok")
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_hello_schema_rejected_before_send() {
+        let mailbox = SharedMailboxFixture::default();
+        let code = ShortCode::parse("PORTL-S-2-nebula-involve").unwrap();
+        let mut receiver_t = mailbox.receiver_transport();
+        let bad = RecipientHelloV1 {
+            schema: "wrong.schema".to_owned(),
+            endpoint_id_hex: None,
+            label_hint: None,
+        };
+        let err = accept_over_mailbox(&mut receiver_t, code, bad)
+            .await
+            .expect_err("invalid schema must reject");
+        assert!(matches!(err, RendezvousError::InvalidPayload(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn invalid_endpoint_id_rejected_before_send() {
+        let mailbox = SharedMailboxFixture::default();
+        let code = ShortCode::parse("PORTL-S-2-nebula-involve").unwrap();
+        let mut receiver_t = mailbox.receiver_transport();
+        let bad = RecipientHelloV1 {
+            schema: PORTL_RECIPIENT_HELLO_SCHEMA_V1.to_owned(),
+            endpoint_id_hex: Some("nothex".to_owned()),
+            label_hint: None,
+        };
+        let err = accept_over_mailbox(&mut receiver_t, code, bad)
+            .await
+            .expect_err("invalid endpoint id must reject");
+        assert!(matches!(err, RendezvousError::InvalidPayload(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn offer_rejects_invalid_hello_from_peer() {
+        // Custom paired flow: receiver sends a hello with wrong schema.
+        let mailbox = SharedMailboxFixture::default();
+        let code = ShortCode::parse("PORTL-S-2-nebula-involve").unwrap();
+        let envelope = fixture_envelope();
+
+        let mut sender_t = mailbox.sender_transport();
+        let mut receiver_t = mailbox.receiver_transport();
+
+        // Drive the receiver side manually so it can send a hello whose
+        // schema is invalid; the offer side must reject deterministically.
+
+        let receiver_code = code.clone();
+        let receiver_fut = async move {
+            use crate::rendezvous::wormhole_crypto::{encrypt_phase, finish_pake, start_pake};
+            let side = "receiver-side".to_owned();
+            let mut client = MailboxClient::new(PORTL_EXCHANGE_APPID_V1, &side, &mut receiver_t);
+            client
+                .claim_and_open(receiver_code.nameplate().to_owned())
+                .await
+                .map_err(RendezvousError::from)?;
+            let password = receiver_code.password();
+            let (state, pake_body) = start_pake(&password, PORTL_EXCHANGE_APPID_V1);
+            client.send_phase("pake", &pake_body).await?;
+            let peer_pake = client.recv_phase_from_peer("pake").await?;
+            let key = finish_pake(state, &peer_pake.body)?;
+            let bad_hello = serde_json::json!({
+                "schema": "evil.schema",
+                "endpoint_id_hex": null,
+                "label_hint": null,
+            });
+            let hello_json = serde_json::to_vec(&bad_hello).unwrap();
+            let cipher = encrypt_phase(&key, &side, "0", &hello_json);
+            client.send_phase("0", &cipher).await?;
+            // Wait for envelope or close.
+            let res = client.recv_phase_from_peer("1").await;
+            Ok::<_, RendezvousError>(res.is_ok())
+        };
+
+        let sender_fut = offer_over_mailbox(&mut sender_t, code.clone(), envelope);
+        let (s_res, r_res) = tokio::time::timeout(
+            Duration::from_secs(5),
+            async { tokio::join!(sender_fut, receiver_fut) },
+        )
+        .await
+        .expect("flow completes within timeout");
+        assert!(s_res.is_err(), "sender must reject invalid hello schema");
+        if let Ok(got_envelope) = r_res {
+            assert!(!got_envelope, "receiver must not get envelope");
         }
-        // Otherwise we timed out: at least one side blocked on a phase that will
-        // never arrive in cleartext form. That is acceptable: no envelope was
-        // imported. The crucial invariant is that no Ok envelope can be produced
-        // from a mismatched short code.
+    }
+
+    #[test]
+    fn validate_accepts_anonymous() {
+        RecipientHelloV1::anonymous().validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_short_endpoint_id() {
+        let h = RecipientHelloV1 {
+            schema: PORTL_RECIPIENT_HELLO_SCHEMA_V1.to_owned(),
+            endpoint_id_hex: Some("aa".to_owned()),
+            label_hint: None,
+        };
+        assert!(matches!(
+            h.validate().unwrap_err(),
+            RendezvousError::InvalidPayload(_)
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_long_label() {
+        let h = RecipientHelloV1 {
+            schema: PORTL_RECIPIENT_HELLO_SCHEMA_V1.to_owned(),
+            endpoint_id_hex: None,
+            label_hint: Some("x".repeat(129)),
+        };
+        assert!(matches!(
+            h.validate().unwrap_err(),
+            RendezvousError::InvalidPayload(_)
+        ));
     }
 
     #[test]
