@@ -173,6 +173,33 @@ pub fn kill(target: &str, session: Option<&str>, provider: Option<&str>) -> Resu
     result
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn share(
+    target: &str,
+    session: Option<&str>,
+    _provider: Option<&str>,
+    _ttl: Duration,
+    _access_ttl: Duration,
+    _label: Option<&str>,
+    _rendezvous_url: Option<&str>,
+    _yes: bool,
+    allow_bearer_fallback: bool,
+) -> Result<ExitCode> {
+    let session_name = default_session_name(target, session);
+    if !allow_bearer_fallback {
+        anyhow::bail!(
+            "session share for target '{target}' (session '{session_name}') is not yet supported by this Portl build: \
+the CLI cannot safely delegate the resolved ticket to an unknown recipient. \
+Ask the target owner to run `portl session share` directly, or issue a recipient-bound ticket and share it manually. \
+Re-run with `--allow-bearer-fallback` to accept a short-lived bearer ticket fallback once recipient identity is unavailable."
+        );
+    }
+    anyhow::bail!(
+        "session share over PORTL-S short codes is not yet wired in this Portl build; \
+the rendezvous backend cannot host a CLI sender flow yet. Track Task 11 follow-up for full network support."
+    );
+}
+
 pub fn attach(
     target: &str,
     session: Option<&str>,

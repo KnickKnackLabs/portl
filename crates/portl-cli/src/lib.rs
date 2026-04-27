@@ -115,6 +115,17 @@ pub enum Command {
         session: Option<String>,
         provider: Option<String>,
     },
+    SessionShare {
+        target: String,
+        session: Option<String>,
+        provider: Option<String>,
+        ttl: std::time::Duration,
+        access_ttl: std::time::Duration,
+        label: Option<String>,
+        rendezvous_url: Option<String>,
+        yes: bool,
+        allow_bearer_fallback: bool,
+    },
     Exec {
         peer: String,
         cwd: Option<String>,
@@ -494,6 +505,27 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             session,
             provider,
         } => commands::session::kill(&target, session.as_deref(), provider.as_deref()),
+        Command::SessionShare {
+            target,
+            session,
+            provider,
+            ttl,
+            access_ttl,
+            label,
+            rendezvous_url,
+            yes,
+            allow_bearer_fallback,
+        } => commands::session::share(
+            &target,
+            session.as_deref(),
+            provider.as_deref(),
+            ttl,
+            access_ttl,
+            label.as_deref(),
+            rendezvous_url.as_deref(),
+            yes,
+            allow_bearer_fallback,
+        ),
         Command::Exec {
             peer,
             cwd,
@@ -1096,6 +1128,44 @@ enum SessionAction {
         #[arg(long)]
         provider: Option<String>,
     },
+    /// Share a session with another machine via a `PORTL-S-*` short online code.
+    ///
+    /// Allocates a short rendezvous code, prints it, and waits for a recipient
+    /// to accept. Keep this command running until they accept; the sender
+    /// process must stay online for the duration of the exchange. The
+    /// recipient runs `portl accept PORTL-S-...` to import the offered
+    /// session.
+    #[command(
+        long_about = "Share a session via a `PORTL-S-*` short online code.\n\nAllocates a short code, prints it, and waits for a recipient to accept.\nYou must keep this command running until the recipient accepts.\nThe recipient runs `portl accept PORTL-S-...` to import the offered session."
+    )]
+    Share {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+        /// Session name. Defaults to the target label, or `default` for raw targets.
+        session: Option<String>,
+        /// Persistent-session provider hint (e.g. `zmx`).
+        #[arg(long)]
+        provider: Option<String>,
+        /// Rendezvous TTL (how long the short code stays valid). Default: 10m.
+        #[arg(long, default_value = "10m", value_parser = humantime::parse_duration)]
+        ttl: std::time::Duration,
+        /// TTL for the resulting Portl ticket the recipient gets. Default: 2h.
+        #[arg(long = "access-ttl", default_value = "2h", value_parser = humantime::parse_duration)]
+        access_ttl: std::time::Duration,
+        /// Optional sender label hint shown to the recipient.
+        #[arg(long)]
+        label: Option<String>,
+        /// Override the rendezvous server URL.
+        #[arg(long = "rendezvous-url")]
+        rendezvous_url: Option<String>,
+        /// Skip confirmation prompts.
+        #[arg(long)]
+        yes: bool,
+        /// Allow falling back to a short-lived bearer ticket when the
+        /// recipient's identity is not available. Capped to min(access-ttl, 10m).
+        #[arg(long = "allow-bearer-fallback")]
+        allow_bearer_fallback: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1531,6 +1601,7 @@ fn trust_into_command(action: TrustTopLevel) -> Command {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn connect_into_command(action: ConnectTopLevel) -> Command {
     match action {
         ConnectTopLevel::Status {
@@ -1608,6 +1679,27 @@ fn connect_into_command(action: ConnectTopLevel) -> Command {
                 target,
                 session,
                 provider,
+            },
+            SessionAction::Share {
+                target,
+                session,
+                provider,
+                ttl,
+                access_ttl,
+                label,
+                rendezvous_url,
+                yes,
+                allow_bearer_fallback,
+            } => Command::SessionShare {
+                target,
+                session,
+                provider,
+                ttl,
+                access_ttl,
+                label,
+                rendezvous_url,
+                yes,
+                allow_bearer_fallback,
             },
         },
         ConnectTopLevel::Exec {

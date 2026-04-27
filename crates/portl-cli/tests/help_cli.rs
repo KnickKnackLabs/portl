@@ -143,6 +143,19 @@ fn invite_accept_help_matches_model_a_surface() {
 }
 
 #[test]
+fn session_share_help_mentions_sender_must_stay_online() {
+    let help = help_output(&["session", "share", "--help"]);
+    assert!(
+        help.contains("keep this command running"),
+        "session share help should tell sender to keep running:\n{help}"
+    );
+    assert!(
+        help.contains("PORTL-S"),
+        "session share help should mention PORTL-S short codes:\n{help}"
+    );
+}
+
+#[test]
 fn top_level_help_snapshots_match() {
     let cases = [
         (

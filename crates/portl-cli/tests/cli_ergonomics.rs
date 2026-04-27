@@ -276,6 +276,19 @@ fn session_surface_matches_spec() {
 }
 
 #[test]
+fn session_share_parses_target_and_session() {
+    let parsed = parse_args(&["session", "share", "shared-box", "dev"]).expect("parse");
+    assert!(matches!(
+        parsed,
+        ParsedCommand::SessionShare {
+            ref target,
+            session: Some(ref session),
+            ..
+        } if target == "shared-box" && session == "dev"
+    ));
+}
+
+#[test]
 fn accept_and_ticket_save_teach_wrong_prefix() {
     let accept = ProcessCommand::cargo_bin("portl")
         .expect("cargo bin")
