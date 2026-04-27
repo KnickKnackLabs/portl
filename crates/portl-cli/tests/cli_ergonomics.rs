@@ -168,6 +168,9 @@ fn invite_accept_surface_matches_spec() {
         ParsedCommand::Accept {
             code: "PORTLINV-AAAA".to_owned(),
             yes: true,
+            label: None,
+            rendezvous_url: None,
+            timeout: std::time::Duration::from_secs(600),
         }
     );
     assert_eq!(
@@ -175,6 +178,9 @@ fn invite_accept_surface_matches_spec() {
         ParsedCommand::Accept {
             code: "PORTLINV-AAAA".to_owned(),
             yes: true,
+            label: None,
+            rendezvous_url: None,
+            timeout: std::time::Duration::from_secs(600),
         }
     );
 

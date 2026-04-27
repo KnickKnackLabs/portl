@@ -18,6 +18,9 @@ fn accept_invite_still_parses() {
         ParsedCommand::Accept {
             code: "PORTLINV-test".to_owned(),
             yes: false,
+            label: None,
+            rendezvous_url: None,
+            timeout: std::time::Duration::from_secs(600),
         }
     );
 }
@@ -29,6 +32,9 @@ fn accept_short_code_parses() {
         ParsedCommand::Accept {
             code: "PORTL-S-2-nebula-involve".to_owned(),
             yes: false,
+            label: None,
+            rendezvous_url: None,
+            timeout: std::time::Duration::from_secs(600),
         }
     );
 }
@@ -81,17 +87,70 @@ fn accept_bad_short_code_reports_prefix_guidance() {
 }
 
 #[test]
-fn accept_short_code_is_not_yet_implemented() {
+fn accept_short_code_attempts_online_rendezvous() {
     let output = ProcessCommand::cargo_bin("portl")
         .expect("cargo bin")
-        .args(["accept", "PORTL-S-2-nebula-involve"])
+        .env("PORTL_HOME", tempfile::TempDir::new().unwrap().path())
+        .args([
+            "accept",
+            "PORTL-S-2-nebula-involve",
+            "--rendezvous-url",
+            "ws://127.0.0.1:9/v1",
+            "--timeout",
+            "1ms",
+        ])
         .output()
         .expect("run accept");
     assert!(!output.status.success(), "expected failure");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("not implemented"),
-        "stderr should say not implemented:\n{stderr}"
+        !stderr.contains("not implemented"),
+        "PORTL-S accept should be wired to the online rendezvous path:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("load local identity")
+            || stderr.contains("connect to rendezvous server")
+            || stderr.contains("accept timed out"),
+        "stderr should come from real accept plumbing:\n{stderr}"
+    );
+}
+
+#[test]
+fn accept_invite_rejects_share_only_flags() {
+    let output = ProcessCommand::cargo_bin("portl")
+        .expect("cargo bin")
+        .args(["accept", "PORTLINV-test", "--label", "dev"])
+        .output()
+        .expect("run accept");
+    assert!(!output.status.success(), "expected failure");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("only apply to PORTL-S"),
+        "stderr should reject share-only flags:\n{stderr}"
+    );
+}
+
+#[test]
+fn accept_ticket_rejects_share_only_flags_without_echoing_ticket() {
+    let output = ProcessCommand::cargo_bin("portl")
+        .expect("cargo bin")
+        .args([
+            "accept",
+            "portlAAAA",
+            "--rendezvous-url",
+            "ws://example.invalid/v1",
+        ])
+        .output()
+        .expect("run accept");
+    assert!(!output.status.success(), "expected failure");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("only apply to PORTL-S"),
+        "stderr should reject share-only flags:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("portlAAAA"),
+        "must not echo ticket: {stderr}"
     );
 }
 

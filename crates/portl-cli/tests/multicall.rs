@@ -85,6 +85,9 @@ fn global_verbose_flags_do_not_change_command_shape() {
         Command::Accept {
             code: "PORTLINV-AAAA".to_owned(),
             yes: false,
+            label: None,
+            rendezvous_url: None,
+            timeout: std::time::Duration::from_secs(600),
         }
     );
 

@@ -172,6 +172,9 @@ pub enum Command {
     Accept {
         code: String,
         yes: bool,
+        label: Option<String>,
+        rendezvous_url: Option<String>,
+        timeout: std::time::Duration,
     },
     TicketIssue {
         caps: Option<String>,
@@ -559,7 +562,19 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
         ),
         Command::InviteLs { json } => commands::peer::invite::list(json),
         Command::InviteRm { prefix } => commands::peer::invite::revoke(&prefix),
-        Command::Accept { code, yes } => commands::accept::run(&code, yes),
+        Command::Accept {
+            code,
+            yes,
+            label,
+            rendezvous_url,
+            timeout,
+        } => commands::accept::run(
+            &code,
+            yes,
+            label.as_deref(),
+            rendezvous_url.as_deref(),
+            timeout,
+        ),
         Command::TicketIssue {
             caps,
             ttl,
@@ -800,7 +815,7 @@ const RELATIONSHIP_HELP: &str = "Relationship between portl trust objects:\n\n  
 
 const INVITE_AFTER_HELP: &str = "Examples:\n  portl invite                              # mutual pair, 1h TTL\n  portl invite --initiator me --for cust    # remote-support invite\n  portl invite --ttl 10m --for laptop\n  portl invite ls\n  portl invite rm abc123\n\nRelationship between portl trust objects:\n\n                    peer              invite                ticket\nOwns on disk        peers.json        pending_invites.json   tickets.json + revocations.jsonl\nLifecycle           permanent         ephemeral (single-use) scoped by TTL\nWhen created        on accept         by `portl invite`      by `portl ticket issue`\nWhen consumed       on rm             on `portl accept`      every connection/operation\n\nWorkflow:\n    first contact     →  `portl invite` + `portl accept`       (writes peer row)\n    day-to-day auth   →  `portl shell <target>`                (one-shot terminal)\n    persistent auth   →  `portl session attach <target>`       (persistent terminal, if available)\n    advanced: bounded →  `portl ticket issue` + `ticket save`  (explicit permission)";
 
-const ACCEPT_AFTER_HELP: &str = "Generic receiver for codes Portl knows how to consume:\n\n  PORTLINV-…     pairing invite from `portl invite` (peer trust handshake)\n  PORTL-S-…      short online session share (online exchange)\n  PORTL-SHARE1-… offline share token (not yet implemented)\n  portl…         ticket string — use `portl ticket save <label> <ticket>`\n\nExamples:\n  portl accept PORTLINV-ABCDEFGH…\n  portl accept PORTL-S-2-nebula-involve\n  portl accept --yes PORTLINV-ABCDEFGH…";
+const ACCEPT_AFTER_HELP: &str = "Generic receiver for codes Portl knows how to consume:\n\n  PORTLINV-…     pairing invite from `portl invite` (peer trust handshake)\n  PORTL-S-…      short online session share (online exchange)\n  PORTL-SHARE1-… offline share token (not yet implemented)\n  portl…         ticket string — use `portl ticket save <label> <ticket>`\n\nExamples:\n  portl accept PORTLINV-ABCDEFGH…\n  portl accept PORTL-S-2-nebula-involve\n  portl accept PORTL-S-2-nebula-involve --label dev-laptop\n  portl accept --yes PORTLINV-ABCDEFGH…";
 
 #[derive(Parser, Debug)]
 #[command(name = "portl", bin_name = "portl", version, about = PORTL_ABOUT, after_long_help = PORTL_AFTER_HELP)]
@@ -944,6 +959,15 @@ enum PairingTopLevel {
         /// Code or token to accept: PORTLINV-…, PORTL-S-…, PORTL-SHARE1-…, or a `portl…` ticket.
         #[arg(value_name = "THING")]
         code: String,
+        /// Label to use when saving an accepted PORTL-S session share.
+        #[arg(long)]
+        label: Option<String>,
+        /// Rendezvous mailbox URL for PORTL-S shares. Defaults to `PORTL_RENDEZVOUS_URL` or the public-compatible relay.
+        #[arg(long)]
+        rendezvous_url: Option<String>,
+        /// Timeout for online PORTL-S rendezvous.
+        #[arg(long, default_value = "10m", value_parser = humantime::parse_duration)]
+        timeout: std::time::Duration,
         /// Skip the confirmation prompt. Implied in non-TTY.
         #[arg(long)]
         yes: bool,
@@ -1470,9 +1494,19 @@ impl Cli {
         match self.command {
             TopLevel::Setup(action) => setup_into_command(action, log_verbose),
             TopLevel::Trust(action) => trust_into_command(action),
-            TopLevel::Pairing(PairingTopLevel::Accept { code, yes }) => {
-                Command::Accept { code, yes }
-            }
+            TopLevel::Pairing(PairingTopLevel::Accept {
+                code,
+                yes,
+                label,
+                rendezvous_url,
+                timeout,
+            }) => Command::Accept {
+                code,
+                yes,
+                label,
+                rendezvous_url,
+                timeout,
+            },
             TopLevel::Connect(action) => connect_into_command(action),
             TopLevel::Permissions(action) => permissions_into_command(action),
             TopLevel::Integrations(action) => integrations_into_command(action),
@@ -1603,7 +1637,13 @@ fn trust_into_command(action: TrustTopLevel) -> Command {
         TrustTopLevel::Invite {
             action: Some(InviteAction::Accept { code, yes }),
             ..
-        } => Command::Accept { code, yes },
+        } => Command::Accept {
+            code,
+            yes,
+            label: None,
+            rendezvous_url: None,
+            timeout: std::time::Duration::from_secs(600),
+        },
     }
 }
 

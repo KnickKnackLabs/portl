@@ -5,31 +5,52 @@
 //! consumer based on its prefix:
 //!
 //! 1. `PORTLINV-*`     → existing peer invite accept implementation.
-//! 2. `PORTL-S-*`      → short online exchange share (Task 12).
+//! 2. `PORTL-S-*`      → short online exchange share.
 //! 3. `PORTL-SHARE1-*` → offline share token (not in this slice).
 //! 4. `portl...`       → ticket string; suggest `portl ticket save`.
 //! 5. unknown          → list supported forms.
 
+use std::path::Path;
 use std::process::ExitCode;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, bail};
-use portl_core::rendezvous::ShortCode;
+use anyhow::{Context, Result, anyhow, bail};
+use iroh_tickets::Ticket;
+use portl_core::peer_store::PeerStore;
+use portl_core::rendezvous::backend::{RecipientHelloV1, accept_over_mailbox};
+use portl_core::rendezvous::exchange::{ExchangePayload, PortlExchangeEnvelopeV1};
+use portl_core::rendezvous::ws::WsRendezvousBackend;
+use portl_core::rendezvous::{RendezvousError, ShortCode};
+use portl_core::store_index::label_in_use;
+use portl_core::ticket::canonical::{canonical_check_ticket, resolved_issuer};
+use portl_core::ticket::schema::PortlTicket;
+use portl_core::ticket::sign::verify_body;
+use portl_core::ticket_store::{TicketEntry, TicketStore};
 
 use crate::commands;
+use crate::commands::session_share::{load_identity, resolve_rendezvous_url, share_caps};
 
 /// Dispatch entry point for the top-level `portl accept` command.
-pub fn run(thing: &str, yes: bool) -> Result<ExitCode> {
+pub fn run(
+    thing: &str,
+    yes: bool,
+    label: Option<&str>,
+    rendezvous_url: Option<&str>,
+    timeout: Duration,
+) -> Result<ExitCode> {
     let trimmed = thing.trim();
 
     if trimmed.starts_with("PORTLINV-") {
+        reject_short_share_only_options(label, rendezvous_url)?;
         return commands::peer::pair::run(trimmed, yes);
     }
 
     if trimmed.starts_with("PORTL-S-") {
-        return run_short_code(trimmed);
+        return run_short_code(trimmed, label, rendezvous_url, timeout);
     }
 
     if trimmed.starts_with("PORTL-SHARE1-") {
+        reject_short_share_only_options(label, rendezvous_url)?;
         bail!(
             "offline share tokens are not implemented yet.\n       \
              `PORTL-SHARE1-*` will be supported in a future release."
@@ -37,6 +58,7 @@ pub fn run(thing: &str, yes: bool) -> Result<ExitCode> {
     }
 
     if trimmed.starts_with("PORTLTKT-") || trimmed.starts_with("portl") {
+        reject_short_share_only_options(label, rendezvous_url)?;
         bail!(
             "this looks like a ticket string, not an invite or share code.\n       \
              To save it for later use:\n         \
@@ -44,6 +66,7 @@ pub fn run(thing: &str, yes: bool) -> Result<ExitCode> {
         );
     }
 
+    reject_short_share_only_options(label, rendezvous_url)?;
     bail!(
         "unrecognized accept input.\n       \
          Supported forms:\n         \
@@ -54,17 +77,415 @@ pub fn run(thing: &str, yes: bool) -> Result<ExitCode> {
     );
 }
 
-fn run_short_code(thing: &str) -> Result<ExitCode> {
+fn reject_short_share_only_options(
+    label: Option<&str>,
+    rendezvous_url: Option<&str>,
+) -> Result<()> {
+    if label.is_some() || rendezvous_url.is_some() {
+        bail!("--label and --rendezvous-url only apply to PORTL-S session shares");
+    }
+    Ok(())
+}
+
+fn run_short_code(
+    thing: &str,
+    label: Option<&str>,
+    rendezvous_url: Option<&str>,
+    timeout: Duration,
+) -> Result<ExitCode> {
     // Validate shape now so we surface clear `PORTL-S-` guidance for
     // malformed inputs even before the network path lands.
-    let _code = ShortCode::parse(thing).map_err(|err| {
+    let code = ShortCode::parse(thing).map_err(|err| {
         anyhow::anyhow!(
             "invalid `PORTL-S-` short code: {err}.\n       \
              Expected `PORTL-S-<nameplate>-<word>-<word>[-…]`."
         )
     })?;
-    bail!(
-        "short online session shares are not implemented yet.\n       \
-         A future release will import the share over the rendezvous mailbox."
+
+    let url = resolve_rendezvous_url(rendezvous_url);
+    let identity = load_identity(None)?;
+    let recipient_endpoint_id_hex = hex::encode(identity.endpoint_id().as_bytes());
+    let hello = RecipientHelloV1 {
+        schema: portl_core::rendezvous::backend::PORTL_RECIPIENT_HELLO_SCHEMA_V1.to_owned(),
+        endpoint_id_hex: Some(recipient_endpoint_id_hex.clone()),
+        label_hint: None,
+    };
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let outcome = runtime.block_on(async move {
+        match tokio::time::timeout(timeout, async {
+            let mut transport = WsRendezvousBackend::new(&url)
+                .map_err(|e| anyhow!("rendezvous backend: {e}"))?
+                .with_timeout(timeout)
+                .connect_transport()
+                .await
+                .map_err(|e| anyhow!("connect to rendezvous server: {e}"))?;
+            accept_over_mailbox(&mut transport, code, hello)
+                .await
+                .map_err(short_code_accept_error)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!(
+                "accept timed out after {}; the sender must keep `portl session share` running",
+                humantime::format_duration(timeout)
+            )),
+        }
+    });
+    runtime.shutdown_background();
+    let outcome = outcome?;
+
+    import_exchange_envelope(
+        &outcome.envelope,
+        ImportOptions {
+            label,
+            recipient_endpoint_id_hex: Some(&recipient_endpoint_id_hex),
+        },
+        &PeerStore::default_path(),
+        &TicketStore::default_path(),
+    )?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn short_code_accept_error(err: RendezvousError) -> anyhow::Error {
+    match err {
+        RendezvousError::AlreadyClaimed => anyhow!("short code was already claimed"),
+        RendezvousError::Expired => anyhow!("short code expired"),
+        RendezvousError::NotFound => anyhow!("short code was not found"),
+        RendezvousError::Backend(msg) => anyhow!("rendezvous backend failed: {msg}"),
+        RendezvousError::Mailbox(err) => anyhow!("mailbox transport error: {err}"),
+        RendezvousError::Crypto(_) => {
+            anyhow!("short-code exchange failed; check the code and try again")
+        }
+        RendezvousError::InvalidPayload(msg) => anyhow!("invalid exchange payload: {msg}"),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ImportOptions<'a> {
+    pub(crate) label: Option<&'a str>,
+    pub(crate) recipient_endpoint_id_hex: Option<&'a str>,
+}
+
+pub(crate) fn import_exchange_envelope(
+    envelope: &PortlExchangeEnvelopeV1,
+    options: ImportOptions<'_>,
+    peers_path: &Path,
+    tickets_path: &Path,
+) -> Result<String> {
+    envelope
+        .validate()
+        .map_err(|err| anyhow!("invalid exchange envelope: {err}"))?;
+    let now = unix_now()?;
+    if let Some(not_after) = envelope.not_after_unix
+        && not_after <= now
+    {
+        bail!("session share expired; ask the sender to run `portl session share` again");
+    }
+    let ExchangePayload::SessionShare(share) = &envelope.payload;
+    if share.access_not_after_unix <= now {
+        bail!("session share access expired; ask the sender to mint a fresh share");
+    }
+
+    let ticket = <PortlTicket as Ticket>::deserialize(&share.ticket)
+        .map_err(|err| anyhow!("parse embedded session ticket: {err}"))?;
+    canonical_check_ticket(&ticket)
+        .map_err(|err| anyhow!("invalid embedded session ticket: {err}"))?;
+    verify_body(&resolved_issuer(&ticket), &ticket.body, &ticket.sig)
+        .map_err(|err| anyhow!("embedded session ticket signature failed: {err}"))?;
+    if ticket.v != 1
+        || ticket.body.parent.is_some()
+        || ticket.body.bearer.is_some()
+        || ticket.body.caps != share_caps()
+    {
+        bail!("embedded session ticket is not a session-share ticket");
+    }
+
+    let endpoint_id_hex = hex::encode(ticket.addr.id.as_bytes());
+    if !endpoint_id_hex.eq_ignore_ascii_case(&share.target_endpoint_id_hex) {
+        bail!("embedded session ticket target did not match share envelope");
+    }
+    if ticket.body.not_after > share.access_not_after_unix {
+        bail!("embedded session ticket outlives share access window");
+    }
+    if ticket.body.not_after <= now {
+        bail!("embedded session ticket has already expired");
+    }
+    if let Some(expected) = options.recipient_endpoint_id_hex {
+        let Some(holder) = ticket.body.to else {
+            bail!("embedded session ticket is not bound to this recipient");
+        };
+        let holder = hex::encode(holder);
+        if !holder.eq_ignore_ascii_case(expected) {
+            bail!("embedded session ticket is bound to a different recipient");
+        }
+    }
+
+    let label = options.label.map_or_else(
+        || share.import_label(),
+        |label| {
+            let trimmed = label.trim();
+            if trimmed.is_empty() {
+                String::new()
+            } else {
+                trimmed.to_owned()
+            }
+        },
     );
+    if label.trim().is_empty() {
+        bail!("session share label is empty; pass --label <name>");
+    }
+
+    let peers = PeerStore::load(peers_path)?;
+    let mut tickets = TicketStore::load(tickets_path)?;
+    if let Some(store) = label_in_use(&label, &peers, &tickets) {
+        bail!(
+            "label '{label}' is already in use by a {store}; pass --label <name> or remove the existing label first"
+        );
+    }
+
+    tickets.insert(
+        label.clone(),
+        TicketEntry {
+            endpoint_id_hex,
+            ticket_string: share.ticket.clone(),
+            expires_at: ticket.body.not_after,
+            saved_at: now,
+        },
+    )?;
+    tickets.save(tickets_path)?;
+
+    let expires_in_secs = ticket.body.not_after - now;
+    if let Some(origin) = &share.origin_label_hint {
+        println!(
+            "Accepted session share \"{}\" from {}.",
+            share.friendly_name, origin
+        );
+    } else {
+        println!("Accepted session share \"{}\".", share.friendly_name);
+    }
+    println!("Saved access as ticket \"{label}\" (expires in {expires_in_secs}s).\n");
+    println!(
+        "Attach with:\n  portl session attach {label} {}",
+        share.provider_session
+    );
+
+    Ok(label)
+}
+
+fn unix_now() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock before unix epoch")?
+        .as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use iroh::EndpointAddr;
+    use portl_core::id::Identity;
+    use portl_core::rendezvous::exchange::SessionShareEnvelopeV1;
+    use portl_core::ticket::mint::mint_root;
+    use portl_core::ticket::schema::MetaCaps;
+    use tempfile::TempDir;
+
+    fn fixture_identity(byte: u8) -> Identity {
+        Identity::from_signing_key(SigningKey::from_bytes(&[byte; 32]))
+    }
+
+    fn fixture_addr() -> EndpointAddr {
+        EndpointAddr::new(fixture_identity(7).endpoint_id())
+    }
+
+    fn broader_caps() -> portl_core::ticket::schema::Capabilities {
+        let mut caps = share_caps();
+        caps.presence |= 0b0010_0000;
+        caps.meta = Some(MetaCaps {
+            ping: true,
+            info: true,
+        });
+        caps
+    }
+
+    fn fixture_session_share(friendly_name: &str, origin: Option<&str>) -> PortlExchangeEnvelopeV1 {
+        fixture_session_share_with_options(
+            friendly_name,
+            origin,
+            Some(fixture_identity(9).verifying_key()),
+            false,
+        )
+    }
+
+    fn fixture_session_share_with_options(
+        friendly_name: &str,
+        origin: Option<&str>,
+        recipient: Option<[u8; 32]>,
+        broader: bool,
+    ) -> PortlExchangeEnvelopeV1 {
+        let now = unix_now().unwrap();
+        let issuer = fixture_identity(3);
+        let addr = fixture_addr();
+        let ticket = mint_root(
+            issuer.signing_key(),
+            addr.clone(),
+            if broader {
+                broader_caps()
+            } else {
+                share_caps()
+            },
+            now,
+            now + 3_600,
+            recipient,
+        )
+        .unwrap();
+        let share = SessionShareEnvelopeV1 {
+            workspace_id: "ws_test".to_owned(),
+            friendly_name: friendly_name.to_owned(),
+            conflict_handle: "abcd1234".to_owned(),
+            origin_label_hint: origin.map(ToOwned::to_owned),
+            target_endpoint_id_hex: hex::encode(addr.id.as_bytes()),
+            provider: Some("zmx".to_owned()),
+            provider_session: friendly_name.to_owned(),
+            ticket: ticket.serialize(),
+            access_not_after_unix: now + 3_600,
+        };
+        PortlExchangeEnvelopeV1::session_share(share, now, Some(now + 300))
+    }
+
+    fn temp_paths(temp: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+        (
+            temp.path().join("peers.json"),
+            temp.path().join("tickets.json"),
+        )
+    }
+
+    #[test]
+    fn accepted_session_share_saves_ticket_under_import_label() {
+        let temp = TempDir::new().unwrap();
+        let (peers_path, tickets_path) = temp_paths(&temp);
+        let envelope = fixture_session_share("dev", Some("alice"));
+        let label = import_exchange_envelope(
+            &envelope,
+            ImportOptions {
+                label: None,
+                recipient_endpoint_id_hex: Some(&hex::encode(fixture_identity(9).verifying_key())),
+            },
+            &peers_path,
+            &tickets_path,
+        )
+        .unwrap();
+
+        assert_eq!(label, "dev@alice");
+        let tickets = TicketStore::load(&tickets_path).unwrap();
+        assert!(tickets.get("dev@alice").is_some());
+    }
+
+    #[test]
+    fn accepted_session_share_requires_label_on_conflict() {
+        let temp = TempDir::new().unwrap();
+        let (peers_path, tickets_path) = temp_paths(&temp);
+        let envelope = fixture_session_share("dev", Some("alice"));
+        import_exchange_envelope(
+            &envelope,
+            ImportOptions {
+                label: None,
+                recipient_endpoint_id_hex: Some(&hex::encode(fixture_identity(9).verifying_key())),
+            },
+            &peers_path,
+            &tickets_path,
+        )
+        .unwrap();
+
+        let err = import_exchange_envelope(
+            &envelope,
+            ImportOptions {
+                label: None,
+                recipient_endpoint_id_hex: Some(&hex::encode(fixture_identity(9).verifying_key())),
+            },
+            &peers_path,
+            &tickets_path,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--label"), "{err}");
+    }
+
+    #[test]
+    fn accepted_session_share_honors_explicit_label() {
+        let temp = TempDir::new().unwrap();
+        let (peers_path, tickets_path) = temp_paths(&temp);
+        let envelope = fixture_session_share("dev", Some("alice"));
+        let label = import_exchange_envelope(
+            &envelope,
+            ImportOptions {
+                label: Some("daily-dev"),
+                recipient_endpoint_id_hex: Some(&hex::encode(fixture_identity(9).verifying_key())),
+            },
+            &peers_path,
+            &tickets_path,
+        )
+        .unwrap();
+        assert_eq!(label, "daily-dev");
+    }
+
+    #[test]
+    fn accepted_session_share_rejects_mismatched_recipient_binding() {
+        let temp = TempDir::new().unwrap();
+        let (peers_path, tickets_path) = temp_paths(&temp);
+        let envelope = fixture_session_share("dev", Some("alice"));
+        let err = import_exchange_envelope(
+            &envelope,
+            ImportOptions {
+                label: None,
+                recipient_endpoint_id_hex: Some(&hex::encode(fixture_identity(8).verifying_key())),
+            },
+            &peers_path,
+            &tickets_path,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("different recipient"), "{err}");
+    }
+
+    #[test]
+    fn accepted_session_share_rejects_unbound_bearer_ticket_when_recipient_known() {
+        let temp = TempDir::new().unwrap();
+        let (peers_path, tickets_path) = temp_paths(&temp);
+        let envelope = fixture_session_share_with_options("dev", Some("alice"), None, false);
+        let err = import_exchange_envelope(
+            &envelope,
+            ImportOptions {
+                label: None,
+                recipient_endpoint_id_hex: Some(&hex::encode(fixture_identity(9).verifying_key())),
+            },
+            &peers_path,
+            &tickets_path,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not bound"), "{err}");
+    }
+
+    #[test]
+    fn accepted_session_share_rejects_non_session_share_caps() {
+        let temp = TempDir::new().unwrap();
+        let (peers_path, tickets_path) = temp_paths(&temp);
+        let envelope = fixture_session_share_with_options(
+            "dev",
+            Some("alice"),
+            Some(fixture_identity(9).verifying_key()),
+            true,
+        );
+        let err = import_exchange_envelope(
+            &envelope,
+            ImportOptions {
+                label: None,
+                recipient_endpoint_id_hex: Some(&hex::encode(fixture_identity(9).verifying_key())),
+            },
+            &peers_path,
+            &tickets_path,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("session-share ticket"), "{err}");
+    }
 }
