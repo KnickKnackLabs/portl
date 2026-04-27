@@ -108,6 +108,10 @@ fn accept_share_token_is_not_yet_implemented() {
         stderr.contains("offline share tokens") && stderr.contains("not implemented"),
         "stderr should say share tokens not implemented:\n{stderr}"
     );
+    assert!(
+        !stderr.contains("short online session shares"),
+        "PORTL-SHARE1-* must not be classified as PORTL-S-*:\n{stderr}"
+    );
 }
 
 #[test]
@@ -120,8 +124,12 @@ fn accept_ticket_string_suggests_ticket_save() {
     assert!(!output.status.success(), "expected failure");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("portl ticket save"),
+        stderr.contains("portl ticket save <label> <ticket>"),
         "stderr should suggest `portl ticket save`:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("portlAAAA"),
+        "stderr should not echo ticket credentials:\n{stderr}"
     );
 }
 

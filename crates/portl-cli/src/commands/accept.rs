@@ -40,7 +40,7 @@ pub fn run(thing: &str, yes: bool) -> Result<ExitCode> {
         bail!(
             "this looks like a ticket string, not an invite or share code.\n       \
              To save it for later use:\n         \
-             portl ticket save <label> {trimmed}"
+             portl ticket save <label> <ticket>"
         );
     }
 
