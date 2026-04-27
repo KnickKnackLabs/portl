@@ -289,6 +289,84 @@ fn session_share_parses_target_and_session() {
 }
 
 #[test]
+fn session_share_parses_full_option_set() {
+    let parsed = parse_args(&[
+        "session",
+        "share",
+        "shared-box",
+        "dev",
+        "--provider",
+        "zmx",
+        "--ttl",
+        "5m",
+        "--access-ttl",
+        "30m",
+        "--label",
+        "alice-laptop",
+        "--rendezvous-url",
+        "ws://relay.example.invalid/v1",
+        "--yes",
+        "--allow-bearer-fallback",
+    ])
+    .expect("parse");
+    match parsed {
+        ParsedCommand::SessionShare {
+            target,
+            session,
+            provider,
+            ttl,
+            access_ttl,
+            label,
+            rendezvous_url,
+            yes,
+            allow_bearer_fallback,
+        } => {
+            assert_eq!(target, "shared-box");
+            assert_eq!(session.as_deref(), Some("dev"));
+            assert_eq!(provider.as_deref(), Some("zmx"));
+            assert_eq!(ttl, std::time::Duration::from_secs(300));
+            assert_eq!(access_ttl, std::time::Duration::from_secs(1_800));
+            assert_eq!(label.as_deref(), Some("alice-laptop"));
+            assert_eq!(
+                rendezvous_url.as_deref(),
+                Some("ws://relay.example.invalid/v1")
+            );
+            assert!(yes);
+            assert!(allow_bearer_fallback);
+        }
+        other => panic!("expected SessionShare, got {other:?}"),
+    }
+}
+
+#[test]
+fn session_share_unsupported_ticket_target_does_not_echo_input() {
+    // Use a long bogus `portl…` string that nonetheless fails ticket
+    // deserialization gracefully and falls through to "unsupported"
+    // — but the error path must still avoid echoing the raw target.
+    // We use a `portl ticket save` style label so it routes through
+    // the saved-ticket guard.
+    //
+    // Instead, drive the share command with a wholly-unknown name to
+    // confirm error text never echoes raw input.
+    let secret_label = "this-is-a-secret-target-string";
+    let output = ProcessCommand::cargo_bin("portl")
+        .expect("cargo bin")
+        .args(["session", "share", secret_label])
+        .output()
+        .expect("run session share");
+    assert!(!output.status.success(), "expected failure");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains(secret_label),
+        "stderr must not echo raw target input: {stderr}"
+    );
+    assert!(
+        stderr.contains("unsupported share target") || stderr.contains("Supported forms"),
+        "stderr must explain supported forms: {stderr}"
+    );
+}
+
+#[test]
 fn accept_and_ticket_save_teach_wrong_prefix() {
     let accept = ProcessCommand::cargo_bin("portl")
         .expect("cargo bin")

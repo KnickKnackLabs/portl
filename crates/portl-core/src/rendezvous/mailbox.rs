@@ -204,6 +204,11 @@ impl<'a, T: MailboxTransport + Send> MailboxClient<'a, T> {
         }
     }
 
+    /// The wire `side` identifier this client is using.
+    pub fn side(&self) -> &str {
+        self.side
+    }
+
     fn buffer_pending(&mut self, msg: PhaseMessage) -> Result<(), MailboxError> {
         if self.pending_messages.len() >= MAX_PENDING_MESSAGES {
             return Err(MailboxError::Unexpected(format!(

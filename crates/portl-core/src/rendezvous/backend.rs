@@ -9,7 +9,7 @@ use super::exchange::PortlExchangeEnvelopeV1;
 use super::mailbox::{MailboxClient, MailboxError, MailboxTransport};
 use super::short_code::ShortCode;
 use super::wormhole_crypto::{
-    WormholeCryptoError, decrypt_phase, encrypt_phase, finish_pake, start_pake,
+    WormholeCryptoError, WormholeKey, decrypt_phase, encrypt_phase, finish_pake, start_pake,
 };
 
 /// Application id used for the Portl V1 short-code exchange.
@@ -159,6 +159,11 @@ fn random_side() -> String {
     hex::encode(bytes)
 }
 
+/// Generate a fresh `side` identifier for a new mailbox client.
+pub fn fresh_side() -> String {
+    random_side()
+}
+
 /// Try to send a `scary` close on `client`, ignoring any error. Used to
 /// signal the peer that we are aborting so they observe a deterministic
 /// `Closed` instead of an indefinite wait.
@@ -167,6 +172,74 @@ where
     T: MailboxTransport + Send,
 {
     let _ = client.close_scary(reason).await;
+}
+
+/// Run the offerer side of the PAKE handshake on an already opened
+/// mailbox and read the recipient's hello.
+///
+/// On success, returns the negotiated symmetric key and the validated
+/// recipient hello so the caller can mint a recipient-bound payload
+/// before continuing with [`offer_send_envelope`]. On failure, the
+/// helper sends a scary close so the peer observes a deterministic
+/// error.
+pub async fn offer_pake_and_recv_hello<T>(
+    client: &mut MailboxClient<'_, T>,
+    code: &ShortCode,
+) -> Result<(WormholeKey, RecipientHelloV1), RendezvousError>
+where
+    T: MailboxTransport + Send,
+{
+    let password = code.password();
+    let (state, pake_body) = start_pake(&password, PORTL_EXCHANGE_APPID_V1);
+    client.send_phase("pake", &pake_body).await?;
+    let peer_pake = client.recv_phase_from_peer("pake").await?;
+    let key = match finish_pake(state, &peer_pake.body) {
+        Ok(k) => k,
+        Err(e) => {
+            best_effort_close_scary(client, "pake failed").await;
+            return Err(e.into());
+        }
+    };
+
+    let hello_msg = client.recv_phase_from_peer("0").await?;
+    let hello_plain = match decrypt_phase(&key, &hello_msg.side, "0", &hello_msg.body) {
+        Ok(plain) => plain,
+        Err(e) => {
+            best_effort_close_scary(client, "hello decrypt failed").await;
+            return Err(e.into());
+        }
+    };
+    let hello: RecipientHelloV1 = match serde_json::from_slice(&hello_plain) {
+        Ok(h) => h,
+        Err(e) => {
+            best_effort_close_scary(client, "hello deserialize failed").await;
+            return Err(RendezvousError::InvalidPayload(e.to_string()));
+        }
+    };
+    if let Err(e) = hello.validate() {
+        best_effort_close_scary(client, "hello validation failed").await;
+        return Err(e);
+    }
+    Ok((key, hello))
+}
+
+/// Encrypt and send the share envelope on phase `"1"`, then close the
+/// mailbox happily.
+pub async fn offer_send_envelope<T>(
+    client: &mut MailboxClient<'_, T>,
+    key: &WormholeKey,
+    envelope: &PortlExchangeEnvelopeV1,
+) -> Result<(), RendezvousError>
+where
+    T: MailboxTransport + Send,
+{
+    let envelope_json =
+        serde_json::to_vec(envelope).map_err(|e| RendezvousError::InvalidPayload(e.to_string()))?;
+    let side = client.side().to_owned();
+    let cipher = encrypt_phase(key, &side, "1", &envelope_json);
+    client.send_phase("1", &cipher).await?;
+    client.close_happy().await?;
+    Ok(())
 }
 
 /// Run the offerer side of a one-shot encrypted exchange over `transport`.
@@ -192,46 +265,8 @@ where
     let side = random_side();
     let mut client = MailboxClient::new(PORTL_EXCHANGE_APPID_V1, &side, transport);
     client.claim_and_open(code.nameplate().to_owned()).await?;
-
-    let password = code.password();
-    let (state, pake_body) = start_pake(&password, PORTL_EXCHANGE_APPID_V1);
-    client.send_phase("pake", &pake_body).await?;
-    let peer_pake = client.recv_phase_from_peer("pake").await?;
-    let key = match finish_pake(state, &peer_pake.body) {
-        Ok(k) => k,
-        Err(e) => {
-            best_effort_close_scary(&mut client, "pake failed").await;
-            return Err(e.into());
-        }
-    };
-
-    let hello_msg = client.recv_phase_from_peer("0").await?;
-    let hello_plain = match decrypt_phase(&key, &hello_msg.side, "0", &hello_msg.body) {
-        Ok(plain) => plain,
-        Err(e) => {
-            best_effort_close_scary(&mut client, "hello decrypt failed").await;
-            return Err(e.into());
-        }
-    };
-    let hello: RecipientHelloV1 = match serde_json::from_slice(&hello_plain) {
-        Ok(h) => h,
-        Err(e) => {
-            best_effort_close_scary(&mut client, "hello deserialize failed").await;
-            return Err(RendezvousError::InvalidPayload(e.to_string()));
-        }
-    };
-    if let Err(e) = hello.validate() {
-        best_effort_close_scary(&mut client, "hello validation failed").await;
-        return Err(e);
-    }
-
-    let envelope_json = serde_json::to_vec(&envelope)
-        .map_err(|e| RendezvousError::InvalidPayload(e.to_string()))?;
-    let cipher = encrypt_phase(&key, &side, "1", &envelope_json);
-    client.send_phase("1", &cipher).await?;
-
-    client.close_happy().await?;
-    Ok(())
+    let (key, _hello) = offer_pake_and_recv_hello(&mut client, &code).await?;
+    offer_send_envelope(&mut client, &key, &envelope).await
 }
 
 /// Run the recipient side of a one-shot encrypted exchange over `transport`.
@@ -708,5 +743,56 @@ mod tests {
             "accepter must surface crypto error after malformed pake, got {a_res:?}"
         );
         p_res.expect("partner observes deterministic close from peer");
+    }
+
+    #[tokio::test]
+    async fn split_offer_helpers_drive_full_exchange_with_allocate() {
+        // Allocate a nameplate from the mailbox, derive a short code
+        // from it, run PAKE+hello, build envelope, and send. This is
+        // the exact pipeline `portl session share` follows so the
+        // helpers must compose cleanly.
+        let mailbox = SharedMailboxFixture::default();
+        let mut sender_t = mailbox.sender_transport();
+        let mut receiver_t = mailbox.receiver_transport();
+
+        let envelope = fixture_envelope();
+
+        let recipient_hello = RecipientHelloV1 {
+            schema: PORTL_RECIPIENT_HELLO_SCHEMA_V1.to_owned(),
+            endpoint_id_hex: Some(hex::encode([0xCDu8; 32])),
+            label_hint: Some("bob".into()),
+        };
+
+        let (code_tx, code_rx) = tokio::sync::oneshot::channel::<ShortCode>();
+
+        let envelope_for_send = envelope.clone();
+        let sender_fut = async move {
+            let side = fresh_side();
+            let mut client = MailboxClient::new(PORTL_EXCHANGE_APPID_V1, &side, &mut sender_t);
+            let setup = client
+                .allocate_and_open()
+                .await
+                .map_err(RendezvousError::from)?;
+            let code = ShortCode::generate_with_nameplate(setup.nameplate.clone())
+                .expect("generate short code");
+            code_tx.send(code.clone()).expect("send code");
+            let (key, hello) = offer_pake_and_recv_hello(&mut client, &code).await?;
+            assert!(hello.endpoint_id_hex.is_some(), "hello must round-trip");
+            offer_send_envelope(&mut client, &key, &envelope_for_send).await?;
+            Ok::<_, RendezvousError>(())
+        };
+        let receiver_fut = async move {
+            let code = code_rx.await.expect("sender produced a code");
+            accept_over_mailbox(&mut receiver_t, code, recipient_hello).await
+        };
+
+        let (s_res, r_res) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(sender_fut, receiver_fut)
+        })
+        .await
+        .expect("flow completes within timeout");
+        s_res.expect("sender finished");
+        let outcome = r_res.expect("receiver finished");
+        assert_eq!(outcome.envelope, envelope);
     }
 }

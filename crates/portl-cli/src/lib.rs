@@ -724,6 +724,12 @@ const PORTL_ABOUT: &str = "portl — peer-to-peer remote access and port forward
 
 pub const TARGET_HELP: &str = "Target identifier. Accepts any of:\n\n  * peer label    — short name from `portl peer ls`\n  * adapter alias — Docker/Slicer target from `portl docker ls` or `portl slicer ls`\n  * ticket label  — saved ticket from `portl ticket ls`\n  * ticket string — raw `portl...` ticket\n  * endpoint_id   — 64-char hex endpoint id\n\nResolution follows portl's connection cascade: inline ticket, peer label, saved ticket, adapter alias, then endpoint_id.";
 
+/// Narrower target help for `portl session share`. The share flow
+/// only supports forms where the CLI can mint a fresh root ticket
+/// from local identity to a resolved endpoint address; saved tickets
+/// and raw ticket strings are intentionally excluded.
+pub const SESSION_SHARE_TARGET_HELP: &str = "Target identifier. Supported forms:\n\n  * peer label    — outbound-capable peer from `portl peer ls`\n  * adapter alias — alias backed by an `endpoint_id`\n  * endpoint_id   — 64-char hex endpoint id (or PPPP…SSSS elided form)\n\nSaved tickets and raw `portl…` ticket strings are NOT accepted here:\nthe share flow refuses to delegate a ticket credential to an unknown\nrecipient.";
+
 const PORTL_AFTER_HELP: &str = "Pair two machines:\n  $ portl init\n  $ portl invite                       # on the other machine\n  $ portl accept PORTLINV-…            # on this machine\n  $ portl shell other-machine          # one-shot interactive shell\n  $ portl session attach other-machine # persistent shell, if available\n\nRun `portl <COMMAND> --help` for details on any subcommand.\n\nEnvironment variables:\n  PORTL_HOME       State directory override.\n  PORTL_CONFIG     Alt portl.toml path.\n  PORTL_JSON       Force --json where supported (0/1).\n  PORTL_QUIET      Force --quiet where supported (0/1).\n  NO_COLOR         Disable color output.\n\nSee `docs/ENV.md` for the full list including relay and internal variables.";
 
 const TOP_LEVEL_HELP: &str = "portl — peer-to-peer remote access and port forwarding.
@@ -1139,7 +1145,7 @@ enum SessionAction {
         long_about = "Share a session via a `PORTL-S-*` short online code.\n\nAllocates a short code, prints it, and waits for a recipient to accept.\nYou must keep this command running until the recipient accepts.\nThe recipient runs `portl accept PORTL-S-...` to import the offered session."
     )]
     Share {
-        #[arg(help = TARGET_HELP)]
+        #[arg(help = SESSION_SHARE_TARGET_HELP)]
         target: String,
         /// Session name. Defaults to the target label, or `default` for raw targets.
         session: Option<String>,

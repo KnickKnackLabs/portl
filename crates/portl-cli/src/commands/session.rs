@@ -16,6 +16,14 @@ use tokio::io::{AsyncWriteExt, copy};
 use tracing::debug;
 
 use crate::commands::peer_resolve::{close_connected, connect_peer};
+use crate::commands::session_share::{
+    BuiltEnvelope, EnvelopeInputs, ResolveTargetError, build_session_share_envelope,
+    classify_share_target, fresh_workspace_handles, load_identity, resolve_rendezvous_url,
+    run_offer_against_transport, unix_now,
+};
+use portl_core::peer_store::PeerStore;
+use portl_core::rendezvous::ws::WsRendezvousBackend;
+use portl_core::ticket_store::TicketStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SessionHistoryFormat {
@@ -173,31 +181,133 @@ pub fn kill(target: &str, session: Option<&str>, provider: Option<&str>) -> Resu
     result
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn share(
     target: &str,
     session: Option<&str>,
-    _provider: Option<&str>,
-    _ttl: Duration,
-    _access_ttl: Duration,
-    _label: Option<&str>,
-    _rendezvous_url: Option<&str>,
+    provider: Option<&str>,
+    ttl: Duration,
+    access_ttl: Duration,
+    label: Option<&str>,
+    rendezvous_url: Option<&str>,
     _yes: bool,
     allow_bearer_fallback: bool,
 ) -> Result<ExitCode> {
+    // Classify target up-front so unsupported forms fail fast without
+    // ever echoing the raw input (which may be a ticket credential).
+    let peers = PeerStore::load(&PeerStore::default_path()).context("load peer store")?;
+    let tickets = TicketStore::load(&TicketStore::default_path()).context("load ticket store")?;
+    let aliases = crate::alias_store::AliasStore::default();
+    let form = match classify_share_target(target, &peers, &tickets, &aliases) {
+        Ok(form) => form,
+        Err(ResolveTargetError::TicketCredential) => {
+            anyhow::bail!(
+                "session share cannot delegate a ticket credential passed as <TARGET>. \
+                 Use a peer-store label, alias, or `endpoint_id` instead."
+            );
+        }
+        Err(err) => return Err(err.into()),
+    };
+
     let session_name = default_session_name(target, session);
-    if !allow_bearer_fallback {
-        anyhow::bail!(
-            "session share for target '{target}' (session '{session_name}') is not yet supported by this Portl build: \
-the CLI cannot safely delegate the resolved ticket to an unknown recipient. \
-Ask the target owner to run `portl session share` directly, or issue a recipient-bound ticket and share it manually. \
-Re-run with `--allow-bearer-fallback` to accept a short-lived bearer ticket fallback once recipient identity is unavailable."
+    let url = resolve_rendezvous_url(rendezvous_url);
+    let identity = load_identity(None)?;
+    let origin_label_hint = label.map(ToOwned::to_owned);
+    let (workspace_id, conflict_handle) = fresh_workspace_handles();
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let result = runtime.block_on(async move {
+        // Resolve the target endpoint address so we can mint into it.
+        let client_endpoint =
+            crate::commands::peer_resolve::bind_client_endpoint(&identity).await?;
+        let endpoint_id = form.endpoint_id();
+        let (target_addr, _provenance) = crate::commands::peer_resolve::resolve_endpoint_addr(
+            &client_endpoint,
+            endpoint_id,
+            false,
+        )
+        .await?;
+        crate::commands::peer_resolve::close_client_endpoint(client_endpoint, "share resolve")
+            .await;
+
+        // Open the rendezvous transport.
+        let backend = WsRendezvousBackend::new(&url)
+            .map_err(|e| anyhow::anyhow!("rendezvous backend: {e}"))?
+            .with_timeout(ttl);
+        let mut transport = backend
+            .connect_transport()
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to rendezvous server {url}: {e}"))?;
+
+        eprintln!(
+            "portl: sharing {} as session \"{session_name}\"",
+            form.safe_display()
         );
-    }
-    anyhow::bail!(
-        "session share over PORTL-S short codes is not yet wired in this Portl build; \
-the rendezvous backend cannot host a CLI sender flow yet. Track Task 11 follow-up for full network support."
-    );
+
+        let now = unix_now()?;
+        let mut printed_code: Option<String> = None;
+        let envelope_result = run_offer_against_transport(
+            &mut transport,
+            None,
+            |code| {
+                let display = code.display_code();
+                println!("{display}");
+                println!(
+                    "Share this code with the recipient and run \
+                     `portl accept {display}` on their machine."
+                );
+                println!(
+                    "Keep this command running until they accept (rendezvous TTL {}s).",
+                    ttl.as_secs()
+                );
+                printed_code = Some(display);
+            },
+            |hello| {
+                let inputs = EnvelopeInputs {
+                    identity: &identity,
+                    target_addr: target_addr.clone(),
+                    hello,
+                    session_name: &session_name,
+                    provider,
+                    origin_label_hint: origin_label_hint.clone(),
+                    workspace_id: workspace_id.clone(),
+                    conflict_handle: conflict_handle.clone(),
+                    now_unix: now,
+                    access_ttl,
+                    allow_bearer_fallback,
+                };
+                let BuiltEnvelope {
+                    envelope,
+                    bound_to_recipient,
+                    effective_access_ttl,
+                } = build_session_share_envelope(inputs)?;
+                if bound_to_recipient {
+                    eprintln!(
+                        "portl: minted recipient-bound ticket (ttl {}s)",
+                        effective_access_ttl.as_secs()
+                    );
+                } else {
+                    eprintln!(
+                        "portl: WARNING: recipient hello had no endpoint id; \
+                         minting bearer ticket capped at {}s (--allow-bearer-fallback)",
+                        effective_access_ttl.as_secs()
+                    );
+                }
+                Ok(envelope)
+            },
+        )
+        .await;
+
+        match envelope_result {
+            Ok(()) => {
+                eprintln!("portl: recipient accepted; share complete");
+                Ok(ExitCode::SUCCESS)
+            }
+            Err(err) => Err(err),
+        }
+    });
+    runtime.shutdown_background();
+    result
 }
 
 pub fn attach(
