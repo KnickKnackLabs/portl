@@ -60,7 +60,7 @@ crypto_secretbox = { workspace = true }
 hkdf             = { workspace = true }
 url              = { workspace = true }
 futures-util     = { workspace = true }
-http             = "1"
+http             = { workspace = true }
 
 [dev-dependencies]
 portl-core = { version = "0.5.2", path = ".", features = ["test-util"] }

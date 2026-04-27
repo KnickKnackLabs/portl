@@ -9,7 +9,7 @@ use super::exchange::PortlExchangeEnvelopeV1;
 use super::mailbox::{MailboxClient, MailboxError, MailboxTransport};
 use super::short_code::ShortCode;
 use super::wormhole_crypto::{
-    decrypt_phase, encrypt_phase, finish_pake, start_pake, WormholeCryptoError,
+    WormholeCryptoError, decrypt_phase, encrypt_phase, finish_pake, start_pake,
 };
 
 /// Application id used for the Portl V1 short-code exchange.
@@ -264,8 +264,8 @@ where
         }
     };
 
-    let hello_json = serde_json::to_vec(&hello)
-        .map_err(|e| RendezvousError::InvalidPayload(e.to_string()))?;
+    let hello_json =
+        serde_json::to_vec(&hello).map_err(|e| RendezvousError::InvalidPayload(e.to_string()))?;
     let hello_cipher = encrypt_phase(&key, &side, "0", &hello_json);
     client.send_phase("0", &hello_cipher).await?;
 
@@ -336,9 +336,9 @@ mod tests {
                     });
                 }
                 ClientMessage::Allocate => {
-                    let _ = self
-                        .incoming_tx
-                        .send(ServerMessage::Allocated { nameplate: "1".into() });
+                    let _ = self.incoming_tx.send(ServerMessage::Allocated {
+                        nameplate: "1".into(),
+                    });
                 }
                 ClientMessage::Claim { nameplate } => {
                     let _ = self.incoming_tx.send(ServerMessage::Claimed {
@@ -371,15 +371,11 @@ mod tests {
                     let _ = self
                         .incoming_tx
                         .send(ServerMessage::Ack { id: "close".into() });
-                    let _ = self
-                        .incoming_tx
-                        .send(ServerMessage::Closed { mood: None });
+                    let _ = self.incoming_tx.send(ServerMessage::Closed { mood: None });
                     // Mirror to the peer so the partner observes a
                     // deterministic mailbox close instead of waiting
                     // forever on a phase that will never arrive.
-                    let _ = self
-                        .peer_tx
-                        .send(ServerMessage::Closed { mood: None });
+                    let _ = self.peer_tx.send(ServerMessage::Closed { mood: None });
                 }
             }
             Ok(())
@@ -451,16 +447,12 @@ mod tests {
         let mut receiver_t = mailbox.receiver_transport();
 
         let sender_fut = offer_over_mailbox(&mut sender_t, code.clone(), envelope.clone());
-        let receiver_fut = accept_over_mailbox(
-            &mut receiver_t,
-            code,
-            RecipientHelloV1::anonymous(),
-        );
+        let receiver_fut =
+            accept_over_mailbox(&mut receiver_t, code, RecipientHelloV1::anonymous());
 
-        let (s_res, r_res) = tokio::time::timeout(
-            Duration::from_secs(5),
-            async { tokio::join!(sender_fut, receiver_fut) },
-        )
+        let (s_res, r_res) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(sender_fut, receiver_fut)
+        })
         .await
         .expect("happy-path exchange completes within timeout");
         s_res.expect("sender flow completes");
@@ -485,10 +477,9 @@ mod tests {
             RecipientHelloV1::anonymous(),
         );
 
-        let (s_res, r_res) = tokio::time::timeout(
-            Duration::from_secs(5),
-            async { tokio::join!(sender_fut, receiver_fut) },
-        )
+        let (s_res, r_res) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(sender_fut, receiver_fut)
+        })
         .await
         .expect("wrong-code flow must complete within bounded timeout");
         assert!(
@@ -575,10 +566,9 @@ mod tests {
         };
 
         let sender_fut = offer_over_mailbox(&mut sender_t, code.clone(), envelope);
-        let (s_res, r_res) = tokio::time::timeout(
-            Duration::from_secs(5),
-            async { tokio::join!(sender_fut, receiver_fut) },
-        )
+        let (s_res, r_res) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(sender_fut, receiver_fut)
+        })
         .await
         .expect("flow completes within timeout");
         assert!(s_res.is_err(), "sender must reject invalid hello schema");
@@ -705,11 +695,7 @@ mod tests {
         let mut receiver_t = mailbox.receiver_transport();
 
         let nameplate = code.nameplate().to_owned();
-        let accept_fut = accept_over_mailbox(
-            &mut receiver_t,
-            code,
-            RecipientHelloV1::anonymous(),
-        );
+        let accept_fut = accept_over_mailbox(&mut receiver_t, code, RecipientHelloV1::anonymous());
         let partner_fut = malformed_pake_partner(&mut sender_t, nameplate, b"not-json".to_vec());
 
         let (a_res, p_res) = tokio::time::timeout(Duration::from_secs(5), async {

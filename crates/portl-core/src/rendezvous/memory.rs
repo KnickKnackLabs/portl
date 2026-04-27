@@ -95,9 +95,7 @@ impl RendezvousBackend for MemoryRendezvousBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rendezvous::exchange::{
-        PortlExchangeEnvelopeV1, SessionShareEnvelopeV1,
-    };
+    use crate::rendezvous::exchange::{PortlExchangeEnvelopeV1, SessionShareEnvelopeV1};
 
     fn fixture_envelope() -> PortlExchangeEnvelopeV1 {
         let share = SessionShareEnvelopeV1 {

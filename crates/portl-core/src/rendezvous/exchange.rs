@@ -54,15 +54,16 @@ pub struct SessionShareEnvelopeV1 {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EnvelopeValidationError {
     #[error("unsupported schema: expected `{expected}`, got `{actual}`")]
-    UnsupportedSchema { expected: &'static str, actual: String },
+    UnsupportedSchema {
+        expected: &'static str,
+        actual: String,
+    },
     #[error("envelope kind `{envelope:?}` does not match payload kind `{payload:?}`")]
     KindMismatch {
         envelope: ExchangeKind,
         payload: ExchangeKind,
     },
-    #[error(
-        "not_after_unix ({not_after}) must be greater than created_at_unix ({created_at})"
-    )]
+    #[error("not_after_unix ({not_after}) must be greater than created_at_unix ({created_at})")]
     NotAfterNotAfterCreatedAt { created_at: u64, not_after: u64 },
     #[error("target_endpoint_id_hex must be {expected} hex characters (32 bytes), got {actual}")]
     InvalidEndpointIdLength { expected: usize, actual: usize },

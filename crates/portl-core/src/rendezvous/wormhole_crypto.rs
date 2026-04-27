@@ -1,8 +1,8 @@
 //! Wormhole-compatible SPAKE2 + secretbox crypto helpers (skeleton).
 
 use crypto_secretbox::{
-    aead::{Aead, KeyInit},
     Key as SecretboxKey, Nonce as SecretboxNonce, XSalsa20Poly1305,
+    aead::{Aead, KeyInit},
 };
 use hkdf::Hkdf;
 use rand::RngCore;

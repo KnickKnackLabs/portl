@@ -22,13 +22,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
-use tokio::time::timeout;
-use tokio_websockets::{ClientBuilder, Limits, Message, WebSocketStream, MaybeTlsStream};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
+use tokio_websockets::{ClientBuilder, Limits, MaybeTlsStream, Message, WebSocketStream};
 
 use super::backend::{
-    accept_over_mailbox, AcceptOutcome, ExchangeOffer, OfferHandle, RecipientHelloV1,
-    RendezvousBackend, RendezvousError,
+    AcceptOutcome, ExchangeOffer, OfferHandle, RecipientHelloV1, RendezvousBackend,
+    RendezvousError, accept_over_mailbox,
 };
 use super::mailbox::{ClientMessage, MailboxError, MailboxTransport, ServerMessage};
 use super::short_code::ShortCode;
@@ -101,6 +101,7 @@ impl WsRendezvousBackend {
 /// `tokio-websockets`-backed [`MailboxTransport`].
 pub struct WsMailboxTransport {
     inner: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    next_id: u64,
 }
 
 impl WsMailboxTransport {
@@ -114,15 +115,34 @@ impl WsMailboxTransport {
             .connect()
             .await
             .map_err(|e| RendezvousError::Backend(format!("websocket connect failed: {e}")))?;
-        Ok(Self { inner: stream })
+        Ok(Self {
+            inner: stream,
+            next_id: 0,
+        })
     }
+
+    fn next_command_id(&mut self) -> String {
+        self.next_id += 1;
+        format!("portl-{}", self.next_id)
+    }
+}
+
+fn serialize_client_message_with_id(msg: ClientMessage, id: &str) -> Result<String, MailboxError> {
+    let mut value = serde_json::to_value(msg)
+        .map_err(|e| MailboxError::Transport(format!("serialize client frame: {e}")))?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        MailboxError::Transport("client frame did not serialize to a JSON object".into())
+    })?;
+    object.insert("id".to_owned(), serde_json::Value::String(id.to_owned()));
+    serde_json::to_string(&value)
+        .map_err(|e| MailboxError::Transport(format!("serialize client frame: {e}")))
 }
 
 #[async_trait]
 impl MailboxTransport for WsMailboxTransport {
     async fn send(&mut self, msg: ClientMessage) -> Result<(), MailboxError> {
-        let body = serde_json::to_string(&msg)
-            .map_err(|e| MailboxError::Transport(format!("serialize client frame: {e}")))?;
+        let id = self.next_command_id();
+        let body = serialize_client_message_with_id(msg, &id)?;
         self.inner
             .send(Message::text(body))
             .await
@@ -136,8 +156,8 @@ impl MailboxTransport for WsMailboxTransport {
                 .next()
                 .await
                 .ok_or_else(|| MailboxError::Transport("websocket stream closed".into()))?;
-            let frame = next
-                .map_err(|e| MailboxError::Transport(format!("websocket recv: {e}")))?;
+            let frame =
+                next.map_err(|e| MailboxError::Transport(format!("websocket recv: {e}")))?;
             if frame.is_ping() || frame.is_pong() {
                 continue;
             }
@@ -154,9 +174,8 @@ impl MailboxTransport for WsMailboxTransport {
             let text = frame.as_text().ok_or_else(|| {
                 MailboxError::Transport("websocket frame missing utf-8 text".into())
             })?;
-            return serde_json::from_str::<ServerMessage>(text).map_err(|e| {
-                MailboxError::Transport(format!("deserialize server frame: {e}"))
-            });
+            return serde_json::from_str::<ServerMessage>(text)
+                .map_err(|e| MailboxError::Transport(format!("deserialize server frame: {e}")));
         }
     }
 }
@@ -175,11 +194,10 @@ impl RendezvousBackend for WsRendezvousBackend {
     }
 
     async fn accept(&self, code: &ShortCode) -> Result<AcceptOutcome, RendezvousError> {
-        let mut transport = self.connect_transport().await?;
-        match timeout(
-            self.timeout,
-            accept_over_mailbox(&mut transport, code.clone(), RecipientHelloV1::anonymous()),
-        )
+        match timeout(self.timeout, async {
+            let mut transport = self.connect_transport().await?;
+            accept_over_mailbox(&mut transport, code.clone(), RecipientHelloV1::anonymous()).await
+        })
         .await
         {
             Ok(res) => res,
@@ -191,6 +209,76 @@ impl RendezvousBackend for WsRendezvousBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio_websockets::ServerBuilder;
+
+    async fn spawn_ws_server<F, Fut>(handler: F) -> String
+    where
+        F: FnOnce(WebSocketStream<TcpStream>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (conn, _) = listener.accept().await.unwrap();
+            let (_request, server) = ServerBuilder::new().accept(conn).await.unwrap();
+            handler(server).await;
+        });
+        format!("ws://{addr}")
+    }
+
+    fn text_json(message: &Message) -> serde_json::Value {
+        let text = message.as_text().expect("websocket text frame");
+        serde_json::from_str(text).expect("json frame")
+    }
+
+    #[test]
+    fn serializes_client_message_with_wire_id() {
+        let encoded =
+            serialize_client_message_with_id(ClientMessage::add("pake", b"abc"), "cmd-1").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "add",
+                "phase": "pake",
+                "body": "616263",
+                "id": "cmd-1",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_send_injects_monotonic_ids() {
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let url = spawn_ws_server(move |mut server| async move {
+            let first = server.next().await.unwrap().unwrap();
+            let second = server.next().await.unwrap().unwrap();
+            seen_tx
+                .send((text_json(&first), text_json(&second)))
+                .expect("send observed frames");
+        })
+        .await;
+
+        let mut transport = WsMailboxTransport::connect(&url).await.unwrap();
+        transport
+            .send(ClientMessage::bind("portl.exchange.v1", "side-a"))
+            .await
+            .unwrap();
+        transport
+            .send(ClientMessage::add("pake", b"abc"))
+            .await
+            .unwrap();
+
+        let (first, second) = seen_rx.await.unwrap();
+        assert_eq!(first["type"], "bind");
+        assert_eq!(first["id"], "portl-1");
+        assert_eq!(second["type"], "add");
+        assert_eq!(second["body"], "616263");
+        assert_eq!(second["id"], "portl-2");
+    }
 
     #[test]
     fn accepts_ws_and_wss_mailbox_urls() {
@@ -213,6 +301,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_recv_parses_text_json() {
+        let url = spawn_ws_server(|mut server| async move {
+            server
+                .send(Message::text(
+                    r#"{"type":"allocated","nameplate":"7","id":"cmd-1"}"#,
+                ))
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let mut transport = WsMailboxTransport::connect(&url).await.unwrap();
+        let frame = transport.recv().await.unwrap();
+        match frame {
+            ServerMessage::Allocated { nameplate } => assert_eq!(nameplate, "7"),
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_recv_rejects_binary_frames() {
+        let url = spawn_ws_server(|mut server| async move {
+            server.send(Message::binary(vec![1, 2, 3])).await.unwrap();
+        })
+        .await;
+
+        let mut transport = WsMailboxTransport::connect(&url).await.unwrap();
+        let err = transport.recv().await.unwrap_err();
+        assert!(err.to_string().contains("binary"));
+    }
+
+    #[tokio::test]
+    async fn websocket_recv_reports_close_frames() {
+        let url = spawn_ws_server(|mut server| async move {
+            server.send(Message::close(None, "bye")).await.unwrap();
+        })
+        .await;
+
+        let mut transport = WsMailboxTransport::connect(&url).await.unwrap();
+        let err = transport.recv().await.unwrap_err();
+        assert!(err.to_string().contains("close frame"));
+    }
+
+    #[tokio::test]
     #[ignore = "requires public Magic Wormhole relay availability"]
     async fn public_relay_offer_accept_smoke() {
         // The offer path is intentionally not implemented through the
@@ -220,8 +352,7 @@ mod tests {
         // operator can manually exercise the websocket transport
         // against the public relay once Task 11 lands. For now we just
         // verify that a connection to the relay can be opened.
-        let backend =
-            WsRendezvousBackend::new("ws://relay.magic-wormhole.io:4000/v1").unwrap();
+        let backend = WsRendezvousBackend::new("ws://relay.magic-wormhole.io:4000/v1").unwrap();
         let _transport = backend
             .connect_transport()
             .await

@@ -6,8 +6,8 @@
 //! state are intentionally out of scope and live with the rendezvous
 //! state machine (Task 7+).
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use async_trait::async_trait;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::VecDeque;
 
 /// Errors produced while encoding or decoding mailbox protocol frames.
@@ -82,7 +82,9 @@ impl Serialize for HexBody {
 impl<'de> Deserialize<'de> for HexBody {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
-        hex::decode(&s).map(HexBody).map_err(serde::de::Error::custom)
+        hex::decode(&s)
+            .map(HexBody)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -95,10 +97,7 @@ impl<'de> Deserialize<'de> for HexBody {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ClientMessage {
     /// Bind this connection to an `appid`/`side` pair.
-    Bind {
-        appid: String,
-        side: String,
-    },
+    Bind { appid: String, side: String },
     /// Ask the server to allocate a fresh nameplate.
     Allocate,
     /// Claim a nameplate; the server responds with a mailbox id.
@@ -320,7 +319,7 @@ impl<'a, T: MailboxTransport + Send> MailboxClient<'a, T> {
                 other => {
                     return Err(MailboxError::Unexpected(format!(
                         "expected closed, got {other:?}"
-                    )))
+                    )));
                 }
             }
         }
@@ -505,7 +504,9 @@ pub enum ServerMessage {
         mood: Option<String>,
     },
     /// Server ack of a prior C->S message; `id` echoes the client's `id`.
-    Ack { id: String },
+    Ack {
+        id: String,
+    },
     Message {
         side: String,
         phase: String,
@@ -685,9 +686,7 @@ mod tests {
                 body: HexBody::new(b"echo".to_vec()),
                 id: "1".into(),
             },
-            ServerMessage::Ack {
-                id: "1".into(),
-            },
+            ServerMessage::Ack { id: "1".into() },
             ServerMessage::Message {
                 side: "peer".into(),
                 phase: "pake".into(),
@@ -706,9 +705,8 @@ mod tests {
 
     #[tokio::test]
     async fn close_happy_sends_close_frame() {
-        let mut transport = ScriptedMailboxTransport::new(vec![ServerMessage::Closed {
-            mood: None,
-        }]);
+        let mut transport =
+            ScriptedMailboxTransport::new(vec![ServerMessage::Closed { mood: None }]);
         let mut client = MailboxClient::new("portl.exchange.v1", "side-a", &mut transport);
         client.close_happy().await.unwrap();
         let sent = transport.sent();
@@ -766,9 +764,8 @@ mod tests {
 
     #[tokio::test]
     async fn send_phase_awaits_ack_and_records_add() {
-        let mut transport = ScriptedMailboxTransport::new(vec![ServerMessage::Ack {
-            id: "add".into(),
-        }]);
+        let mut transport =
+            ScriptedMailboxTransport::new(vec![ServerMessage::Ack { id: "add".into() }]);
         let mut client = MailboxClient::new("portl.exchange.v1", "side-a", &mut transport);
         client.send_phase("pake", b"hi").await.unwrap();
         assert_eq!(transport.sent_types(), vec!["add"]);
@@ -909,7 +906,10 @@ mod tests {
             nameplate: "4".into(),
         })
         .unwrap();
-        assert_eq!(claim, serde_json::json!({ "type": "claim", "nameplate": "4" }));
+        assert_eq!(
+            claim,
+            serde_json::json!({ "type": "claim", "nameplate": "4" })
+        );
 
         let release = serde_json::to_value(ClientMessage::Release {
             nameplate: "4".into(),
@@ -924,7 +924,10 @@ mod tests {
             mailbox: "mb1".into(),
         })
         .unwrap();
-        assert_eq!(open, serde_json::json!({ "type": "open", "mailbox": "mb1" }));
+        assert_eq!(
+            open,
+            serde_json::json!({ "type": "open", "mailbox": "mb1" })
+        );
     }
 
     #[test]
@@ -949,8 +952,7 @@ mod tests {
 
     #[test]
     fn server_ack_carries_id() {
-        let ack: ServerMessage =
-            serde_json::from_str(r#"{"type":"ack","id":"req-1"}"#).unwrap();
+        let ack: ServerMessage = serde_json::from_str(r#"{"type":"ack","id":"req-1"}"#).unwrap();
         match ack {
             ServerMessage::Ack { id } => assert_eq!(id, "req-1"),
             other => panic!("expected ack, got {other:?}"),
@@ -996,8 +998,7 @@ mod tests {
             serde_json::from_str(r#"{"type":"claimed","mailbox":"mb1"}"#).unwrap();
         assert!(matches!(claimed, ServerMessage::Claimed { .. }));
 
-        let released: ServerMessage =
-            serde_json::from_str(r#"{"type":"released"}"#).unwrap();
+        let released: ServerMessage = serde_json::from_str(r#"{"type":"released"}"#).unwrap();
         assert!(matches!(released, ServerMessage::Released));
 
         let err: ServerMessage =
