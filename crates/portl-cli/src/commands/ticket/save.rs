@@ -53,9 +53,10 @@ pub fn run(label: &str, ticket_string: Option<&str>) -> Result<ExitCode> {
     let mut tickets = TicketStore::load(&tickets_path)?;
     let peers = PeerStore::load(&PeerStore::default_path())?;
 
-    let label = explicit_label
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| auto_ticket_label(&endpoint_id_hex, &ticket.body.caps, &peers));
+    let label = explicit_label.map_or_else(
+        || auto_ticket_label(&endpoint_id_hex, &ticket.body.caps, &peers),
+        ToOwned::to_owned,
+    );
 
     if peers.get_by_label(&label).is_some() {
         bail!(
@@ -99,8 +100,10 @@ fn auto_ticket_label(endpoint_id_hex: &str, caps: &Capabilities, peers: &PeerSto
         .iter()
         .find(|peer| peer.endpoint_id_hex.eq_ignore_ascii_case(endpoint_id_hex))
         .map(|peer| peer.label.as_str())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| portl_core::labels::machine_label(None, endpoint_id_hex));
+        .map_or_else(
+            || portl_core::labels::machine_label(None, endpoint_id_hex),
+            ToOwned::to_owned,
+        );
     portl_core::labels::ticket_label(&machine, &cap_summary(caps))
 }
 

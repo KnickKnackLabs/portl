@@ -115,7 +115,7 @@ async fn run_async_with_endpoint(
         nonce: invite.nonce,
         initiator: invite.initiator,
         caller_relay_hint,
-        caller_label: Some(crate::commands::local_machine_label(&our_eid_hex)),
+        caller_label: Some(crate::commands::local_machine_label(our_eid_hex)),
     };
     let body = postcard::to_stdvec(&request).context("encode PairRequest")?;
     let len_prefix: u32 = body

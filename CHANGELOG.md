@@ -5,6 +5,30 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.6.2 — 2026-04-28
+
+### Changed
+
+- Pairing, self rows, session-share imports, and generic saved tickets now
+  use stable human-readable labels based on the target hostname plus the
+  last four endpoint-id characters, such as `max-b265`,
+  `max-b265-dotfiles`, and `max-b265-ticket-shell`.
+- Re-importing a session share or saved ticket for the same label and
+  endpoint now replaces the saved credential only when the new ticket
+  extends the expiry; labels that point at a different endpoint still
+  fail closed.
+
+### Fixed
+
+- Fixed `portl accept PORTLINV-…` pairing by making the agent read the
+  same length-prefixed pair request format the CLI sends and by keeping
+  the pair connection alive long enough for the accepter to read the
+  response.
+- Normalized client endpoint shutdown across status, pairing,
+  revocation publishing, Docker injection, and UDP paths so successful
+  commands are not reported as timeout failures during cleanup and avoid
+  noisy ungraceful endpoint-drop diagnostics.
+
 ## 0.6.1 — 2026-04-27
 
 ### Changed

@@ -63,7 +63,7 @@ futures-util     = { workspace = true }
 http             = { workspace = true }
 
 [dev-dependencies]
-portl-core = { version = "0.6.1", path = ".", features = ["test-util"] }
+portl-core = { version = "0.6.2", path = ".", features = ["test-util"] }
 tokio      = { workspace = true }
 tokio-websockets = { workspace = true, features = ["server"] }
 proptest   = { workspace = true }

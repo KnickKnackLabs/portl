@@ -164,8 +164,10 @@ impl SessionShareEnvelopeV1 {
             .as_deref()
             .map(str::trim)
             .filter(|label| !label.is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| crate::labels::machine_label(None, &self.target_endpoint_id_hex));
+            .map_or_else(
+                || crate::labels::machine_label(None, &self.target_endpoint_id_hex),
+                ToOwned::to_owned,
+            );
         crate::labels::session_share_label(&machine, &self.friendly_name)
     }
 

@@ -168,6 +168,7 @@ pub(crate) struct ImportOptions<'a> {
     pub(crate) recipient_endpoint_id_hex: Option<&'a str>,
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn import_exchange_envelope(
     envelope: &PortlExchangeEnvelopeV1,
     options: ImportOptions<'_>,
@@ -636,11 +637,11 @@ mod tests {
             &tickets_path,
         )
         .unwrap();
-        assert_eq!(label, "dev@alice");
+        assert_eq!(label, "max-b265-dev");
         assert!(
             TicketStore::load(&tickets_path)
                 .unwrap()
-                .get("dev@alice")
+                .get("max-b265-dev")
                 .is_some()
         );
     }
