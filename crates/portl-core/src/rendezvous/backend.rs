@@ -197,7 +197,13 @@ where
     let (state, pake_body) = start_pake(&password, PORTL_EXCHANGE_APPID_V1);
     client.send_phase("pake", &pake_body).await?;
     let peer_pake = client.recv_phase_from_peer("pake").await?;
-    let key = finish_pake(state, &peer_pake.body)?;
+    let key = match finish_pake(state, &peer_pake.body) {
+        Ok(k) => k,
+        Err(e) => {
+            best_effort_close_scary(&mut client, "pake failed").await;
+            return Err(e.into());
+        }
+    };
 
     let hello_msg = client.recv_phase_from_peer("0").await?;
     let hello_plain = match decrypt_phase(&key, &hello_msg.side, "0", &hello_msg.body) {
@@ -250,7 +256,13 @@ where
     let (state, pake_body) = start_pake(&password, PORTL_EXCHANGE_APPID_V1);
     client.send_phase("pake", &pake_body).await?;
     let peer_pake = client.recv_phase_from_peer("pake").await?;
-    let key = finish_pake(state, &peer_pake.body)?;
+    let key = match finish_pake(state, &peer_pake.body) {
+        Ok(k) => k,
+        Err(e) => {
+            best_effort_close_scary(&mut client, "pake failed").await;
+            return Err(e.into());
+        }
+    };
 
     let hello_json = serde_json::to_vec(&hello)
         .map_err(|e| RendezvousError::InvalidPayload(e.to_string()))?;
@@ -629,5 +641,86 @@ mod tests {
         let bytes = serde_json::to_vec(&hello).unwrap();
         let decoded: RecipientHelloV1 = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(decoded, hello);
+    }
+
+    /// Drive a partner that completes nameplate claim/open and then
+    /// sends a deliberately malformed `pake` body, so the side under
+    /// test fails inside `finish_pake` and must close-scary before
+    /// returning.
+    async fn malformed_pake_partner(
+        transport: &mut PairedMailboxTransport,
+        nameplate: String,
+        bad_pake_body: Vec<u8>,
+    ) -> Result<(), RendezvousError> {
+        let side = "bad-partner".to_owned();
+        let mut client = MailboxClient::new(PORTL_EXCHANGE_APPID_V1, &side, transport);
+        client.claim_and_open(nameplate).await?;
+        // Receive whatever pake the peer sent; we ignore it.
+        let _ = client.recv_phase_from_peer("pake").await?;
+        client.send_phase("pake", &bad_pake_body).await?;
+        // Wait for the peer's scary close. Recv any further message;
+        // the paired transport mirrors the peer's Close as a Closed
+        // frame, which surfaces as `MailboxError::Closed`.
+        let res = client.recv_phase_from_peer("0").await;
+        match res {
+            Err(MailboxError::Closed { .. }) => Ok(()),
+            Err(e) => Err(RendezvousError::from(e)),
+            Ok(_) => Err(RendezvousError::InvalidPayload(
+                "peer unexpectedly proceeded after malformed pake".into(),
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn offer_closes_scary_on_malformed_peer_pake() {
+        let mailbox = SharedMailboxFixture::default();
+        let code = ShortCode::parse("PORTL-S-2-nebula-involve").unwrap();
+        let envelope = fixture_envelope();
+
+        let mut sender_t = mailbox.sender_transport();
+        let mut receiver_t = mailbox.receiver_transport();
+
+        let nameplate = code.nameplate().to_owned();
+        let sender_fut = offer_over_mailbox(&mut sender_t, code, envelope);
+        let partner_fut = malformed_pake_partner(&mut receiver_t, nameplate, b"not-json".to_vec());
+
+        let (s_res, p_res) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(sender_fut, partner_fut)
+        })
+        .await
+        .expect("flow completes within timeout");
+        assert!(
+            matches!(s_res, Err(RendezvousError::Crypto(_))),
+            "sender must surface crypto error after malformed pake, got {s_res:?}"
+        );
+        p_res.expect("partner observes deterministic close from peer");
+    }
+
+    #[tokio::test]
+    async fn accept_closes_scary_on_malformed_peer_pake() {
+        let mailbox = SharedMailboxFixture::default();
+        let code = ShortCode::parse("PORTL-S-2-nebula-involve").unwrap();
+
+        let mut sender_t = mailbox.sender_transport();
+        let mut receiver_t = mailbox.receiver_transport();
+
+        let nameplate = code.nameplate().to_owned();
+        let accept_fut = accept_over_mailbox(
+            &mut receiver_t,
+            code,
+            RecipientHelloV1::anonymous(),
+        );
+        let partner_fut = malformed_pake_partner(&mut sender_t, nameplate, b"not-json".to_vec());
+
+        let (a_res, p_res) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(accept_fut, partner_fut)
+        })
+        .await
+        .expect("flow completes within timeout");
+        assert!(
+            matches!(a_res, Err(RendezvousError::Crypto(_))),
+            "accepter must surface crypto error after malformed pake, got {a_res:?}"
+        );
+        p_res.expect("partner observes deterministic close from peer");
     }
 }
