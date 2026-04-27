@@ -19,13 +19,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use iroh::endpoint::Connection;
+use portl_core::labels;
 use portl_core::pair_store::PairStore;
 use portl_core::peer_store::{PeerEntry, PeerOrigin, PeerStore};
 use portl_proto::pair_v1::{PairRequest, PairResponse, PairResult};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::{debug, info, instrument};
 
 use crate::AgentState;
-use crate::stream_io::read_postcard_prefix;
 
 const MAX_PAIR_REQ_BYTES: usize = 8 * 1024;
 
@@ -37,7 +38,7 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
         .await
         .context("accept pair bi-stream")?;
 
-    let (request, _buffered): (PairRequest, _) = read_postcard_prefix(recv, MAX_PAIR_REQ_BYTES)
+    let request = read_pair_request_frame(recv)
         .await
         .context("read PairRequest")?;
     debug!(initiator = ?request.initiator, nonce = %short_nonce(&request.nonce), "received pair request");
@@ -56,9 +57,29 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
     send.write_all(&framed)
         .await
         .context("write PairResponse")?;
-    send.finish().ok();
+    send.finish().context("finish PairResponse")?;
+    connection.closed().await;
 
     Ok(())
+}
+
+async fn read_pair_request_frame<R>(mut recv: R) -> Result<PairRequest>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut len_buf = [0u8; 4];
+    recv.read_exact(&mut len_buf)
+        .await
+        .context("read PairRequest length prefix")?;
+    let req_len = u32::from_le_bytes(len_buf) as usize;
+    if req_len > MAX_PAIR_REQ_BYTES {
+        anyhow::bail!("PairRequest size {req_len} exceeds cap {MAX_PAIR_REQ_BYTES}");
+    }
+    let mut body = vec![0u8; req_len];
+    recv.read_exact(&mut body)
+        .await
+        .context("read PairRequest body")?;
+    postcard::from_bytes(&body).context("decode PairRequest")
 }
 
 #[allow(clippy::too_many_lines)]
@@ -205,15 +226,12 @@ fn choose_label(
     for_label_hint: Option<&str>,
     caller_eid_hex: &str,
 ) -> String {
-    let candidate = caller_label
-        .or(for_label_hint)
-        .unwrap_or(&caller_eid_hex[..8.min(caller_eid_hex.len())]);
-    if !label_in_use(peers, candidate) {
-        return candidate.to_owned();
+    let candidate =
+        labels::machine_label_from_hint(for_label_hint.or(caller_label), caller_eid_hex);
+    if !label_in_use(peers, &candidate) {
+        return candidate;
     }
-    // Disambiguate with a 4-char hex suffix on collision.
-    let suffix = &caller_eid_hex[..4.min(caller_eid_hex.len())];
-    format!("{candidate}-{suffix}")
+    extend_machine_label_until_unique(peers, &candidate, caller_eid_hex)
 }
 
 fn label_in_use(peers: &PeerStore, label: &str) -> bool {
@@ -241,7 +259,48 @@ fn short_nonce(nonce: &[u8; 16]) -> String {
 fn responder_self_label(state: &AgentState) -> Option<String> {
     let peers = state.peers_path.as_ref()?;
     let store = PeerStore::load(peers).ok()?;
-    store.iter().find(|e| e.is_self).map(|e| e.label.clone())
+    let self_entry = store.iter().find(|e| e.is_self)?;
+    Some(local_machine_label(&self_entry.endpoint_id_hex))
+}
+
+fn local_machine_label(endpoint_id_hex: &str) -> String {
+    labels::machine_label(local_hostname().as_deref(), endpoint_id_hex)
+}
+
+fn local_hostname() -> Option<String> {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .and_then(|out| out.status.success().then_some(out.stdout))
+                .and_then(|stdout| String::from_utf8(stdout).ok())
+                .map(|h| h.trim().to_owned())
+                .filter(|h| !h.is_empty())
+        })
+}
+
+fn extend_machine_label_until_unique(
+    peers: &PeerStore,
+    candidate: &str,
+    endpoint_id_hex: &str,
+) -> String {
+    let Some((base, _suffix)) = candidate.rsplit_once('-') else {
+        return format!(
+            "{}-{}",
+            candidate,
+            labels::endpoint_suffix(endpoint_id_hex, 6)
+        );
+    };
+    for len in [6usize, 8, 12, 16, 64] {
+        let label = format!("{}-{}", base, labels::endpoint_suffix(endpoint_id_hex, len));
+        if !label_in_use(peers, &label) {
+            return label;
+        }
+    }
+    candidate.to_owned()
 }
 
 #[cfg(test)]
@@ -249,6 +308,8 @@ mod tests {
     use super::*;
     use portl_core::pair_code::InitiatorMode;
     use portl_core::pair_store::PendingInvite;
+    use portl_core::test_util::pair;
+    use portl_proto::pair_v1::ALPN_PAIR_V1;
     use tempfile::tempdir;
 
     fn put_invite(store_path: &std::path::Path, nonce_hex: &str, not_after: u64) {
@@ -334,6 +395,93 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn reads_cli_length_prefixed_pair_request() {
+        let request = PairRequest {
+            version: 1,
+            nonce: [7u8; 16],
+            initiator: InitiatorMode::Mutual,
+            caller_relay_hint: Some("https://relay.caller./".to_owned()),
+            caller_label: Some("onyx".to_owned()),
+        };
+        let body = postcard::to_stdvec(&request).unwrap();
+        let mut framed = Vec::with_capacity(4 + body.len());
+        framed.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&body);
+
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            tokio::io::AsyncWriteExt::write_all(&mut writer, &framed)
+                .await
+                .unwrap();
+        });
+
+        let decoded = read_pair_request_frame(reader).await.unwrap();
+
+        assert_eq!(decoded, request);
+    }
+
+    #[tokio::test]
+    async fn serve_connection_delivers_pair_response() {
+        let (client, server) = pair().await.unwrap();
+        server.inner().set_alpns(vec![ALPN_PAIR_V1.to_vec()]);
+
+        let tmp = tempdir().unwrap();
+        let peers_path = tmp.path().join("peers.json");
+        let pair_path = tmp.path().join("pending_invites.json");
+        seed_self(&peers_path);
+        put_invite(&pair_path, &hex::encode([7u8; 16]), u64::MAX / 2);
+        let state = Arc::new(make_state(&peers_path));
+
+        let server_task = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let incoming = server.inner().accept().await.unwrap();
+                let connection = incoming.await.unwrap();
+                serve_connection(connection, state).await.unwrap();
+            }
+        });
+
+        let connection = client
+            .inner()
+            .connect(server.addr(), ALPN_PAIR_V1)
+            .await
+            .unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        let request = PairRequest {
+            version: 1,
+            nonce: [7u8; 16],
+            initiator: InitiatorMode::Mutual,
+            caller_relay_hint: Some("https://relay.caller./".to_owned()),
+            caller_label: Some("onyx".to_owned()),
+        };
+        let body = postcard::to_stdvec(&request).unwrap();
+        let mut framed = Vec::with_capacity(4 + body.len());
+        framed.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&body);
+        send.write_all(&framed).await.unwrap();
+        send.finish().unwrap();
+
+        let mut len_buf = [0u8; 4];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            recv.read_exact(&mut len_buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let resp_len = u32::from_le_bytes(len_buf) as usize;
+        let mut resp_body = vec![0u8; resp_len];
+        recv.read_exact(&mut resp_body).await.unwrap();
+        let response: PairResponse = postcard::from_bytes(&resp_body).unwrap();
+
+        assert_eq!(response.result, PairResult::Ok);
+        connection.close(0u32.into(), b"test complete");
+        client.inner().close().await;
+        server.inner().close().await;
+        server_task.await.unwrap();
+    }
+
     #[test]
     fn handle_pair_happy_path() {
         let tmp = tempdir().unwrap();
@@ -353,14 +501,17 @@ mod tests {
         };
         let resp = handle_pair(&state, caller_eid, &req).unwrap();
         assert_eq!(resp.result, PairResult::Ok);
-        assert_eq!(resp.responder_self_label.as_deref(), Some("max"));
+        assert_eq!(
+            resp.responder_self_label.as_deref(),
+            Some(local_machine_label(&hex::encode([9u8; 32])).as_str())
+        );
 
         let peers = PeerStore::load(&peers_path).unwrap();
         let entry = peers
             .iter()
             .find(|e| e.endpoint_id_hex == hex::encode(caller_eid))
             .unwrap();
-        assert_eq!(entry.label, "onyx");
+        assert_eq!(entry.label, "friend-laptop-0b0b");
         assert!(entry.accepts_from_them);
         assert!(entry.they_accept_from_me);
         assert_eq!(entry.origin, PeerOrigin::Paired);
@@ -394,7 +545,10 @@ mod tests {
         let resp = handle_pair(&state, [33u8; 32], &req).unwrap();
         assert_eq!(resp.result, PairResult::Ok);
         let peers = PeerStore::load(&peers_path).unwrap();
-        let entry = peers.iter().find(|e| e.label == "biz-customer").unwrap();
+        let entry = peers
+            .iter()
+            .find(|e| e.label == "friend-laptop-2121")
+            .unwrap();
         assert!(!entry.accepts_from_them);
         assert!(entry.they_accept_from_me);
         assert_eq!(entry.origin, PeerOrigin::Paired);
@@ -449,7 +603,10 @@ mod tests {
         let resp = handle_pair(&state, [33u8; 32], &req).unwrap();
         assert_eq!(resp.result, PairResult::Ok);
         let peers = PeerStore::load(&peers_path).unwrap();
-        let entry = peers.iter().find(|e| e.label == "biz-customer").unwrap();
+        let entry = peers
+            .iter()
+            .find(|e| e.label == "friend-laptop-2121")
+            .unwrap();
         assert!(entry.accepts_from_them);
         assert!(!entry.they_accept_from_me);
         assert_eq!(entry.origin, PeerOrigin::Paired);

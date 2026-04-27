@@ -58,7 +58,25 @@ async fn run_async(invite: &InviteCode) -> Result<ExitCode> {
     let caller_relay_hint = crate::client_endpoint::preferred_relay_hint(&client_cfg);
     let endpoint =
         crate::client_endpoint::bind_client_endpoint_with_config(&identity, &client_cfg).await?;
+    let result = run_async_with_endpoint(
+        invite,
+        &identity,
+        &our_eid_hex,
+        caller_relay_hint,
+        &endpoint,
+    )
+    .await;
+    crate::commands::peer_resolve::close_client_endpoint(endpoint, "pair command").await;
+    result
+}
 
+async fn run_async_with_endpoint(
+    invite: &InviteCode,
+    identity: &Identity,
+    our_eid_hex: &str,
+    caller_relay_hint: Option<String>,
+    endpoint: &iroh::Endpoint,
+) -> Result<ExitCode> {
     // Dial the inviter's endpoint_id directly. Relay hint from the
     // invite code (if any) gives us a fallback when direct + DNS fail.
     let inviter_eid = EndpointId::from_bytes(&invite.inviter_eid)
@@ -97,7 +115,7 @@ async fn run_async(invite: &InviteCode) -> Result<ExitCode> {
         nonce: invite.nonce,
         initiator: invite.initiator,
         caller_relay_hint,
-        caller_label: None,
+        caller_label: Some(crate::commands::local_machine_label(&our_eid_hex)),
     };
     let body = postcard::to_stdvec(&request).context("encode PairRequest")?;
     let len_prefix: u32 = body
@@ -128,9 +146,8 @@ async fn run_async(invite: &InviteCode) -> Result<ExitCode> {
     tracing::debug!(result = ?response.result, "received pair response");
 
     connection.close(0u32.into(), b"pair complete");
-    endpoint.close().await;
 
-    apply_response(&identity, invite, &our_eid_hex, &response)
+    apply_response(identity, invite, our_eid_hex, &response)
 }
 
 fn apply_response(

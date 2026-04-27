@@ -57,10 +57,12 @@ pub fn seed_peer_store_self_row_if_missing() -> Result<Option<String>> {
     let eid_hex = hex::encode(eid);
     let path = PeerStore::default_path();
     let mut peers = PeerStore::load(&path).context("load peer store")?;
+    let self_label = crate::commands::local_machine_label(&eid_hex);
     if let Some(existing) = peers.get_by_endpoint(&eid)
         && existing.is_self
         && existing.accepts_from_them
         && existing.they_accept_from_me
+        && existing.label == self_label
     {
         // Already seeded correctly; avoid touching disk (the agent
         // reload task picks up on mtime changes).
@@ -72,7 +74,7 @@ pub fn seed_peer_store_self_row_if_missing() -> Result<Option<String>> {
         .as_secs();
     peers
         .insert_or_update(PeerEntry {
-            label: "self".to_owned(),
+            label: self_label,
             endpoint_id_hex: eid_hex.clone(),
             accepts_from_them: true,
             they_accept_from_me: true,

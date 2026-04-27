@@ -309,7 +309,6 @@ async fn run_with_endpoint(
     );
 
     connection.close(0u32.into(), b"status complete");
-    close_client_endpoint(raw_endpoint, "status command").await;
     Ok(ExitCode::SUCCESS)
 }
 

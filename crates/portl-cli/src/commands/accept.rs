@@ -239,7 +239,28 @@ pub(crate) fn import_exchange_envelope(
 
     let peers = PeerStore::load(peers_path)?;
     let mut tickets = TicketStore::load(tickets_path)?;
-    if let Some(store) = label_in_use(&label, &peers, &tickets) {
+    if peers.get_by_label(&label).is_some() {
+        bail!(
+            "label '{label}' is already in use by a peer; pass --label <name> or choose another label"
+        );
+    }
+
+    if let Some(existing) = tickets.get(&label).cloned() {
+        if !existing
+            .endpoint_id_hex
+            .eq_ignore_ascii_case(&endpoint_id_hex)
+        {
+            bail!(
+                "label '{label}' is already in use by a ticket for a different endpoint; pass --label <name> or remove the existing label first"
+            );
+        }
+        if existing.expires_at >= ticket.body.not_after {
+            bail!(
+                "ticket '{label}' already exists for this endpoint and expires later or at the same time; keeping the existing ticket"
+            );
+        }
+        tickets.remove(&label);
+    } else if let Some(store) = label_in_use(&label, &peers, &tickets) {
         bail!(
             "label '{label}' is already in use by a {store}; pass --label <name> or remove the existing label first"
         );
@@ -317,11 +338,20 @@ mod tests {
     }
 
     fn fixture_session_share(friendly_name: &str, origin: Option<&str>) -> PortlExchangeEnvelopeV1 {
+        fixture_session_share_with_ttl(friendly_name, origin, 3_600)
+    }
+
+    fn fixture_session_share_with_ttl(
+        friendly_name: &str,
+        origin: Option<&str>,
+        ttl_secs: u64,
+    ) -> PortlExchangeEnvelopeV1 {
         fixture_session_share_with_options(
             friendly_name,
             origin,
             Some(fixture_identity(9).verifying_key()),
             false,
+            ttl_secs,
         )
     }
 
@@ -330,6 +360,7 @@ mod tests {
         origin: Option<&str>,
         recipient: Option<[u8; 32]>,
         broader: bool,
+        ttl_secs: u64,
     ) -> PortlExchangeEnvelopeV1 {
         let now = unix_now().unwrap();
         let issuer = fixture_identity(3);
@@ -343,7 +374,7 @@ mod tests {
                 share_caps()
             },
             now,
-            now + 3_600,
+            now + ttl_secs,
             recipient,
         )
         .unwrap();
@@ -352,11 +383,12 @@ mod tests {
             friendly_name: friendly_name.to_owned(),
             conflict_handle: "abcd1234".to_owned(),
             origin_label_hint: origin.map(ToOwned::to_owned),
+            target_label_hint: Some("max-b265".to_owned()),
             target_endpoint_id_hex: hex::encode(addr.id.as_bytes()),
             provider: Some("zmx".to_owned()),
             provider_session: friendly_name.to_owned(),
             ticket: ticket.serialize(),
-            access_not_after_unix: now + 3_600,
+            access_not_after_unix: now + ttl_secs,
         };
         PortlExchangeEnvelopeV1::session_share(share, now, Some(now + 300))
     }
@@ -470,13 +502,48 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(label, "dev@alice");
+        assert_eq!(label, "max-b265-dev");
         let tickets = TicketStore::load(&tickets_path).unwrap();
-        assert!(tickets.get("dev@alice").is_some());
+        assert!(tickets.get("max-b265-dev").is_some());
     }
 
     #[test]
-    fn accepted_session_share_requires_label_on_conflict() {
+    fn accepted_session_share_replaces_same_endpoint_when_expiry_extends() {
+        let temp = TempDir::new().unwrap();
+        let (peers_path, tickets_path) = temp_paths(&temp);
+        let short = fixture_session_share_with_ttl("dev", Some("alice"), 60);
+        let long = fixture_session_share_with_ttl("dev", Some("alice"), 3_600);
+        let recipient = Some(hex::encode(fixture_identity(9).verifying_key()));
+        import_exchange_envelope(
+            &short,
+            ImportOptions {
+                label: None,
+                recipient_endpoint_id_hex: recipient.as_deref(),
+            },
+            &peers_path,
+            &tickets_path,
+        )
+        .unwrap();
+        let label = import_exchange_envelope(
+            &long,
+            ImportOptions {
+                label: None,
+                recipient_endpoint_id_hex: recipient.as_deref(),
+            },
+            &peers_path,
+            &tickets_path,
+        )
+        .unwrap();
+
+        assert_eq!(label, "max-b265-dev");
+        let tickets = TicketStore::load(&tickets_path).unwrap();
+        let saved = tickets.get("max-b265-dev").unwrap();
+        let ExchangePayload::SessionShare(long_share) = &long.payload;
+        assert_eq!(saved.expires_at, long_share.access_not_after_unix);
+    }
+
+    #[test]
+    fn accepted_session_share_keeps_same_endpoint_when_not_newer() {
         let temp = TempDir::new().unwrap();
         let (peers_path, tickets_path) = temp_paths(&temp);
         let envelope = fixture_session_share("dev", Some("alice"));
@@ -501,7 +568,10 @@ mod tests {
             &tickets_path,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("--label"), "{err}");
+        assert!(
+            err.to_string().contains("keeping the existing ticket"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -597,7 +667,7 @@ mod tests {
     fn accepted_session_share_rejects_unbound_bearer_ticket_when_recipient_known() {
         let temp = TempDir::new().unwrap();
         let (peers_path, tickets_path) = temp_paths(&temp);
-        let envelope = fixture_session_share_with_options("dev", Some("alice"), None, false);
+        let envelope = fixture_session_share_with_options("dev", Some("alice"), None, false, 3_600);
         let err = import_exchange_envelope(
             &envelope,
             ImportOptions {
@@ -620,6 +690,7 @@ mod tests {
             Some("alice"),
             Some(fixture_identity(9).verifying_key()),
             true,
+            3_600,
         );
         let err = import_exchange_envelope(
             &envelope,

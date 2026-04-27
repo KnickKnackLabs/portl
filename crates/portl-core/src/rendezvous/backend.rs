@@ -340,6 +340,7 @@ mod tests {
             friendly_name: "dev".to_owned(),
             conflict_handle: "7k3p".to_owned(),
             origin_label_hint: Some("alice-laptop".to_owned()),
+            target_label_hint: Some("max-b265".to_owned()),
             target_endpoint_id_hex: hex::encode([1u8; 32]),
             provider: Some("zmx".to_owned()),
             provider_session: "dev".to_owned(),

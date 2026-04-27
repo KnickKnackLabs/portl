@@ -21,7 +21,9 @@ const PUBLISH_TIMEOUT: Duration = Duration::from_secs(10);
 use portl_core::ticket::schema::{Capabilities, MetaCaps};
 
 use crate::alias_store::AliasStore;
-use crate::commands::peer_resolve::{bind_client_endpoint, connect_peer_with_endpoint};
+use crate::commands::peer_resolve::{
+    bind_client_endpoint, close_client_endpoint, connect_peer_with_endpoint,
+};
 use crate::commands::revoke::local_revocations_path;
 
 /// Dispatch for the `publish` subcommand.
@@ -60,6 +62,7 @@ pub fn publish(peer: Option<&str>, all_peers: bool) -> Result<ExitCode> {
             }
         }
 
+        close_client_endpoint(endpoint, "revocations publish").await;
         Ok(if any_success {
             ExitCode::SUCCESS
         } else {

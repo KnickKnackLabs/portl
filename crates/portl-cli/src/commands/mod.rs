@@ -29,6 +29,25 @@ use anyhow::{Context, Result};
 use clap::{Command, CommandFactory};
 use clap_complete::Shell;
 
+pub(crate) fn local_machine_label(endpoint_id_hex: &str) -> String {
+    portl_core::labels::machine_label(local_hostname().as_deref(), endpoint_id_hex)
+}
+
+fn local_hostname() -> Option<String> {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .and_then(|out| out.status.success().then_some(out.stdout))
+                .and_then(|stdout| String::from_utf8(stdout).ok())
+                .map(|h| h.trim().to_owned())
+                .filter(|h| !h.is_empty())
+        })
+}
+
 pub fn completions(shell: Shell) -> ExitCode {
     let mut cmd = crate::Cli::command();
     let name = cmd.get_name().to_owned();

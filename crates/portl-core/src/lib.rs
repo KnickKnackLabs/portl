@@ -10,6 +10,7 @@ pub mod endpoint;
 pub mod error;
 pub mod id;
 pub mod io;
+pub mod labels;
 pub mod net;
 pub mod pair_code;
 pub mod pair_store;

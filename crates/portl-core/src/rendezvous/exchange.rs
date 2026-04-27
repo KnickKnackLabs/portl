@@ -43,6 +43,8 @@ pub struct SessionShareEnvelopeV1 {
     pub friendly_name: String,
     pub conflict_handle: String,
     pub origin_label_hint: Option<String>,
+    #[serde(default)]
+    pub target_label_hint: Option<String>,
     pub target_endpoint_id_hex: String,
     pub provider: Option<String>,
     pub provider_session: String,
@@ -157,10 +159,14 @@ impl<'de> Deserialize<'de> for PortlExchangeEnvelopeV1 {
 
 impl SessionShareEnvelopeV1 {
     pub fn import_label(&self) -> String {
-        match self.origin_label_hint.as_deref() {
-            Some(origin) if !origin.is_empty() => format!("{}@{}", self.friendly_name, origin),
-            _ => self.friendly_name.clone(),
-        }
+        let machine = self
+            .target_label_hint
+            .as_deref()
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| crate::labels::machine_label(None, &self.target_endpoint_id_hex));
+        crate::labels::session_share_label(&machine, &self.friendly_name)
     }
 
     fn validate(&self) -> Result<(), EnvelopeValidationError> {
@@ -192,6 +198,7 @@ mod tests {
             friendly_name: "dev".to_owned(),
             conflict_handle: "7k3p".to_owned(),
             origin_label_hint: Some("alice-laptop".to_owned()),
+            target_label_hint: Some("max-b265".to_owned()),
             target_endpoint_id_hex: hex::encode([1u8; 32]),
             provider: Some("zmx".to_owned()),
             provider_session: "dev".to_owned(),
@@ -231,6 +238,7 @@ mod tests {
                     "friendly_name": "dev",
                     "conflict_handle": "7k3p",
                     "origin_label_hint": "alice-laptop",
+                    "target_label_hint": "max-b265",
                     "target_endpoint_id_hex": "0101010101010101010101010101010101010101010101010101010101010101",
                     "provider": "zmx",
                     "provider_session": "dev",
@@ -307,22 +315,24 @@ mod tests {
     }
 
     #[test]
-    fn imported_label_prefers_origin_hint() {
+    fn imported_label_uses_target_machine_then_friendly_name() {
         let share = sample_share();
-        assert_eq!(share.import_label(), "dev@alice-laptop");
+        assert_eq!(share.import_label(), "max-b265-dev");
     }
 
     #[test]
-    fn imported_label_falls_back_when_origin_hint_missing() {
+    fn imported_label_falls_back_to_endpoint_when_target_hint_missing() {
         let mut share = sample_share();
-        share.origin_label_hint = None;
-        assert_eq!(share.import_label(), "dev");
+        share.target_label_hint = None;
+        share.target_endpoint_id_hex = "bba96591b265".to_owned();
+        assert_eq!(share.import_label(), "host-b265-dev");
     }
 
     #[test]
-    fn imported_label_falls_back_when_origin_hint_empty() {
+    fn imported_label_falls_back_when_target_hint_empty() {
         let mut share = sample_share();
-        share.origin_label_hint = Some(String::new());
-        assert_eq!(share.import_label(), "dev");
+        share.target_label_hint = Some(String::new());
+        share.target_endpoint_id_hex = "bba96591b265".to_owned();
+        assert_eq!(share.import_label(), "host-b265-dev");
     }
 }

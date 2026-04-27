@@ -9,7 +9,7 @@ use portl_proto::udp_v1::UdpBind;
 use tokio::sync::watch;
 
 use crate::commands::peer_resolve::{
-    bind_client_endpoint, connect_peer_with_endpoint, resolve_identity_path,
+    bind_client_endpoint, close_client_endpoint, connect_peer_with_endpoint, resolve_identity_path,
 };
 
 pub fn run(peer: &str, specs: &[String]) -> Result<ExitCode> {
@@ -38,6 +38,7 @@ pub fn run(peer: &str, specs: &[String]) -> Result<ExitCode> {
                 let mut backoff = Duration::from_millis(100);
                 loop {
                     if *shutdown_rx.borrow() {
+                        close_client_endpoint(endpoint, "udp command").await;
                         return Ok::<_, anyhow::Error>(());
                     }
 
@@ -90,6 +91,7 @@ pub fn run(peer: &str, specs: &[String]) -> Result<ExitCode> {
                         changed = shutdown_rx.changed() => {
                             let _ = changed;
                             connected.connection.close(0u32.into(), b"udp shutdown");
+                            close_client_endpoint(endpoint, "udp command").await;
                             return Ok(());
                         }
                     };

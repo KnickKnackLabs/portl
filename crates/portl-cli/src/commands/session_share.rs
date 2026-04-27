@@ -87,6 +87,16 @@ impl ShareTargetForm {
 
     /// Display tag used in `using …` and progress lines. Never echoes
     /// raw target input that could be a ticket credential.
+    pub(crate) fn target_label_hint(&self) -> String {
+        match self {
+            Self::PeerStore { label, .. } | Self::AliasEid { label, .. } => label.clone(),
+            Self::RawEid { endpoint_id } => {
+                let hex = hex::encode(endpoint_id.as_bytes());
+                portl_core::labels::machine_label(None, &hex)
+            }
+        }
+    }
+
     pub(crate) fn safe_display(&self) -> String {
         match self {
             Self::PeerStore { label, .. } => format!("peer \"{label}\""),
@@ -214,6 +224,7 @@ pub(crate) struct EnvelopeInputs<'a> {
     pub(crate) session_name: &'a str,
     pub(crate) provider: Option<&'a str>,
     pub(crate) origin_label_hint: Option<String>,
+    pub(crate) target_label_hint: Option<String>,
     pub(crate) workspace_id: String,
     pub(crate) conflict_handle: String,
     pub(crate) now_unix: u64,
@@ -283,6 +294,7 @@ pub(crate) fn build_session_share_envelope(inputs: EnvelopeInputs<'_>) -> Result
         friendly_name: inputs.session_name.to_owned(),
         conflict_handle: inputs.conflict_handle,
         origin_label_hint: inputs.origin_label_hint,
+        target_label_hint: inputs.target_label_hint,
         target_endpoint_id_hex: target_eid_hex,
         provider: inputs.provider.map(ToOwned::to_owned),
         provider_session: inputs.session_name.to_owned(),
@@ -567,6 +579,7 @@ mod tests {
             session_name: "dev",
             provider: Some("zmx"),
             origin_label_hint: Some("alice-laptop".into()),
+            target_label_hint: Some("max-b265".into()),
             workspace_id: "ws_abc".into(),
             conflict_handle: "1111".into(),
             now_unix: 1_000,
@@ -595,6 +608,7 @@ mod tests {
             session_name: "dev",
             provider: None,
             origin_label_hint: None,
+            target_label_hint: None,
             workspace_id: "ws_abc".into(),
             conflict_handle: "1111".into(),
             now_unix: 1_000,
@@ -616,6 +630,7 @@ mod tests {
             session_name: "dev",
             provider: None,
             origin_label_hint: None,
+            target_label_hint: None,
             workspace_id: "ws_abc".into(),
             conflict_handle: "1111".into(),
             now_unix: 1_000,
@@ -649,6 +664,7 @@ mod tests {
             session_name: "dev",
             provider: None,
             origin_label_hint: None,
+            target_label_hint: None,
             workspace_id: "ws_abc".into(),
             conflict_handle: "1111".into(),
             now_unix: 1_000,

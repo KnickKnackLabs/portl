@@ -212,7 +212,11 @@ pub fn share(
     let session_name = default_session_name(target, session);
     let url = resolve_rendezvous_url(rendezvous_url);
     let identity = load_identity(None)?;
-    let origin_label_hint = label.map(ToOwned::to_owned);
+    let origin_label_hint = Some(label.map_or_else(
+        || crate::commands::local_machine_label(&hex::encode(identity.verifying_key())),
+        ToOwned::to_owned,
+    ));
+    let target_label_hint = Some(form.target_label_hint());
     let (workspace_id, conflict_handle) = fresh_workspace_handles();
 
     let runtime = tokio::runtime::Runtime::new()?;
@@ -270,6 +274,7 @@ pub fn share(
                         session_name: &session_name,
                         provider,
                         origin_label_hint: origin_label_hint.clone(),
+                        target_label_hint: target_label_hint.clone(),
                         workspace_id: workspace_id.clone(),
                         conflict_handle: conflict_handle.clone(),
                         now_unix: now,

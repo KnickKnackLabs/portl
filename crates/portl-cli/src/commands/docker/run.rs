@@ -12,7 +12,9 @@ use portl_core::ticket::mint::mint_root;
 
 use crate::alias_store::{AliasStore, SessionProviderInstall};
 use crate::commands::mint_root::{parse_caps, parse_ttl};
-use crate::commands::peer_resolve::{ResolveOpts, bind_client_endpoint, resolve_peer};
+use crate::commands::peer_resolve::{
+    ResolveOpts, bind_client_endpoint, close_client_endpoint, resolve_peer,
+};
 use crate::release_binary;
 
 use super::aliases::{resolve_alias_record, save_injected_alias};
@@ -164,32 +166,38 @@ pub(super) async fn finalize_connectable_ticket(
 ) -> Result<()> {
     let endpoint = bind_client_endpoint(operator).await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        match resolve_peer(
-            &plan.endpoint_id_hex,
-            &ResolveOpts {
-                caps: plan.caps.clone(),
-                force_relay: false,
-                identity: operator,
-                endpoint: &endpoint,
-            },
-        )
-        .await
-        {
-            Ok(resolved) => {
-                plan.root_ticket_id = ticket_id(&resolved.ticket.sig);
-                plan.ticket = resolved.ticket;
-                return Ok(());
-            }
-            Err(err) if tokio::time::Instant::now() < deadline => {
-                let _ = err;
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-            Err(err) => {
-                return Err(err).context("resolve injected agent address into connectable ticket");
+    let result = async {
+        loop {
+            match resolve_peer(
+                &plan.endpoint_id_hex,
+                &ResolveOpts {
+                    caps: plan.caps.clone(),
+                    force_relay: false,
+                    identity: operator,
+                    endpoint: &endpoint,
+                },
+            )
+            .await
+            {
+                Ok(resolved) => {
+                    plan.root_ticket_id = ticket_id(&resolved.ticket.sig);
+                    plan.ticket = resolved.ticket;
+                    return Ok(());
+                }
+                Err(err) if tokio::time::Instant::now() < deadline => {
+                    let _ = err;
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Err(err) => {
+                    return Err(err)
+                        .context("resolve injected agent address into connectable ticket");
+                }
             }
         }
     }
+    .await;
+    close_client_endpoint(endpoint, "docker run finalize").await;
+    result
 }
 
 pub(super) fn prepare_injection_plan(
