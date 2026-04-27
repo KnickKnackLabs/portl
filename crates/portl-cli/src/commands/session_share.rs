@@ -355,7 +355,13 @@ where
         .map_err(|e| anyhow!("generate short code: {e}"))?;
     on_code(&code);
     let (key, hello) = offer_pake_and_recv_hello(&mut client, &code).await?;
-    let envelope = mint_envelope(&hello)?;
+    let envelope = match mint_envelope(&hello) {
+        Ok(envelope) => envelope,
+        Err(err) => {
+            let _ = client.close_scary("offer refused").await;
+            return Err(err);
+        }
+    };
     offer_send_envelope(&mut client, &key, &envelope).await?;
     Ok(())
 }
@@ -369,10 +375,14 @@ pub(crate) fn unix_now() -> Result<u64> {
 
 /// Resolve `--rendezvous-url` / `PORTL_RENDEZVOUS_URL` / default.
 pub(crate) fn resolve_rendezvous_url(flag: Option<&str>) -> String {
+    resolve_rendezvous_url_from(flag, std::env::var("PORTL_RENDEZVOUS_URL").ok())
+}
+
+pub(crate) fn resolve_rendezvous_url_from(flag: Option<&str>, env_url: Option<String>) -> String {
     if let Some(url) = flag {
         return url.to_owned();
     }
-    if let Ok(url) = std::env::var("PORTL_RENDEZVOUS_URL")
+    if let Some(url) = env_url
         && !url.is_empty()
     {
         return url;
@@ -402,7 +412,9 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use portl_core::id::Identity;
+    use portl_core::peer_store::{PeerEntry, PeerOrigin};
     use portl_core::rendezvous::backend::PORTL_RECIPIENT_HELLO_SCHEMA_V1;
+    use portl_core::ticket_store::TicketEntry;
     // (No additional rendezvous helpers needed in tests beyond what
     // is already imported via the module body.)
 
@@ -455,6 +467,78 @@ mod tests {
         let aliases = AliasStore::default();
         let form = classify_share_target(&hexed, &peers, &tickets, &aliases).unwrap();
         assert!(matches!(form, ShareTargetForm::RawEid { .. }));
+    }
+
+    fn peer_entry(label: &str, they_accept_from_me: bool, held: bool) -> PeerEntry {
+        let endpoint_id_hex = hex::encode(fixture_addr().id.as_bytes());
+        PeerEntry {
+            label: label.to_owned(),
+            endpoint_id_hex,
+            accepts_from_them: true,
+            they_accept_from_me,
+            since: 1_000,
+            origin: PeerOrigin::Raw,
+            last_hold_at: held.then_some(1_001),
+            is_self: false,
+            relay_hint: None,
+            schema_version: PeerEntry::default_schema_version(),
+        }
+    }
+
+    #[test]
+    fn outbound_peer_label_classifies_as_share_form() {
+        let mut peers = PeerStore::default();
+        peers
+            .insert_or_update(peer_entry("devbox", true, false))
+            .unwrap();
+        let tickets = TicketStore::default();
+        let aliases = AliasStore::default();
+        let form = classify_share_target("devbox", &peers, &tickets, &aliases).unwrap();
+        assert!(matches!(form, ShareTargetForm::PeerStore { label, .. } if label == "devbox"));
+    }
+
+    #[test]
+    fn inbound_only_peer_is_rejected() {
+        let mut peers = PeerStore::default();
+        peers
+            .insert_or_update(peer_entry("inbound", false, false))
+            .unwrap();
+        let tickets = TicketStore::default();
+        let aliases = AliasStore::default();
+        let err = classify_share_target("inbound", &peers, &tickets, &aliases).unwrap_err();
+        assert!(matches!(err, ResolveTargetError::InboundOnlyPeer(label) if label == "inbound"));
+    }
+
+    #[test]
+    fn held_peer_is_rejected() {
+        let mut peers = PeerStore::default();
+        peers
+            .insert_or_update(peer_entry("held", true, true))
+            .unwrap();
+        let tickets = TicketStore::default();
+        let aliases = AliasStore::default();
+        let err = classify_share_target("held", &peers, &tickets, &aliases).unwrap_err();
+        assert!(matches!(err, ResolveTargetError::HeldPeer(label) if label == "held"));
+    }
+
+    #[test]
+    fn saved_ticket_label_is_rejected() {
+        let peers = PeerStore::default();
+        let mut tickets = TicketStore::default();
+        tickets
+            .insert(
+                "saved".to_owned(),
+                TicketEntry {
+                    endpoint_id_hex: hex::encode(fixture_addr().id.as_bytes()),
+                    ticket_string: "portl-redacted".to_owned(),
+                    expires_at: 2_000,
+                    saved_at: 1_000,
+                },
+            )
+            .unwrap();
+        let aliases = AliasStore::default();
+        let err = classify_share_target("saved", &peers, &tickets, &aliases).unwrap_err();
+        assert!(matches!(err, ResolveTargetError::SavedTicketLabel(label) if label == "saved"));
     }
 
     #[test]
@@ -577,8 +661,35 @@ mod tests {
 
     #[test]
     fn resolve_rendezvous_url_prefers_flag() {
-        let url = resolve_rendezvous_url(Some("ws://flag-url/v1"));
+        let url = resolve_rendezvous_url_from(
+            Some("ws://flag-url/v1"),
+            Some("ws://env-url/v1".to_owned()),
+        );
         assert_eq!(url, "ws://flag-url/v1");
+    }
+
+    #[test]
+    fn resolve_rendezvous_url_uses_env_when_flag_absent() {
+        assert_eq!(
+            resolve_rendezvous_url_from(None, Some("ws://env-url/v1".to_owned())),
+            "ws://env-url/v1"
+        );
+    }
+
+    #[test]
+    fn resolve_rendezvous_url_ignores_empty_env() {
+        assert_eq!(
+            resolve_rendezvous_url_from(None, Some(String::new())),
+            DEFAULT_RENDEZVOUS_URL
+        );
+    }
+
+    #[test]
+    fn resolve_rendezvous_url_uses_default_without_flag_or_env() {
+        assert_eq!(
+            resolve_rendezvous_url_from(None, None),
+            DEFAULT_RENDEZVOUS_URL
+        );
     }
 
     #[test]

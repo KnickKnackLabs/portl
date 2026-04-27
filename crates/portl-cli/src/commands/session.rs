@@ -2,7 +2,7 @@ use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::ValueEnum;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use iroh::endpoint::SendStream;
@@ -221,89 +221,99 @@ pub fn share(
         let client_endpoint =
             crate::commands::peer_resolve::bind_client_endpoint(&identity).await?;
         let endpoint_id = form.endpoint_id();
-        let (target_addr, _provenance) = crate::commands::peer_resolve::resolve_endpoint_addr(
+        let resolved_addr = crate::commands::peer_resolve::resolve_endpoint_addr(
             &client_endpoint,
             endpoint_id,
             false,
         )
-        .await?;
+        .await;
         crate::commands::peer_resolve::close_client_endpoint(client_endpoint, "share resolve")
             .await;
+        let (target_addr, _provenance) = resolved_addr?;
 
-        // Open the rendezvous transport.
-        let backend = WsRendezvousBackend::new(&url)
-            .map_err(|e| anyhow::anyhow!("rendezvous backend: {e}"))?
-            .with_timeout(ttl);
-        let mut transport = backend
-            .connect_transport()
-            .await
-            .map_err(|e| anyhow::anyhow!("connect to rendezvous server {url}: {e}"))?;
+        let share_result = tokio::time::timeout(ttl, async {
+            // Open the rendezvous transport.
+            let backend = WsRendezvousBackend::new(&url)
+                .map_err(|e| anyhow!("rendezvous backend: {e}"))?
+                .with_timeout(ttl);
+            let mut transport = backend
+                .connect_transport()
+                .await
+                .map_err(|e| anyhow!("connect to rendezvous server: {e}"))?;
 
-        eprintln!(
-            "portl: sharing {} as session \"{session_name}\"",
-            form.safe_display()
-        );
+            eprintln!(
+                "portl: sharing {} as session \"{session_name}\"",
+                form.safe_display()
+            );
 
-        let now = unix_now()?;
-        let mut printed_code: Option<String> = None;
-        let envelope_result = run_offer_against_transport(
-            &mut transport,
-            None,
-            |code| {
-                let display = code.display_code();
-                println!("{display}");
-                println!(
-                    "Share this code with the recipient and run \
-                     `portl accept {display}` on their machine."
-                );
-                println!(
-                    "Keep this command running until they accept (rendezvous TTL {}s).",
-                    ttl.as_secs()
-                );
-                printed_code = Some(display);
-            },
-            |hello| {
-                let inputs = EnvelopeInputs {
-                    identity: &identity,
-                    target_addr: target_addr.clone(),
-                    hello,
-                    session_name: &session_name,
-                    provider,
-                    origin_label_hint: origin_label_hint.clone(),
-                    workspace_id: workspace_id.clone(),
-                    conflict_handle: conflict_handle.clone(),
-                    now_unix: now,
-                    access_ttl,
-                    allow_bearer_fallback,
-                };
-                let BuiltEnvelope {
-                    envelope,
-                    bound_to_recipient,
-                    effective_access_ttl,
-                } = build_session_share_envelope(inputs)?;
-                if bound_to_recipient {
-                    eprintln!(
-                        "portl: minted recipient-bound ticket (ttl {}s)",
-                        effective_access_ttl.as_secs()
+            let now = unix_now()?;
+            let envelope_result = run_offer_against_transport(
+                &mut transport,
+                None,
+                |code| {
+                    let display = code.display_code();
+                    println!("{display}");
+                    println!(
+                        "Share this code with a recipient running a Portl build that supports \
+                     `portl accept PORTL-S-*`; they should run `portl accept {display}`."
                     );
-                } else {
-                    eprintln!(
-                        "portl: WARNING: recipient hello had no endpoint id; \
+                    println!(
+                        "Keep this command running until they accept (rendezvous TTL {}s).",
+                        ttl.as_secs()
+                    );
+                },
+                |hello| {
+                    let inputs = EnvelopeInputs {
+                        identity: &identity,
+                        target_addr: target_addr.clone(),
+                        hello,
+                        session_name: &session_name,
+                        provider,
+                        origin_label_hint: origin_label_hint.clone(),
+                        workspace_id: workspace_id.clone(),
+                        conflict_handle: conflict_handle.clone(),
+                        now_unix: now,
+                        access_ttl,
+                        allow_bearer_fallback,
+                    };
+                    let BuiltEnvelope {
+                        envelope,
+                        bound_to_recipient,
+                        effective_access_ttl,
+                    } = build_session_share_envelope(inputs)?;
+                    if bound_to_recipient {
+                        eprintln!(
+                            "portl: minted recipient-bound ticket (ttl {}s)",
+                            effective_access_ttl.as_secs()
+                        );
+                    } else {
+                        eprintln!(
+                            "portl: WARNING: recipient hello had no endpoint id; \
                          minting bearer ticket capped at {}s (--allow-bearer-fallback)",
-                        effective_access_ttl.as_secs()
-                    );
+                            effective_access_ttl.as_secs()
+                        );
+                    }
+                    Ok(envelope)
+                },
+            )
+            .await;
+
+            match envelope_result {
+                Ok(()) => {
+                    eprintln!("portl: recipient accepted; share complete");
+                    Ok(ExitCode::SUCCESS)
                 }
-                Ok(envelope)
-            },
-        )
+                Err(err) => Err(err),
+            }
+        })
         .await;
 
-        match envelope_result {
-            Ok(()) => {
-                eprintln!("portl: recipient accepted; share complete");
-                Ok(ExitCode::SUCCESS)
-            }
-            Err(err) => Err(err),
+        match share_result {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!(
+                "session share timed out after {}s; the short code is no longer being hosted",
+                ttl.as_secs()
+            )),
         }
     });
     runtime.shutdown_background();
