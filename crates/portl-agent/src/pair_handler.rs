@@ -406,7 +406,7 @@ mod tests {
         };
         let body = postcard::to_stdvec(&request).unwrap();
         let mut framed = Vec::with_capacity(4 + body.len());
-        framed.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());
         framed.extend_from_slice(&body);
 
         let (mut writer, reader) = tokio::io::duplex(1024);
@@ -457,7 +457,7 @@ mod tests {
         };
         let body = postcard::to_stdvec(&request).unwrap();
         let mut framed = Vec::with_capacity(4 + body.len());
-        framed.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());
         framed.extend_from_slice(&body);
         send.write_all(&framed).await.unwrap();
         send.finish().unwrap();
