@@ -284,13 +284,19 @@ fn unix_now() -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::session_share::run_offer_against_transport;
+    use async_trait::async_trait;
     use ed25519_dalek::SigningKey;
     use iroh::EndpointAddr;
     use portl_core::id::Identity;
     use portl_core::rendezvous::exchange::SessionShareEnvelopeV1;
+    use portl_core::rendezvous::mailbox::{
+        ClientMessage, MailboxError, MailboxTransport, ServerMessage,
+    };
     use portl_core::ticket::mint::mint_root;
     use portl_core::ticket::schema::MetaCaps;
     use tempfile::TempDir;
+    use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
     fn fixture_identity(byte: u8) -> Identity {
         Identity::from_signing_key(SigningKey::from_bytes(&[byte; 32]))
@@ -353,6 +359,92 @@ mod tests {
             access_not_after_unix: now + 3_600,
         };
         PortlExchangeEnvelopeV1::session_share(share, now, Some(now + 300))
+    }
+
+    struct PairedMailboxTransport {
+        own_side: Option<String>,
+        incoming_rx: UnboundedReceiver<ServerMessage>,
+        incoming_tx: UnboundedSender<ServerMessage>,
+        peer_tx: UnboundedSender<ServerMessage>,
+    }
+
+    impl PairedMailboxTransport {
+        fn pair() -> (Self, Self) {
+            let (a_tx, a_rx) = mpsc::unbounded_channel();
+            let (b_tx, b_rx) = mpsc::unbounded_channel();
+            (
+                Self {
+                    own_side: None,
+                    incoming_rx: a_rx,
+                    incoming_tx: a_tx.clone(),
+                    peer_tx: b_tx.clone(),
+                },
+                Self {
+                    own_side: None,
+                    incoming_rx: b_rx,
+                    incoming_tx: b_tx,
+                    peer_tx: a_tx,
+                },
+            )
+        }
+    }
+
+    #[async_trait]
+    impl MailboxTransport for PairedMailboxTransport {
+        async fn send(&mut self, msg: ClientMessage) -> Result<(), MailboxError> {
+            match msg {
+                ClientMessage::Bind { side, .. } => {
+                    self.own_side = Some(side);
+                    let _ = self.incoming_tx.send(ServerMessage::Welcome {
+                        welcome: serde_json::json!({}),
+                    });
+                }
+                ClientMessage::Allocate => {
+                    let _ = self.incoming_tx.send(ServerMessage::Allocated {
+                        nameplate: "7".to_owned(),
+                    });
+                }
+                ClientMessage::Claim { nameplate } => {
+                    let _ = self.incoming_tx.send(ServerMessage::Claimed {
+                        mailbox: format!("mailbox-{nameplate}"),
+                    });
+                }
+                ClientMessage::Release { .. } => {
+                    let _ = self.incoming_tx.send(ServerMessage::Released);
+                }
+                ClientMessage::Open { .. } => {
+                    let _ = self
+                        .incoming_tx
+                        .send(ServerMessage::Ack { id: "open".into() });
+                }
+                ClientMessage::Add { phase, body, .. } => {
+                    let side = self.own_side.clone().unwrap_or_else(|| "side".to_owned());
+                    let _ = self
+                        .incoming_tx
+                        .send(ServerMessage::Ack { id: phase.clone() });
+                    let _ = self.peer_tx.send(ServerMessage::Message {
+                        id: format!("msg-{phase}"),
+                        side,
+                        phase,
+                        body,
+                    });
+                }
+                ClientMessage::Close { mood, .. } => {
+                    let _ = self
+                        .incoming_tx
+                        .send(ServerMessage::Closed { mood: mood.clone() });
+                    let _ = self.peer_tx.send(ServerMessage::Closed { mood });
+                }
+            }
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> Result<ServerMessage, MailboxError> {
+            self.incoming_rx
+                .recv()
+                .await
+                .ok_or(MailboxError::Closed { mood: None })
+        }
     }
 
     fn temp_paths(temp: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -428,6 +520,59 @@ mod tests {
         )
         .unwrap();
         assert_eq!(label, "daily-dev");
+    }
+
+    #[test]
+    fn shortcode_offer_accept_and_import_e2e_without_network() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let outcome = runtime.block_on(async {
+            let (mut sender_t, mut receiver_t) = PairedMailboxTransport::pair();
+            let (code_tx, code_rx) = tokio::sync::oneshot::channel();
+            let sender = async move {
+                run_offer_against_transport(
+                    &mut sender_t,
+                    None,
+                    |code| {
+                        let _ = code_tx.send(code.clone());
+                    },
+                    |_hello| Ok(fixture_session_share("dev", Some("alice"))),
+                )
+                .await
+            };
+            let receiver = async move {
+                let code = code_rx.await.unwrap();
+                let hello = RecipientHelloV1 {
+                    schema: portl_core::rendezvous::backend::PORTL_RECIPIENT_HELLO_SCHEMA_V1
+                        .to_owned(),
+                    endpoint_id_hex: Some(hex::encode(fixture_identity(9).verifying_key())),
+                    label_hint: Some("recipient".to_owned()),
+                };
+                accept_over_mailbox(&mut receiver_t, code, hello).await
+            };
+            let (sender_result, receiver_result) = tokio::join!(sender, receiver);
+            sender_result.unwrap();
+            receiver_result.unwrap()
+        });
+
+        let temp = TempDir::new().unwrap();
+        let (peers_path, tickets_path) = temp_paths(&temp);
+        let label = import_exchange_envelope(
+            &outcome.envelope,
+            ImportOptions {
+                label: None,
+                recipient_endpoint_id_hex: Some(&hex::encode(fixture_identity(9).verifying_key())),
+            },
+            &peers_path,
+            &tickets_path,
+        )
+        .unwrap();
+        assert_eq!(label, "dev@alice");
+        assert!(
+            TicketStore::load(&tickets_path)
+                .unwrap()
+                .get("dev@alice")
+                .is_some()
+        );
     }
 
     #[test]
