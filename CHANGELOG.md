@@ -5,6 +5,8 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.6.0 — 2026-04-27
+
 ### Added
 
 - Added `PORTL-S-*` short online session sharing: `portl session share`

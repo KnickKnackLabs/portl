@@ -12,8 +12,8 @@ description  = "Docker adapter for portl (M4)."
 workspace = true
 
 [dependencies]
-portl-core   = { version = "0.5.2", path = "../../crates/portl-core" }
-portl-agent  = { version = "0.5.2", path = "../../crates/portl-agent" }
+portl-core   = { version = "0.6.0", path = "../../crates/portl-core" }
+portl-agent  = { version = "0.6.0", path = "../../crates/portl-agent" }
 anyhow       = { workspace = true }
 async-trait  = { workspace = true }
 bollard      = { workspace = true }
