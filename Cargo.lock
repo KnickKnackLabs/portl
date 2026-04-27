@@ -3786,8 +3786,10 @@ dependencies = [
  "crypto_secretbox",
  "directories",
  "ed25519-dalek 2.2.0",
+ "futures-util",
  "hex",
  "hkdf",
+ "http",
  "iroh",
  "iroh-base",
  "iroh-tickets",
@@ -3811,6 +3813,7 @@ dependencies = [
  "tokio-websockets",
  "tracing",
  "tracing-subscriber",
+ "url",
  "zeroize",
 ]
 

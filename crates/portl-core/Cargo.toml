@@ -58,6 +58,9 @@ tokio-websockets = { workspace = true }
 spake2           = { workspace = true }
 crypto_secretbox = { workspace = true }
 hkdf             = { workspace = true }
+url              = { workspace = true }
+futures-util     = { workspace = true }
+http             = "1"
 
 [dev-dependencies]
 portl-core = { version = "0.5.2", path = ".", features = ["test-util"] }
