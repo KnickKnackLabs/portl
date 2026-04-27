@@ -56,6 +56,10 @@ pub enum Command {
         mode: Option<AgentModeArg>,
         upstream_url: Option<String>,
     },
+    AgentLifecycle {
+        action: AgentAction,
+        json: bool,
+    },
     Init {
         force: bool,
         role: Option<InitRole>,
@@ -305,6 +309,18 @@ pub enum AgentModeArg {
     Gateway,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
+pub enum AgentAction {
+    /// Show installed service, running process, and IPC status.
+    Status,
+    /// Install/enable/start the agent service.
+    Up,
+    /// Stop/disable/unload the agent service, keeping binaries and state.
+    Down,
+    /// Restart the installed agent service.
+    Restart,
+}
+
 /// Errors returned by [`parse`].
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
@@ -324,11 +340,8 @@ pub enum ParseError {
 /// `gateway` subcommand.
 pub fn parse(argv: Vec<OsString>) -> Result<Command, ParseError> {
     if is_portl_agent_invocation(&argv)? {
-        let _ = AgentCli::try_parse_from(argv)?;
-        return Ok(Command::AgentRun {
-            mode: None,
-            upstream_url: None,
-        });
+        let cli = AgentCli::try_parse_from(argv)?;
+        return Ok(agent_cli_to_command(&cli));
     }
     let argv = rewrite_multicall(argv)?;
     let cli = Cli::try_parse_from(argv)?;
@@ -364,11 +377,8 @@ pub fn run(argv: Vec<OsString>) -> ExitCode {
     portl_core::tls::install_default_crypto_provider();
     match is_portl_agent_invocation(&argv) {
         Ok(true) => {
-            return match AgentCli::try_parse_from(argv) {
-                Ok(_) => match dispatch(Command::AgentRun {
-                    mode: None,
-                    upstream_url: None,
-                }) {
+            return match AgentCli::try_parse_from(argv).map(|cli| agent_cli_to_command(&cli)) {
+                Ok(command) => match dispatch(command) {
                     Ok(code) => code,
                     Err(err) => {
                         eprintln!("{err:#}");
@@ -445,6 +455,7 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
         Command::AgentRun { mode, upstream_url } => {
             commands::agent::run::run(mode, upstream_url.as_deref())
         }
+        Command::AgentLifecycle { action, json } => commands::agent::service::run(action, json),
         Command::Init { force, role, quiet } => commands::init::run(force, role, quiet),
         Command::Doctor {
             fix,
@@ -832,7 +843,26 @@ struct Cli {
 
 #[derive(Parser, Debug)]
 #[command(name = "portl-agent", bin_name = "portl-agent", version, about = "portl-agent daemon entrypoint", long_about = None)]
-struct AgentCli {}
+struct AgentCli {
+    /// Emit structured JSON where supported.
+    #[arg(long, global = true)]
+    json: bool,
+    #[command(subcommand)]
+    action: Option<AgentAction>,
+}
+
+fn agent_cli_to_command(cli: &AgentCli) -> Command {
+    match cli.action {
+        Some(action) => Command::AgentLifecycle {
+            action,
+            json: cli.json,
+        },
+        None => Command::AgentRun {
+            mode: None,
+            upstream_url: None,
+        },
+    }
+}
 
 #[derive(Subcommand, Debug)]
 enum TopLevel {

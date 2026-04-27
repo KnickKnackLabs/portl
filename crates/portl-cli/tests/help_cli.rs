@@ -44,6 +44,44 @@ fn cli_help_lists_expected_top_level_commands() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn portl_agent_help_lists_lifecycle_commands() {
+    let portl = assert_cmd::cargo::cargo_bin("portl");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let agent = temp.path().join("portl-agent");
+    std::os::unix::fs::symlink(&portl, &agent).expect("symlink portl-agent");
+    let output = Command::new(&agent)
+        .arg("--help")
+        .output()
+        .expect("run portl-agent --help");
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).expect("utf8 stdout");
+    for needle in [
+        "Usage: portl-agent [OPTIONS] [COMMAND]",
+        "status",
+        "up",
+        "down",
+        "restart",
+        "--json",
+    ] {
+        assert!(help.contains(needle), "missing {needle:?}\n{help}");
+    }
+
+    let status = Command::new(&agent)
+        .args(["status", "--help"])
+        .output()
+        .expect("run portl-agent status --help");
+    assert!(status.status.success());
+    let status_help = String::from_utf8(status.stdout).expect("utf8 stdout");
+    for needle in ["Usage: portl-agent status", "--json", "Print help"] {
+        assert!(
+            status_help.contains(needle),
+            "missing {needle:?}\n{status_help}"
+        );
+    }
+}
+
 #[test]
 fn top_level_help_uses_logical_command_groups() {
     let help = help_output(&["--help"]);

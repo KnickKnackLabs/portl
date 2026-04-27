@@ -53,6 +53,16 @@ whether this machine was already configured as a client or agent. Set
 service, or `--uninstall` to remove binaries and service while keeping
 `$PORTL_HOME`. Release artifacts cover macOS and Linux on arm64 / x86_64.
 
+Daemon lifecycle commands live on `portl-agent`:
+
+```bash
+portl-agent status          # service + process + IPC status
+portl-agent status --json   # script-friendly status
+portl-agent up              # install/enable/start service
+portl-agent restart         # restart installed service
+portl-agent down            # stop/disable service, keeping state
+```
+
 ### Package managers and source
 
 ```bash

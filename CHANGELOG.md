@@ -13,6 +13,9 @@ All notable changes land here. This project follows
 - `install.sh` now preserves an existing agent/client mode by default,
   accepts `PORTL_VERSION` and `PORTL_AGENT` environment variables, and
   uses `--agent=off` as the explicit service-disable path.
+- `portl-agent` now has lifecycle commands for daemon-oriented service
+  management: `status`, `up`, `down`, and `restart`, each with JSON
+  output for scripts.
 
 ### Fixed
 

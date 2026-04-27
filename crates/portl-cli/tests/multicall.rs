@@ -24,6 +24,34 @@ fn portl_agent_symlink_enters_daemon_mode() {
 }
 
 #[test]
+fn portl_agent_lifecycle_subcommands_parse() {
+    let prefixed = parse(argv(&["portl-agent", "--json", "status"])).expect("parse global json");
+    assert_eq!(
+        prefixed,
+        Command::AgentLifecycle {
+            action: portl_cli::AgentAction::Status,
+            json: true,
+        }
+    );
+
+    for (verb, expected) in [
+        ("status", portl_cli::AgentAction::Status),
+        ("up", portl_cli::AgentAction::Up),
+        ("down", portl_cli::AgentAction::Down),
+        ("restart", portl_cli::AgentAction::Restart),
+    ] {
+        let cmd = parse(argv(&["portl-agent", verb, "--json"])).expect("parse lifecycle action");
+        assert_eq!(
+            cmd,
+            Command::AgentLifecycle {
+                action: expected,
+                json: true,
+            }
+        );
+    }
+}
+
+#[test]
 fn portl_agent_symlink_respects_full_path() {
     let cmd =
         parse(argv(&["/usr/local/bin/portl-agent"])).expect("parse with absolute path argv[0]");
