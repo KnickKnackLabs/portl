@@ -215,6 +215,31 @@ impl<'a, T: MailboxTransport + Send> MailboxClient<'a, T> {
         }
     }
 
+    /// Like [`Self::recv_meaningful`] but used in setup paths where unsolicited
+    /// peer `message` frames may arrive before the named response. Buffers any
+    /// `Message` frames into [`Self::pending_messages`] so subsequent
+    /// [`Self::recv_phase_from_peer`] calls observe them.
+    async fn recv_meaningful_setup(&mut self) -> Result<ServerMessage, MailboxError> {
+        loop {
+            match self.recv_meaningful().await? {
+                ServerMessage::Message {
+                    side,
+                    phase,
+                    body,
+                    id,
+                } => {
+                    self.pending_messages.push_back(PhaseMessage {
+                        side,
+                        phase,
+                        body: body.into_inner(),
+                        id,
+                    });
+                }
+                other => return Ok(other),
+            }
+        }
+    }
+
     /// Await the per-command universal `ack` that the mailbox server sends in
     /// reply to every C->S message. `Error` frames are surfaced; any other
     /// frame at this point is unexpected (the server replies to commands
@@ -279,7 +304,7 @@ impl<'a, T: MailboxTransport + Send> MailboxClient<'a, T> {
     }
 
     async fn await_welcome(&mut self) -> Result<(), MailboxError> {
-        match self.recv_meaningful().await? {
+        match self.recv_meaningful_setup().await? {
             ServerMessage::Welcome { .. } => Ok(()),
             other => Err(MailboxError::Unexpected(format!(
                 "expected welcome, got {other:?}"
@@ -293,7 +318,7 @@ impl<'a, T: MailboxTransport + Send> MailboxClient<'a, T> {
         self.await_welcome().await?;
 
         self.transport.send(ClientMessage::Allocate).await?;
-        let nameplate = match self.recv_meaningful().await? {
+        let nameplate = match self.recv_meaningful_setup().await? {
             ServerMessage::Allocated { nameplate } => nameplate,
             other => {
                 return Err(MailboxError::Unexpected(format!(
@@ -324,7 +349,7 @@ impl<'a, T: MailboxTransport + Send> MailboxClient<'a, T> {
                 nameplate: nameplate.clone(),
             })
             .await?;
-        let mailbox = match self.recv_meaningful().await? {
+        let mailbox = match self.recv_meaningful_setup().await? {
             ServerMessage::Claimed { mailbox } => mailbox,
             other => {
                 return Err(MailboxError::Unexpected(format!(
