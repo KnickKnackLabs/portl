@@ -115,9 +115,9 @@ fn invite_accept_help_matches_model_a_surface() {
 
     let accept = help_output(&["accept", "--help"]);
     for needle in [
-        "Usage: portl accept [OPTIONS] <CODE>",
-        "Consume an invite code",
-        "PORTLINV-… code received from the inviter",
+        "Usage: portl accept [OPTIONS] <THING>",
+        "PORTLINV",
+        "PORTL-S",
         "--yes",
     ] {
         assert!(accept.contains(needle), "missing {needle:?}\n{accept}");

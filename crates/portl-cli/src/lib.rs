@@ -527,7 +527,7 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
         ),
         Command::InviteLs { json } => commands::peer::invite::list(json),
         Command::InviteRm { prefix } => commands::peer::invite::revoke(&prefix),
-        Command::Accept { code, yes } => commands::peer::pair::run(&code, yes),
+        Command::Accept { code, yes } => commands::accept::run(&code, yes),
         Command::TicketIssue {
             caps,
             ttl,
@@ -711,7 +711,7 @@ Trust:
   invite       Issue codes to pair with new machines
 
 Pairing:
-  accept       Consume an invite code
+  accept       Consume an invite (PORTLINV-…) or short share (PORTL-S-…)
 
 Connect:
   status       Report health for this machine or probe a target
@@ -762,8 +762,7 @@ const RELATIONSHIP_HELP: &str = "Relationship between portl trust objects:\n\n  
 
 const INVITE_AFTER_HELP: &str = "Examples:\n  portl invite                              # mutual pair, 1h TTL\n  portl invite --initiator me --for cust    # remote-support invite\n  portl invite --ttl 10m --for laptop\n  portl invite ls\n  portl invite rm abc123\n\nRelationship between portl trust objects:\n\n                    peer              invite                ticket\nOwns on disk        peers.json        pending_invites.json   tickets.json + revocations.jsonl\nLifecycle           permanent         ephemeral (single-use) scoped by TTL\nWhen created        on accept         by `portl invite`      by `portl ticket issue`\nWhen consumed       on rm             on `portl accept`      every connection/operation\n\nWorkflow:\n    first contact     →  `portl invite` + `portl accept`       (writes peer row)\n    day-to-day auth   →  `portl shell <target>`                (one-shot terminal)\n    persistent auth   →  `portl session attach <target>`       (persistent terminal, if available)\n    advanced: bounded →  `portl ticket issue` + `ticket save`  (explicit permission)";
 
-const ACCEPT_AFTER_HELP: &str =
-    "Examples:\n  portl accept PORTLINV-ABCDEFGH…\n  portl accept --yes PORTLINV-ABCDEFGH…";
+const ACCEPT_AFTER_HELP: &str = "Generic receiver for codes Portl knows how to consume:\n\n  PORTLINV-…     pairing invite from `portl invite` (peer trust handshake)\n  PORTL-S-…      short online session share (online exchange)\n  PORTL-SHARE1-… offline share token (not yet implemented)\n  portl…         ticket string — use `portl ticket save <label> <ticket>`\n\nExamples:\n  portl accept PORTLINV-ABCDEFGH…\n  portl accept PORTL-S-2-nebula-involve\n  portl accept --yes PORTLINV-ABCDEFGH…";
 
 #[derive(Parser, Debug)]
 #[command(name = "portl", bin_name = "portl", version, about = PORTL_ABOUT, after_long_help = PORTL_AFTER_HELP)]
@@ -901,10 +900,11 @@ enum TrustTopLevel {
 
 #[derive(Subcommand, Debug)]
 enum PairingTopLevel {
-    /// Consume an invite code.
+    /// Consume an invite code, short online share, or other Portl code.
     #[command(display_order = 80, after_long_help = ACCEPT_AFTER_HELP)]
     Accept {
-        /// PORTLINV-… code received from the inviter.
+        /// Code or token to accept: PORTLINV-…, PORTL-S-…, PORTL-SHARE1-…, or a `portl…` ticket.
+        #[arg(value_name = "THING")]
         code: String,
         /// Skip the confirmation prompt. Implied in non-TTY.
         #[arg(long)]

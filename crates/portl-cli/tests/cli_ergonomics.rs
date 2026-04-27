@@ -286,7 +286,7 @@ fn accept_and_ticket_save_teach_wrong_prefix() {
     let stderr = String::from_utf8_lossy(&accept.stderr);
     assert!(stderr.contains("looks like a ticket string"), "{stderr}");
     assert!(
-        stderr.contains("portl ticket save PORTLTKT-abc"),
+        stderr.contains("portl ticket save") && stderr.contains("PORTLTKT-abc"),
         "{stderr}"
     );
 
