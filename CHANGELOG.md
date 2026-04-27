@@ -5,6 +5,21 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Changed
+
+- Simplified installer examples around readable multiline curl commands
+  for the default preserve-current-mode install and the `PORTL_AGENT=1`
+  share-this-machine path.
+- `install.sh` now preserves an existing agent/client mode by default,
+  accepts `PORTL_VERSION` and `PORTL_AGENT` environment variables, and
+  uses `--agent=off` as the explicit service-disable path.
+
+### Fixed
+
+- `install.sh --agent` now probes identity with `portl whoami --eid`
+  instead of `portl doctor`, so unrelated health issues such as expired
+  saved tickets no longer prevent service reinstall/restart.
+
 ## 0.6.0 — 2026-04-27
 
 ### Added

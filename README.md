@@ -36,32 +36,29 @@ Run `portl --help` for the grouped command map.
 ### One-liner
 
 ```bash
-# client-only CLI binaries
-curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash
+# install or upgrade; preserves the current client/agent mode
+curl -fsSL \
+  https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh \
+  | bash
 
-# share this machine too: install + enable portl-agent
-curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash -s -- --agent
-
-# pin a version
-curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash -s -- --version 0.6.0
-
-# toggle back to client-only; keeps binaries + identity
-curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash -s -- --client-only --yes
-
-# fully uninstall; keeps $PORTL_HOME
-curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash -s -- --uninstall --yes
+# install or upgrade and make this machine shareable
+curl -fsSL \
+  https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh \
+  | PORTL_AGENT=1 bash
 ```
 
-The installer is idempotent. Re-run it to upgrade, switch between
-client-only and agent modes, or pin a specific version. Release
-artifacts cover macOS and Linux on arm64 / x86_64.
+The installer is idempotent. Re-run it to upgrade; by default it preserves
+whether this machine was already configured as a client or agent. Set
+`PORTL_VERSION=0.6.0` to pin a release. Use `--agent=off` to disable the
+service, or `--uninstall` to remove binaries and service while keeping
+`$PORTL_HOME`. Release artifacts cover macOS and Linux on arm64 / x86_64.
 
 ### Package managers and source
 
 ```bash
 # mise
 mise use -g github:KnickKnackLabs/portl@0.6.0
-# mise only shims `portl`; run install.sh --agent if this machine should be shared.
+# mise only shims `portl`; run install.sh with PORTL_AGENT=1 if this machine should be shared.
 
 # cargo
 cargo install --git https://github.com/KnickKnackLabs/portl --locked portl

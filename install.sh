@@ -3,13 +3,13 @@
 #
 # usage (one-liners):
 #   curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash
-#   curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash -s -- --agent
-#   curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash -s -- --version 0.3.0
+#   curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | PORTL_AGENT=1 bash
 #
 # modes (all idempotent — re-run any time):
-#   default / --client-only : install/upgrade portl binaries, no background service
-#   --agent                 : install/upgrade + enable launchd/systemd service
-#   --uninstall             : remove binaries and service
+#   default     : install/upgrade portl binaries, preserving existing service mode
+#   PORTL_AGENT=1 / --agent=on  : enable launchd/systemd service
+#   PORTL_AGENT=0 / --agent=off : disable launchd/systemd service
+#   --uninstall : remove binaries and service
 #
 # The script is explicitly NOT a wrapper around mise / brew / apt —
 # it downloads a release tarball from github.com/KnickKnackLabs/portl
@@ -25,9 +25,9 @@ REPO="KnickKnackLabs/portl"
 RELEASES_URL="https://github.com/${REPO}/releases"
 API_URL="https://api.github.com/repos/${REPO}"
 
-VERSION=""
+VERSION="${PORTL_VERSION:-}"
 INSTALL_DIR=""
-MODE="client"   # client | agent | uninstall
+MODE=""         # empty = auto-preserve existing service mode; otherwise client | agent | uninstall
 FORCE=0
 SKIP_INIT=0
 DRY_RUN=0
@@ -55,10 +55,9 @@ portl installer
 
 usage: install.sh [OPTIONS]
 
-  --version <X.Y.Z>      install specific version (default: latest release)
+  --version <X.Y.Z>      install specific version (default: $PORTL_VERSION or latest release)
   --install-dir <path>   binaries go here (default: ~/.local/bin, or /usr/local/bin as root)
-  --agent                install + enable portl-agent service
-  --client-only          install binaries only (default)
+  --agent[=on|off]       enable/disable portl-agent service (default: preserve current mode)
   --uninstall            remove binaries + service
   --force                overwrite matching version without prompting
   --no-init              skip `portl init` on fresh machines
@@ -67,22 +66,25 @@ usage: install.sh [OPTIONS]
   -h, --help             show this help
 
 examples:
-  # client mode, latest release
+  # install or upgrade; preserves the current client/agent mode
   curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash
 
-  # enable agent service (asks for sudo if installing system-wide)
-  curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash -s -- --agent
-
-  # pin version, skip confirmation
-  curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash -s -- --version 0.3.0 --yes
-
-  # toggle back to client-only (tears down the service)
-  curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash -s -- --client-only --yes
-
-  # uninstall everything
-  curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | bash -s -- --uninstall --yes
+  # install or upgrade and make this machine shareable
+  curl -fsSL https://raw.githubusercontent.com/KnickKnackLabs/portl/main/install.sh | PORTL_AGENT=1 bash
 EOF
 }
+
+parse_agent_mode() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on|agent) printf 'agent\n' ;;
+        0|false|no|off|client) printf 'client\n' ;;
+        *) err "invalid agent mode: $1 (expected on/off)" ;;
+    esac
+}
+
+if [ -n "${PORTL_AGENT:-}" ]; then
+    MODE="$(parse_agent_mode "$PORTL_AGENT")"
+fi
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -91,7 +93,7 @@ while [ $# -gt 0 ]; do
         --install-dir)   INSTALL_DIR="$2"; shift 2 ;;
         --install-dir=*) INSTALL_DIR="${1#*=}"; shift ;;
         --agent)         MODE="agent"; shift ;;
-        --client-only)   MODE="client"; shift ;;
+        --agent=*)       MODE="$(parse_agent_mode "${1#*=}")"; shift ;;
         --uninstall)     MODE="uninstall"; shift ;;
         --force)         FORCE=1; shift ;;
         --no-init)       SKIP_INIT=1; shift ;;
@@ -201,6 +203,46 @@ if [ -z "$INSTALL_DIR" ]; then
     INSTALL_DIR="$(default_install_dir)"
 fi
 
+existing_service_mode() {
+    case "$(uname -s)" in
+        Darwin)
+            if launchctl print "gui/$(id -u)/com.portl.agent" >/dev/null 2>&1; then
+                printf 'agent\n'
+                return 0
+            fi
+            if [ -f "${HOME:-/root}/Library/LaunchAgents/com.portl.agent.plist" ]; then
+                printf 'agent\n'
+                return 0
+            fi
+            if [ -f /Library/LaunchDaemons/com.portl.agent.plist ]; then
+                printf 'agent\n'
+                return 0
+            fi
+            ;;
+        Linux)
+            if has systemctl; then
+                if systemctl --user is-enabled portl-agent.service >/dev/null 2>&1; then
+                    printf 'agent\n'
+                    return 0
+                fi
+                if systemctl is-enabled portl-agent.service >/dev/null 2>&1; then
+                    printf 'agent\n'
+                    return 0
+                fi
+            fi
+            if [ -f "${HOME:-/root}/.config/systemd/user/portl-agent.service" ] || [ -f /etc/systemd/system/portl-agent.service ]; then
+                printf 'agent\n'
+                return 0
+            fi
+            ;;
+    esac
+    printf 'client\n'
+}
+
+if [ -z "$MODE" ]; then
+    MODE="$(existing_service_mode)"
+fi
+
 ensure_in_path() {
     # Don't modify any shell rc files — that's a footgun. Just warn.
     case ":${PATH:-}:" in
@@ -298,11 +340,19 @@ do_install() {
     install_man_pages_best_effort
     install_completions_best_effort
 
-    # init identity on fresh machines
+    # init identity on fresh machines. Use a narrow identity probe —
+    # `doctor` can fail for unrelated health issues (for example an
+    # expired saved ticket) and must not block service reinstall/restart.
     if [ "$SKIP_INIT" -ne 1 ]; then
-        if ! "$INSTALL_DIR/portl" doctor 2>/dev/null | grep -q '\[ok *\] identity:'; then
+        if ! "$INSTALL_DIR/portl" whoami --eid >/dev/null 2>&1; then
             info "initializing portl identity…"
-            run "$INSTALL_DIR/portl" init
+            if ! run "$INSTALL_DIR/portl" init; then
+                if "$INSTALL_DIR/portl" whoami --eid >/dev/null 2>&1; then
+                    warn "init reported health issues after creating/loading identity; continuing"
+                else
+                    err "failed to initialize portl identity"
+                fi
+            fi
         fi
     fi
 
@@ -312,8 +362,13 @@ do_install() {
     esac
 
     echo
-    ok "done"
-    "$INSTALL_DIR/portl" doctor 2>/dev/null || true
+    if [ "$DRY_RUN" -eq 1 ]; then
+        ok "dry-run complete (no changes made)"
+        info "to check status after a real install: portl doctor"
+    else
+        ok "done"
+        "$INSTALL_DIR/portl" doctor 2>/dev/null || true
+    fi
 }
 
 download_and_place() {
@@ -433,7 +488,11 @@ install_service() {
         warn "run the agent manually:  ${INSTALL_DIR}/portl-agent"
         return 0
     fi
-    info "installing portl-agent service"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        info "would install portl-agent service"
+    else
+        info "installing portl-agent service"
+    fi
     # Delegate to `portl install --apply`. It writes launchd plist /
     # systemd unit referencing the binary we just placed. Re-running
     # is idempotent.
@@ -442,23 +501,27 @@ install_service() {
     else
         run "$INSTALL_DIR/portl" install --apply --yes
     fi
-    ok "service installed"
-    info "to check status: portl doctor"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        ok "service install would be applied"
+    else
+        ok "service installed"
+        info "to check status: portl doctor"
+    fi
 }
 
 uninstall_service_if_present() {
-    # --client-only re-run: if a service is loaded, tear it down.
+    # Explicit client-mode re-run: if a service is loaded, tear it down.
     local touched=0
     if [ "$(uname -s)" = "Darwin" ]; then
         if launchctl print "gui/$(id -u)/com.portl.agent" >/dev/null 2>&1; then
-            info "tearing down user LaunchAgent (switching to client-only)"
+            info "tearing down user LaunchAgent (switching to client mode)"
             run launchctl bootout "gui/$(id -u)/com.portl.agent" || true
             run rm -f "${HOME:-/root}/Library/LaunchAgents/com.portl.agent.plist"
             touched=1
         fi
         if [ "$(id -u)" -eq 0 ] || sudo -n true 2>/dev/null; then
             if sudo launchctl print system/com.portl.agent >/dev/null 2>&1; then
-                info "tearing down system LaunchDaemon (switching to client-only)"
+                info "tearing down system LaunchDaemon (switching to client mode)"
                 run sudo launchctl bootout system/com.portl.agent || true
                 run sudo rm -f /Library/LaunchDaemons/com.portl.agent.plist
                 touched=1
@@ -466,13 +529,13 @@ uninstall_service_if_present() {
         fi
     elif [ "$(uname -s)" = "Linux" ] && has systemctl; then
         if systemctl --user is-enabled portl-agent.service >/dev/null 2>&1; then
-            info "tearing down user systemd unit (switching to client-only)"
+            info "tearing down user systemd unit (switching to client mode)"
             run systemctl --user disable --now portl-agent.service || true
             run rm -f "${HOME:-/root}/.config/systemd/user/portl-agent.service"
             touched=1
         fi
         if systemctl is-enabled portl-agent.service >/dev/null 2>&1; then
-            info "tearing down system systemd unit (switching to client-only)"
+            info "tearing down system systemd unit (switching to client mode)"
             run sudo systemctl disable --now portl-agent.service || true
             run sudo rm -f /etc/systemd/system/portl-agent.service
             touched=1
