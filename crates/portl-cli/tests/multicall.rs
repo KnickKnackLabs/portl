@@ -29,13 +29,23 @@ fn portl_agent_lifecycle_subcommands_parse() {
     assert_eq!(
         prefixed,
         Command::AgentLifecycle {
-            action: portl_cli::AgentAction::Status,
+            action: portl_cli::AgentAction::Status { service: false },
+            json: true,
+        }
+    );
+
+    let service = parse(argv(&["portl-agent", "status", "--service", "--json"]))
+        .expect("parse service status");
+    assert_eq!(
+        service,
+        Command::AgentLifecycle {
+            action: portl_cli::AgentAction::Status { service: true },
             json: true,
         }
     );
 
     for (verb, expected) in [
-        ("status", portl_cli::AgentAction::Status),
+        ("status", portl_cli::AgentAction::Status { service: false }),
         ("up", portl_cli::AgentAction::Up),
         ("down", portl_cli::AgentAction::Down),
         ("restart", portl_cli::AgentAction::Restart),

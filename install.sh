@@ -27,7 +27,7 @@ API_URL="https://api.github.com/repos/${REPO}"
 
 VERSION="${PORTL_VERSION:-}"
 INSTALL_DIR=""
-MODE=""         # empty = auto-preserve existing service mode; otherwise client | agent | uninstall
+MODE=""         # empty = preserve existing service mode; otherwise client | agent | uninstall
 FORCE=0
 SKIP_INIT=0
 DRY_RUN=0
@@ -203,46 +203,6 @@ if [ -z "$INSTALL_DIR" ]; then
     INSTALL_DIR="$(default_install_dir)"
 fi
 
-existing_service_mode() {
-    case "$(uname -s)" in
-        Darwin)
-            if launchctl print "gui/$(id -u)/com.portl.agent" >/dev/null 2>&1; then
-                printf 'agent\n'
-                return 0
-            fi
-            if [ -f "${HOME:-/root}/Library/LaunchAgents/com.portl.agent.plist" ]; then
-                printf 'agent\n'
-                return 0
-            fi
-            if [ -f /Library/LaunchDaemons/com.portl.agent.plist ]; then
-                printf 'agent\n'
-                return 0
-            fi
-            ;;
-        Linux)
-            if has systemctl; then
-                if systemctl --user is-enabled portl-agent.service >/dev/null 2>&1; then
-                    printf 'agent\n'
-                    return 0
-                fi
-                if systemctl is-enabled portl-agent.service >/dev/null 2>&1; then
-                    printf 'agent\n'
-                    return 0
-                fi
-            fi
-            if [ -f "${HOME:-/root}/.config/systemd/user/portl-agent.service" ] || [ -f /etc/systemd/system/portl-agent.service ]; then
-                printf 'agent\n'
-                return 0
-            fi
-            ;;
-    esac
-    printf 'client\n'
-}
-
-if [ -z "$MODE" ]; then
-    MODE="$(existing_service_mode)"
-fi
-
 ensure_in_path() {
     # Don't modify any shell rc files — that's a footgun. Just warn.
     case ":${PATH:-}:" in
@@ -320,7 +280,7 @@ do_install() {
     info "target     : ${TARGET}"
     info "version    : ${TAG}"
     info "install dir: ${INSTALL_DIR}"
-    info "mode       : ${MODE}"
+    info "mode       : ${MODE:-preserve}"
     [ "$IS_CONTAINER" -eq 1 ] && info "container  : detected (service install will be skipped)"
 
     local current
@@ -356,10 +316,7 @@ do_install() {
         fi
     fi
 
-    case "$MODE" in
-        agent)  install_service ;;
-        client) uninstall_service_if_present ;;
-    esac
+    apply_service_mode
 
     echo
     if [ "$DRY_RUN" -eq 1 ]; then
@@ -482,72 +439,61 @@ install_completions_best_effort() {
 
 # --- service management -----------------------------------------------
 
-install_service() {
+service_configured() {
+    if "$INSTALL_DIR/portl-agent" status --service >/dev/null 2>&1; then
+        return 0
+    fi
+    # Transitional fallback for upgrading from releases before
+    # `portl-agent status --service` existed. Newer installs answer
+    # through the Rust lifecycle command above.
+    case "$(uname -s)" in
+        Darwin)
+            launchctl print "gui/$(id -u)/com.portl.agent" >/dev/null 2>&1 && return 0
+            [ -f "${HOME:-/root}/Library/LaunchAgents/com.portl.agent.plist" ] && return 0
+            [ -f /Library/LaunchDaemons/com.portl.agent.plist ] && return 0
+            ;;
+        Linux)
+            if has systemctl; then
+                systemctl --user is-enabled portl-agent.service >/dev/null 2>&1 && return 0
+                systemctl is-enabled portl-agent.service >/dev/null 2>&1 && return 0
+            fi
+            [ -f "${HOME:-/root}/.config/systemd/user/portl-agent.service" ] && return 0
+            [ -f /etc/systemd/system/portl-agent.service ] && return 0
+            ;;
+    esac
+    return 1
+}
+
+apply_service_mode() {
     if [ "$IS_CONTAINER" -eq 1 ]; then
-        warn "container detected — skipping service install"
+        warn "container detected — skipping service management"
         warn "run the agent manually:  ${INSTALL_DIR}/portl-agent"
         return 0
     fi
-    if [ "$DRY_RUN" -eq 1 ]; then
-        info "would install portl-agent service"
-    else
-        info "installing portl-agent service"
-    fi
-    # Delegate to `portl install --apply`. It writes launchd plist /
-    # systemd unit referencing the binary we just placed. Re-running
-    # is idempotent.
-    if [ "$(id -u)" -eq 0 ]; then
-        run "$INSTALL_DIR/portl" install --apply --yes
-    else
-        run "$INSTALL_DIR/portl" install --apply --yes
-    fi
-    if [ "$DRY_RUN" -eq 1 ]; then
-        ok "service install would be applied"
-    else
-        ok "service installed"
-        info "to check status: portl doctor"
-    fi
-}
 
-uninstall_service_if_present() {
-    # Explicit client-mode re-run: if a service is loaded, tear it down.
-    local touched=0
-    if [ "$(uname -s)" = "Darwin" ]; then
-        if launchctl print "gui/$(id -u)/com.portl.agent" >/dev/null 2>&1; then
-            info "tearing down user LaunchAgent (switching to client mode)"
-            run launchctl bootout "gui/$(id -u)/com.portl.agent" || true
-            run rm -f "${HOME:-/root}/Library/LaunchAgents/com.portl.agent.plist"
-            touched=1
-        fi
-        if [ "$(id -u)" -eq 0 ] || sudo -n true 2>/dev/null; then
-            if sudo launchctl print system/com.portl.agent >/dev/null 2>&1; then
-                info "tearing down system LaunchDaemon (switching to client mode)"
-                run sudo launchctl bootout system/com.portl.agent || true
-                run sudo rm -f /Library/LaunchDaemons/com.portl.agent.plist
-                touched=1
+    case "$MODE" in
+        agent)
+            info "ensuring portl-agent service is enabled"
+            run "$INSTALL_DIR/portl-agent" up
+            ;;
+        client)
+            info "ensuring portl-agent service is disabled"
+            run "$INSTALL_DIR/portl-agent" down
+            ;;
+        "")
+            if service_configured; then
+                info "existing portl-agent service detected; restarting"
+                run "$INSTALL_DIR/portl-agent" restart
+            else
+                info "no managed portl-agent service detected; leaving client-only"
             fi
-        fi
-    elif [ "$(uname -s)" = "Linux" ] && has systemctl; then
-        if systemctl --user is-enabled portl-agent.service >/dev/null 2>&1; then
-            info "tearing down user systemd unit (switching to client mode)"
-            run systemctl --user disable --now portl-agent.service || true
-            run rm -f "${HOME:-/root}/.config/systemd/user/portl-agent.service"
-            touched=1
-        fi
-        if systemctl is-enabled portl-agent.service >/dev/null 2>&1; then
-            info "tearing down system systemd unit (switching to client mode)"
-            run sudo systemctl disable --now portl-agent.service || true
-            run sudo rm -f /etc/systemd/system/portl-agent.service
-            touched=1
-        fi
-    fi
-    [ "$touched" -eq 1 ] && ok "service removed (binaries retained)"
-    return 0
+            ;;
+    esac
 }
 
 # --- main --------------------------------------------------------------
 
 case "$MODE" in
     uninstall) do_uninstall ;;
-    client|agent) do_install ;;
+    ""|client|agent) do_install ;;
 esac

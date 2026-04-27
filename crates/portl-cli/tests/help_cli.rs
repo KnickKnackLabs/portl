@@ -74,7 +74,12 @@ fn portl_agent_help_lists_lifecycle_commands() {
         .expect("run portl-agent status --help");
     assert!(status.status.success());
     let status_help = String::from_utf8(status.stdout).expect("utf8 stdout");
-    for needle in ["Usage: portl-agent status", "--json", "Print help"] {
+    for needle in [
+        "Usage: portl-agent status",
+        "--service",
+        "--json",
+        "Print help",
+    ] {
         assert!(
             status_help.contains(needle),
             "missing {needle:?}\n{status_help}"

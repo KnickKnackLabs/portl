@@ -59,21 +59,26 @@ struct AgentActionReport {
 
 pub fn run(action: AgentAction, json: bool) -> Result<ExitCode> {
     match action {
-        AgentAction::Status => status(json),
+        AgentAction::Status { service } => status(json, service),
         AgentAction::Up => up(json),
         AgentAction::Down => down(json),
         AgentAction::Restart => restart(json),
     }
 }
 
-fn status(json: bool) -> Result<ExitCode> {
+fn status(json: bool, service_only: bool) -> Result<ExitCode> {
     let report = collect_report();
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print_status_human(&report);
     }
-    Ok(if report.ipc.ok {
+    let success = if service_only {
+        report.service.installed || report.service.loaded || report.service.enabled
+    } else {
+        report.ipc.ok
+    };
+    Ok(if success {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE

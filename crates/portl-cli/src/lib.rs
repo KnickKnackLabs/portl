@@ -312,7 +312,11 @@ pub enum AgentModeArg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
 pub enum AgentAction {
     /// Show installed service, running process, and IPC status.
-    Status,
+    Status {
+        /// Exit based on service-manager configuration instead of IPC health.
+        #[arg(long)]
+        service: bool,
+    },
     /// Install/enable/start the agent service.
     Up,
     /// Stop/disable/unload the agent service, keeping binaries and state.
