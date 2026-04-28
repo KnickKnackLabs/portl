@@ -5,6 +5,8 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.6.5 — 2026-04-28
+
 ### Added
 
 - Added top-level daily session aliases: `portl attach`, `portl run`,
