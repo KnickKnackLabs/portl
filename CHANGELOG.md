@@ -5,6 +5,8 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.6.6 — 2026-04-29
+
 ### Added
 
 - Peer-target commands now accept unique hostname shorthands such as
