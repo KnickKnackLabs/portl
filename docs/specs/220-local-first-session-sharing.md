@@ -57,10 +57,11 @@ to carry the same Portl exchange envelope without changing the normal code
 shape.
 
 The first shippable slice implements CLI-hosted `PORTL-S-*` exchange:
-`portl session share <TARGET> [SESSION]` keeps the sender process online,
-prints a short code, and `portl accept <CODE>` imports the resulting
-session share as a saved ticket label until the local workspace registry
-lands. Recipient-bound tickets are required whenever the accepter
+`portl session share <SESSION>` keeps the sender process online, prints a
+short code, and `portl accept <CODE>` imports the resulting session share
+as a saved ticket label until the local workspace registry lands. Advanced
+senders can use `--target <TARGET>` to share a session on another peer
+explicitly. Recipient-bound tickets are required whenever the accepter
 advertises an endpoint id; bearer fallback is sender-explicit and
 short-lived.
 
@@ -116,7 +117,7 @@ transporting it through a rendezvous backend.
 ## 4. Non-goals
 
 - Removing `portl shell`, `portl exec`, or explicit remote
-  `portl session attach <TARGET> [SESSION]`.
+  `portl session attach <TARGET> --session <SESSION>`.
 - Making provider-native zmx/tmux session names globally unique.
 - Building a permanent URL-shortener service that stores authority-bearing
   tickets under short keys.
@@ -251,7 +252,7 @@ swift-river
 Keep the existing remote provider surface:
 
 ```bash
-portl session attach <TARGET> [SESSION] [--provider PROVIDER] [--user USER] [--cwd CWD] [-- <ARGV>...]
+portl session attach <TARGET> [--session SESSION] [--provider PROVIDER] [--user USER] [--cwd CWD] [-- <ARGV>...]
 portl session providers <TARGET> [--json]
 portl session ls <TARGET> [--provider PROVIDER] [--json]
 portl session run <TARGET> [SESSION] [--provider PROVIDER] -- <ARGV>...

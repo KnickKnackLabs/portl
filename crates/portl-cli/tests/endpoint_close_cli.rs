@@ -11,6 +11,7 @@ use portl_core::ticket::schema::{Capabilities, MetaCaps};
 use tempfile::tempdir;
 
 #[tokio::test]
+#[ignore = "slow e2e smoke; run before release tagging with `mise run release:verify -- VERSION --full`"]
 async fn cli_closes_endpoint_after_dial_timeout() -> Result<()> {
     let (_client, server) = pair().await?;
     let operator = Identity::new();

@@ -120,8 +120,8 @@ pub enum Command {
         provider: Option<String>,
     },
     SessionShare {
-        target: String,
-        session: Option<String>,
+        session: String,
+        target: Option<String>,
         provider: Option<String>,
         ttl: std::time::Duration,
         access_ttl: std::time::Duration,
@@ -524,8 +524,8 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             provider,
         } => commands::session::kill(&target, session.as_deref(), provider.as_deref()),
         Command::SessionShare {
-            target,
             session,
+            target,
             provider,
             ttl,
             access_ttl,
@@ -534,8 +534,8 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             yes,
             allow_bearer_fallback,
         } => commands::session::share(
-            &target,
-            session.as_deref(),
+            target.as_deref(),
+            &session,
             provider.as_deref(),
             ttl,
             access_ttl,
@@ -1143,7 +1143,8 @@ enum SessionAction {
     Attach {
         #[arg(help = TARGET_HELP)]
         target: String,
-        /// Session name. Defaults to the target label, or `default` for raw targets.
+        /// Session name override. Imported session-share tickets infer this automatically.
+        #[arg(long)]
         session: Option<String>,
         #[arg(long)]
         provider: Option<String>,
@@ -1192,7 +1193,7 @@ enum SessionAction {
         #[arg(long)]
         provider: Option<String>,
     },
-    /// Share a session with another machine via a `PORTL-S-*` short online code.
+    /// Share a local session with another machine via a `PORTL-S-*` short online code.
     ///
     /// Allocates a short rendezvous code, prints it, and waits for a recipient
     /// to accept. Keep this command running until they accept; the sender
@@ -1200,13 +1201,14 @@ enum SessionAction {
     /// recipient runs `portl accept PORTL-S-...` to import the offered
     /// session.
     #[command(
-        long_about = "Share a session via a `PORTL-S-*` short online code.\n\nAllocates a short code, prints it, and waits for a recipient to accept.\nYou must keep this command running until the recipient accepts.\nThe recipient runs `portl accept PORTL-S-...` to import the offered session."
+        long_about = "Share local session SESSION via a `PORTL-S-*` short online code.\n\nAllocates a short code, prints it, and waits for a recipient to accept.\nYou must keep this command running until the recipient accepts.\nThe recipient runs `portl accept PORTL-S-...` to import the offered session.\n\nBy default, SESSION is shared from this machine. Use --target only to share a session on another peer explicitly."
     )]
     Share {
-        #[arg(help = SESSION_SHARE_TARGET_HELP)]
-        target: String,
-        /// Session name. Defaults to the target label, or `default` for raw targets.
-        session: Option<String>,
+        /// Local session name to share.
+        session: String,
+        /// Explicit target peer/alias/endpoint to share instead of this machine.
+        #[arg(long, help = SESSION_SHARE_TARGET_HELP)]
+        target: Option<String>,
         /// Persistent-session provider hint (e.g. `zmx`).
         #[arg(long)]
         provider: Option<String>,
@@ -1761,8 +1763,8 @@ fn connect_into_command(action: ConnectTopLevel) -> Command {
                 provider,
             },
             SessionAction::Share {
-                target,
                 session,
+                target,
                 provider,
                 ttl,
                 access_ttl,
@@ -1771,8 +1773,8 @@ fn connect_into_command(action: ConnectTopLevel) -> Command {
                 yes,
                 allow_bearer_fallback,
             } => Command::SessionShare {
-                target,
                 session,
+                target,
                 provider,
                 ttl,
                 access_ttl,

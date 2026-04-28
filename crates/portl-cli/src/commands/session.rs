@@ -183,8 +183,8 @@ pub fn kill(target: &str, session: Option<&str>, provider: Option<&str>) -> Resu
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn share(
-    target: &str,
-    session: Option<&str>,
+    target: Option<&str>,
+    session: &str,
     provider: Option<&str>,
     ttl: Duration,
     access_ttl: Duration,
@@ -193,47 +193,64 @@ pub fn share(
     _yes: bool,
     allow_bearer_fallback: bool,
 ) -> Result<ExitCode> {
-    // Classify target up-front so unsupported forms fail fast without
-    // ever echoing the raw input (which may be a ticket credential).
-    let peers = PeerStore::load(&PeerStore::default_path()).context("load peer store")?;
-    let tickets = TicketStore::load(&TicketStore::default_path()).context("load ticket store")?;
-    let aliases = crate::alias_store::AliasStore::default();
-    let form = match classify_share_target(target, &peers, &tickets, &aliases) {
-        Ok(form) => form,
-        Err(ResolveTargetError::TicketCredential) => {
-            anyhow::bail!(
-                "session share cannot delegate a ticket credential passed as <TARGET>. \
-                 Use a peer-store label, alias, or `endpoint_id` instead."
-            );
-        }
-        Err(err) => return Err(err.into()),
+    let session_name = session.trim();
+    if session_name.is_empty() {
+        anyhow::bail!("session name cannot be empty");
+    }
+
+    let identity = load_identity(None)?;
+    let local_label = crate::commands::local_machine_label(&hex::encode(identity.verifying_key()));
+    let (target_form, target_label_hint, share_display) = if let Some(target) = target {
+        // Classify explicit targets up-front so unsupported forms fail fast without
+        // ever echoing raw input that may be a ticket credential.
+        let peers = PeerStore::load(&PeerStore::default_path()).context("load peer store")?;
+        let tickets =
+            TicketStore::load(&TicketStore::default_path()).context("load ticket store")?;
+        let aliases = crate::alias_store::AliasStore::default();
+        let form = match classify_share_target(target, &peers, &tickets, &aliases) {
+            Ok(form) => form,
+            Err(ResolveTargetError::TicketCredential) => {
+                anyhow::bail!(
+                    "session share cannot delegate a ticket credential passed as --target. \
+                     Use a peer-store label, alias, or `endpoint_id` instead."
+                );
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let target_label_hint = form.target_label_hint();
+        let display = format!("session \"{session_name}\" on {}", form.safe_display());
+        (Some(form), target_label_hint, display)
+    } else {
+        let display = format!("local session \"{session_name}\" from {local_label}");
+        (None, local_label.clone(), display)
     };
 
-    let session_name = default_session_name(target, session);
     let url = resolve_rendezvous_url(rendezvous_url);
-    let identity = load_identity(None)?;
-    let origin_label_hint = Some(label.map_or_else(
-        || crate::commands::local_machine_label(&hex::encode(identity.verifying_key())),
-        ToOwned::to_owned,
-    ));
-    let target_label_hint = Some(form.target_label_hint());
+    let origin_label_hint = Some(label.map_or_else(|| local_label.clone(), ToOwned::to_owned));
+    let target_label_hint = Some(target_label_hint);
     let (workspace_id, conflict_handle) = fresh_workspace_handles();
+    let client_cfg = crate::client_endpoint::load_client_config()?;
 
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
-        // Resolve the target endpoint address so we can mint into it.
-        let client_endpoint =
-            crate::commands::peer_resolve::bind_client_endpoint(&identity).await?;
-        let endpoint_id = form.endpoint_id();
-        let resolved_addr = crate::commands::peer_resolve::resolve_endpoint_addr(
-            &client_endpoint,
-            endpoint_id,
-            false,
-        )
-        .await;
-        crate::commands::peer_resolve::close_client_endpoint(client_endpoint, "share resolve")
+        let target_addr = if let Some(form) = target_form {
+            let client_endpoint =
+                crate::client_endpoint::bind_client_endpoint_with_config(&identity, &client_cfg)
+                    .await?;
+            let endpoint_id = form.endpoint_id();
+            let resolved_addr = crate::commands::peer_resolve::resolve_endpoint_addr(
+                &client_endpoint,
+                endpoint_id,
+                false,
+            )
             .await;
-        let (target_addr, _provenance) = resolved_addr?;
+            crate::commands::peer_resolve::close_client_endpoint(client_endpoint, "share resolve")
+                .await;
+            let (target_addr, _provenance) = resolved_addr?;
+            target_addr
+        } else {
+            local_session_target_addr(&identity, &client_cfg)?
+        };
 
         let share_result = tokio::time::timeout(ttl, async {
             // Open the rendezvous transport.
@@ -245,10 +262,7 @@ pub fn share(
                 .await
                 .map_err(|e| anyhow!("connect to rendezvous server: {e}"))?;
 
-            eprintln!(
-                "portl: sharing {} as session \"{session_name}\"",
-                form.safe_display()
-            );
+            eprintln!("portl: sharing {share_display}");
 
             let now = unix_now()?;
             let envelope_result = run_offer_against_transport(
@@ -271,7 +285,7 @@ pub fn share(
                         identity: &identity,
                         target_addr: target_addr.clone(),
                         hello,
-                        session_name: &session_name,
+                        session_name,
                         provider,
                         origin_label_hint: origin_label_hint.clone(),
                         target_label_hint: target_label_hint.clone(),
@@ -325,6 +339,59 @@ pub fn share(
     result
 }
 
+fn local_session_target_addr(
+    identity: &portl_core::id::Identity,
+    cfg: &portl_agent::AgentConfig,
+) -> Result<iroh_base::EndpointAddr> {
+    let mut addr = iroh_base::EndpointAddr::new(identity.endpoint_id());
+    if let Some(relay_hint) = crate::client_endpoint::preferred_relay_hint(cfg) {
+        let relay_url = relay_hint
+            .parse()
+            .with_context(|| format!("parse configured relay URL {relay_hint:?}"))?;
+        addr = addr.with_relay_url(relay_url);
+    }
+    Ok(addr)
+}
+
+fn attach_session_defaults(
+    target: &str,
+    session: Option<&str>,
+    provider: Option<&str>,
+) -> Result<(String, Option<String>)> {
+    let tickets = TicketStore::load(&TicketStore::default_path()).context("load ticket store")?;
+    Ok(attach_session_defaults_from_store(
+        target, session, provider, &tickets,
+    ))
+}
+
+fn attach_session_defaults_from_store(
+    target: &str,
+    session: Option<&str>,
+    provider: Option<&str>,
+    tickets: &TicketStore,
+) -> (String, Option<String>) {
+    if let Some(session) = session {
+        return (session.to_owned(), provider.map(ToOwned::to_owned));
+    }
+
+    if let Some(metadata) = tickets
+        .get(target)
+        .and_then(|entry| entry.session_share.as_ref())
+    {
+        return (
+            metadata.provider_session.clone(),
+            provider
+                .map(ToOwned::to_owned)
+                .or_else(|| metadata.provider.clone()),
+        );
+    }
+
+    (
+        default_session_name(target, None),
+        provider.map(ToOwned::to_owned),
+    )
+}
+
 pub fn attach(
     target: &str,
     session: Option<&str>,
@@ -333,21 +400,21 @@ pub fn attach(
     cwd: Option<&str>,
     argv: &[String],
 ) -> Result<ExitCode> {
+    let (session_name, provider_name) = attach_session_defaults(target, session, provider)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
         let connected = connect_peer(target, session_caps()).await?;
         let (cols, rows) = size().unwrap_or((80, 24));
         let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_owned());
-        let session_name = default_session_name(target, session);
         eprintln!(
             "portl: using session provider {}",
-            provider.unwrap_or("target default")
+            provider_name.as_deref().unwrap_or("target default")
         );
         eprintln!("portl: attaching to session \"{session_name}\"");
         let session = open_session_attach(
             &connected.connection,
             &connected.session,
-            provider.map(ToOwned::to_owned),
+            provider_name,
             session_name,
             (!argv.is_empty()).then_some(argv.to_vec()),
             user.map(ToOwned::to_owned),
@@ -563,4 +630,54 @@ async fn read_exit(recv: &mut BufferedRecv) -> Result<i32> {
         .await?
         .context("missing exit frame")?;
     Ok(frame.code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use portl_core::ticket_store::{SessionShareMetadata, TicketEntry};
+
+    #[test]
+    fn attach_defaults_infer_session_share_metadata() {
+        let mut tickets = TicketStore::new();
+        tickets
+            .insert(
+                "max-b265-dotfiles".to_owned(),
+                TicketEntry {
+                    endpoint_id_hex: hex::encode([1u8; 32]),
+                    ticket_string: "portl-redacted".to_owned(),
+                    expires_at: 2_000_000,
+                    saved_at: 1_000_000,
+                    session_share: Some(SessionShareMetadata {
+                        friendly_name: "dotfiles".to_owned(),
+                        provider_session: "dotfiles".to_owned(),
+                        provider: Some("zmx".to_owned()),
+                        origin_label_hint: Some("max-b265".to_owned()),
+                        target_label_hint: Some("max-b265".to_owned()),
+                    }),
+                },
+            )
+            .unwrap();
+
+        let (session, provider) =
+            attach_session_defaults_from_store("max-b265-dotfiles", None, None, &tickets);
+
+        assert_eq!(session, "dotfiles");
+        assert_eq!(provider.as_deref(), Some("zmx"));
+    }
+
+    #[test]
+    fn attach_defaults_honor_explicit_session_and_provider() {
+        let tickets = TicketStore::new();
+
+        let (session, provider) = attach_session_defaults_from_store(
+            "max-b265-dotfiles",
+            Some("override"),
+            Some("manual"),
+            &tickets,
+        );
+
+        assert_eq!(session, "override");
+        assert_eq!(provider.as_deref(), Some("manual"));
+    }
 }

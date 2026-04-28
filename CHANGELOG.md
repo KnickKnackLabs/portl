@@ -5,6 +5,15 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Changed
+
+- `portl session share` is now local-session-first: use
+  `portl session share dotfiles` to share this machine's `dotfiles`
+  session, and `--target <peer>` only for explicit remote-target shares.
+- Imported session-share tickets now remember their provider session, so
+  the suggested attach command is simply `portl session attach <label>`
+  instead of repeating the session name.
+
 ## 0.6.3 — 2026-04-28
 
 ### Fixed

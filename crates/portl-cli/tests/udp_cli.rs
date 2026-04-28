@@ -15,6 +15,7 @@ use tempfile::tempdir;
 use tokio::net::UdpSocket;
 
 #[tokio::test]
+#[ignore = "slow e2e smoke; run before release tagging with `mise run release:verify -- VERSION --full`"]
 async fn udp_command_connects_and_forwards_datagrams() -> Result<()> {
     let remote = UdpSocket::bind(("127.0.0.1", 0)).await?;
     let remote_port = remote.local_addr()?.port();
@@ -67,6 +68,7 @@ async fn udp_command_connects_and_forwards_datagrams() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "slow e2e smoke; run before release tagging with `mise run release:verify -- VERSION --full`"]
 async fn udp_forward_handle_reconnects_and_preserves_session() -> Result<()> {
     let remote = UdpSocket::bind(("127.0.0.1", 0)).await?;
     let remote_port = remote.local_addr()?.port();

@@ -545,6 +545,7 @@ mod tests {
                     ticket_string: "portl-redacted".to_owned(),
                     expires_at: 2_000,
                     saved_at: 1_000,
+                    session_share: None,
                 },
             )
             .unwrap();

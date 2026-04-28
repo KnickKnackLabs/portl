@@ -87,6 +87,7 @@ pub fn run(label: &str, ticket_string: Option<&str>) -> Result<ExitCode> {
             ticket_string: ticket_string.to_owned(),
             expires_at,
             saved_at: now,
+            session_share: None,
         },
     )?;
     tickets.save(&tickets_path)?;

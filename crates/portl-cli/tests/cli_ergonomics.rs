@@ -60,7 +60,7 @@ fn connect_commands_use_target_metavars() {
         ),
         (
             &["session", "attach", "--help"][..],
-            "Usage: portl session attach [OPTIONS] <TARGET> [SESSION] [-- <ARGV>...]",
+            "Usage: portl session attach [OPTIONS] <TARGET> [-- <ARGV>...]",
         ),
     ] {
         let help = help_output(args);
@@ -213,6 +213,7 @@ fn session_surface_matches_spec() {
             "session",
             "attach",
             "dev",
+            "--session",
             "frontend",
             "--provider",
             "zmx",
@@ -282,16 +283,24 @@ fn session_surface_matches_spec() {
 }
 
 #[test]
-fn session_share_parses_target_and_session() {
-    let parsed = parse_args(&["session", "share", "shared-box", "dev"]).expect("parse");
+fn session_share_parses_local_session_first() {
+    let parsed = parse_args(&["session", "share", "dev"]).expect("parse");
     assert!(matches!(
         parsed,
         ParsedCommand::SessionShare {
-            ref target,
-            session: Some(ref session),
+            ref session,
+            target: None,
             ..
-        } if target == "shared-box" && session == "dev"
+        } if session == "dev"
     ));
+}
+
+#[test]
+fn session_share_rejects_old_target_session_positionals() {
+    assert_clap_error(
+        &["session", "share", "shared-box", "dev"],
+        &["unexpected argument"],
+    );
 }
 
 #[test]
@@ -299,8 +308,9 @@ fn session_share_parses_full_option_set() {
     let parsed = parse_args(&[
         "session",
         "share",
-        "shared-box",
         "dev",
+        "--target",
+        "shared-box",
         "--provider",
         "zmx",
         "--ttl",
@@ -327,8 +337,8 @@ fn session_share_parses_full_option_set() {
             yes,
             allow_bearer_fallback,
         } => {
-            assert_eq!(target, "shared-box");
-            assert_eq!(session.as_deref(), Some("dev"));
+            assert_eq!(target.as_deref(), Some("shared-box"));
+            assert_eq!(session, "dev");
             assert_eq!(provider.as_deref(), Some("zmx"));
             assert_eq!(ttl, std::time::Duration::from_secs(300));
             assert_eq!(access_ttl, std::time::Duration::from_secs(1_800));
@@ -357,7 +367,7 @@ fn session_share_unsupported_ticket_target_does_not_echo_input() {
     let secret_label = "this-is-a-secret-target-string";
     let output = ProcessCommand::cargo_bin("portl")
         .expect("cargo bin")
-        .args(["session", "share", secret_label])
+        .args(["session", "share", "dev", "--target", secret_label])
         .output()
         .expect("run session share");
     assert!(!output.status.success(), "expected failure");

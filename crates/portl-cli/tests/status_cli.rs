@@ -11,6 +11,7 @@ use portl_core::ticket::schema::{Capabilities, MetaCaps};
 use tempfile::tempdir;
 
 #[tokio::test]
+#[ignore = "slow e2e smoke; run before release tagging with `mise run release:verify -- VERSION --full`"]
 async fn status_command_reports_cached_ticket_peer() -> Result<()> {
     let (client, server) = pair().await?;
     let operator = Identity::new();
@@ -54,6 +55,7 @@ async fn status_command_reports_cached_ticket_peer() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "slow e2e smoke; run before release tagging with `mise run release:verify -- VERSION --full`"]
 async fn status_command_reports_bare_endpoint_peer() -> Result<()> {
     let (client, server) = pair().await?;
     let operator = Identity::new();
@@ -84,17 +86,19 @@ async fn status_command_reports_bare_endpoint_peer() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "slow e2e smoke; run before release tagging with `mise run release:verify -- VERSION --full`"]
 async fn status_refuses_delegated_tickets() -> Result<()> {
     let home = tempdir()?;
     let identity_path = home.path().join("identity.bin");
     let operator = Identity::new();
     store::save(&operator, &identity_path)?;
 
-    let (_, server) = pair().await?;
+    let target = Identity::new();
+    let target_id = iroh_base::EndpointId::from_bytes(&target.verifying_key())?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let root = mint_root(
         operator.signing_key(),
-        server.addr(),
+        iroh_base::EndpointAddr::new(target_id),
         meta_caps(),
         now,
         now + 300,
@@ -127,7 +131,6 @@ async fn status_refuses_delegated_tickets() -> Result<()> {
         "unexpected error: {err:#}"
     );
 
-    server.inner().close().await;
     Ok(())
 }
 

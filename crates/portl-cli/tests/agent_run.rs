@@ -26,6 +26,7 @@ const AGENT_ENV_VARS: &[&str] = &[
 ];
 
 #[tokio::test]
+#[ignore = "slow e2e smoke; run before release tagging with `mise run release:verify -- VERSION --full`"]
 async fn agent_run_loads_env_config_and_accepts_configured_root() -> Result<()> {
     let home = tempdir()?;
     let identity_path = home.path().join("identity.bin");

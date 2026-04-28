@@ -15,6 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 #[tokio::test]
+#[ignore = "slow e2e smoke; run before release tagging with `mise run release:verify -- VERSION --full`"]
 async fn exec_command_connects_and_returns_output() -> Result<()> {
     let (client, server) = pair().await?;
     let operator = Identity::new();
@@ -52,6 +53,7 @@ async fn exec_command_connects_and_returns_output() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "slow e2e smoke; run before release tagging with `mise run release:verify -- VERSION --full`"]
 async fn exec_exits_promptly_when_child_exits_with_stdin_idle() -> Result<()> {
     let (client, server) = pair().await?;
     let operator = Identity::new();
@@ -81,6 +83,7 @@ async fn exec_exits_promptly_when_child_exits_with_stdin_idle() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "slow e2e smoke; run before release tagging with `mise run release:verify -- VERSION --full`"]
 async fn shell_command_connects_and_dispatches_noninteractive_session() -> Result<()> {
     let (client, server) = pair().await?;
     let operator = Identity::new();
@@ -123,6 +126,7 @@ async fn shell_command_connects_and_dispatches_noninteractive_session() -> Resul
 }
 
 #[tokio::test]
+#[ignore = "slow e2e smoke; run before release tagging with `mise run release:verify -- VERSION --full`"]
 async fn tcp_command_connects_and_forwards_bytes() -> Result<()> {
     let remote_listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let remote_port = remote_listener.local_addr()?.port();

@@ -19,6 +19,18 @@ use serde::{Deserialize, Serialize};
 use crate::peer_store::home_dir_pub as home_dir;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionShareMetadata {
+    pub friendly_name: String,
+    pub provider_session: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_label_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_label_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketEntry {
     /// Hex-encoded 32-byte endpoint id parsed from the ticket's
     /// terminal endpoint address. Bound at save time; `shell <label>`
@@ -32,6 +44,11 @@ pub struct TicketEntry {
     pub expires_at: u64,
     /// When the entry was saved (unix seconds).
     pub saved_at: u64,
+    /// Metadata captured when this ticket was imported from a
+    /// `PORTL-S-*` session share. Lets `portl session attach <label>`
+    /// infer the provider session without repeating it positionally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_share: Option<SessionShareMetadata>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -159,6 +176,7 @@ mod tests {
             ticket_string: format!("portl{eid:02x}"),
             expires_at,
             saved_at: 1_000_000,
+            session_share: None,
         }
     }
 
@@ -174,6 +192,33 @@ mod tests {
         let loaded = TicketStore::load(&path).unwrap();
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded.get("a").unwrap().expires_at, 2_000_000);
+    }
+
+    #[test]
+    fn session_share_metadata_roundtrips_through_disk() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tickets.json");
+        let mut entry = mk(1, 2_000_000);
+        entry.session_share = Some(SessionShareMetadata {
+            friendly_name: "dotfiles".to_owned(),
+            provider_session: "dotfiles".to_owned(),
+            provider: Some("zmx".to_owned()),
+            origin_label_hint: Some("max-b265".to_owned()),
+            target_label_hint: Some("max-b265".to_owned()),
+        });
+        let mut store = TicketStore::new();
+        store.insert("max-b265-dotfiles".into(), entry).unwrap();
+        store.save(&path).unwrap();
+
+        let loaded = TicketStore::load(&path).unwrap();
+        let metadata = loaded
+            .get("max-b265-dotfiles")
+            .unwrap()
+            .session_share
+            .as_ref()
+            .unwrap();
+        assert_eq!(metadata.provider_session, "dotfiles");
+        assert_eq!(metadata.origin_label_hint.as_deref(), Some("max-b265"));
     }
 
     #[test]

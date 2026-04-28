@@ -199,6 +199,36 @@ fn session_share_help_mentions_sender_must_stay_online() {
 }
 
 #[test]
+fn session_share_help_is_local_session_first() {
+    let help = help_output(&["session", "share", "--help"]);
+    assert!(
+        help.contains("Usage: portl session share [OPTIONS] <SESSION>"),
+        "session share should take exactly one positional session name:\n{help}"
+    );
+    assert!(
+        help.contains("--target <TARGET>"),
+        "session share should expose explicit remote targets only via --target:\n{help}"
+    );
+    assert!(
+        help.contains("Share local session SESSION"),
+        "session share help should describe the local-session-first UX:\n{help}"
+    );
+}
+
+#[test]
+fn session_attach_help_uses_one_positional_with_session_flag() {
+    let help = help_output(&["session", "attach", "--help"]);
+    assert!(
+        help.contains("Usage: portl session attach [OPTIONS] <TARGET>"),
+        "session attach should not require a repeated positional session name:\n{help}"
+    );
+    assert!(
+        help.contains("--session <SESSION>"),
+        "session attach should expose an explicit --session override:\n{help}"
+    );
+}
+
+#[test]
 fn top_level_help_snapshots_match() {
     let cases = [
         (

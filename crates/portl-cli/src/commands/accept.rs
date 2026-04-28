@@ -25,7 +25,7 @@ use portl_core::store_index::label_in_use;
 use portl_core::ticket::canonical::{canonical_check_ticket, resolved_issuer};
 use portl_core::ticket::schema::PortlTicket;
 use portl_core::ticket::sign::verify_body;
-use portl_core::ticket_store::{TicketEntry, TicketStore};
+use portl_core::ticket_store::{SessionShareMetadata, TicketEntry, TicketStore};
 
 use crate::commands;
 use crate::commands::session_share::{load_identity, resolve_rendezvous_url, share_caps};
@@ -274,6 +274,13 @@ pub(crate) fn import_exchange_envelope(
             ticket_string: share.ticket.clone(),
             expires_at: ticket.body.not_after,
             saved_at: now,
+            session_share: Some(SessionShareMetadata {
+                friendly_name: share.friendly_name.clone(),
+                provider_session: share.provider_session.clone(),
+                provider: share.provider.clone(),
+                origin_label_hint: share.origin_label_hint.clone(),
+                target_label_hint: share.target_label_hint.clone(),
+            }),
         },
     )?;
     tickets.save(tickets_path)?;
@@ -287,11 +294,8 @@ pub(crate) fn import_exchange_envelope(
     } else {
         println!("Accepted session share \"{}\".", share.friendly_name);
     }
-    println!("Saved access as ticket \"{label}\" (expires in {expires_in_secs}s).\n");
-    println!(
-        "Attach with:\n  portl session attach {label} {}",
-        share.provider_session
-    );
+    println!("Saved as \"{label}\" (expires in {expires_in_secs}s).\n");
+    println!("Attach with:\n  portl session attach {label}");
 
     Ok(label)
 }
@@ -638,12 +642,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(label, "max-b265-dev");
-        assert!(
-            TicketStore::load(&tickets_path)
-                .unwrap()
-                .get("max-b265-dev")
-                .is_some()
-        );
+        let tickets = TicketStore::load(&tickets_path).unwrap();
+        let saved = tickets.get("max-b265-dev").unwrap();
+        let metadata = saved.session_share.as_ref().unwrap();
+        assert_eq!(metadata.provider_session, "dev");
+        assert_eq!(metadata.origin_label_hint.as_deref(), Some("alice"));
+        assert_eq!(metadata.target_label_hint.as_deref(), Some("max-b265"));
     }
 
     #[test]

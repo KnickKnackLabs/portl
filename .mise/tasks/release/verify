@@ -96,6 +96,14 @@ def main() -> int:
             run(["cargo", "test", "-p", "portl-cli", "--test", "help_cli"])
             run(["cargo", "test", "-p", "portl-cli", "--lib"])
             run(["cargo", "clippy", "-p", "portl-cli", "--all-targets", "--", "-D", "warnings"])
+            for test_target in [
+                "endpoint_close_cli",
+                "status_cli",
+                "agent_run",
+                "udp_cli",
+                "m3_cli",
+            ]:
+                run(["cargo", "test", "-p", "portl-cli", "--test", test_target, "--", "--ignored"])
     print(f"release metadata verified for v{args.version}")
     return 0
 

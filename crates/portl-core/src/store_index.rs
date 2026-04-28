@@ -50,6 +50,7 @@ mod tests {
                     ticket_string: "portl...".into(),
                     expires_at: 2_000_000,
                     saved_at: 1_000_000,
+                    session_share: None,
                 },
             )
             .unwrap();
