@@ -5,6 +5,8 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.6.7 — 2026-04-29
+
 ### Fixed
 
 - Fresh peer dialing now starts from stored/configured relay candidates
