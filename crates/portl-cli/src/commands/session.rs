@@ -198,31 +198,38 @@ pub fn share(
         anyhow::bail!("session name cannot be empty");
     }
 
-    let identity = load_identity(None)?;
-    let local_label = crate::commands::local_machine_label(&hex::encode(identity.verifying_key()));
-    let (target_form, target_label_hint, share_display) = if let Some(target) = target {
+    let target_form = if let Some(target) = target {
         // Classify explicit targets up-front so unsupported forms fail fast without
-        // ever echoing raw input that may be a ticket credential.
+        // needing local identity and without echoing raw input that may be a ticket credential.
         let peers = PeerStore::load(&PeerStore::default_path()).context("load peer store")?;
         let tickets =
             TicketStore::load(&TicketStore::default_path()).context("load ticket store")?;
         let aliases = crate::alias_store::AliasStore::default();
-        let form = match classify_share_target(target, &peers, &tickets, &aliases) {
-            Ok(form) => form,
-            Err(ResolveTargetError::TicketCredential) => {
-                anyhow::bail!(
-                    "session share cannot delegate a ticket credential passed as --target. \
+        Some(
+            match classify_share_target(target, &peers, &tickets, &aliases) {
+                Ok(form) => form,
+                Err(ResolveTargetError::TicketCredential) => {
+                    anyhow::bail!(
+                        "session share cannot delegate a ticket credential passed as --target. \
                      Use a peer-store label, alias, or `endpoint_id` instead."
-                );
-            }
-            Err(err) => return Err(err.into()),
-        };
+                    );
+                }
+                Err(err) => return Err(err.into()),
+            },
+        )
+    } else {
+        None
+    };
+
+    let identity = load_identity(None)?;
+    let local_label = crate::commands::local_machine_label(&hex::encode(identity.verifying_key()));
+    let (target_label_hint, share_display) = if let Some(form) = &target_form {
         let target_label_hint = form.target_label_hint();
         let display = format!("session \"{session_name}\" on {}", form.safe_display());
-        (Some(form), target_label_hint, display)
+        (target_label_hint, display)
     } else {
         let display = format!("local session \"{session_name}\" from {local_label}");
-        (None, local_label.clone(), display)
+        (local_label.clone(), display)
     };
 
     let url = resolve_rendezvous_url(rendezvous_url);
