@@ -5,6 +5,8 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.6.4 — 2026-04-28
+
 ### Changed
 
 - `portl session share` is now local-session-first: use
