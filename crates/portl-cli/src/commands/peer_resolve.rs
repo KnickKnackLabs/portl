@@ -410,9 +410,14 @@ fn unix_now() -> Result<u64> {
         .as_secs())
 }
 
-/// Run iroh's address discovery for `endpoint_id` and return the
-/// first usable `EndpointAddr`, plus its provenance string ("dns",
-/// "pkarr", "mdns", "relay", …) for surfacing to users.
+/// Run iroh's address discovery for `endpoint_id` and return as soon as
+/// the first usable `EndpointAddr` appears, plus its provenance string
+/// ("dns", "pkarr", "mdns", "relay", …) for surfacing to users.
+///
+/// Discovery streams are not treated as finite enumerations: local/mDNS
+/// discovery can keep probing after DNS/PKARR has already yielded a viable
+/// relay. Callers that know static relay hints should merge them around this
+/// helper rather than waiting for the stream to exhaust.
 ///
 /// When `force_relay` is true, the returned addr is rewritten to
 /// the peer's relay URL only (direct-UDP candidates dropped). This
@@ -424,10 +429,7 @@ pub(crate) async fn resolve_endpoint_addr_with_relay_hints(
     configured_relay_hints: &[String],
     force_relay: bool,
 ) -> Result<(EndpointAddr, String)> {
-    if force_relay
-        && let Some(fallback) =
-            relay_fallback_addr(endpoint_id, relay_hint, configured_relay_hints)?
-    {
+    if let Some(fallback) = relay_fallback_addr(endpoint_id, relay_hint, configured_relay_hints)? {
         return Ok(fallback);
     }
 
@@ -475,8 +477,6 @@ pub(crate) async fn resolve_endpoint_addr(
         );
     }
     let mut saw_empty_addr = false;
-    let mut merged_addr = EndpointAddr::new(endpoint_id);
-    let mut provenances = Vec::new();
     let mut stream = endpoint
         .address_lookup()
         .context("access address lookup")?
@@ -490,8 +490,8 @@ pub(crate) async fn resolve_endpoint_addr(
                     saw_empty_addr = true;
                     continue;
                 }
-                merged_addr = merged_addr.with_addrs(addr.addrs);
-                provenances.push(normalize_discovery_source(&provenance));
+                let addr = maybe_force_relay_addr(endpoint_id, addr, force_relay)?;
+                return Ok((addr, normalize_discovery_source(&provenance)));
             }
             Ok(Err(_)) => {}
             Err(AddressLookupFailed::NoServiceConfigured { .. }) => {
@@ -509,25 +509,10 @@ pub(crate) async fn resolve_endpoint_addr(
                     .map(|err| err.to_string())
                     .collect::<Vec<_>>()
                     .join("; ");
-                if is_usable_endpoint_addr(&merged_addr) {
-                    break;
-                }
                 bail!("discovery failed: {detail}")
             }
             Err(err) => return Err(anyhow!(err)),
         }
-    }
-
-    if is_usable_endpoint_addr(&merged_addr) {
-        let addr = maybe_force_relay_addr(endpoint_id, merged_addr, force_relay)?;
-        provenances.sort();
-        provenances.dedup();
-        let provenance = if provenances.is_empty() {
-            "discovery".to_owned()
-        } else {
-            provenances.join("+")
-        };
-        return Ok((addr, provenance));
     }
 
     if saw_empty_addr {
@@ -682,6 +667,26 @@ mod tests {
     fn empty_endpoint_addr_is_not_usable_for_ticket_minting() {
         let addr = EndpointAddr::new(endpoint_id());
         assert!(!is_usable_endpoint_addr(&addr));
+    }
+
+    #[test]
+    fn static_relay_hints_are_added_to_discovered_addr() {
+        let endpoint_id = endpoint_id();
+        let discovered = EndpointAddr::new(endpoint_id)
+            .with_relay_url("https://discovered.example/".parse().unwrap());
+        let configured = vec!["https://configured.example/".to_owned()];
+
+        let addr = add_relay_hints(discovered, Some("https://stored.example/"), &configured)
+            .expect("valid relay hints");
+
+        assert_eq!(
+            relay_urls(&addr),
+            vec![
+                "https://configured.example/",
+                "https://discovered.example/",
+                "https://stored.example/",
+            ]
+        );
     }
 
     #[test]

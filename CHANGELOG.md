@@ -5,6 +5,16 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Fixed
+
+- Fresh peer dialing now starts from stored/configured relay candidates
+  immediately instead of waiting for open-ended ambient discovery streams
+  to finish, avoiding short command timeouts after DNS/PKARR already found
+  a usable relay.
+- Local session commands that resolve to this machine now use the local
+  `zmx` provider path instead of attempting an unsupported Iroh
+  self-connection.
+
 ## 0.6.6 — 2026-04-29
 
 ### Added

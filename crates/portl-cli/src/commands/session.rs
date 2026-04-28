@@ -1,5 +1,6 @@
 use std::io::IsTerminal;
-use std::process::ExitCode;
+use std::path::{Path, PathBuf};
+use std::process::{ExitCode, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -13,6 +14,7 @@ use portl_core::net::{
 };
 use portl_core::ticket::schema::{Capabilities, EnvPolicy, ShellCaps};
 use tokio::io::{AsyncWriteExt, copy};
+use tokio::process::Command;
 use tracing::debug;
 
 use crate::commands::peer_resolve::{close_connected, connect_peer};
@@ -24,6 +26,7 @@ use crate::commands::session_share::{
 use portl_core::peer_store::PeerStore;
 use portl_core::rendezvous::ws::WsRendezvousBackend;
 use portl_core::ticket_store::TicketStore;
+use portl_proto::session_v1::{ProviderCapabilities, ProviderReport, ProviderStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SessionHistoryFormat {
@@ -46,8 +49,14 @@ pub fn providers(target: Option<&str>, json: bool) -> Result<ExitCode> {
     let target = resolve_target_only(target)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
-        let connected = connect_peer(&target, session_caps()).await?;
-        let report = open_session_providers(&connected.connection, &connected.session).await?;
+        let report = if resolved_target_is_local(&target)? {
+            local_session_providers()
+        } else {
+            let connected = connect_peer(&target, session_caps()).await?;
+            let report = open_session_providers(&connected.connection, &connected.session).await?;
+            close_connected(connected, b"session complete").await;
+            report
+        };
         if json {
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
@@ -77,7 +86,6 @@ pub fn providers(target: Option<&str>, json: bool) -> Result<ExitCode> {
                 );
             }
         }
-        close_connected(connected, b"session complete").await;
         Ok(ExitCode::SUCCESS)
     });
     runtime.shutdown_background();
@@ -88,13 +96,19 @@ pub fn ls(target: Option<&str>, provider: Option<&str>, json: bool) -> Result<Ex
     let target = resolve_target_only(target)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
-        let connected = connect_peer(&target, session_caps()).await?;
-        let sessions = open_session_list(
-            &connected.connection,
-            &connected.session,
-            provider.map(ToOwned::to_owned),
-        )
-        .await?;
+        let sessions = if resolved_target_is_local(&target)? {
+            local_session_list(provider).await?
+        } else {
+            let connected = connect_peer(&target, session_caps()).await?;
+            let sessions = open_session_list(
+                &connected.connection,
+                &connected.session,
+                provider.map(ToOwned::to_owned),
+            )
+            .await?;
+            close_connected(connected, b"session complete").await;
+            sessions
+        };
         if json {
             println!("{}", serde_json::to_string_pretty(&sessions)?);
         } else {
@@ -102,7 +116,6 @@ pub fn ls(target: Option<&str>, provider: Option<&str>, json: bool) -> Result<Ex
                 println!("{session}");
             }
         }
-        close_connected(connected, b"session complete").await;
         Ok(ExitCode::SUCCESS)
     });
     runtime.shutdown_background();
@@ -118,18 +131,23 @@ pub fn run(
     let resolved = resolve_session_ref(session, target)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
-        let connected = connect_peer(&resolved.target, session_caps()).await?;
-        let run = open_session_run(
-            &connected.connection,
-            &connected.session,
-            provider.map(ToOwned::to_owned),
-            resolved.session,
-            argv.to_vec(),
-        )
-        .await?;
+        let run = if resolved_target_is_local(&resolved.target)? {
+            local_session_run(provider, &resolved.session, argv).await?
+        } else {
+            let connected = connect_peer(&resolved.target, session_caps()).await?;
+            let run = open_session_run(
+                &connected.connection,
+                &connected.session,
+                provider.map(ToOwned::to_owned),
+                resolved.session,
+                argv.to_vec(),
+            )
+            .await?;
+            close_connected(connected, b"session complete").await;
+            run
+        };
         print!("{}", run.stdout);
         eprint!("{}", run.stderr);
-        close_connected(connected, b"session complete").await;
         Ok(exit_code_from_i32(run.code))
     });
     runtime.shutdown_background();
@@ -151,16 +169,21 @@ pub fn history(
     let resolved = resolve_session_ref(session, target)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
-        let connected = connect_peer(&resolved.target, session_caps()).await?;
-        let output = open_session_history(
-            &connected.connection,
-            &connected.session,
-            provider.map(ToOwned::to_owned),
-            resolved.session,
-        )
-        .await?;
+        let output = if resolved_target_is_local(&resolved.target)? {
+            local_session_history(provider, &resolved.session).await?
+        } else {
+            let connected = connect_peer(&resolved.target, session_caps()).await?;
+            let output = open_session_history(
+                &connected.connection,
+                &connected.session,
+                provider.map(ToOwned::to_owned),
+                resolved.session,
+            )
+            .await?;
+            close_connected(connected, b"session complete").await;
+            output
+        };
         print!("{output}");
-        close_connected(connected, b"session complete").await;
         Ok(ExitCode::SUCCESS)
     });
     runtime.shutdown_background();
@@ -175,15 +198,19 @@ pub fn kill(
     let resolved = resolve_session_ref(session, target)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
-        let connected = connect_peer(&resolved.target, session_caps()).await?;
-        open_session_kill(
-            &connected.connection,
-            &connected.session,
-            provider.map(ToOwned::to_owned),
-            resolved.session,
-        )
-        .await?;
-        close_connected(connected, b"session complete").await;
+        if resolved_target_is_local(&resolved.target)? {
+            local_session_kill(provider, &resolved.session).await?;
+        } else {
+            let connected = connect_peer(&resolved.target, session_caps()).await?;
+            open_session_kill(
+                &connected.connection,
+                &connected.session,
+                provider.map(ToOwned::to_owned),
+                resolved.session,
+            )
+            .await?;
+            close_connected(connected, b"session complete").await;
+        }
         Ok(ExitCode::SUCCESS)
     });
     runtime.shutdown_background();
@@ -401,6 +428,224 @@ fn local_session_target_addr(
     Ok(addr)
 }
 
+fn resolved_target_is_local(target: &str) -> Result<bool> {
+    let identity = load_identity(None)?;
+    let local_endpoint_hex = hex::encode(identity.verifying_key());
+    let local_label = crate::commands::local_machine_label(&local_endpoint_hex);
+    let peers = PeerStore::load(&PeerStore::default_path()).context("load peer store")?;
+    let tickets = TicketStore::load(&TicketStore::default_path()).context("load ticket store")?;
+    let aliases = crate::alias_store::AliasStore::default();
+    Ok(resolved_target_is_local_with_stores(
+        target,
+        &local_label,
+        &local_endpoint_hex,
+        &peers,
+        &tickets,
+        &aliases,
+    ))
+}
+
+fn resolved_target_is_local_with_stores(
+    target: &str,
+    local_label: &str,
+    local_endpoint_hex: &str,
+    peers: &PeerStore,
+    tickets: &TicketStore,
+    aliases: &crate::alias_store::AliasStore,
+) -> bool {
+    let target = target.trim();
+    if target.eq_ignore_ascii_case(local_endpoint_hex) || target == local_label {
+        return true;
+    }
+
+    for hint in target_hints_for_locality(target) {
+        if hint.eq_ignore_ascii_case(local_endpoint_hex) || hint == local_label {
+            return true;
+        }
+        if let Some(entry) = peers.get_by_label(hint)
+            && (entry.is_self
+                || entry
+                    .endpoint_id_hex
+                    .eq_ignore_ascii_case(local_endpoint_hex))
+        {
+            return true;
+        }
+        if let Some(entry) = tickets.get(hint)
+            && entry
+                .endpoint_id_hex
+                .eq_ignore_ascii_case(local_endpoint_hex)
+        {
+            return true;
+        }
+        if let Ok(resolved) = resolve_target_hint_with_stores(hint, peers, tickets, aliases)
+            && resolved
+                .endpoint_id_hex
+                .as_deref()
+                .is_some_and(|endpoint| endpoint.eq_ignore_ascii_case(local_endpoint_hex))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn target_hints_for_locality(target: &str) -> Vec<&str> {
+    let mut hints = vec![target];
+    if let Some((host, _session)) = target.split_once('/') {
+        hints.push(host);
+    }
+    hints
+}
+
+fn local_session_providers() -> ProviderReport {
+    let status = local_zmx_status();
+    ProviderReport {
+        default_provider: status.available.then(|| "zmx".to_owned()),
+        providers: vec![status],
+    }
+}
+
+async fn local_session_list(provider: Option<&str>) -> Result<Vec<String>> {
+    ensure_local_provider(provider)?;
+    let output = run_local_zmx_capture(&["list"]).await?;
+    ensure_local_zmx_success("zmx list", &output)?;
+    Ok(output
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+async fn local_session_run(
+    provider: Option<&str>,
+    session: &str,
+    argv: &[String],
+) -> Result<portl_proto::session_v1::SessionRunResult> {
+    ensure_local_provider(provider)?;
+    let mut zmx_args = vec!["run", session];
+    zmx_args.extend(argv.iter().map(String::as_str));
+    run_local_zmx_capture(&zmx_args).await
+}
+
+async fn local_session_history(provider: Option<&str>, session: &str) -> Result<String> {
+    ensure_local_provider(provider)?;
+    let output = run_local_zmx_capture(&["history", session]).await?;
+    ensure_local_zmx_success("zmx history", &output)?;
+    Ok(output.stdout)
+}
+
+async fn local_session_kill(provider: Option<&str>, session: &str) -> Result<()> {
+    ensure_local_provider(provider)?;
+    let output = run_local_zmx_capture(&["kill", session]).await?;
+    ensure_local_zmx_success("zmx kill", &output)
+}
+
+async fn local_session_attach(
+    provider: Option<&str>,
+    session: &str,
+    user: Option<&str>,
+    cwd: Option<&str>,
+    argv: &[String],
+) -> Result<ExitCode> {
+    ensure_local_provider(provider)?;
+    if let Some(user) = user {
+        anyhow::bail!(
+            "--user is only supported for remote session targets, not local attach ({user})"
+        );
+    }
+    let path = local_zmx_path()?;
+    eprintln!("portl: using local session provider zmx");
+    eprintln!("portl: attaching to local session \"{session}\"");
+    let mut command = Command::new(path);
+    command.arg("attach").arg(session).args(argv);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    command
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let status = command.status().await.context("run zmx attach")?;
+    Ok(exit_code_from_i32(status.code().unwrap_or(1)))
+}
+
+fn local_zmx_status() -> ProviderStatus {
+    let path = local_zmx_path_opt();
+    ProviderStatus {
+        name: "zmx".to_owned(),
+        available: path.is_some(),
+        path: path.as_ref().map(|path| path.display().to_string()),
+        notes: path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .or_else(|| Some("not found".to_owned())),
+        capabilities: ProviderCapabilities::zmx(),
+        tier: Some("local".to_owned()),
+        features: Vec::new(),
+    }
+}
+
+async fn run_local_zmx_capture(args: &[&str]) -> Result<portl_proto::session_v1::SessionRunResult> {
+    let path = local_zmx_path()?;
+    let output = Command::new(&path)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .with_context(|| format!("run {} {}", path.display(), args.join(" ")))?;
+    Ok(portl_proto::session_v1::SessionRunResult {
+        code: output.status.code().unwrap_or(1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
+fn ensure_local_zmx_success(
+    context: &str,
+    output: &portl_proto::session_v1::SessionRunResult,
+) -> Result<()> {
+    if output.code == 0 {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "{context} failed with code {}: {}",
+            output.code,
+            output.stderr.trim()
+        )
+    }
+}
+
+fn ensure_local_provider(provider: Option<&str>) -> Result<()> {
+    match provider {
+        None | Some("zmx") => Ok(()),
+        Some(other) => {
+            anyhow::bail!("unsupported local session provider '{other}' (supported: zmx)")
+        }
+    }
+}
+
+fn local_zmx_path() -> Result<PathBuf> {
+    local_zmx_path_opt().ok_or_else(|| anyhow!("zmx is not installed locally"))
+}
+
+fn local_zmx_path_opt() -> Option<PathBuf> {
+    crate::client_endpoint::load_client_config()
+        .ok()
+        .and_then(|cfg| cfg.session_provider_path)
+        .filter(|path| path.exists())
+        .or_else(|| find_on_safe_path("zmx"))
+}
+
+fn find_on_safe_path(program: &str) -> Option<PathBuf> {
+    ["/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"]
+        .into_iter()
+        .map(|dir| Path::new(dir).join(program))
+        .find(|candidate| candidate.exists())
+}
+
 fn attach_session_defaults(
     target: &str,
     session: Option<&str>,
@@ -453,6 +698,11 @@ pub fn attach(
         attach_session_defaults(&resolved.target, Some(&resolved.session), provider)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
+        if resolved_target_is_local(&resolved.target)? {
+            return local_session_attach(provider_name.as_deref(), &session_name, user, cwd, argv)
+                .await;
+        }
+
         let connected = connect_peer(&resolved.target, session_caps()).await?;
         let (cols, rows) = size().unwrap_or((80, 24));
         let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_owned());
@@ -1071,6 +1321,45 @@ mod tests {
         .unwrap();
         assert_eq!(resolved.target, "max-b265/dotfiles");
         assert_eq!(resolved.session, "dotfiles");
+    }
+
+    #[test]
+    fn resolved_targets_detect_local_self_endpoint() {
+        let dir = TempDir::new().unwrap();
+        let mut peers = PeerStore::new();
+        peers
+            .insert_or_update(PeerEntry {
+                label: "max-b265".to_owned(),
+                endpoint_id_hex: hex::encode([0xb2; 32]),
+                accepts_from_them: true,
+                they_accept_from_me: true,
+                since: 1,
+                origin: PeerOrigin::Zelf,
+                last_hold_at: None,
+                is_self: true,
+                relay_hint: Some("https://relay.example/".to_owned()),
+                schema_version: PeerEntry::default_schema_version(),
+            })
+            .unwrap();
+        let tickets = TicketStore::new();
+        let aliases = crate::alias_store::AliasStore::new(dir.path().join("aliases.json"));
+
+        assert!(resolved_target_is_local_with_stores(
+            "max-b265",
+            "max-b265",
+            &hex::encode([0xb2; 32]),
+            &peers,
+            &tickets,
+            &aliases,
+        ));
+        assert!(resolved_target_is_local_with_stores(
+            "max-b265/dotfiles",
+            "max-b265",
+            &hex::encode([0xb2; 32]),
+            &peers,
+            &tickets,
+            &aliases,
+        ));
     }
 
     #[test]
