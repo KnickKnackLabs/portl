@@ -26,7 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::address_lookup::AddressLookupFailed;
 use iroh::endpoint::Connection;
-use iroh_base::{EndpointAddr, EndpointId};
+use iroh_base::{EndpointAddr, EndpointId, TransportAddr};
 use iroh_tickets::Ticket;
 use n0_future::StreamExt;
 use portl_core::endpoint::Endpoint;
@@ -216,8 +216,15 @@ pub(crate) async fn resolve_peer(peer: &str, opts: &ResolveOpts<'_>) -> Result<R
             let eid = entry.endpoint_id_bytes()?;
             let endpoint_id =
                 EndpointId::from_bytes(&eid).context("peer endpoint_id is not a valid iroh id")?;
-            let (addr, provenance) =
-                resolve_endpoint_addr(opts.endpoint, endpoint_id, opts.force_relay).await?;
+            let configured_relay_hints = configured_relay_hints();
+            let (addr, provenance) = resolve_endpoint_addr_with_relay_hints(
+                opts.endpoint,
+                endpoint_id,
+                entry.relay_hint.as_deref(),
+                &configured_relay_hints,
+                opts.force_relay,
+            )
+            .await?;
             let ticket = mint_fresh(opts.identity, addr, opts.caps.clone())?;
             return Ok(ResolvedPeer {
                 ticket,
@@ -270,8 +277,15 @@ pub(crate) async fn resolve_peer(peer: &str, opts: &ResolveOpts<'_>) -> Result<R
         }
         let endpoint_id = crate::eid::resolve(&alias.endpoint_id, None, None)
             .context("alias endpoint_id is not valid hex")?;
-        let (addr, provenance) =
-            resolve_endpoint_addr(opts.endpoint, endpoint_id, opts.force_relay).await?;
+        let configured_relay_hints = configured_relay_hints();
+        let (addr, provenance) = resolve_endpoint_addr_with_relay_hints(
+            opts.endpoint,
+            endpoint_id,
+            None,
+            &configured_relay_hints,
+            opts.force_relay,
+        )
+        .await?;
         eprintln!("using alias \"{peer}\"");
         let ticket = mint_fresh(opts.identity, addr, opts.caps.clone())?;
         return Ok(ResolvedPeer {
@@ -285,8 +299,15 @@ pub(crate) async fn resolve_peer(peer: &str, opts: &ResolveOpts<'_>) -> Result<R
     if let Ok(endpoint_id) = crate::eid::resolve(peer, Some(&peers), Some(&tickets)) {
         let short = crate::eid::format_short(&hex::encode(endpoint_id.as_bytes()));
         eprintln!("using endpoint \"{short}\"");
-        let (addr, provenance) =
-            resolve_endpoint_addr(opts.endpoint, endpoint_id, opts.force_relay).await?;
+        let configured_relay_hints = configured_relay_hints();
+        let (addr, provenance) = resolve_endpoint_addr_with_relay_hints(
+            opts.endpoint,
+            endpoint_id,
+            None,
+            &configured_relay_hints,
+            opts.force_relay,
+        )
+        .await?;
         let ticket = mint_fresh(opts.identity, addr, opts.caps.clone())?;
         return Ok(ResolvedPeer {
             ticket,
@@ -295,16 +316,41 @@ pub(crate) async fn resolve_peer(peer: &str, opts: &ResolveOpts<'_>) -> Result<R
         });
     }
 
-    // If we reached this point and the peer store had an entry that
-    // was just inbound-only, give the same inbound-only diagnosis as
-    // before — it's more actionable than the generic "unknown peer"
-    // message when the user genuinely has a paired-but-inbound peer.
-    if peers
-        .get_by_label(peer)
-        .is_some_and(|e| !e.they_accept_from_me)
+    // 6) Unique hostname shorthand → peer store. Checked after exact
+    //    ticket/alias/raw endpoint matches so shorthand never steals
+    //    an explicit saved credential label.
+    if let Some(peer_label) = resolve_peer_store_shorthand(&peers, peer)?
+        && let Some(entry) = peers.get_by_label(&peer_label)
     {
+        if entry.last_hold_at.is_some() {
+            bail!(
+                "peer '{peer_label}' is currently held; resume it with `portl peer resume {peer_label}` \
+                 before dialing"
+            );
+        }
+        if entry.they_accept_from_me {
+            eprintln!("using peer \"{peer_label}\"");
+            let eid = entry.endpoint_id_bytes()?;
+            let endpoint_id =
+                EndpointId::from_bytes(&eid).context("peer endpoint_id is not a valid iroh id")?;
+            let configured_relay_hints = configured_relay_hints();
+            let (addr, provenance) = resolve_endpoint_addr_with_relay_hints(
+                opts.endpoint,
+                endpoint_id,
+                entry.relay_hint.as_deref(),
+                &configured_relay_hints,
+                opts.force_relay,
+            )
+            .await?;
+            let ticket = mint_fresh(opts.identity, addr, opts.caps.clone())?;
+            return Ok(ResolvedPeer {
+                ticket,
+                source: PeerSource::PeerStore,
+                discovery: normalize_discovery_source(&provenance),
+            });
+        }
         bail!(
-            "peer '{peer}' is inbound-only — they accept from us, but we don't have \
+            "peer '{peer_label}' is inbound-only — they accept from us, but we don't have \
              outbound authority to mint into them, and no ticket / alias named \
              '{peer}' is stored locally. Ask the peer to run \
              `portl ticket issue <caps> --ttl <dur> --to {our_eid}` and paste the \
@@ -321,6 +367,34 @@ pub(crate) async fn resolve_peer(peer: &str, opts: &ResolveOpts<'_>) -> Result<R
          - pass a `portl…` ticket string directly\n  \
          - `portl peer add-unsafe-raw <endpoint_id> --label {peer} …` to pin"
     );
+}
+
+fn resolve_peer_store_shorthand(peers: &PeerStore, peer: &str) -> Result<Option<String>> {
+    let mut matches = peers
+        .iter()
+        .filter(|entry| label_hostname(&entry.label).as_deref() == Some(peer))
+        .map(|entry| entry.label.clone())
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.dedup();
+
+    match matches.as_slice() {
+        [] => Ok(None),
+        [only] => Ok(Some(only.clone())),
+        many => {
+            let labels = many
+                .iter()
+                .map(|label| format!("  {label}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            anyhow::bail!("ambiguous peer shorthand '{peer}'\n\nMatches:\n{labels}")
+        }
+    }
+}
+
+fn label_hostname(label: &str) -> Option<String> {
+    let (host, suffix) = label.rsplit_once('-')?;
+    (suffix.len() == 4 && suffix.chars().all(|ch| ch.is_ascii_hexdigit())).then(|| host.to_owned())
 }
 
 fn mint_fresh(identity: &Identity, addr: EndpointAddr, caps: Capabilities) -> Result<PortlTicket> {
@@ -343,6 +417,52 @@ fn unix_now() -> Result<u64> {
 /// When `force_relay` is true, the returned addr is rewritten to
 /// the peer's relay URL only (direct-UDP candidates dropped). This
 /// errors clearly if the peer has no relay address configured.
+pub(crate) async fn resolve_endpoint_addr_with_relay_hints(
+    endpoint: &iroh::Endpoint,
+    endpoint_id: EndpointId,
+    relay_hint: Option<&str>,
+    configured_relay_hints: &[String],
+    force_relay: bool,
+) -> Result<(EndpointAddr, String)> {
+    if force_relay
+        && let Some(fallback) =
+            relay_fallback_addr(endpoint_id, relay_hint, configured_relay_hints)?
+    {
+        return Ok(fallback);
+    }
+
+    match resolve_endpoint_addr(endpoint, endpoint_id, force_relay).await {
+        Ok((addr, provenance)) => {
+            let addr = if force_relay {
+                addr
+            } else {
+                add_relay_hints(addr, relay_hint, configured_relay_hints)?
+            };
+            Ok((addr, provenance))
+        }
+        Err(discovery_err) => {
+            if let Some(fallback) =
+                relay_fallback_addr(endpoint_id, relay_hint, configured_relay_hints)?
+            {
+                return Ok(fallback);
+            }
+            Err(discovery_err)
+        }
+    }
+}
+
+fn configured_relay_hints() -> Vec<String> {
+    crate::client_endpoint::load_client_config()
+        .map(|cfg| {
+            cfg.discovery
+                .relays
+                .into_iter()
+                .map(|relay| relay.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub(crate) async fn resolve_endpoint_addr(
     endpoint: &iroh::Endpoint,
     endpoint_id: EndpointId,
@@ -354,6 +474,9 @@ pub(crate) async fn resolve_endpoint_addr(
              pass a ticket with a relay address"
         );
     }
+    let mut saw_empty_addr = false;
+    let mut merged_addr = EndpointAddr::new(endpoint_id);
+    let mut provenances = Vec::new();
     let mut stream = endpoint
         .address_lookup()
         .context("access address lookup")?
@@ -363,8 +486,12 @@ pub(crate) async fn resolve_endpoint_addr(
             Ok(Ok(item)) => {
                 let provenance = item.provenance().to_owned();
                 let addr = item.into_endpoint_addr();
-                let addr = maybe_force_relay_addr(endpoint_id, addr, force_relay)?;
-                return Ok((addr, provenance));
+                if !is_usable_endpoint_addr(&addr) {
+                    saw_empty_addr = true;
+                    continue;
+                }
+                merged_addr = merged_addr.with_addrs(addr.addrs);
+                provenances.push(normalize_discovery_source(&provenance));
             }
             Ok(Err(_)) => {}
             Err(AddressLookupFailed::NoServiceConfigured { .. }) => {
@@ -382,13 +509,74 @@ pub(crate) async fn resolve_endpoint_addr(
                     .map(|err| err.to_string())
                     .collect::<Vec<_>>()
                     .join("; ");
+                if is_usable_endpoint_addr(&merged_addr) {
+                    break;
+                }
                 bail!("discovery failed: {detail}")
             }
             Err(err) => return Err(anyhow!(err)),
         }
     }
 
+    if is_usable_endpoint_addr(&merged_addr) {
+        let addr = maybe_force_relay_addr(endpoint_id, merged_addr, force_relay)?;
+        provenances.sort();
+        provenances.dedup();
+        let provenance = if provenances.is_empty() {
+            "discovery".to_owned()
+        } else {
+            provenances.join("+")
+        };
+        return Ok((addr, provenance));
+    }
+
+    if saw_empty_addr {
+        bail!("discovery returned no usable addresses")
+    }
     bail!("discovery returned no addresses")
+}
+
+fn relay_fallback_addr(
+    endpoint_id: EndpointId,
+    relay_hint: Option<&str>,
+    configured_relay_hints: &[String],
+) -> Result<Option<(EndpointAddr, String)>> {
+    let addr = add_relay_hints(
+        EndpointAddr::new(endpoint_id),
+        relay_hint,
+        configured_relay_hints,
+    )?;
+    if addr.is_empty() {
+        return Ok(None);
+    }
+    let provenance = match (relay_hint.is_some(), configured_relay_hints.is_empty()) {
+        (true, false) => "stored+configured-relay",
+        (true, true) => "stored-relay",
+        (false, false) => "configured-relay",
+        (false, true) => "relay",
+    };
+    Ok(Some((addr, provenance.to_owned())))
+}
+
+fn add_relay_hints(
+    mut addr: EndpointAddr,
+    relay_hint: Option<&str>,
+    configured_relay_hints: &[String],
+) -> Result<EndpointAddr> {
+    for relay_hint in relay_hint
+        .into_iter()
+        .chain(configured_relay_hints.iter().map(String::as_str))
+    {
+        let relay_url = relay_hint
+            .parse()
+            .with_context(|| format!("parse relay URL {relay_hint:?}"))?;
+        addr = addr.with_relay_url(relay_url);
+    }
+    Ok(addr)
+}
+
+fn is_usable_endpoint_addr(addr: &EndpointAddr) -> bool {
+    !addr.is_empty()
 }
 
 fn maybe_force_relay_ticket(mut ticket: PortlTicket, force_relay: bool) -> Result<PortlTicket> {
@@ -410,11 +598,18 @@ fn maybe_force_relay_addr(
 }
 
 fn relay_only_addr(endpoint_id: EndpointId, addr: &EndpointAddr) -> Result<EndpointAddr> {
-    let relay_url = addr.relay_urls().next().cloned().context(
-        "peer does not advertise a relay address; rerun without --relay or use a ticket \
-         with relay information",
-    )?;
-    Ok(EndpointAddr::new(endpoint_id).with_relay_url(relay_url))
+    let relays = addr
+        .relay_urls()
+        .cloned()
+        .map(TransportAddr::Relay)
+        .collect::<Vec<_>>();
+    if relays.is_empty() {
+        anyhow::bail!(
+            "peer does not advertise a relay address; rerun without --relay or use a ticket \
+         with relay information"
+        );
+    }
+    Ok(EndpointAddr::from_parts(endpoint_id, relays))
 }
 
 fn relay_discovery_disabled() -> bool {
@@ -428,5 +623,110 @@ pub(crate) fn normalize_discovery_source(source: &str) -> String {
     match source {
         "mdns" => "local".to_owned(),
         other => other.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer_entry(label: &str) -> portl_core::peer_store::PeerEntry {
+        portl_core::peer_store::PeerEntry {
+            label: label.to_owned(),
+            endpoint_id_hex: hex::encode(endpoint_id().as_bytes()),
+            accepts_from_them: true,
+            they_accept_from_me: true,
+            since: 1_000,
+            origin: portl_core::peer_store::PeerOrigin::Paired,
+            last_hold_at: None,
+            is_self: false,
+            relay_hint: None,
+            schema_version: 2,
+        }
+    }
+
+    fn endpoint_id() -> EndpointId {
+        let bytes = hex::decode("bba9659180ddc99df3295c488914d244055017c3bda5938340252961e98eb265")
+            .expect("valid hex");
+        let bytes: [u8; 32] = bytes.try_into().expect("32 byte endpoint id");
+        EndpointId::from_bytes(&bytes).expect("valid endpoint id")
+    }
+
+    #[test]
+    fn peer_store_label_accepts_unique_hostname_shorthand() {
+        let mut peers = PeerStore::new();
+        peers.insert_or_update(peer_entry("max-b265")).unwrap();
+
+        let resolved = resolve_peer_store_shorthand(&peers, "max").unwrap();
+
+        assert_eq!(resolved.as_deref(), Some("max-b265"));
+    }
+
+    #[test]
+    fn peer_store_label_rejects_ambiguous_hostname_shorthand() {
+        let mut peers = PeerStore::new();
+        let mut first = peer_entry("max-b265");
+        first.endpoint_id_hex = hex::encode(endpoint_id().as_bytes());
+        peers.insert_or_update(first).unwrap();
+        let mut second = peer_entry("max-7310");
+        second.endpoint_id_hex =
+            "d65f9e656607519c4c28f52ddd9ecb71c0598492656ff8ce21b5079526e57310".to_owned();
+        peers.insert_or_update(second).unwrap();
+
+        let err = resolve_peer_store_shorthand(&peers, "max").unwrap_err();
+
+        assert!(err.to_string().contains("ambiguous peer shorthand 'max'"));
+    }
+
+    #[test]
+    fn empty_endpoint_addr_is_not_usable_for_ticket_minting() {
+        let addr = EndpointAddr::new(endpoint_id());
+        assert!(!is_usable_endpoint_addr(&addr));
+    }
+
+    #[test]
+    fn stored_and_configured_relay_hints_are_aggregated() {
+        let endpoint_id = endpoint_id();
+        let configured = vec![
+            "https://configured-a.example/".to_owned(),
+            "https://configured-b.example/".to_owned(),
+        ];
+        let (addr, provenance) = relay_fallback_addr(
+            endpoint_id,
+            Some("https://stored-relay.example/"),
+            &configured,
+        )
+        .expect("valid relay hints")
+        .expect("fallback exists");
+
+        assert!(is_usable_endpoint_addr(&addr));
+        assert_eq!(addr.id, endpoint_id);
+        assert_eq!(provenance, "stored+configured-relay");
+        let relays = relay_urls(&addr);
+        assert_eq!(
+            relays,
+            vec![
+                "https://configured-a.example/",
+                "https://configured-b.example/",
+                "https://stored-relay.example/",
+            ]
+        );
+    }
+
+    #[test]
+    fn configured_relay_hint_recovers_legacy_peer_without_stored_hint() {
+        let endpoint_id = endpoint_id();
+        let configured = vec!["https://configured-relay.example/".to_owned()];
+        let (addr, provenance) = relay_fallback_addr(endpoint_id, None, &configured)
+            .expect("valid relay hint")
+            .expect("fallback exists");
+
+        assert!(is_usable_endpoint_addr(&addr));
+        assert_eq!(provenance, "configured-relay");
+        assert_eq!(relay_urls(&addr), vec!["https://configured-relay.example/"]);
+    }
+
+    fn relay_urls(addr: &EndpointAddr) -> Vec<String> {
+        addr.relay_urls().map(ToString::to_string).collect()
     }
 }

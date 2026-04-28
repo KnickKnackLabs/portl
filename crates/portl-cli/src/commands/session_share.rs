@@ -66,6 +66,7 @@ pub(crate) enum ShareTargetForm {
     PeerStore {
         label: String,
         endpoint_id: EndpointId,
+        relay_hint: Option<String>,
     },
     /// Alias entry pointing to a bare endpoint id (no stored ticket).
     AliasEid {
@@ -188,6 +189,7 @@ pub(crate) fn classify_share_target(
         return Ok(ShareTargetForm::PeerStore {
             label: trimmed.to_owned(),
             endpoint_id,
+            relay_hint: entry.relay_hint.clone(),
         });
     }
 
@@ -216,6 +218,7 @@ pub(crate) fn classify_share_target(
         return Ok(ShareTargetForm::PeerStore {
             label: entry.label.clone(),
             endpoint_id,
+            relay_hint: entry.relay_hint.clone(),
         });
     }
     if host_matches.len() > 1 {
@@ -518,6 +521,17 @@ mod tests {
     }
 
     fn peer_entry(label: &str, they_accept_from_me: bool, held: bool) -> PeerEntry {
+        let mut entry = peer_entry_with_relay(label, they_accept_from_me, held, None);
+        entry.schema_version = PeerEntry::default_schema_version();
+        entry
+    }
+
+    fn peer_entry_with_relay(
+        label: &str,
+        they_accept_from_me: bool,
+        held: bool,
+        relay_hint: Option<&str>,
+    ) -> PeerEntry {
         let endpoint_id_hex = hex::encode(fixture_addr().id.as_bytes());
         PeerEntry {
             label: label.to_owned(),
@@ -528,8 +542,8 @@ mod tests {
             origin: PeerOrigin::Raw,
             last_hold_at: held.then_some(1_001),
             is_self: false,
-            relay_hint: None,
-            schema_version: PeerEntry::default_schema_version(),
+            relay_hint: relay_hint.map(ToOwned::to_owned),
+            schema_version: 2,
         }
     }
 
@@ -537,12 +551,19 @@ mod tests {
     fn outbound_peer_label_classifies_as_share_form() {
         let mut peers = PeerStore::default();
         peers
-            .insert_or_update(peer_entry("devbox", true, false))
+            .insert_or_update(peer_entry_with_relay(
+                "devbox",
+                true,
+                false,
+                Some("https://relay.example/"),
+            ))
             .unwrap();
         let tickets = TicketStore::default();
         let aliases = AliasStore::default();
         let form = classify_share_target("devbox", &peers, &tickets, &aliases).unwrap();
-        assert!(matches!(form, ShareTargetForm::PeerStore { label, .. } if label == "devbox"));
+        assert!(
+            matches!(form, ShareTargetForm::PeerStore { label, relay_hint, .. } if label == "devbox" && relay_hint.as_deref() == Some("https://relay.example/"))
+        );
     }
 
     #[test]

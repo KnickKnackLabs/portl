@@ -5,6 +5,20 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Added
+
+- Peer-target commands now accept unique hostname shorthands such as
+  `portl status max` and `portl shell max` when exactly one peer label
+  matches a canonical `host-last4` machine label.
+
+### Fixed
+
+- Peer-label dialing now aggregates all known relay candidates from live
+  discovery, stored peer relay hints, and configured relays before minting
+  fresh ephemeral tickets. This lets legacy peer rows without a stored
+  relay hint recover when ambient DNS/PKARR discovery returns no usable
+  address.
+
 ## 0.6.5 — 2026-04-28
 
 ### Added

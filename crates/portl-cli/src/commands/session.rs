@@ -17,9 +17,9 @@ use tracing::debug;
 
 use crate::commands::peer_resolve::{close_connected, connect_peer};
 use crate::commands::session_share::{
-    BuiltEnvelope, EnvelopeInputs, ResolveTargetError, build_session_share_envelope,
-    classify_share_target, fresh_workspace_handles, load_identity, resolve_rendezvous_url,
-    run_offer_against_transport, unix_now,
+    BuiltEnvelope, EnvelopeInputs, ResolveTargetError, ShareTargetForm,
+    build_session_share_envelope, classify_share_target, fresh_workspace_handles, load_identity,
+    resolve_rendezvous_url, run_offer_against_transport, unix_now,
 };
 use portl_core::peer_store::PeerStore;
 use portl_core::rendezvous::ws::WsRendezvousBackend;
@@ -264,12 +264,34 @@ pub fn share(
                 crate::client_endpoint::bind_client_endpoint_with_config(&identity, &client_cfg)
                     .await?;
             let endpoint_id = form.endpoint_id();
-            let resolved_addr = crate::commands::peer_resolve::resolve_endpoint_addr(
-                &client_endpoint,
-                endpoint_id,
-                false,
-            )
-            .await;
+            let configured_relay_hints = client_cfg
+                .discovery
+                .relays
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            let resolved_addr = match &form {
+                ShareTargetForm::PeerStore { relay_hint, .. } => {
+                    crate::commands::peer_resolve::resolve_endpoint_addr_with_relay_hints(
+                        &client_endpoint,
+                        endpoint_id,
+                        relay_hint.as_deref(),
+                        &configured_relay_hints,
+                        false,
+                    )
+                    .await
+                }
+                ShareTargetForm::AliasEid { .. } | ShareTargetForm::RawEid { .. } => {
+                    crate::commands::peer_resolve::resolve_endpoint_addr_with_relay_hints(
+                        &client_endpoint,
+                        endpoint_id,
+                        None,
+                        &configured_relay_hints,
+                        false,
+                    )
+                    .await
+                }
+            };
             crate::commands::peer_resolve::close_client_endpoint(client_endpoint, "share resolve")
                 .await;
             let (target_addr, _provenance) = resolved_addr?;
