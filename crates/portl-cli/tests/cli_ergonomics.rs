@@ -60,7 +60,7 @@ fn connect_commands_use_target_metavars() {
         ),
         (
             &["session", "attach", "--help"][..],
-            "Usage: portl session attach [OPTIONS] <TARGET> [-- <ARGV>...]",
+            "Usage: portl session attach [OPTIONS] [SESSION] [-- <ARGV>...]",
         ),
     ] {
         let help = help_output(args);
@@ -200,11 +200,19 @@ fn invite_accept_surface_matches_spec() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn session_surface_matches_spec() {
     assert_eq!(
-        parse_args(&["session", "providers", "dev", "--json"]).expect("parse"),
+        parse_args(&["session", "providers", "--target", "dev", "--json"]).expect("parse"),
         ParsedCommand::SessionProviders {
-            target: "dev".to_owned(),
+            target: Some("dev".to_owned()),
+            json: true,
+        }
+    );
+    assert_eq!(
+        parse_args(&["session", "providers", "--json"]).expect("parse"),
+        ParsedCommand::SessionProviders {
+            target: None,
             json: true,
         }
     );
@@ -212,9 +220,9 @@ fn session_surface_matches_spec() {
         parse_args(&[
             "session",
             "attach",
-            "dev",
-            "--session",
             "frontend",
+            "--target",
+            "dev",
             "--provider",
             "zmx",
             "--user",
@@ -227,7 +235,7 @@ fn session_surface_matches_spec() {
         ])
         .expect("parse"),
         ParsedCommand::SessionAttach {
-            target: "dev".to_owned(),
+            target: Some("dev".to_owned()),
             session: Some("frontend".to_owned()),
             provider: Some("zmx".to_owned()),
             user: Some("root".to_owned()),
@@ -236,26 +244,32 @@ fn session_surface_matches_spec() {
         }
     );
     assert_eq!(
-        parse_args(&["session", "ls", "dev", "--provider", "zmx"]).expect("parse"),
+        parse_args(&["session", "ls", "--target", "dev", "--provider", "zmx"]).expect("parse"),
         ParsedCommand::SessionLs {
-            target: "dev".to_owned(),
+            target: Some("dev".to_owned()),
             provider: Some("zmx".to_owned()),
             json: false,
         }
     );
     assert_eq!(
-        parse_args(&["session", "run", "dev", "frontend", "--", "make", "test"]).expect("parse"),
+        parse_args(&[
+            "session", "run", "frontend", "--target", "dev", "--", "make", "test"
+        ])
+        .expect("parse"),
         ParsedCommand::SessionRun {
-            target: "dev".to_owned(),
+            target: Some("dev".to_owned()),
             session: Some("frontend".to_owned()),
             provider: None,
             argv: vec!["make".to_owned(), "test".to_owned()],
         }
     );
     assert_eq!(
-        parse_args(&["session", "history", "dev", "frontend", "--format", "plain"]).expect("parse"),
+        parse_args(&[
+            "session", "history", "frontend", "--target", "dev", "--format", "plain"
+        ])
+        .expect("parse"),
         ParsedCommand::SessionHistory {
-            target: "dev".to_owned(),
+            target: Some("dev".to_owned()),
             session: Some("frontend".to_owned()),
             provider: None,
             format: portl_cli::SessionHistoryFormat::Plain,
@@ -263,7 +277,9 @@ fn session_surface_matches_spec() {
     );
     let unsupported_history = ProcessCommand::cargo_bin("portl")
         .expect("cargo bin")
-        .args(["session", "history", "dev", "frontend", "--format", "html"])
+        .args([
+            "session", "history", "frontend", "--target", "dev", "--format", "html",
+        ])
         .output()
         .expect("run unsupported history format");
     assert!(!unsupported_history.status.success());
@@ -273,12 +289,90 @@ fn session_surface_matches_spec() {
         "{stderr}"
     );
     assert_eq!(
-        parse_args(&["session", "kill", "dev", "frontend", "--provider", "zmx"]).expect("parse"),
+        parse_args(&[
+            "session",
+            "kill",
+            "frontend",
+            "--target",
+            "dev",
+            "--provider",
+            "zmx"
+        ])
+        .expect("parse"),
         ParsedCommand::SessionKill {
-            target: "dev".to_owned(),
+            target: Some("dev".to_owned()),
             session: Some("frontend".to_owned()),
             provider: Some("zmx".to_owned()),
         }
+    );
+}
+
+#[test]
+fn top_level_session_aliases_parse_like_session_subcommands() {
+    assert_eq!(
+        parse_args(&[
+            "attach",
+            "max/dotfiles",
+            "--target",
+            "max",
+            "--provider",
+            "zmx"
+        ])
+        .expect("parse"),
+        ParsedCommand::SessionAttach {
+            target: Some("max".to_owned()),
+            session: Some("max/dotfiles".to_owned()),
+            provider: Some("zmx".to_owned()),
+            user: None,
+            cwd: None,
+            argv: Vec::new(),
+        }
+    );
+    assert_eq!(
+        parse_args(&["run", "dotfiles", "--target", "max", "--", "git", "status"]).expect("parse"),
+        ParsedCommand::SessionRun {
+            target: Some("max".to_owned()),
+            session: Some("dotfiles".to_owned()),
+            provider: None,
+            argv: vec!["git".to_owned(), "status".to_owned()],
+        }
+    );
+    assert_eq!(
+        parse_args(&["ls", "--target", "max"]).expect("parse"),
+        ParsedCommand::SessionLs {
+            target: Some("max".to_owned()),
+            provider: None,
+            json: false,
+        }
+    );
+    assert_eq!(
+        parse_args(&["history", "dotfiles"]).expect("parse"),
+        ParsedCommand::SessionHistory {
+            target: None,
+            session: Some("dotfiles".to_owned()),
+            provider: None,
+            format: portl_cli::SessionHistoryFormat::Plain,
+        }
+    );
+    assert_eq!(
+        parse_args(&["kill", "dotfiles"]).expect("parse"),
+        ParsedCommand::SessionKill {
+            target: None,
+            session: Some("dotfiles".to_owned()),
+            provider: None,
+        }
+    );
+}
+
+#[test]
+fn old_target_first_session_positionals_are_rejected() {
+    assert_clap_error(
+        &["session", "attach", "shared-box", "dev"],
+        &["unexpected argument"],
+    );
+    assert_clap_error(
+        &["session", "run", "shared-box", "dev", "--", "true"],
+        &["unexpected argument"],
     );
 }
 

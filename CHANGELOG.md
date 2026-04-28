@@ -5,6 +5,23 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Added
+
+- Added top-level daily session aliases: `portl attach`, `portl run`,
+  `portl ls`, `portl history`, and `portl kill` mirror their
+  `portl session ...` forms.
+- Added `PORTL_TARGET` as a default target for session commands, including
+  unique host shorthands such as `PORTL_TARGET=max`.
+
+### Changed
+
+- Session commands are now local/session-first: use `--target <target>` or
+  `host/session` refs for remote sessions instead of target-first
+  positionals.
+- Imported session-share labels now use `host/session` refs such as
+  `max-b265/dotfiles`, with `max/dotfiles` accepted when the host shorthand
+  is unique.
+
 ## 0.6.4 — 2026-04-28
 
 ### Changed
@@ -34,7 +51,7 @@ All notable changes land here. This project follows
 - Pairing, self rows, session-share imports, and generic saved tickets now
   use stable human-readable labels based on the target hostname plus the
   last four endpoint-id characters, such as `max-b265`,
-  `max-b265-dotfiles`, and `max-b265-ticket-shell`.
+`max-b265-dotfiles`, and `max-b265-ticket-shell`.
 - Re-importing a session share or saved ticket for the same label and
   endpoint now replaces the saved credential only when the new ticket
   extends the expiry; labels that point at a different endpoint still

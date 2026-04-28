@@ -21,12 +21,12 @@ pub fn machine_label_from_hint(hint: Option<&str>, endpoint_id_hex: &str) -> Str
     }
 }
 
-/// Build the default label for an imported session share:
-/// `<machine-label>-<friendly-name>`.
+/// Build the default ref for an imported session share:
+/// `<machine-label>/<friendly-name>`.
 #[must_use]
 pub fn session_share_label(machine_label: &str, friendly_name: &str) -> String {
     let friendly = sanitize_label_component(friendly_name).unwrap_or_else(|| "session".to_owned());
-    format!("{}-{friendly}", machine_label.trim_matches('-'))
+    format!("{}/{friendly}", machine_label.trim_matches('-'))
 }
 
 /// Build the default label for a generic saved ticket:
@@ -86,10 +86,10 @@ mod tests {
     }
 
     #[test]
-    fn session_share_label_is_machine_then_friendly_name() {
+    fn session_share_label_is_machine_slash_friendly_name() {
         assert_eq!(
             session_share_label("max-b265", "Dotfiles Main"),
-            "max-b265-dotfiles-main"
+            "max-b265/dotfiles-main"
         );
     }
 

@@ -149,7 +149,7 @@ are adapters"). That temptation trades one renumbering crisis
   `session/v1`, `tcp/v1`, and `udp/v1` are small, separately
   reviewable protocol modules.
 - **Sessions are named workspaces.** A command like
-  `portl session attach <TARGET> <SESSION>` reconnects to
+  `portl attach <SESSION> --target <TARGET>` reconnects to
   provider-backed terminal state. zmx-control is the optimized path;
   tmux `-CC` is the compatibility path.
 - **Bootstrap is pluggable.** Docker and Slicer create target aliases;

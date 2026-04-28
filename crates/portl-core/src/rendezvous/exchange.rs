@@ -319,7 +319,7 @@ mod tests {
     #[test]
     fn imported_label_uses_target_machine_then_friendly_name() {
         let share = sample_share();
-        assert_eq!(share.import_label(), "max-b265-dev");
+        assert_eq!(share.import_label(), "max-b265/dev");
     }
 
     #[test]
@@ -327,7 +327,7 @@ mod tests {
         let mut share = sample_share();
         share.target_label_hint = None;
         share.target_endpoint_id_hex = "bba96591b265".to_owned();
-        assert_eq!(share.import_label(), "host-b265-dev");
+        assert_eq!(share.import_label(), "host-b265/dev");
     }
 
     #[test]
@@ -335,6 +335,6 @@ mod tests {
         let mut share = sample_share();
         share.target_label_hint = Some(String::new());
         share.target_endpoint_id_hex = "bba96591b265".to_owned();
-        assert_eq!(share.import_label(), "host-b265-dev");
+        assert_eq!(share.import_label(), "host-b265/dev");
     }
 }

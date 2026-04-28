@@ -42,10 +42,11 @@ impl SessionHistoryFormat {
     }
 }
 
-pub fn providers(target: &str, json: bool) -> Result<ExitCode> {
+pub fn providers(target: Option<&str>, json: bool) -> Result<ExitCode> {
+    let target = resolve_target_only(target)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
-        let connected = connect_peer(target, session_caps()).await?;
+        let connected = connect_peer(&target, session_caps()).await?;
         let report = open_session_providers(&connected.connection, &connected.session).await?;
         if json {
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -83,10 +84,11 @@ pub fn providers(target: &str, json: bool) -> Result<ExitCode> {
     result
 }
 
-pub fn ls(target: &str, provider: Option<&str>, json: bool) -> Result<ExitCode> {
+pub fn ls(target: Option<&str>, provider: Option<&str>, json: bool) -> Result<ExitCode> {
+    let target = resolve_target_only(target)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
-        let connected = connect_peer(target, session_caps()).await?;
+        let connected = connect_peer(&target, session_caps()).await?;
         let sessions = open_session_list(
             &connected.connection,
             &connected.session,
@@ -108,19 +110,20 @@ pub fn ls(target: &str, provider: Option<&str>, json: bool) -> Result<ExitCode> 
 }
 
 pub fn run(
-    target: &str,
     session: Option<&str>,
+    target: Option<&str>,
     provider: Option<&str>,
     argv: &[String],
 ) -> Result<ExitCode> {
+    let resolved = resolve_session_ref(session, target)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
-        let connected = connect_peer(target, session_caps()).await?;
+        let connected = connect_peer(&resolved.target, session_caps()).await?;
         let run = open_session_run(
             &connected.connection,
             &connected.session,
             provider.map(ToOwned::to_owned),
-            default_session_name(target, session),
+            resolved.session,
             argv.to_vec(),
         )
         .await?;
@@ -134,8 +137,8 @@ pub fn run(
 }
 
 pub fn history(
-    target: &str,
     session: Option<&str>,
+    target: Option<&str>,
     provider: Option<&str>,
     format: SessionHistoryFormat,
 ) -> Result<ExitCode> {
@@ -145,14 +148,15 @@ pub fn history(
             format.as_str()
         );
     }
+    let resolved = resolve_session_ref(session, target)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
-        let connected = connect_peer(target, session_caps()).await?;
+        let connected = connect_peer(&resolved.target, session_caps()).await?;
         let output = open_session_history(
             &connected.connection,
             &connected.session,
             provider.map(ToOwned::to_owned),
-            default_session_name(target, session),
+            resolved.session,
         )
         .await?;
         print!("{output}");
@@ -163,15 +167,20 @@ pub fn history(
     result
 }
 
-pub fn kill(target: &str, session: Option<&str>, provider: Option<&str>) -> Result<ExitCode> {
+pub fn kill(
+    session: Option<&str>,
+    target: Option<&str>,
+    provider: Option<&str>,
+) -> Result<ExitCode> {
+    let resolved = resolve_session_ref(session, target)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
-        let connected = connect_peer(target, session_caps()).await?;
+        let connected = connect_peer(&resolved.target, session_caps()).await?;
         open_session_kill(
             &connected.connection,
             &connected.session,
             provider.map(ToOwned::to_owned),
-            default_session_name(target, session),
+            resolved.session,
         )
         .await?;
         close_connected(connected, b"session complete").await;
@@ -193,32 +202,42 @@ pub fn share(
     _yes: bool,
     allow_bearer_fallback: bool,
 ) -> Result<ExitCode> {
-    let session_name = session.trim();
-    if session_name.is_empty() {
+    let raw_session = session.trim();
+    if raw_session.is_empty() {
         anyhow::bail!("session name cannot be empty");
     }
+    let (target_from_ref, session_name) = split_session_ref(Some(raw_session))?;
+    let session_name = session_name.expect("split_session_ref returns a session for Some input");
 
-    let target_form = if let Some(target) = target {
+    let target_form = {
         // Classify explicit targets up-front so unsupported forms fail fast without
         // needing local identity and without echoing raw input that may be a ticket credential.
         let peers = PeerStore::load(&PeerStore::default_path()).context("load peer store")?;
         let tickets =
             TicketStore::load(&TicketStore::default_path()).context("load ticket store")?;
         let aliases = crate::alias_store::AliasStore::default();
-        Some(
-            match classify_share_target(target, &peers, &tickets, &aliases) {
-                Ok(form) => form,
-                Err(ResolveTargetError::TicketCredential) => {
-                    anyhow::bail!(
-                        "session share cannot delegate a ticket credential passed as --target. \
+        let classify = |hint: &str| match classify_share_target(hint, &peers, &tickets, &aliases) {
+            Ok(form) => Ok(form),
+            Err(ResolveTargetError::TicketCredential) => {
+                anyhow::bail!(
+                    "session share cannot delegate a ticket credential passed as --target. \
                      Use a peer-store label, alias, or `endpoint_id` instead."
-                    );
-                }
-                Err(err) => return Err(err.into()),
-            },
-        )
-    } else {
-        None
+                );
+            }
+            Err(err) => Err(err.into()),
+        };
+        let from_ref = target_from_ref.map(classify).transpose()?;
+        let from_flag = target.map(classify).transpose()?;
+        if let (Some(left), Some(right)) = (&from_ref, &from_flag)
+            && left.endpoint_id() != right.endpoint_id()
+        {
+            anyhow::bail!(
+                "conflicting session share targets: ref selects '{}' but --target selects '{}'",
+                left.target_label_hint(),
+                right.target_label_hint()
+            );
+        }
+        from_flag.or(from_ref)
     };
 
     let identity = load_identity(None)?;
@@ -292,7 +311,7 @@ pub fn share(
                         identity: &identity,
                         target_addr: target_addr.clone(),
                         hello,
-                        session_name,
+                        session_name: &session_name,
                         provider,
                         origin_label_hint: origin_label_hint.clone(),
                         target_label_hint: target_label_hint.clone(),
@@ -400,17 +419,19 @@ fn attach_session_defaults_from_store(
 }
 
 pub fn attach(
-    target: &str,
     session: Option<&str>,
+    target: Option<&str>,
     provider: Option<&str>,
     user: Option<&str>,
     cwd: Option<&str>,
     argv: &[String],
 ) -> Result<ExitCode> {
-    let (session_name, provider_name) = attach_session_defaults(target, session, provider)?;
+    let resolved = resolve_session_ref(session, target)?;
+    let (session_name, provider_name) =
+        attach_session_defaults(&resolved.target, Some(&resolved.session), provider)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
-        let connected = connect_peer(target, session_caps()).await?;
+        let connected = connect_peer(&resolved.target, session_caps()).await?;
         let (cols, rows) = size().unwrap_or((80, 24));
         let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_owned());
         eprintln!(
@@ -435,6 +456,246 @@ pub fn attach(
     });
     runtime.shutdown_background();
     result
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedSessionRef {
+    target: String,
+    session: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedTargetHint {
+    label: String,
+    endpoint_id_hex: Option<String>,
+}
+
+fn resolve_target_only(target: Option<&str>) -> Result<String> {
+    let peers = PeerStore::load(&PeerStore::default_path()).context("load peer store")?;
+    let tickets = TicketStore::load(&TicketStore::default_path()).context("load ticket store")?;
+    let aliases = crate::alias_store::AliasStore::default();
+    if let Some(hint) = target.map(str::trim).filter(|value| !value.is_empty()) {
+        return resolve_target_hint_with_stores(hint, &peers, &tickets, &aliases)
+            .map(|resolved| resolved.label);
+    }
+    if let Some(hint) = env_target() {
+        return resolve_target_hint_with_stores(&hint, &peers, &tickets, &aliases)
+            .map(|resolved| resolved.label);
+    }
+    local_target_label()
+}
+
+fn resolve_session_ref(
+    session_ref: Option<&str>,
+    target: Option<&str>,
+) -> Result<ResolvedSessionRef> {
+    let peers = PeerStore::load(&PeerStore::default_path()).context("load peer store")?;
+    let tickets = TicketStore::load(&TicketStore::default_path()).context("load ticket store")?;
+    let aliases = crate::alias_store::AliasStore::default();
+    let env = env_target();
+    resolve_session_ref_with_stores(
+        session_ref,
+        target,
+        env.as_deref(),
+        &peers,
+        &tickets,
+        &aliases,
+    )
+}
+
+fn resolve_session_ref_with_stores(
+    session_ref: Option<&str>,
+    target: Option<&str>,
+    env_target: Option<&str>,
+    peers: &PeerStore,
+    tickets: &TicketStore,
+    aliases: &crate::alias_store::AliasStore,
+) -> Result<ResolvedSessionRef> {
+    let session_ref = session_ref.map(str::trim).filter(|value| !value.is_empty());
+    if let Some(session_ref) = session_ref
+        && target.is_none()
+        && let Some(metadata) = tickets
+            .get(session_ref)
+            .and_then(|entry| entry.session_share.as_ref())
+    {
+        return Ok(ResolvedSessionRef {
+            target: session_ref.to_owned(),
+            session: metadata.provider_session.clone(),
+        });
+    }
+
+    let (host_from_ref, session_name) = split_session_ref(session_ref)?;
+    let target_from_ref = host_from_ref
+        .map(|hint| resolve_target_hint_with_stores(hint, peers, tickets, aliases))
+        .transpose()?;
+    let target_from_flag = target
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|hint| resolve_target_hint_with_stores(hint, peers, tickets, aliases))
+        .transpose()?;
+
+    if let (Some(left), Some(right)) = (&target_from_ref, &target_from_flag)
+        && !same_target(left, right)
+    {
+        anyhow::bail!(
+            "conflicting session targets: ref selects '{}' but --target selects '{}'",
+            left.label,
+            right.label
+        );
+    }
+
+    let explicit_target = target_from_flag.or(target_from_ref);
+    let env_target = if explicit_target.is_none() {
+        env_target
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|hint| resolve_target_hint_with_stores(hint, peers, tickets, aliases))
+            .transpose()?
+    } else {
+        None
+    };
+    let target_hint = explicit_target.or(env_target);
+
+    let session = session_name.unwrap_or_else(|| "default".to_owned());
+    let target = if let Some(target_hint) = target_hint {
+        session_share_ticket_label(tickets, &target_hint.label, &session)
+            .unwrap_or(target_hint.label)
+    } else {
+        local_target_label()?
+    };
+
+    Ok(ResolvedSessionRef { target, session })
+}
+
+fn split_session_ref(session_ref: Option<&str>) -> Result<(Option<&str>, Option<String>)> {
+    let Some(session_ref) = session_ref else {
+        return Ok((None, None));
+    };
+    if let Some((host, session)) = session_ref.split_once('/') {
+        let host = host.trim();
+        let session = session.trim();
+        if host.is_empty() || session.is_empty() || session.contains('/') {
+            anyhow::bail!("session refs must use HOST/SESSION with non-empty host and session");
+        }
+        Ok((Some(host), Some(session.to_owned())))
+    } else {
+        Ok((None, Some(session_ref.to_owned())))
+    }
+}
+
+fn env_target() -> Option<String> {
+    std::env::var("PORTL_TARGET")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn local_target_label() -> Result<String> {
+    let identity = load_identity(None)?;
+    Ok(crate::commands::local_machine_label(&hex::encode(
+        identity.verifying_key(),
+    )))
+}
+
+fn resolve_target_hint_with_stores(
+    hint: &str,
+    peers: &PeerStore,
+    tickets: &TicketStore,
+    aliases: &crate::alias_store::AliasStore,
+) -> Result<ResolvedTargetHint> {
+    if let Some(entry) = peers.get_by_label(hint) {
+        return Ok(ResolvedTargetHint {
+            label: entry.label.clone(),
+            endpoint_id_hex: Some(entry.endpoint_id_hex.clone()),
+        });
+    }
+    if let Some(entry) = tickets.get(hint) {
+        return Ok(ResolvedTargetHint {
+            label: hint.to_owned(),
+            endpoint_id_hex: Some(entry.endpoint_id_hex.clone()),
+        });
+    }
+    if let Some(alias) = aliases.get(hint)? {
+        return Ok(ResolvedTargetHint {
+            label: alias.name,
+            endpoint_id_hex: Some(alias.endpoint_id),
+        });
+    }
+    if hint.len() == 64 && hint.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Ok(ResolvedTargetHint {
+            label: hint.to_ascii_lowercase(),
+            endpoint_id_hex: Some(hint.to_ascii_lowercase()),
+        });
+    }
+
+    resolve_unique_hostname(hint, peers, tickets)
+}
+
+fn resolve_unique_hostname(
+    host: &str,
+    peers: &PeerStore,
+    tickets: &TicketStore,
+) -> Result<ResolvedTargetHint> {
+    let mut matches: Vec<ResolvedTargetHint> = Vec::new();
+    for entry in peers.iter() {
+        if label_hostname(&entry.label).as_deref() == Some(host) {
+            matches.push(ResolvedTargetHint {
+                label: entry.label.clone(),
+                endpoint_id_hex: Some(entry.endpoint_id_hex.clone()),
+            });
+        }
+    }
+    for (label, entry) in tickets.iter() {
+        if let Some((ticket_host, _)) = label.split_once('/')
+            && label_hostname(ticket_host).as_deref() == Some(host)
+        {
+            matches.push(ResolvedTargetHint {
+                label: ticket_host.to_owned(),
+                endpoint_id_hex: Some(entry.endpoint_id_hex.clone()),
+            });
+        }
+    }
+    matches.sort_by(|a, b| a.label.cmp(&b.label));
+    matches.dedup_by(|a, b| same_target(a, b));
+
+    match matches.as_slice() {
+        [only] => Ok(only.clone()),
+        [] => anyhow::bail!(
+            "unsupported session target '{host}'. Use a peer label, saved ticket label, endpoint_id, or unique host shorthand"
+        ),
+        many => {
+            let labels = many
+                .iter()
+                .map(|item| format!("  {}", item.label))
+                .collect::<Vec<_>>()
+                .join("\n");
+            anyhow::bail!("ambiguous target shorthand '{host}'\n\nMatches:\n{labels}")
+        }
+    }
+}
+
+fn label_hostname(label: &str) -> Option<String> {
+    let (host, suffix) = label.rsplit_once('-')?;
+    (suffix.len() == 4 && suffix.chars().all(|ch| ch.is_ascii_hexdigit())).then(|| host.to_owned())
+}
+
+fn same_target(left: &ResolvedTargetHint, right: &ResolvedTargetHint) -> bool {
+    match (&left.endpoint_id_hex, &right.endpoint_id_hex) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        _ => left.label == right.label,
+    }
+}
+
+fn session_share_ticket_label(
+    tickets: &TicketStore,
+    target_label: &str,
+    session_name: &str,
+) -> Option<String> {
+    let label = portl_core::labels::session_share_label(target_label, session_name);
+    tickets
+        .get(&label)
+        .and_then(|entry| entry.session_share.as_ref())
+        .map(|_| label)
 }
 
 async fn bridge_attach(session: SessionClient, cols: u16, rows: u16) -> Result<i32> {
@@ -642,14 +903,16 @@ async fn read_exit(recv: &mut BufferedRecv) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use portl_core::peer_store::{PeerEntry, PeerOrigin, PeerStore};
     use portl_core::ticket_store::{SessionShareMetadata, TicketEntry};
+    use tempfile::TempDir;
 
     #[test]
     fn attach_defaults_infer_session_share_metadata() {
         let mut tickets = TicketStore::new();
         tickets
             .insert(
-                "max-b265-dotfiles".to_owned(),
+                "max-b265/dotfiles".to_owned(),
                 TicketEntry {
                     endpoint_id_hex: hex::encode([1u8; 32]),
                     ticket_string: "portl-redacted".to_owned(),
@@ -667,7 +930,7 @@ mod tests {
             .unwrap();
 
         let (session, provider) =
-            attach_session_defaults_from_store("max-b265-dotfiles", None, None, &tickets);
+            attach_session_defaults_from_store("max-b265/dotfiles", None, None, &tickets);
 
         assert_eq!(session, "dotfiles");
         assert_eq!(provider.as_deref(), Some("zmx"));
@@ -678,7 +941,7 @@ mod tests {
         let tickets = TicketStore::new();
 
         let (session, provider) = attach_session_defaults_from_store(
-            "max-b265-dotfiles",
+            "max-b265/dotfiles",
             Some("override"),
             Some("manual"),
             &tickets,
@@ -686,5 +949,136 @@ mod tests {
 
         assert_eq!(session, "override");
         assert_eq!(provider.as_deref(), Some("manual"));
+    }
+
+    struct ResolverFixture {
+        _dir: TempDir,
+        peers: PeerStore,
+        tickets: TicketStore,
+        aliases: crate::alias_store::AliasStore,
+    }
+
+    fn seed_peer_and_share() -> ResolverFixture {
+        let dir = TempDir::new().unwrap();
+        let mut peers = PeerStore::new();
+        peers
+            .insert_or_update(PeerEntry {
+                label: "max-b265".to_owned(),
+                endpoint_id_hex: hex::encode([0x2a; 32]),
+                accepts_from_them: true,
+                they_accept_from_me: true,
+                since: 1,
+                origin: PeerOrigin::Paired,
+                last_hold_at: None,
+                is_self: false,
+                relay_hint: None,
+                schema_version: PeerEntry::default_schema_version(),
+            })
+            .unwrap();
+
+        let mut tickets = TicketStore::new();
+        tickets
+            .insert(
+                "max-b265/dotfiles".to_owned(),
+                TicketEntry {
+                    endpoint_id_hex: hex::encode([0x2a; 32]),
+                    ticket_string: "portl-redacted".to_owned(),
+                    expires_at: 2_000_000,
+                    saved_at: 1_000_000,
+                    session_share: Some(SessionShareMetadata {
+                        friendly_name: "dotfiles".to_owned(),
+                        provider_session: "dotfiles".to_owned(),
+                        provider: Some("zmx".to_owned()),
+                        origin_label_hint: Some("max-b265".to_owned()),
+                        target_label_hint: Some("max-b265".to_owned()),
+                    }),
+                },
+            )
+            .unwrap();
+        ResolverFixture {
+            aliases: crate::alias_store::AliasStore::new(dir.path().join("aliases.json")),
+            _dir: dir,
+            peers,
+            tickets,
+        }
+    }
+
+    #[test]
+    fn session_ref_accepts_unique_host_shorthand() {
+        let fixture = seed_peer_and_share();
+        let resolved = resolve_session_ref_with_stores(
+            Some("max/dotfiles"),
+            None,
+            None,
+            &fixture.peers,
+            &fixture.tickets,
+            &fixture.aliases,
+        )
+        .unwrap();
+        assert_eq!(resolved.target, "max-b265/dotfiles");
+        assert_eq!(resolved.session, "dotfiles");
+    }
+
+    #[test]
+    fn portl_target_accepts_unique_host_shorthand() {
+        let fixture = seed_peer_and_share();
+        let resolved = resolve_session_ref_with_stores(
+            Some("dotfiles"),
+            None,
+            Some("max"),
+            &fixture.peers,
+            &fixture.tickets,
+            &fixture.aliases,
+        )
+        .unwrap();
+        assert_eq!(resolved.target, "max-b265/dotfiles");
+        assert_eq!(resolved.session, "dotfiles");
+    }
+
+    #[test]
+    fn session_ref_and_target_may_duplicate_same_target() {
+        let fixture = seed_peer_and_share();
+        let resolved = resolve_session_ref_with_stores(
+            Some("max/dotfiles"),
+            Some("max-b265"),
+            None,
+            &fixture.peers,
+            &fixture.tickets,
+            &fixture.aliases,
+        )
+        .unwrap();
+        assert_eq!(resolved.target, "max-b265/dotfiles");
+        assert_eq!(resolved.session, "dotfiles");
+    }
+
+    #[test]
+    fn session_ref_and_target_reject_conflicts() {
+        let mut fixture = seed_peer_and_share();
+        fixture
+            .peers
+            .insert_or_update(PeerEntry {
+                label: "onyx-7310".to_owned(),
+                endpoint_id_hex: hex::encode([0x31; 32]),
+                accepts_from_them: true,
+                they_accept_from_me: true,
+                since: 1,
+                origin: PeerOrigin::Paired,
+                last_hold_at: None,
+                is_self: false,
+                relay_hint: None,
+                schema_version: PeerEntry::default_schema_version(),
+            })
+            .unwrap();
+
+        let err = resolve_session_ref_with_stores(
+            Some("max/dotfiles"),
+            Some("onyx"),
+            None,
+            &fixture.peers,
+            &fixture.tickets,
+            &fixture.aliases,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("conflicting session targets"));
     }
 }

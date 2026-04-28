@@ -507,9 +507,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(label, "max-b265-dev");
+        assert_eq!(label, "max-b265/dev");
         let tickets = TicketStore::load(&tickets_path).unwrap();
-        assert!(tickets.get("max-b265-dev").is_some());
+        assert!(tickets.get("max-b265/dev").is_some());
     }
 
     #[test]
@@ -540,9 +540,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(label, "max-b265-dev");
+        assert_eq!(label, "max-b265/dev");
         let tickets = TicketStore::load(&tickets_path).unwrap();
-        let saved = tickets.get("max-b265-dev").unwrap();
+        let saved = tickets.get("max-b265/dev").unwrap();
         let ExchangePayload::SessionShare(long_share) = &long.payload;
         assert_eq!(saved.expires_at, long_share.access_not_after_unix);
     }
@@ -641,9 +641,9 @@ mod tests {
             &tickets_path,
         )
         .unwrap();
-        assert_eq!(label, "max-b265-dev");
+        assert_eq!(label, "max-b265/dev");
         let tickets = TicketStore::load(&tickets_path).unwrap();
-        let saved = tickets.get("max-b265-dev").unwrap();
+        let saved = tickets.get("max-b265/dev").unwrap();
         let metadata = saved.session_share.as_ref().unwrap();
         assert_eq!(metadata.provider_session, "dev");
         assert_eq!(metadata.origin_label_hint.as_deref(), Some("alice"));

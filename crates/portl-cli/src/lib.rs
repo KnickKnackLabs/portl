@@ -86,37 +86,37 @@ pub enum Command {
         user: Option<String>,
     },
     SessionProviders {
-        target: String,
+        target: Option<String>,
         json: bool,
     },
     SessionAttach {
-        target: String,
         session: Option<String>,
+        target: Option<String>,
         provider: Option<String>,
         user: Option<String>,
         cwd: Option<String>,
         argv: Vec<String>,
     },
     SessionLs {
-        target: String,
+        target: Option<String>,
         provider: Option<String>,
         json: bool,
     },
     SessionRun {
-        target: String,
         session: Option<String>,
+        target: Option<String>,
         provider: Option<String>,
         argv: Vec<String>,
     },
     SessionHistory {
-        target: String,
         session: Option<String>,
+        target: Option<String>,
         provider: Option<String>,
         format: SessionHistoryFormat,
     },
     SessionKill {
-        target: String,
         session: Option<String>,
+        target: Option<String>,
         provider: Option<String>,
     },
     SessionShare {
@@ -485,7 +485,9 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
         Command::Shell { peer, cwd, user } => {
             commands::shell::run(&peer, cwd.as_deref(), user.as_deref())
         }
-        Command::SessionProviders { target, json } => commands::session::providers(&target, json),
+        Command::SessionProviders { target, json } => {
+            commands::session::providers(target.as_deref(), json)
+        }
         Command::SessionAttach {
             target,
             session,
@@ -494,8 +496,8 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             cwd,
             argv,
         } => commands::session::attach(
-            &target,
             session.as_deref(),
+            target.as_deref(),
             provider.as_deref(),
             user.as_deref(),
             cwd.as_deref(),
@@ -505,24 +507,34 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             target,
             provider,
             json,
-        } => commands::session::ls(&target, provider.as_deref(), json),
+        } => commands::session::ls(target.as_deref(), provider.as_deref(), json),
         Command::SessionRun {
             target,
             session,
             provider,
             argv,
-        } => commands::session::run(&target, session.as_deref(), provider.as_deref(), &argv),
+        } => commands::session::run(
+            session.as_deref(),
+            target.as_deref(),
+            provider.as_deref(),
+            &argv,
+        ),
         Command::SessionHistory {
             target,
             session,
             provider,
             format,
-        } => commands::session::history(&target, session.as_deref(), provider.as_deref(), format),
+        } => commands::session::history(
+            session.as_deref(),
+            target.as_deref(),
+            provider.as_deref(),
+            format,
+        ),
         Command::SessionKill {
             target,
             session,
             provider,
-        } => commands::session::kill(&target, session.as_deref(), provider.as_deref()),
+        } => commands::session::kill(session.as_deref(), target.as_deref(), provider.as_deref()),
         Command::SessionShare {
             session,
             target,
@@ -760,7 +772,7 @@ pub const TARGET_HELP: &str = "Target identifier. Accepts any of:\n\n  * peer la
 /// and raw ticket strings are intentionally excluded.
 pub const SESSION_SHARE_TARGET_HELP: &str = "Target identifier. Supported forms:\n\n  * peer label    — outbound-capable peer from `portl peer ls`\n  * adapter alias — alias backed by an `endpoint_id`\n  * endpoint_id   — 64-char hex endpoint id (or PPPP…SSSS elided form)\n\nSaved tickets and raw `portl…` ticket strings are NOT accepted here:\nthe share flow refuses to delegate a ticket credential to an unknown\nrecipient.";
 
-const PORTL_AFTER_HELP: &str = "Pair two machines:\n  $ portl init\n  $ portl invite                       # on the other machine\n  $ portl accept PORTLINV-…            # on this machine\n  $ portl shell other-machine          # one-shot interactive shell\n  $ portl session attach other-machine # persistent shell, if available\n\nRun `portl <COMMAND> --help` for details on any subcommand.\n\nEnvironment variables:\n  PORTL_HOME       State directory override.\n  PORTL_CONFIG     Alt portl.toml path.\n  PORTL_JSON       Force --json where supported (0/1).\n  PORTL_QUIET      Force --quiet where supported (0/1).\n  NO_COLOR         Disable color output.\n\nSee `docs/ENV.md` for the full list including relay and internal variables.";
+const PORTL_AFTER_HELP: &str = "Everyday sessions:\n  $ portl attach dotfiles\n  $ portl run dotfiles -- git status\n  $ PORTL_TARGET=other-machine portl attach dotfiles\n  $ portl session share dotfiles\n\nPair two machines:\n  $ portl init\n  $ portl invite                       # on the other machine\n  $ portl accept PORTLINV-…            # on this machine\n\nRun `portl <COMMAND> --help` for details on any subcommand.\n\nEnvironment variables:\n  PORTL_HOME       State directory override.\n  PORTL_CONFIG     Alt portl.toml path.\n  PORTL_TARGET     Default target for session commands.\n  PORTL_JSON       Force --json where supported (0/1).\n  PORTL_QUIET      Force --quiet where supported (0/1).\n  NO_COLOR         Disable color output.\n\nSee `docs/ENV.md` for the full list including relay and internal variables.";
 
 const TOP_LEVEL_HELP: &str = "portl — peer-to-peer remote access and port forwarding.
 
@@ -781,11 +793,18 @@ Trust:
 Pairing:
   accept       Consume an invite (PORTLINV-…) or short share (PORTL-S-…)
 
+Sessions:
+  attach       Attach to a persistent session
+  run          Run a command in a persistent session
+  ls           List persistent sessions
+  history      Print persistent session history
+  kill         Kill a persistent session
+  session      Manage persistent terminal sessions
+
 Connect:
   status       Report health for this machine or probe a target
-  shell        Open an interactive remote PTY shell
-  session      Manage persistent terminal sessions
-  exec         Run a remote command without a PTY
+  shell        Open a one-shot remote PTY shell
+  exec         Run a one-shot remote command without a persistent session
   tcp          Set up one or more local TCP forwards
   udp          Set up one or more local UDP forwards
 
@@ -808,27 +827,32 @@ Options:
   -h, --help          Print help
   -V, --version       Print version
 
+Everyday sessions:
+  $ portl attach dotfiles
+  $ portl run dotfiles -- git status
+  $ PORTL_TARGET=other-machine portl attach dotfiles
+  $ portl session share dotfiles
+
 Pair two machines:
   $ portl init
   $ portl invite                       # on the other machine
   $ portl accept PORTLINV-…            # on this machine
-  $ portl shell other-machine          # one-shot interactive shell
-  $ portl session attach other-machine # persistent shell, if available
 
 Run `portl <COMMAND> --help` for details on any subcommand.
 
 Environment variables:
   PORTL_HOME       State directory override.
   PORTL_CONFIG     Alt portl.toml path.
+  PORTL_TARGET     Default target for session commands.
   PORTL_JSON       Force --json where supported (0/1).
   PORTL_QUIET      Force --quiet where supported (0/1).
   NO_COLOR         Disable color output.
 
 See `docs/ENV.md` for the full list including relay and internal variables.";
 
-const RELATIONSHIP_HELP: &str = "Relationship between portl trust objects:\n\n                    peer              invite                ticket\nOwns on disk        peers.json        pending_invites.json   tickets.json + revocations.jsonl\nLifecycle           permanent         ephemeral (single-use) scoped by TTL\nWhen created        on accept         by `portl invite`      by `portl ticket issue`\nWhen consumed       on rm             on `portl accept`      every connection/operation\n\nWorkflow:\n    first contact     →  `portl invite` + `portl accept`       (writes peer row)\n    day-to-day auth   →  `portl shell <target>`                (one-shot terminal)\n    persistent auth   →  `portl session attach <target>`       (persistent terminal, if available)\n    advanced: bounded →  `portl ticket issue` + `ticket save`  (explicit permission)";
+const RELATIONSHIP_HELP: &str = "Relationship between portl trust objects:\n\n                    peer              invite                ticket\nOwns on disk        peers.json        pending_invites.json   tickets.json + revocations.jsonl\nLifecycle           permanent         ephemeral (single-use) scoped by TTL\nWhen created        on accept         by `portl invite`      by `portl ticket issue`\nWhen consumed       on rm             on `portl accept`      every connection/operation\n\nWorkflow:\n    first contact     →  `portl invite` + `portl accept`       (writes peer row)\n    day-to-day auth   →  `portl shell <target>`                (one-shot terminal)\n    persistent auth   →  `portl attach <session> --target <target>` (persistent terminal, if available)\n    advanced: bounded →  `portl ticket issue` + `ticket save`  (explicit permission)";
 
-const INVITE_AFTER_HELP: &str = "Examples:\n  portl invite                              # mutual pair, 1h TTL\n  portl invite --initiator me --for cust    # remote-support invite\n  portl invite --ttl 10m --for laptop\n  portl invite ls\n  portl invite rm abc123\n\nRelationship between portl trust objects:\n\n                    peer              invite                ticket\nOwns on disk        peers.json        pending_invites.json   tickets.json + revocations.jsonl\nLifecycle           permanent         ephemeral (single-use) scoped by TTL\nWhen created        on accept         by `portl invite`      by `portl ticket issue`\nWhen consumed       on rm             on `portl accept`      every connection/operation\n\nWorkflow:\n    first contact     →  `portl invite` + `portl accept`       (writes peer row)\n    day-to-day auth   →  `portl shell <target>`                (one-shot terminal)\n    persistent auth   →  `portl session attach <target>`       (persistent terminal, if available)\n    advanced: bounded →  `portl ticket issue` + `ticket save`  (explicit permission)";
+const INVITE_AFTER_HELP: &str = "Examples:\n  portl invite                              # mutual pair, 1h TTL\n  portl invite --initiator me --for cust    # remote-support invite\n  portl invite --ttl 10m --for laptop\n  portl invite ls\n  portl invite rm abc123\n\nRelationship between portl trust objects:\n\n                    peer              invite                ticket\nOwns on disk        peers.json        pending_invites.json   tickets.json + revocations.jsonl\nLifecycle           permanent         ephemeral (single-use) scoped by TTL\nWhen created        on accept         by `portl invite`      by `portl ticket issue`\nWhen consumed       on rm             on `portl accept`      every connection/operation\n\nWorkflow:\n    first contact     →  `portl invite` + `portl accept`       (writes peer row)\n    day-to-day auth   →  `portl shell <target>`                (one-shot terminal)\n    persistent auth   →  `portl attach <session> --target <target>` (persistent terminal, if available)\n    advanced: bounded →  `portl ticket issue` + `ticket save`  (explicit permission)";
 
 const ACCEPT_AFTER_HELP: &str = "Generic receiver for codes Portl knows how to consume:\n\n  PORTLINV-…     pairing invite from `portl invite` (peer trust handshake)\n  PORTL-S-…      short online session share (online exchange)\n  PORTL-SHARE1-… offline share token (not yet implemented)\n  portl…         ticket string — use `portl ticket save <label> <ticket>`\n\nExamples:\n  portl accept PORTLINV-ABCDEFGH…\n  portl accept PORTL-S-2-nebula-involve\n  portl accept PORTL-S-2-nebula-involve --label dev-laptop\n  portl accept --yes PORTLINV-ABCDEFGH…";
 
@@ -876,7 +900,9 @@ enum TopLevel {
     Trust(TrustTopLevel),
     #[command(flatten, next_help_heading = "Pairing", next_display_order = 80)]
     Pairing(PairingTopLevel),
-    #[command(flatten, next_help_heading = "Connect", next_display_order = 100)]
+    #[command(flatten, next_help_heading = "Sessions", next_display_order = 100)]
+    Sessions(SessionTopLevel),
+    #[command(flatten, next_help_heading = "Connect", next_display_order = 150)]
     Connect(ConnectTopLevel),
     #[command(flatten, next_help_heading = "Permissions", next_display_order = 200)]
     Permissions(PermissionsTopLevel),
@@ -1009,6 +1035,86 @@ enum PairingTopLevel {
 }
 
 #[derive(Subcommand, Debug)]
+enum SessionTopLevel {
+    /// Attach to a persistent session.
+    #[command(display_order = 100)]
+    Attach {
+        /// Session name or HOST/SESSION ref. Defaults to `default`.
+        #[arg(value_name = "SESSION")]
+        session: Option<String>,
+        /// Explicit remote target. Defaults to `PORTL_TARGET`, then local.
+        #[arg(long, help = TARGET_HELP)]
+        target: Option<String>,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        user: Option<String>,
+        #[arg(long)]
+        cwd: Option<String>,
+        #[arg(last = true)]
+        argv: Vec<String>,
+    },
+    /// Run a command in a persistent session.
+    #[command(display_order = 101)]
+    Run {
+        /// Session name or HOST/SESSION ref. Defaults to `default`.
+        #[arg(value_name = "SESSION")]
+        session: Option<String>,
+        /// Explicit remote target. Defaults to `PORTL_TARGET`, then local.
+        #[arg(long, help = TARGET_HELP)]
+        target: Option<String>,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
+    },
+    /// List persistent sessions.
+    #[command(display_order = 102)]
+    Ls {
+        /// Explicit remote target. Defaults to `PORTL_TARGET`, then local.
+        #[arg(long, help = TARGET_HELP)]
+        target: Option<String>,
+        #[arg(long)]
+        provider: Option<String>,
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print persistent session history.
+    #[command(display_order = 103)]
+    History {
+        /// Session name or HOST/SESSION ref. Defaults to `default`.
+        #[arg(value_name = "SESSION")]
+        session: Option<String>,
+        /// Explicit remote target. Defaults to `PORTL_TARGET`, then local.
+        #[arg(long, help = TARGET_HELP)]
+        target: Option<String>,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long, value_enum, default_value = "plain")]
+        format: SessionHistoryFormat,
+    },
+    /// Kill a persistent session.
+    #[command(display_order = 104)]
+    Kill {
+        /// Session name or HOST/SESSION ref. Defaults to `default`.
+        #[arg(value_name = "SESSION")]
+        session: Option<String>,
+        /// Explicit remote target. Defaults to `PORTL_TARGET`, then local.
+        #[arg(long, help = TARGET_HELP)]
+        target: Option<String>,
+        #[arg(long)]
+        provider: Option<String>,
+    },
+    /// Manage persistent terminal sessions.
+    #[command(display_order = 120)]
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum ConnectTopLevel {
     /// Report health for this machine or probe a target.
     #[command(display_order = 100)]
@@ -1031,8 +1137,8 @@ enum ConnectTopLevel {
         #[arg(long, requires = "target", default_value = "5s", value_parser = humantime::parse_duration)]
         timeout: std::time::Duration,
     },
-    /// Open an interactive remote PTY shell.
-    #[command(display_order = 110)]
+    /// Open a one-shot remote PTY shell.
+    #[command(display_order = 160)]
     Shell {
         #[arg(help = TARGET_HELP, value_name = "TARGET")]
         peer: String,
@@ -1041,14 +1147,8 @@ enum ConnectTopLevel {
         #[arg(long)]
         user: Option<String>,
     },
-    /// Manage persistent terminal sessions.
-    #[command(display_order = 120)]
-    Session {
-        #[command(subcommand)]
-        action: SessionAction,
-    },
-    /// Run a remote command without a PTY.
-    #[command(display_order = 130)]
+    /// Run a one-shot remote command without a persistent session.
+    #[command(display_order = 170)]
     Exec {
         #[arg(help = TARGET_HELP, value_name = "TARGET")]
         peer: String,
@@ -1060,7 +1160,7 @@ enum ConnectTopLevel {
         argv: Vec<String>,
     },
     /// Set up one or more local TCP forwards.
-    #[command(display_order = 140)]
+    #[command(display_order = 180)]
     Tcp {
         /// Local forward spec: `[LOCAL_HOST:]LOCAL_PORT:REMOTE_HOST:REMOTE_PORT`.
         #[arg(short = 'L', required = true)]
@@ -1069,7 +1169,7 @@ enum ConnectTopLevel {
         peer: String,
     },
     /// Set up one or more local UDP forwards.
-    #[command(display_order = 150)]
+    #[command(display_order = 190)]
     Udp {
         /// Local forward spec: `[LOCAL_HOST:]LOCAL_PORT:REMOTE_HOST:REMOTE_PORT`.
         #[arg(short = 'L', required = true)]
@@ -1131,21 +1231,23 @@ enum UtilityTopLevel {
 
 #[derive(Subcommand, Debug)]
 enum SessionAction {
-    /// Show available persistent-session providers on a target.
+    /// Show available persistent-session providers.
     Providers {
-        #[arg(help = TARGET_HELP)]
-        target: String,
+        /// Explicit remote target. Defaults to `PORTL_TARGET`, then local.
+        #[arg(long, help = TARGET_HELP)]
+        target: Option<String>,
         /// Emit structured JSON.
         #[arg(long)]
         json: bool,
     },
     /// Attach to a persistent terminal session, creating it when supported.
     Attach {
-        #[arg(help = TARGET_HELP)]
-        target: String,
-        /// Session name override. Imported session-share tickets infer this automatically.
-        #[arg(long)]
+        /// Session name or HOST/SESSION ref. Defaults to `default`.
+        #[arg(value_name = "SESSION")]
         session: Option<String>,
+        /// Explicit remote target. Defaults to `PORTL_TARGET`, then local.
+        #[arg(long, help = TARGET_HELP)]
+        target: Option<String>,
         #[arg(long)]
         provider: Option<String>,
         #[arg(long)]
@@ -1155,41 +1257,51 @@ enum SessionAction {
         #[arg(last = true)]
         argv: Vec<String>,
     },
-    /// List provider sessions on a target.
+    /// List persistent sessions.
     Ls {
-        #[arg(help = TARGET_HELP)]
-        target: String,
+        /// Explicit remote target. Defaults to `PORTL_TARGET`, then local.
+        #[arg(long, help = TARGET_HELP)]
+        target: Option<String>,
         #[arg(long)]
         provider: Option<String>,
         /// Emit structured JSON.
         #[arg(long)]
         json: bool,
     },
-    /// Run a command in a provider session.
+    /// Run a command in a persistent session.
     Run {
-        #[arg(help = TARGET_HELP)]
-        target: String,
+        /// Session name or HOST/SESSION ref. Defaults to `default`.
+        #[arg(value_name = "SESSION")]
         session: Option<String>,
+        /// Explicit remote target. Defaults to `PORTL_TARGET`, then local.
+        #[arg(long, help = TARGET_HELP)]
+        target: Option<String>,
         #[arg(long)]
         provider: Option<String>,
         #[arg(last = true, required = true)]
         argv: Vec<String>,
     },
-    /// Print provider history for a session.
+    /// Print persistent session history.
     History {
-        #[arg(help = TARGET_HELP)]
-        target: String,
+        /// Session name or HOST/SESSION ref. Defaults to `default`.
+        #[arg(value_name = "SESSION")]
         session: Option<String>,
+        /// Explicit remote target. Defaults to `PORTL_TARGET`, then local.
+        #[arg(long, help = TARGET_HELP)]
+        target: Option<String>,
         #[arg(long)]
         provider: Option<String>,
         #[arg(long, value_enum, default_value = "plain")]
         format: SessionHistoryFormat,
     },
-    /// Kill a provider session.
+    /// Kill a persistent session.
     Kill {
-        #[arg(help = TARGET_HELP)]
-        target: String,
+        /// Session name or HOST/SESSION ref. Defaults to `default`.
+        #[arg(value_name = "SESSION")]
         session: Option<String>,
+        /// Explicit remote target. Defaults to `PORTL_TARGET`, then local.
+        #[arg(long, help = TARGET_HELP)]
+        target: Option<String>,
         #[arg(long)]
         provider: Option<String>,
     },
@@ -1543,6 +1655,7 @@ impl Cli {
                 rendezvous_url,
                 timeout,
             },
+            TopLevel::Sessions(action) => session_top_level_into_command(action),
             TopLevel::Connect(action) => connect_into_command(action),
             TopLevel::Permissions(action) => permissions_into_command(action),
             TopLevel::Integrations(action) => integrations_into_command(action),
@@ -1684,6 +1797,154 @@ fn trust_into_command(action: TrustTopLevel) -> Command {
 }
 
 #[allow(clippy::too_many_lines)]
+fn session_top_level_into_command(action: SessionTopLevel) -> Command {
+    match action {
+        SessionTopLevel::Attach {
+            session,
+            target,
+            provider,
+            user,
+            cwd,
+            argv,
+        } => Command::SessionAttach {
+            session,
+            target,
+            provider,
+            user,
+            cwd,
+            argv,
+        },
+        SessionTopLevel::Run {
+            session,
+            target,
+            provider,
+            argv,
+        } => Command::SessionRun {
+            session,
+            target,
+            provider,
+            argv,
+        },
+        SessionTopLevel::Ls {
+            target,
+            provider,
+            json,
+        } => Command::SessionLs {
+            target,
+            provider,
+            json: json || env_flag("PORTL_JSON"),
+        },
+        SessionTopLevel::History {
+            session,
+            target,
+            provider,
+            format,
+        } => Command::SessionHistory {
+            session,
+            target,
+            provider,
+            format,
+        },
+        SessionTopLevel::Kill {
+            session,
+            target,
+            provider,
+        } => Command::SessionKill {
+            session,
+            target,
+            provider,
+        },
+        SessionTopLevel::Session { action } => session_action_into_command(action),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn session_action_into_command(action: SessionAction) -> Command {
+    match action {
+        SessionAction::Providers { target, json } => Command::SessionProviders {
+            target,
+            json: json || env_flag("PORTL_JSON"),
+        },
+        SessionAction::Attach {
+            session,
+            target,
+            provider,
+            user,
+            cwd,
+            argv,
+        } => Command::SessionAttach {
+            session,
+            target,
+            provider,
+            user,
+            cwd,
+            argv,
+        },
+        SessionAction::Ls {
+            target,
+            provider,
+            json,
+        } => Command::SessionLs {
+            target,
+            provider,
+            json: json || env_flag("PORTL_JSON"),
+        },
+        SessionAction::Run {
+            session,
+            target,
+            provider,
+            argv,
+        } => Command::SessionRun {
+            session,
+            target,
+            provider,
+            argv,
+        },
+        SessionAction::History {
+            session,
+            target,
+            provider,
+            format,
+        } => Command::SessionHistory {
+            session,
+            target,
+            provider,
+            format,
+        },
+        SessionAction::Kill {
+            session,
+            target,
+            provider,
+        } => Command::SessionKill {
+            session,
+            target,
+            provider,
+        },
+        SessionAction::Share {
+            session,
+            target,
+            provider,
+            ttl,
+            access_ttl,
+            label,
+            rendezvous_url,
+            yes,
+            allow_bearer_fallback,
+        } => Command::SessionShare {
+            session,
+            target,
+            provider,
+            ttl,
+            access_ttl,
+            label,
+            rendezvous_url,
+            yes,
+            allow_bearer_fallback,
+        },
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 fn connect_into_command(action: ConnectTopLevel) -> Command {
     match action {
         ConnectTopLevel::Status {
@@ -1702,88 +1963,6 @@ fn connect_into_command(action: ConnectTopLevel) -> Command {
             timeout,
         },
         ConnectTopLevel::Shell { peer, cwd, user } => Command::Shell { peer, cwd, user },
-        ConnectTopLevel::Session { action } => match action {
-            SessionAction::Providers { target, json } => Command::SessionProviders {
-                target,
-                json: json || env_flag("PORTL_JSON"),
-            },
-            SessionAction::Attach {
-                target,
-                session,
-                provider,
-                user,
-                cwd,
-                argv,
-            } => Command::SessionAttach {
-                target,
-                session,
-                provider,
-                user,
-                cwd,
-                argv,
-            },
-            SessionAction::Ls {
-                target,
-                provider,
-                json,
-            } => Command::SessionLs {
-                target,
-                provider,
-                json: json || env_flag("PORTL_JSON"),
-            },
-            SessionAction::Run {
-                target,
-                session,
-                provider,
-                argv,
-            } => Command::SessionRun {
-                target,
-                session,
-                provider,
-                argv,
-            },
-            SessionAction::History {
-                target,
-                session,
-                provider,
-                format,
-            } => Command::SessionHistory {
-                target,
-                session,
-                provider,
-                format,
-            },
-            SessionAction::Kill {
-                target,
-                session,
-                provider,
-            } => Command::SessionKill {
-                target,
-                session,
-                provider,
-            },
-            SessionAction::Share {
-                session,
-                target,
-                provider,
-                ttl,
-                access_ttl,
-                label,
-                rendezvous_url,
-                yes,
-                allow_bearer_fallback,
-            } => Command::SessionShare {
-                session,
-                target,
-                provider,
-                ttl,
-                access_ttl,
-                label,
-                rendezvous_url,
-                yes,
-                allow_bearer_fallback,
-            },
-        },
         ConnectTopLevel::Exec {
             peer,
             cwd,

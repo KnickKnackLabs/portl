@@ -207,12 +207,12 @@ mod tests {
             target_label_hint: Some("max-b265".to_owned()),
         });
         let mut store = TicketStore::new();
-        store.insert("max-b265-dotfiles".into(), entry).unwrap();
+        store.insert("max-b265/dotfiles".into(), entry).unwrap();
         store.save(&path).unwrap();
 
         let loaded = TicketStore::load(&path).unwrap();
         let metadata = loaded
-            .get("max-b265-dotfiles")
+            .get("max-b265/dotfiles")
             .unwrap()
             .session_share
             .as_ref()

@@ -17,7 +17,7 @@ Portl's current session surface is remote-first:
 
 ```bash
 portl shell <TARGET>                  # one-shot PTY
-portl session attach <TARGET> [NAME]  # persistent remote provider session
+portl attach [SESSION] --target TARGET # persistent remote provider session
 ```
 
 That works technically, but it makes persistent sessions feel like an
@@ -117,7 +117,7 @@ transporting it through a rendezvous backend.
 ## 4. Non-goals
 
 - Removing `portl shell`, `portl exec`, or explicit remote
-  `portl session attach <TARGET> --session <SESSION>`.
+  `portl attach <SESSION> --target <TARGET>`.
 - Making provider-native zmx/tmux session names globally unique.
 - Building a permanent URL-shortener service that stores authority-bearing
   tickets under short keys.
@@ -252,12 +252,12 @@ swift-river
 Keep the existing remote provider surface:
 
 ```bash
-portl session attach <TARGET> [--session SESSION] [--provider PROVIDER] [--user USER] [--cwd CWD] [-- <ARGV>...]
-portl session providers <TARGET> [--json]
-portl session ls <TARGET> [--provider PROVIDER] [--json]
-portl session run <TARGET> [SESSION] [--provider PROVIDER] -- <ARGV>...
-portl session history <TARGET> [SESSION] [--provider PROVIDER]
-portl session kill <TARGET> [SESSION] [--provider PROVIDER]
+portl attach [SESSION] [--target TARGET] [--provider PROVIDER] [--user USER] [--cwd CWD] [-- <ARGV>...]
+portl session providers [--target TARGET] [--json]
+portl ls [--target TARGET] [--provider PROVIDER] [--json]
+portl run [SESSION] [--target TARGET] [--provider PROVIDER] -- <ARGV>...
+portl history [SESSION] [--target TARGET] [--provider PROVIDER]
+portl kill [SESSION] [--target TARGET] [--provider PROVIDER]
 ```
 
 These remain useful for direct target/provider management and for

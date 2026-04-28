@@ -94,6 +94,7 @@ fn top_level_help_uses_logical_command_groups() {
         "Setup:",
         "Trust:",
         "Pairing:",
+        "Sessions:",
         "Connect:",
         "Permissions:",
         "Integrations:",
@@ -117,13 +118,16 @@ fn top_level_help_uses_logical_command_groups() {
         &["Trust:", "  peer", "  invite"],
         &["Pairing:", "  accept"],
         &[
-            "Connect:",
-            "  status",
-            "  shell",
+            "Sessions:",
+            "  attach",
+            "  run",
+            "  ls",
+            "  history",
+            "  kill",
             "  session",
-            "  exec",
-            "  tcp",
-            "  udp",
+        ],
+        &[
+            "Connect:", "  status", "  shell", "  exec", "  tcp", "  udp",
         ],
         &["Permissions:", "  ticket"],
         &["Integrations:", "  docker", "  slicer", "  gateway"],
@@ -216,15 +220,34 @@ fn session_share_help_is_local_session_first() {
 }
 
 #[test]
-fn session_attach_help_uses_one_positional_with_session_flag() {
+fn session_attach_help_is_local_first_with_target_flag() {
     let help = help_output(&["session", "attach", "--help"]);
     assert!(
-        help.contains("Usage: portl session attach [OPTIONS] <TARGET>"),
-        "session attach should not require a repeated positional session name:\n{help}"
+        help.contains("Usage: portl session attach [OPTIONS] [SESSION]"),
+        "session attach should take an optional session ref, not a target-first positional:\n{help}"
     );
     assert!(
-        help.contains("--session <SESSION>"),
-        "session attach should expose an explicit --session override:\n{help}"
+        help.contains("--target <TARGET>"),
+        "session attach should expose an explicit target selector:\n{help}"
+    );
+}
+
+#[test]
+fn top_level_help_groups_daily_session_aliases() {
+    let help = help_output(&["--help"]);
+    assert!(
+        help.contains("Sessions:"),
+        "missing Sessions group:\n{help}"
+    );
+    for command in ["attach", "run", "ls", "history", "kill", "session"] {
+        assert!(
+            help.contains(command),
+            "missing {command} in top-level help:\n{help}"
+        );
+    }
+    assert!(
+        help.contains("PORTL_TARGET"),
+        "top-level help should document PORTL_TARGET:\n{help}"
     );
 }
 

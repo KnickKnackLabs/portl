@@ -127,22 +127,23 @@ On the other device:
 
 ```bash
 portl accept PORTLINV-...
-portl session attach shared-box pair
+portl attach pair --target shared-box
 ```
 
 The session name (`pair` above) is the rendezvous point. Anyone with
-permission to the target can attach to the same named session:
+permission to the target can attach to the same named session. For repeated
+work on one machine, set a default target:
 
 ```bash
-portl session attach shared-box pair
+PORTL_TARGET=shared-box portl attach pair
 ```
 
 Detach by closing the local terminal; the provider session stays alive.
 Destroy it explicitly when finished:
 
 ```bash
-portl session ls shared-box
-portl session kill shared-box pair
+portl ls --target shared-box
+portl kill pair --target shared-box
 ```
 
 ### Share a session with a short code
@@ -152,7 +153,7 @@ pairing, keep a sender command running and send them the printed
 `PORTL-S-*` code:
 
 ```bash
-portl session share shared-box pair --label shared-box --ttl 10m --access-ttl 2h
+portl session share pair --target shared-box --label shared-box --ttl 10m --access-ttl 2h
 # prints PORTL-S-...
 ```
 
@@ -160,7 +161,7 @@ On the recipient machine:
 
 ```bash
 portl accept PORTL-S-...
-portl session attach pair@shared-box pair
+portl attach shared-box/pair
 ```
 
 `portl accept` saves the imported access as a local ticket label. Pass
@@ -180,14 +181,14 @@ Send the printed `portl...` ticket string. The recipient can attach
 directly:
 
 ```bash
-portl session attach 'portl...' pair
+portl attach pair --target 'portl...'
 ```
 
 Or save it under a local label first:
 
 ```bash
 portl ticket save shared-box 'portl...'
-portl session attach shared-box pair
+portl attach pair --target shared-box
 ```
 
 Use `portl ticket issue dev --ttl 2h` for a broader development ticket

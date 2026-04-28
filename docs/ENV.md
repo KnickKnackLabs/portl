@@ -10,6 +10,7 @@ surface.
 | --- | --- |
 | `PORTL_HOME` | State directory override for identity, peer store, tickets, and revocations. |
 | `PORTL_CONFIG` | Alternate `portl.toml` path. |
+| `PORTL_TARGET` | Default target for session commands. Accepts peer labels, saved ticket labels, endpoint IDs, aliases, and unique hostname shorthands such as `max` for `max-b265`. Explicit `--target` or `host/session` refs take precedence. |
 | `PORTL_JSON` | Force `--json` on commands that support structured output. Truthy values are `1`, `true`, `yes`, and `on`; falsey values are `0`, `false`, `no`, and `off`. |
 | `PORTL_QUIET` | Force quiet output on commands that support it, including `init` and `doctor`. Uses the same boolean values as `PORTL_JSON`. |
 | `NO_COLOR` | Disable color output, following the community `NO_COLOR` convention. |

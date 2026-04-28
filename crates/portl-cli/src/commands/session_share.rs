@@ -152,6 +152,11 @@ pub(crate) enum ResolveTargetError {
     Unsupported,
 }
 
+fn label_hostname(label: &str) -> Option<String> {
+    let (host, suffix) = label.rsplit_once('-')?;
+    (suffix.len() == 4 && suffix.chars().all(|ch| ch.is_ascii_hexdigit())).then(|| host.to_owned())
+}
+
 /// Resolve `target` to a [`ShareTargetForm`] without echoing the raw
 /// argument. Mutates no state and performs no network I/O.
 pub(crate) fn classify_share_target(
@@ -186,13 +191,44 @@ pub(crate) fn classify_share_target(
         });
     }
 
-    // 3) Saved-ticket label. Refuse — never echo (label is fine but
+    // 3) Unique hostname shorthand for canonical machine labels like
+    //    `max-b265` → `max`. Only peer rows can be shared this way;
+    //    saved tickets are intentionally not delegated.
+    let mut host_matches = peers
+        .iter()
+        .filter(|entry| label_hostname(&entry.label).as_deref() == Some(trimmed))
+        .collect::<Vec<_>>();
+    host_matches.sort_by(|a, b| a.label.cmp(&b.label));
+    host_matches.dedup_by(|a, b| a.endpoint_id_hex.eq_ignore_ascii_case(&b.endpoint_id_hex));
+    if host_matches.len() == 1 {
+        let entry = host_matches[0];
+        if entry.last_hold_at.is_some() {
+            return Err(ResolveTargetError::HeldPeer(entry.label.clone()));
+        }
+        if !entry.they_accept_from_me {
+            return Err(ResolveTargetError::InboundOnlyPeer(entry.label.clone()));
+        }
+        let eid_bytes = entry
+            .endpoint_id_bytes()
+            .map_err(|_| ResolveTargetError::Unsupported)?;
+        let endpoint_id =
+            EndpointId::from_bytes(&eid_bytes).map_err(|_| ResolveTargetError::Unsupported)?;
+        return Ok(ShareTargetForm::PeerStore {
+            label: entry.label.clone(),
+            endpoint_id,
+        });
+    }
+    if host_matches.len() > 1 {
+        return Err(ResolveTargetError::Unsupported);
+    }
+
+    // 4) Saved-ticket label. Refuse — never echo (label is fine but
     //    delegation is not supported here).
     if tickets.get(trimmed).is_some() {
         return Err(ResolveTargetError::SavedTicketLabel(trimmed.to_owned()));
     }
 
-    // 4) Alias label.
+    // 5) Alias label.
     if let Ok(Some(alias)) = aliases.get(trimmed) {
         if let Ok(Some(spec)) = aliases.get_spec(trimmed)
             && spec.ticket_file_path.is_some()
@@ -208,7 +244,7 @@ pub(crate) fn classify_share_target(
         return Err(ResolveTargetError::Unsupported);
     }
 
-    // 5) Raw endpoint id (full hex or middle-elided form).
+    // 6) Raw endpoint id (full hex or middle-elided form).
     if let Ok(endpoint_id) = crate::eid::resolve(trimmed, Some(peers), Some(tickets)) {
         return Ok(ShareTargetForm::RawEid { endpoint_id });
     }
