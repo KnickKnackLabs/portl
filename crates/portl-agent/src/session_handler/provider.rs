@@ -490,6 +490,12 @@ fn validate_tmux_control_target(target: &str) -> Result<()> {
     Ok(())
 }
 
+fn tmux_list_empty_error(stderr: &str) -> bool {
+    stderr.contains("no server running")
+        || stderr.contains("no sessions")
+        || (stderr.contains("error connecting") && stderr.contains("no such file or directory"))
+}
+
 fn parse_tmux_panes(stdout: &str) -> Vec<TmuxPane> {
     stdout
         .lines()
@@ -579,7 +585,7 @@ impl TmuxProvider {
             .await?;
         if output.code != 0 {
             let stderr = output.stderr.to_lowercase();
-            if stderr.contains("no server running") || stderr.contains("no sessions") {
+            if tmux_list_empty_error(&stderr) {
                 return Ok(Vec::new());
             }
             ensure_success("tmux list-sessions", &output)?;
@@ -1341,7 +1347,7 @@ esac
             r#"#!/bin/sh
 case "$1" in
   -V) echo "tmux 3.6" ;;
-  list-sessions) echo "no server running on /tmp/tmux" >&2; exit 1 ;;
+  list-sessions) echo "error connecting to /tmp/tmux-1001/default (No such file or directory)" >&2; exit 1 ;;
 esac
 "#,
         )?;

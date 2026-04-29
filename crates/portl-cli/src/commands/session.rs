@@ -636,7 +636,7 @@ async fn local_tmux_list() -> Result<Vec<String>> {
     let output = run_local_tmux_capture(&["list-sessions", "-F", "#{session_name}"]).await?;
     if output.code != 0 {
         let stderr = output.stderr.to_lowercase();
-        if stderr.contains("no server running") || stderr.contains("no sessions") {
+        if tmux_list_empty_error(&stderr) {
             return Ok(Vec::new());
         }
         ensure_local_provider_success("tmux list-sessions", &output)?;
@@ -651,6 +651,12 @@ fn session_names_from_stdout(stdout: &str) -> Vec<String> {
         .filter(|line| !line.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn tmux_list_empty_error(stderr: &str) -> bool {
+    stderr.contains("no server running")
+        || stderr.contains("no sessions")
+        || (stderr.contains("error connecting") && stderr.contains("no such file or directory"))
 }
 
 async fn local_session_run(
