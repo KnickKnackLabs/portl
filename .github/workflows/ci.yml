@@ -60,7 +60,7 @@ env:
 
 jobs:
   test:
-    name: cargo test
+    name: cargo nextest
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -82,7 +82,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --profile ci --workspace --all-features
+      - run: cargo nextest run --profile ci --workspace --all-features --lib --bins --tests
 
   fmt:
     name: rustfmt

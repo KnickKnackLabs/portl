@@ -61,5 +61,5 @@ n0-future  = { workspace = true }
 # Pre-main hook used by `tests/common/mod.rs` to install a per-test-binary
 # watchdog that aborts the process after `PORTL_TEST_WATCHDOG_SECS` (default
 # 30s). Prevents a single hung integration test (e.g. iroh relay stalls)
-# from wedging `cargo test --workspace` indefinitely.
+# from wedging the nextest/cargo test runner indefinitely.
 ctor = "0.2"

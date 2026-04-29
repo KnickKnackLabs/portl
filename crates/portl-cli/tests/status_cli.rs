@@ -147,6 +147,7 @@ async fn start_agent(
         trust_roots: vec![operator.verifying_key()],
         revocations_path: Some(revocations_path),
         endpoint: Some(server),
+        metrics_enabled: Some(false),
         ..AgentConfig::default()
     })
     .await

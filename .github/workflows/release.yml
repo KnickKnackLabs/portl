@@ -42,7 +42,7 @@ jobs:
       fail-fast: true
       matrix:
         check:
-          - cargo test
+          - cargo nextest
           - rustfmt
           - clippy
           - cargo deny

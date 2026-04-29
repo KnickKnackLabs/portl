@@ -6,9 +6,15 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
+import time
+from collections.abc import Mapping
 from pathlib import Path
 
 FIRST_PARTY = {
@@ -23,9 +29,19 @@ FIRST_PARTY = {
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 
 
-def run(cmd: list[str], *, capture: bool = False) -> subprocess.CompletedProcess[str]:
+def run(
+    cmd: list[str],
+    *,
+    capture: bool = False,
+    env: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     print("$", " ".join(cmd))
-    return subprocess.run(cmd, text=True, capture_output=capture, check=True)
+    started = time.monotonic()
+    try:
+        return subprocess.run(cmd, text=True, capture_output=capture, check=True, env=env)
+    finally:
+        elapsed = time.monotonic() - started
+        print(f"[release:verify] completed in {elapsed:.1f}s: {' '.join(cmd)}")
 
 
 def repo_root() -> Path:
@@ -71,15 +87,92 @@ def verify_metadata(root: Path, version: str, allow_existing_tag: bool) -> None:
     readme = (root / "README.md").read_text()
     for needle in [f"PORTL_VERSION={version}", f"KnickKnackLabs/portl@{version}"]:
         require(needle in readme, f"README.md missing {needle}")
+    metadata = json.loads(
+        run(["cargo", "metadata", "--format-version", "1", "--no-deps"], capture=True).stdout
+    )
+    first_party_versions = {
+        package["name"]: package["version"]
+        for package in metadata["packages"]
+        if package["name"] in FIRST_PARTY
+    }
+    for name in sorted(FIRST_PARTY):
+        found = first_party_versions.get(name)
+        require(found == version, f"cargo metadata {name} is {found}, expected {version}")
     local_tag = subprocess.run(["git", "rev-parse", "-q", "--verify", f"refs/tags/v{version}"], capture_output=True)
     if not allow_existing_tag:
         require(local_tag.returncode != 0, f"local tag v{version} already exists")
 
 
+def require_tool(tool: str, install_hint: str) -> None:
+    if shutil.which(tool) is None:
+        raise SystemExit(f"Required command not found: {tool}. {install_hint}")
+
+
+def nextest_env(*, temp_home: bool) -> dict[str, str]:
+    env = os.environ.copy()
+    env.setdefault("PORTL_TEST_WATCHDOG_SECS", "90")
+    if temp_home:
+        env["PORTL_HOME"] = tempfile.mkdtemp(prefix="portl-release-verify-")
+    return env
+
+
+def run_ci_checks() -> None:
+    require_tool("cargo-nextest", "Run `mise install` or `cargo install cargo-nextest`.")
+    run(
+        [
+            "cargo",
+            "nextest",
+            "run",
+            "--profile",
+            "ci",
+            "--workspace",
+            "--all-features",
+            "--lib",
+            "--bins",
+            "--tests",
+            "--status-level",
+            "slow",
+            "--final-status-level",
+            "slow",
+        ]
+    )
+    run(["cargo", "clippy", "--workspace", "--all-features", "--all-targets", "--", "-D", "warnings"])
+
+
+def run_smoke_checks() -> None:
+    require_tool("cargo-nextest", "Run `mise install` or `cargo install cargo-nextest`.")
+    smoke_targets = [
+        "endpoint_close_cli",
+        "status_cli",
+        "agent_run",
+        "udp_cli",
+        "m3_cli",
+    ]
+    cmd = [
+        "cargo",
+        "nextest",
+        "run",
+        "--profile",
+        "ci",
+        "-p",
+        "portl-cli",
+        "--status-level",
+        "slow",
+        "--final-status-level",
+        "slow",
+    ]
+    for target in smoke_targets:
+        cmd.extend(["--test", target])
+    cmd.extend(["--run-ignored", "only"])
+    run(cmd, env=nextest_env(temp_home=True))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Verify a Portl release")
     parser.add_argument("version")
-    parser.add_argument("--full", action="store_true", help="Run focused tests and clippy")
+    parser.add_argument("--ci", action="store_true", help="Run CI-equivalent nextest and clippy checks")
+    parser.add_argument("--smoke", action="store_true", help="Run ignored release smoke tests with nextest")
+    parser.add_argument("--full", action="store_true", help="Run --ci and --smoke")
     parser.add_argument("--skip-command-checks", action="store_true")
     parser.add_argument("--allow-existing-tag", action="store_true")
     args = parser.parse_args()
@@ -90,20 +183,13 @@ def main() -> int:
     if not args.skip_command_checks:
         run(["cargo", "fmt", "--check"])
         run(["git", "diff", "--check"])
-        version = subprocess.check_output(["cargo", "run", "-q", "--bin", "portl", "--", "--version"], text=True).strip()
-        require(version == f"portl {args.version}", f"portl --version printed {version!r}")
         if args.full:
-            run(["cargo", "test", "-p", "portl-cli", "--test", "help_cli"])
-            run(["cargo", "test", "-p", "portl-cli", "--lib"])
-            run(["cargo", "clippy", "-p", "portl-cli", "--all-targets", "--", "-D", "warnings"])
-            for test_target in [
-                "endpoint_close_cli",
-                "status_cli",
-                "agent_run",
-                "udp_cli",
-                "m3_cli",
-            ]:
-                run(["cargo", "test", "-p", "portl-cli", "--test", test_target, "--", "--ignored"])
+            args.ci = True
+            args.smoke = True
+        if args.ci:
+            run_ci_checks()
+        if args.smoke:
+            run_smoke_checks()
     print(f"release metadata verified for v{args.version}")
     return 0
 

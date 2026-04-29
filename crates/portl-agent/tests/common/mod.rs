@@ -10,7 +10,7 @@
 //! after `PORTL_TEST_WATCHDOG_SECS` (default 30s). This prevents a
 //! single hung integration test — most often an `iroh` endpoint
 //! waiting on the public n0 relay infrastructure — from wedging
-//! `cargo test --workspace` for minutes at a time. Set
+//! the nextest/cargo test runner for minutes at a time. Set
 //! `PORTL_TEST_WATCHDOG_SECS=0` to disable for local debugging.
 //!
 //! Each test file that uses this module writes
@@ -24,7 +24,7 @@ use std::time::Duration;
 
 /// Per-test-binary timeout. After this many seconds from process
 /// start, the watchdog thread calls [`std::process::abort`] so a
-/// hung test can't wedge `cargo test`. Override with
+/// hung test can't wedge the test runner. Override with
 /// `PORTL_TEST_WATCHDOG_SECS`; `0` disables the watchdog.
 const DEFAULT_WATCHDOG_SECS: u64 = 30;
 
