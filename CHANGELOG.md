@@ -5,6 +5,8 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.7.0 — 2026-04-29
+
 ### Added
 
 - `zmx` control attaches now understand semantic viewport and live-output
