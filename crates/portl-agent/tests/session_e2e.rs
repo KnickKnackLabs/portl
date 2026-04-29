@@ -11,7 +11,7 @@ use portl_core::id::Identity;
 use portl_core::net::shell_client::PtyCfg;
 use portl_core::net::{
     open_session_attach, open_session_entries, open_session_history, open_session_list,
-    open_session_run, open_ticket_v1,
+    open_session_list_detailed, open_session_run, open_ticket_v1,
 };
 use portl_core::test_util::pair;
 use portl_core::ticket::mint::mint_root;
@@ -48,6 +48,13 @@ async fn session_zmx_provider_maps_core_ops_over_session_protocol() -> Result<()
 
     let listed = open_session_list(&connection, &session, Some("zmx".to_owned())).await?;
     assert_eq!(listed, vec!["dev".to_owned(), "frontend".to_owned()]);
+    let detailed =
+        open_session_list_detailed(&connection, &session, Some("zmx".to_owned())).await?;
+    assert_eq!(detailed.len(), 1);
+    assert_eq!(detailed[0].provider, "zmx");
+    assert!(detailed[0].default);
+    assert_eq!(detailed[0].sessions[0].name, "dev");
+    assert_eq!(detailed[0].sessions[0].provider, "zmx");
 
     let run = open_session_run(
         &connection,

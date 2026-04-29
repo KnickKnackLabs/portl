@@ -1,11 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use portl_proto::session_v1::{
-    ProviderCapabilities, ProviderReport, ProviderStatus, SessionRunResult,
+    ProviderCapabilities, ProviderReport, ProviderStatus, SessionInfo, SessionRunResult,
 };
 use tokio::process::Command;
 
@@ -118,7 +118,24 @@ impl ZmxProvider {
         Ok(self.probe_control(&path).await?.is_some())
     }
 
+    #[cfg(test)]
     pub(crate) async fn list(&self) -> Result<Vec<String>> {
+        Ok(self
+            .list_detailed()
+            .await?
+            .into_iter()
+            .map(|session| session.name)
+            .collect())
+    }
+
+    pub(crate) async fn list_detailed(&self) -> Result<Vec<SessionInfo>> {
+        let json_output = self.run_capture(&["list", "--json"]).await?;
+        if json_output.code == 0 {
+            if let Ok(sessions) = parse_zmx_session_json(&json_output.stdout) {
+                return Ok(sessions);
+            }
+        }
+
         let output = self.run_capture(&["list"]).await?;
         ensure_success("zmx list", &output)?;
         Ok(output
@@ -126,7 +143,11 @@ impl ZmxProvider {
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
-            .map(ToOwned::to_owned)
+            .map(|name| SessionInfo {
+                name: name.to_owned(),
+                provider: "zmx".to_owned(),
+                metadata: BTreeMap::new(),
+            })
             .collect())
     }
 
@@ -579,9 +600,23 @@ impl TmuxProvider {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn list(&self) -> Result<Vec<String>> {
+        Ok(self
+            .list_detailed()
+            .await?
+            .into_iter()
+            .map(|session| session.name)
+            .collect())
+    }
+
+    pub(crate) async fn list_detailed(&self) -> Result<Vec<SessionInfo>> {
         let output = self
-            .run_capture(&["list-sessions", "-F", "#{session_name}"])
+            .run_capture(&[
+                "list-sessions",
+                "-F",
+                "#{session_name}\t#{session_id}\t#{session_attached}\t#{session_created}\t#{session_windows}\t#{window_width}\t#{window_height}",
+            ])
             .await?;
         if output.code != 0 {
             let stderr = output.stderr.to_lowercase();
@@ -595,7 +630,7 @@ impl TmuxProvider {
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
-            .map(ToOwned::to_owned)
+            .map(parse_tmux_session_line)
             .collect())
     }
 
@@ -779,6 +814,73 @@ fn tmux_provider_status(
         tier,
         features,
     }
+}
+
+fn parse_zmx_session_json(stdout: &str) -> Result<Vec<SessionInfo>> {
+    let value: serde_json::Value = serde_json::from_str(stdout).context("parse zmx list --json")?;
+    let Some(items) = value.as_array() else {
+        return Ok(Vec::new());
+    };
+    Ok(items
+        .iter()
+        .filter_map(|item| match item {
+            serde_json::Value::String(name) => Some(SessionInfo {
+                name: name.clone(),
+                provider: "zmx".to_owned(),
+                metadata: BTreeMap::new(),
+            }),
+            serde_json::Value::Object(object) => object
+                .get("name")
+                .or_else(|| object.get("session"))
+                .and_then(serde_json::Value::as_str)
+                .map(|name| SessionInfo {
+                    name: name.to_owned(),
+                    provider: "zmx".to_owned(),
+                    metadata: stringify_json_object(object, &["name", "session"]),
+                }),
+            _ => None,
+        })
+        .collect())
+}
+
+fn parse_tmux_session_line(line: &str) -> SessionInfo {
+    let mut parts = line.split('\t');
+    let name = parts.next().unwrap_or_default().to_owned();
+    let id = parts.next().unwrap_or_default();
+    let attached = parts.next().unwrap_or_default();
+    let created = parts.next().unwrap_or_default();
+    let windows = parts.next().unwrap_or_default();
+    let width = parts.next().unwrap_or_default();
+    let height = parts.next().unwrap_or_default();
+    SessionInfo {
+        name,
+        provider: "tmux".to_owned(),
+        metadata: BTreeMap::from([
+            ("id".to_owned(), id.to_owned()),
+            ("attached".to_owned(), (attached == "1").to_string()),
+            ("created_unix".to_owned(), created.to_owned()),
+            ("windows".to_owned(), windows.to_owned()),
+            ("width".to_owned(), width.to_owned()),
+            ("height".to_owned(), height.to_owned()),
+        ]),
+    }
+}
+
+fn stringify_json_object(
+    object: &serde_json::Map<String, serde_json::Value>,
+    skip_keys: &[&str],
+) -> BTreeMap<String, String> {
+    object
+        .iter()
+        .filter(|(key, _)| !skip_keys.contains(&key.as_str()))
+        .map(|(key, value)| {
+            let value = value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            (key.clone(), value)
+        })
+        .collect()
 }
 
 fn tmux_features() -> Vec<String> {
@@ -1332,7 +1434,9 @@ esac
 
         let calls = fs::read_to_string(log)?;
         assert!(calls.contains("-V\n"));
-        assert!(calls.contains("list-sessions\n-F\n#{session_name}\n"));
+        assert!(calls.contains(
+            "list-sessions\n-F\n#{session_name}\t#{session_id}\t#{session_attached}\t#{session_created}\t#{session_windows}\t#{window_width}\t#{window_height}\n"
+        ));
         assert!(calls.contains("capture-pane\n-p\n-e\n-S\n-\n-E\n-\n-t\ndev\n"));
         assert!(calls.contains("kill-session\n-t\ndev\n"));
         Ok(())

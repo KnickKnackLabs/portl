@@ -6,7 +6,8 @@ use crate::net::PeerSession;
 use crate::wire::StreamPreamble;
 use crate::wire::session::{
     ALPN_SESSION_V1, ProviderReport, SessionAck, SessionEntry, SessionFirstFrame, SessionOp,
-    SessionReason, SessionReqBody, SessionRunResult, SessionStreamKind, SessionSubTail,
+    SessionProviderSessions, SessionReason, SessionReqBody, SessionRunResult, SessionStreamKind,
+    SessionSubTail,
 };
 use crate::wire::shell::{ExitFrame, PtyCfg, ResizeFrame, SignalFrame};
 
@@ -110,6 +111,21 @@ pub async fn open_session_entries(
             })
             .collect())
     }
+}
+
+pub async fn open_session_list_detailed(
+    connection: &Connection,
+    session: &PeerSession,
+    provider: Option<String>,
+) -> Result<Vec<SessionProviderSessions>> {
+    let ack = request_ack(
+        connection,
+        session,
+        req(SessionOp::List, provider, None, None),
+    )
+    .await?;
+    ack.session_groups
+        .context("detailed session list response missing")
 }
 
 pub async fn open_session_run(

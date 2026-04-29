@@ -1,4 +1,4 @@
-use std::fmt::Write as _;
+use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::{ExitCode, Stdio};
@@ -10,8 +10,8 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use iroh::endpoint::SendStream;
 use portl_core::io::BufferedRecv;
 use portl_core::net::{
-    SessionClient, open_session_attach, open_session_entries, open_session_history,
-    open_session_kill, open_session_list, open_session_providers, open_session_run,
+    SessionClient, open_session_attach, open_session_history, open_session_kill,
+    open_session_list_detailed, open_session_providers, open_session_run,
 };
 use portl_core::ticket::schema::{Capabilities, EnvPolicy, ShellCaps};
 use tokio::io::{AsyncWriteExt, copy};
@@ -27,13 +27,135 @@ use crate::commands::session_share::{
 use portl_core::peer_store::PeerStore;
 use portl_core::rendezvous::ws::WsRendezvousBackend;
 use portl_core::ticket_store::TicketStore;
-use portl_proto::session_v1::{ProviderCapabilities, ProviderReport, ProviderStatus, SessionEntry};
+use portl_proto::session_v1::{
+    ProviderCapabilities, ProviderReport, ProviderStatus, SessionInfo, SessionProviderSessions,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SessionHistoryFormat {
     Plain,
     Vt,
     Html,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct SessionListing {
+    target: String,
+    provider_filter: Option<String>,
+    total: usize,
+    providers: BTreeMap<String, SessionProviderListing>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct SessionProviderListing {
+    available: bool,
+    #[serde(rename = "default")]
+    is_default: bool,
+    count: usize,
+    sessions: Vec<SessionListingEntry>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct SessionListingEntry {
+    name: String,
+    provider: String,
+    metadata: serde_json::Value,
+}
+
+impl SessionListing {
+    fn from_groups(
+        target: &str,
+        provider_filter: Option<&str>,
+        groups: Vec<SessionProviderSessions>,
+    ) -> Self {
+        let total = groups.iter().map(|group| group.sessions.len()).sum();
+        let providers = groups
+            .into_iter()
+            .map(|group| {
+                let provider = group.provider.clone();
+                let sessions = group
+                    .sessions
+                    .into_iter()
+                    .map(SessionListingEntry::from)
+                    .collect::<Vec<_>>();
+                (
+                    provider,
+                    SessionProviderListing {
+                        available: group.available,
+                        is_default: group.default,
+                        count: sessions.len(),
+                        sessions,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            target: target.to_owned(),
+            provider_filter: provider_filter.map(ToOwned::to_owned),
+            total,
+            providers,
+        }
+    }
+}
+
+impl From<SessionInfo> for SessionListingEntry {
+    fn from(session: SessionInfo) -> Self {
+        Self {
+            name: session.name,
+            provider: session.provider,
+            metadata: metadata_map_to_json(session.metadata),
+        }
+    }
+}
+
+fn metadata_map_to_json(metadata: BTreeMap<String, String>) -> serde_json::Value {
+    serde_json::Value::Object(
+        metadata
+            .into_iter()
+            .map(|(key, value)| (key, metadata_value_to_json(&value)))
+            .collect(),
+    )
+}
+
+fn metadata_value_to_json(value: &str) -> serde_json::Value {
+    if value.eq_ignore_ascii_case("true") {
+        serde_json::Value::Bool(true)
+    } else if value.eq_ignore_ascii_case("false") {
+        serde_json::Value::Bool(false)
+    } else if let Ok(number) = value.parse::<u64>() {
+        serde_json::Value::Number(number.into())
+    } else if value.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(value.to_owned())
+    }
+}
+
+fn render_session_listing_human(listing: &SessionListing) -> String {
+    if listing.total == 0 {
+        return match listing.provider_filter.as_deref() {
+            Some(provider) => format!("0 existing {provider} sessions found.\n"),
+            None => "0 existing sessions found.\n".to_owned(),
+        };
+    }
+
+    let mut out = String::new();
+    if listing.provider_filter.is_some() && listing.providers.len() == 1 {
+        for provider in listing.providers.values() {
+            for session in &provider.sessions {
+                out.push_str(&session.name);
+                out.push('\n');
+            }
+        }
+    } else {
+        out.push_str("PROVIDER  NAME\n");
+        for (provider_name, provider) in &listing.providers {
+            for session in &provider.sessions {
+                out.push_str(&format!("{provider_name:<8}  {}\n", session.name));
+            }
+        }
+    }
+    out
 }
 
 impl SessionHistoryFormat {
@@ -44,13 +166,6 @@ impl SessionHistoryFormat {
             Self::Html => "html",
         }
     }
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(untagged)]
-enum ListedSessions {
-    Names(Vec<String>),
-    Entries(Vec<SessionEntry>),
 }
 
 fn effective_provider(provider: Option<&str>) -> Option<String> {
@@ -71,35 +186,6 @@ fn effective_provider_from_env(
                 .filter(|value| !value.is_empty())
         })
         .map(ToOwned::to_owned)
-}
-
-fn print_listed_sessions(sessions: &ListedSessions, json: bool) -> Result<()> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(sessions)?);
-        return Ok(());
-    }
-
-    print!("{}", listed_sessions_human(sessions));
-    Ok(())
-}
-
-fn listed_sessions_human(sessions: &ListedSessions) -> String {
-    match sessions {
-        ListedSessions::Names(names) => {
-            let mut out = String::new();
-            for name in names {
-                let _ = writeln!(out, "{name}");
-            }
-            out
-        }
-        ListedSessions::Entries(entries) => {
-            let mut out = "PROVIDER  SESSION\n".to_owned();
-            for entry in entries {
-                let _ = writeln!(out, "{:<8}  {}", entry.provider, entry.name);
-            }
-            out
-        }
-    }
 }
 
 pub fn providers(target: Option<&str>, json: bool) -> Result<ExitCode> {
@@ -145,7 +231,7 @@ pub fn providers(target: Option<&str>, json: bool) -> Result<ExitCode> {
         }
         Ok(ExitCode::SUCCESS)
     });
-    runtime.shutdown_background();
+    runtime.shutdown_timeout(Duration::from_secs(2));
     result
 }
 
@@ -154,27 +240,28 @@ pub fn ls(target: Option<&str>, provider: Option<&str>, json: bool) -> Result<Ex
     let provider = effective_provider(provider);
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
-        let sessions = if resolved_target_is_local(&target)? {
-            local_session_list(provider.as_deref()).await?
+        let groups = if resolved_target_is_local(&target)? {
+            local_session_list_detailed(provider.as_deref()).await?
         } else {
             let connected = connect_peer(&target, session_caps()).await?;
-            let sessions = if let Some(provider) = provider {
-                ListedSessions::Names(
-                    open_session_list(&connected.connection, &connected.session, Some(provider))
-                        .await?,
-                )
-            } else {
-                ListedSessions::Entries(
-                    open_session_entries(&connected.connection, &connected.session, None).await?,
-                )
-            };
+            let groups = open_session_list_detailed(
+                &connected.connection,
+                &connected.session,
+                provider.clone(),
+            )
+            .await?;
             close_connected(connected, b"session complete").await;
-            sessions
+            groups
         };
-        print_listed_sessions(&sessions, json)?;
+        let listing = SessionListing::from_groups(&target, provider.as_deref(), groups);
+        if json {
+            println!("{}", serde_json::to_string_pretty(&listing)?);
+        } else {
+            print!("{}", render_session_listing_human(&listing));
+        }
         Ok(ExitCode::SUCCESS)
     });
-    runtime.shutdown_background();
+    runtime.shutdown_timeout(Duration::from_secs(2));
     result
 }
 
@@ -207,7 +294,7 @@ pub fn run(
         eprint!("{}", run.stderr);
         Ok(exit_code_from_i32(run.code))
     });
-    runtime.shutdown_background();
+    runtime.shutdown_timeout(Duration::from_secs(2));
     result
 }
 
@@ -244,7 +331,7 @@ pub fn history(
         print!("{output}");
         Ok(ExitCode::SUCCESS)
     });
-    runtime.shutdown_background();
+    runtime.shutdown_timeout(Duration::from_secs(2));
     result
 }
 
@@ -272,7 +359,7 @@ pub fn kill(
         }
         Ok(ExitCode::SUCCESS)
     });
-    runtime.shutdown_background();
+    runtime.shutdown_timeout(Duration::from_secs(2));
     result
 }
 
@@ -596,34 +683,92 @@ fn provider_capabilities(provider: &str) -> ProviderCapabilities {
     }
 }
 
-async fn local_session_list(provider: Option<&str>) -> Result<ListedSessions> {
+async fn local_session_list_detailed(
+    provider: Option<&str>,
+) -> Result<Vec<SessionProviderSessions>> {
     match provider {
-        Some("zmx") => Ok(ListedSessions::Names(local_zmx_list().await?)),
-        Some("tmux") => Ok(ListedSessions::Names(local_tmux_list().await?)),
+        Some("zmx") => Ok(vec![local_zmx_session_group(true).await?]),
+        Some("tmux") => Ok(vec![
+            local_tmux_session_group(local_zmx_path_opt().is_none()).await?,
+        ]),
         Some(other) => {
             anyhow::bail!("unsupported local session provider '{other}' (supported: zmx, tmux)")
         }
         None => {
-            let mut entries = Vec::new();
+            let default_provider = local_default_provider().ok();
+            let mut groups = Vec::new();
             if local_zmx_path_opt().is_some() {
-                for name in local_zmx_list().await? {
-                    entries.push(SessionEntry {
-                        provider: "zmx".to_owned(),
-                        name,
-                    });
-                }
+                groups.push(
+                    local_zmx_session_group(default_provider.as_deref() == Some("zmx")).await?,
+                );
             }
             if local_tmux_path_opt().is_some() {
-                for name in local_tmux_list().await? {
-                    entries.push(SessionEntry {
-                        provider: "tmux".to_owned(),
-                        name,
-                    });
-                }
+                groups.push(
+                    local_tmux_session_group(default_provider.as_deref() == Some("tmux")).await?,
+                );
             }
-            Ok(ListedSessions::Entries(entries))
+            Ok(groups)
         }
     }
+}
+
+async fn local_zmx_session_group(is_default: bool) -> Result<SessionProviderSessions> {
+    Ok(SessionProviderSessions {
+        provider: "zmx".to_owned(),
+        available: true,
+        default: is_default,
+        sessions: local_zmx_sessions_detailed().await?,
+    })
+}
+
+async fn local_tmux_session_group(is_default: bool) -> Result<SessionProviderSessions> {
+    Ok(SessionProviderSessions {
+        provider: "tmux".to_owned(),
+        available: true,
+        default: is_default,
+        sessions: local_tmux_sessions_detailed().await?,
+    })
+}
+
+async fn local_zmx_sessions_detailed() -> Result<Vec<SessionInfo>> {
+    let output = run_local_zmx_capture(&["list", "--json"]).await?;
+    if output.code == 0 {
+        if let Some(sessions) = parse_local_zmx_json_sessions(&output.stdout) {
+            return Ok(sessions);
+        }
+    }
+    Ok(local_zmx_list()
+        .await?
+        .into_iter()
+        .map(|name| SessionInfo {
+            name,
+            provider: "zmx".to_owned(),
+            metadata: BTreeMap::new(),
+        })
+        .collect())
+}
+
+async fn local_tmux_sessions_detailed() -> Result<Vec<SessionInfo>> {
+    let output = run_local_tmux_capture(&[
+        "list-sessions",
+        "-F",
+        "#{session_name}\t#{session_id}\t#{session_attached}\t#{session_created}\t#{session_windows}\t#{window_width}\t#{window_height}",
+    ])
+    .await?;
+    if output.code != 0 {
+        let stderr = output.stderr.to_lowercase();
+        if tmux_list_empty_error(&stderr) {
+            return Ok(Vec::new());
+        }
+        ensure_local_provider_success("tmux list-sessions", &output)?;
+    }
+    Ok(output
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(parse_local_tmux_session_line)
+        .collect())
 }
 
 async fn local_zmx_list() -> Result<Vec<String>> {
@@ -644,6 +789,56 @@ async fn local_tmux_list() -> Result<Vec<String>> {
     Ok(session_names_from_stdout(&output.stdout))
 }
 
+fn parse_local_zmx_json_sessions(stdout: &str) -> Option<Vec<SessionInfo>> {
+    let value: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    let items = value.as_array()?;
+    Some(
+        items
+            .iter()
+            .filter_map(|item| match item {
+                serde_json::Value::String(name) => Some(SessionInfo {
+                    name: name.clone(),
+                    provider: "zmx".to_owned(),
+                    metadata: BTreeMap::new(),
+                }),
+                serde_json::Value::Object(object) => object
+                    .get("name")
+                    .or_else(|| object.get("session"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(|name| SessionInfo {
+                        name: name.to_owned(),
+                        provider: "zmx".to_owned(),
+                        metadata: stringify_local_json_object(object, &["name", "session"]),
+                    }),
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
+fn parse_local_tmux_session_line(line: &str) -> SessionInfo {
+    let mut parts = line.split('\t');
+    let name = parts.next().unwrap_or_default().to_owned();
+    let id = parts.next().unwrap_or_default();
+    let attached = parts.next().unwrap_or_default();
+    let created = parts.next().unwrap_or_default();
+    let windows = parts.next().unwrap_or_default();
+    let width = parts.next().unwrap_or_default();
+    let height = parts.next().unwrap_or_default();
+    SessionInfo {
+        name,
+        provider: "tmux".to_owned(),
+        metadata: BTreeMap::from([
+            ("id".to_owned(), id.to_owned()),
+            ("attached".to_owned(), (attached == "1").to_string()),
+            ("created_unix".to_owned(), created.to_owned()),
+            ("windows".to_owned(), windows.to_owned()),
+            ("width".to_owned(), width.to_owned()),
+            ("height".to_owned(), height.to_owned()),
+        ]),
+    }
+}
+
 fn session_names_from_stdout(stdout: &str) -> Vec<String> {
     stdout
         .lines()
@@ -657,6 +852,23 @@ fn tmux_list_empty_error(stderr: &str) -> bool {
     stderr.contains("no server running")
         || stderr.contains("no sessions")
         || (stderr.contains("error connecting") && stderr.contains("no such file or directory"))
+}
+
+fn stringify_local_json_object(
+    object: &serde_json::Map<String, serde_json::Value>,
+    skip_keys: &[&str],
+) -> BTreeMap<String, String> {
+    object
+        .iter()
+        .filter(|(key, _)| !skip_keys.contains(&key.as_str()))
+        .map(|(key, value)| {
+            let value = value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            (key.clone(), value)
+        })
+        .collect()
 }
 
 async fn local_session_run(
@@ -1691,6 +1903,67 @@ mod tests {
             &tickets,
             &aliases,
         ));
+    }
+
+    #[test]
+    fn human_session_list_reports_empty_provider_filter() {
+        let listing = SessionListing {
+            target: "max-b265".to_owned(),
+            provider_filter: Some("zmx".to_owned()),
+            total: 0,
+            providers: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            render_session_listing_human(&listing),
+            "0 existing zmx sessions found.\n"
+        );
+    }
+
+    #[test]
+    fn json_session_list_groups_sessions_by_provider_with_metadata() {
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "tmux".to_owned(),
+            SessionProviderListing {
+                available: true,
+                is_default: false,
+                count: 2,
+                sessions: vec![
+                    SessionListingEntry {
+                        name: "dev".to_owned(),
+                        provider: "tmux".to_owned(),
+                        metadata: serde_json::json!({
+                            "id": "$1",
+                            "attached": false,
+                            "windows": 2
+                        }),
+                    },
+                    SessionListingEntry {
+                        name: "frontend".to_owned(),
+                        provider: "tmux".to_owned(),
+                        metadata: serde_json::json!({}),
+                    },
+                ],
+            },
+        );
+        let listing = SessionListing {
+            target: "max-b265".to_owned(),
+            provider_filter: None,
+            total: 2,
+            providers,
+        };
+
+        let value = serde_json::to_value(&listing).unwrap();
+        assert_eq!(value["target"], "max-b265");
+        assert_eq!(value["provider_filter"], serde_json::Value::Null);
+        assert_eq!(value["total"], 2);
+        assert_eq!(value["providers"]["tmux"]["count"], 2);
+        assert_eq!(value["providers"]["tmux"]["sessions"][0]["name"], "dev");
+        assert_eq!(
+            value["providers"]["tmux"]["sessions"][0]["metadata"]["attached"],
+            false
+        );
     }
 
     #[test]

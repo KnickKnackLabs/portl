@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::wire::StreamPreamble;
@@ -130,6 +132,23 @@ pub struct ProviderReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub name: String,
+    pub provider: String,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionProviderSessions {
+    pub provider: String,
+    pub available: bool,
+    #[serde(default)]
+    pub default: bool,
+    pub sessions: Vec<SessionInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRunResult {
     pub code: i32,
     pub stdout: String,
@@ -152,6 +171,8 @@ pub struct SessionAck {
     pub sessions: Option<Vec<String>>,
     #[serde(default)]
     pub session_entries: Option<Vec<SessionEntry>>,
+    #[serde(default)]
+    pub session_groups: Option<Vec<SessionProviderSessions>>,
     pub run: Option<SessionRunResult>,
     pub output: Option<String>,
 }
@@ -252,6 +273,16 @@ mod tests {
             session_entries: Some(vec![SessionEntry {
                 provider: "zmx".to_owned(),
                 name: "dev".to_owned(),
+            }]),
+            session_groups: Some(vec![SessionProviderSessions {
+                provider: "zmx".to_owned(),
+                available: true,
+                default: true,
+                sessions: vec![SessionInfo {
+                    name: "dev".to_owned(),
+                    provider: "zmx".to_owned(),
+                    metadata: BTreeMap::from([("pid".to_owned(), "123".to_owned())]),
+                }],
             }]),
             run: Some(SessionRunResult {
                 code: 0,
