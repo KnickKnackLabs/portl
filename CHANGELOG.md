@@ -5,6 +5,8 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.7.1 — 2026-04-29
+
 ### Added
 
 - `PORTL_SESSION_PROVIDER` now acts as an environment-level default for
