@@ -564,6 +564,7 @@ case "$1" in
     ;;
   kill-session) echo "killed:$3" ;;
   -CC)
+    stty -echo 2>/dev/null || true
     printf 'tmux:-CC\n' >> "{}"
     printf '%s\n' "$@" >> "{}"
     session=""
@@ -613,6 +614,7 @@ case "$1" in
     ;;
   kill-session) echo "killed:$3" ;;
   -CC)
+    stty -echo 2>/dev/null || true
     printf '\033P1000p%%output %%1 tmux:dev\\012\r\n'
     while IFS= read -r line; do
       printf 'stdin:%s\n' "$line" >> "{}"
