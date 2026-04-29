@@ -5,6 +5,23 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.7.2 — 2026-04-30
+
+### Changed
+
+- `portl session ls --json` now returns sessions grouped by provider, with
+  provider counts and available metadata, while human output reports an
+  explicit empty-session message such as `0 existing zmx sessions found.`
+
+### Fixed
+
+- `portl doctor` now fails when `session_provider_path` is configured to a
+  missing binary and tells users to remove the override or point it at an
+  existing provider.
+- Short-lived session commands now wait briefly for Iroh endpoint cleanup,
+  reducing noisy `Endpoint dropped without calling Endpoint::close` messages
+  during normal exits.
+
 ## 0.7.1 — 2026-04-29
 
 ### Added
