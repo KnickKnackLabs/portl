@@ -130,7 +130,10 @@ async fn session_attach_prefers_zmx_control_when_probe_succeeds() -> Result<()> 
     attach.close_stdin()?;
     let mut attached = Vec::new();
     AsyncReadExt::read_to_end(&mut attach.stdout, &mut attached).await?;
-    assert_eq!(String::from_utf8_lossy(&attached), "control:dev\n");
+    assert_eq!(
+        String::from_utf8_lossy(&attached),
+        "viewport:dev\nlive:dev\n"
+    );
     assert_eq!(attach.wait_exit().await?, 0);
 
     let calls = fs::read_to_string(log)?;
@@ -233,10 +236,9 @@ async fn session_tmux_provider_attaches_with_control_mode() -> Result<()> {
     attach.close_stdin()?;
     let mut attached = Vec::new();
     AsyncReadExt::read_to_end(&mut attach.stdout, &mut attached).await?;
-    assert!(
-        String::from_utf8_lossy(&attached).contains("tmux:dev"),
-        "tmux attach output was {:?}",
-        String::from_utf8_lossy(&attached)
+    assert_eq!(
+        String::from_utf8_lossy(&attached),
+        "viewport:dev\ntmux:dev\n"
     );
     assert_eq!(attach.wait_exit().await?, 0);
 
@@ -373,10 +375,16 @@ printf '%s\n' "$@" >> "{}"
 case "$1" in
   -V) echo "tmux 3.6" ;;
   list-sessions) printf 'dev\nfrontend\n' ;;
-  capture-pane) echo "history:$9" ;;
+  capture-pane)
+    if [ "$5" = "0" ]; then
+      echo "viewport:$9"
+    else
+      echo "history:$9"
+    fi
+    ;;
   kill-session) echo "killed:$3" ;;
   -CC)
-    printf '\033P1000p%%output %%1 tmux:dev\\\\012\r\n'
+    printf '\033P1000p%%output %%1 tmux:dev\\012\r\n'
     while IFS= read -r line; do
       printf 'stdin:%s\n' "$line" >> "{}"
       [ "$line" = "detach-client" ] && exit 0
@@ -426,7 +434,7 @@ if [ "$1" = "control" ] && [ "$2" = "--protocol" ] && [ "$3" = "zmx-control/v1" 
     session="$4"
   fi
   case "$session" in
-    dev) printf '\001\014\000\000\000control:dev\n' ;;
+    dev) printf '\016\015\000\000\000viewport:dev\n\017\011\000\000\000live:dev\n' ;;
     *) exit 65 ;;
   esac
   exit 0

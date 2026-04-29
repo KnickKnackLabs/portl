@@ -27,6 +27,9 @@ mod tmux_control;
 const MAX_CONTROL_BYTES: usize = 256 * 1024;
 const ZMX_CONTROL_HEADER_BYTES: usize = 5;
 const MAX_ZMX_CONTROL_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const ZMX_TAG_OUTPUT: u8 = 1;
+const ZMX_TAG_VIEWPORT_SNAPSHOT: u8 = 14;
+const ZMX_TAG_LIVE_OUTPUT: u8 = 15;
 
 pub(crate) async fn serve_stream(
     connection: Connection,
@@ -354,6 +357,7 @@ async fn serve_attach(
             return Ok(());
         }
         let name = name.to_owned();
+        let initial_snapshot = tmux.viewport_snapshot(&name).await.ok();
         return serve_tmux_control_attach(
             session,
             state,
@@ -363,6 +367,7 @@ async fn serve_attach(
             tmux,
             &name,
             &workload_context,
+            initial_snapshot,
         )
         .await;
     }
@@ -528,6 +533,7 @@ async fn serve_tmux_control_attach(
     tmux: provider::TmuxProvider,
     name: &str,
     context: &TargetProcessContext,
+    initial_snapshot: Option<Vec<u8>>,
 ) -> Result<()> {
     let session_id = rand::random::<[u8; 16]>();
     let audit_session_id = hex::encode(session_id);
@@ -540,6 +546,7 @@ async fn serve_tmux_control_attach(
         req.argv.as_deref(),
         &context.env,
         &audit_session_id,
+        initial_snapshot,
     ) {
         Ok(process) => process,
         Err(err) => {
@@ -597,6 +604,7 @@ fn spawn_tmux_control_process(
     argv: Option<&[String]>,
     workload_env: &[(String, String)],
     audit_session_id: &str,
+    initial_snapshot: Option<Vec<u8>>,
 ) -> Result<Arc<ShellProcess>> {
     use std::sync::Mutex;
 
@@ -626,12 +634,41 @@ fn spawn_tmux_control_process(
     let (pty_tx, pty_rx) = mpsc::unbounded_channel();
     let (stdout_tx, stdout_rx) = mpsc::channel(32);
     let (stderr_tx, stderr_rx) = mpsc::channel(32);
+    let (overflow_tx, mut overflow_rx) = mpsc::channel(1);
     let exit_code = Arc::new(Mutex::new(None));
     let (exit_tx, _) = watch::channel(None);
 
+    if let Some(snapshot) = initial_snapshot.filter(|snapshot| !snapshot.is_empty()) {
+        let _ = stdout_tx.try_send(snapshot);
+    }
+
+    let snapshot_tx = stdout_tx.clone();
+    let snapshot_tmux = tmux.clone();
+    let snapshot_session = name.to_owned();
     tokio::spawn(async move {
-        if let Err(err) =
-            tmux_control::pump_tmux_cc_pty(master, stdout_tx, stderr_tx, stdin_rx, pty_rx).await
+        while overflow_rx.recv().await.is_some() {
+            match snapshot_tmux.viewport_snapshot(&snapshot_session).await {
+                Ok(snapshot) if !snapshot.is_empty() => {
+                    if snapshot_tx.send(snapshot).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => tracing::debug!(%err, "tmux viewport snapshot refresh failed"),
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        if let Err(err) = tmux_control::pump_tmux_cc_pty(
+            master,
+            stdout_tx,
+            stderr_tx,
+            stdin_rx,
+            pty_rx,
+            overflow_tx,
+        )
+        .await
         {
             tracing::debug!(%err, "tmux -CC pty task ended with error");
         }
@@ -748,7 +785,11 @@ fn spawn_zmx_control_process(
 
     tokio::spawn(async move {
         while let Ok(Some((tag, payload))) = read_control_frame(&mut stdout).await {
-            if tag == 1 && stdout_tx.send(payload).await.is_err() {
+            if matches!(
+                tag,
+                ZMX_TAG_OUTPUT | ZMX_TAG_VIEWPORT_SNAPSHOT | ZMX_TAG_LIVE_OUTPUT
+            ) && stdout_tx.send(payload).await.is_err()
+            {
                 break;
             }
         }

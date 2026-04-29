@@ -540,6 +540,24 @@ impl TmuxProvider {
         Ok(output.stdout)
     }
 
+    pub(crate) async fn viewport_snapshot(&self, session: &str) -> Result<Vec<u8>> {
+        let output = self
+            .run_capture(&[
+                "capture-pane",
+                "-p",
+                "-e",
+                "-S",
+                "0",
+                "-E",
+                "-",
+                "-t",
+                session,
+            ])
+            .await?;
+        ensure_success("tmux capture-pane", &output)?;
+        Ok(output.stdout.into_bytes())
+    }
+
     pub(crate) async fn kill(&self, session: &str) -> Result<()> {
         let output = self.run_capture(&["kill-session", "-t", session]).await?;
         ensure_success("tmux kill-session", &output)

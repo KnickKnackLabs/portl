@@ -5,6 +5,20 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Added
+
+- `zmx` control attaches now understand semantic viewport and live-output
+  frames, allowing targets with updated `zmx-control/v1` providers to show
+  the active terminal surface before scrollback/history backfill work.
+- `tmux -CC` session attaches now capture the active pane before streaming
+  live control-mode output, giving reconnects a viewport-first render path.
+
+### Changed
+
+- `tmux -CC` live-output forwarding no longer blocks the control pump when
+  a client is slow; overflow requests a fresh pane snapshot instead of
+  letting stale output backlog delay input and resize handling.
+
 ## 0.6.8 — 2026-04-29
 
 ### Added
