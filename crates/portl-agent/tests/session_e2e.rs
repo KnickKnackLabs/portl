@@ -138,6 +138,33 @@ async fn session_attach_prefers_zmx_control_when_probe_succeeds() -> Result<()> 
     assert!(calls.contains(
         "control\n--protocol\nzmx-control/v1\n--rows\n24\n--cols\n80\ndev\necho\nfrom-control\n"
     ));
+    let user = current_user()?;
+    let home = user.dir.display().to_string();
+    let shell = user.shell.display().to_string();
+    assert!(
+        calls.contains(&format!("env:PWD={home}\n")),
+        "calls were {calls:?}"
+    );
+    assert!(
+        calls.contains(&format!("env:HOME={home}\n")),
+        "calls were {calls:?}"
+    );
+    assert!(
+        calls.contains(&format!("env:SHELL={shell}\n")),
+        "calls were {calls:?}"
+    );
+    assert!(
+        calls.contains(&format!("env:USER={}\n", user.name)),
+        "calls were {calls:?}"
+    );
+    assert!(
+        calls.contains(&format!("env:LOGNAME={}\n", user.name)),
+        "calls were {calls:?}"
+    );
+    assert!(
+        calls.contains("env:TERM=xterm-256color\n"),
+        "calls were {calls:?}"
+    );
     assert!(!calls.contains("attach\ndev\n"));
 
     shutdown(connection, client, server, agent).await
@@ -214,7 +241,13 @@ async fn session_tmux_provider_attaches_with_control_mode() -> Result<()> {
     assert_eq!(attach.wait_exit().await?, 0);
 
     let calls = fs::read_to_string(log)?;
-    assert!(calls.contains("-CC\nnew-session\n-A\n-s\ndev\n-x\n80\n-y\n24\ntop\n"));
+    let home = current_user()?.dir.display().to_string();
+    assert!(
+        calls.contains(&format!(
+            "-CC\nnew-session\n-A\n-s\ndev\n-x\n80\n-y\n24\n-c\n{home}\ntop\n"
+        )),
+        "calls were {calls:?}"
+    );
     assert!(calls.contains("stdin:send-keys -H 41 03\n"));
     assert!(calls.contains("stdin:refresh-client -C 100,40\n"));
     assert!(calls.contains("stdin:resize-window -x 100 -y 40\n"));
@@ -362,6 +395,12 @@ esac
     Ok(())
 }
 
+#[cfg(unix)]
+fn current_user() -> Result<nix::unistd::User> {
+    nix::unistd::User::from_uid(nix::unistd::geteuid())?
+        .context("current uid should resolve to a user")
+}
+
 fn write_fake_zmx_control(path: &std::path::Path, log: &std::path::Path) -> Result<()> {
     fs::write(
         path,
@@ -375,6 +414,12 @@ if [ "$1" = "control" ] && [ "$2" = "--protocol" ] && [ "$3" = "zmx-control/v1" 
   exit 0
 fi
 if [ "$1" = "control" ] && [ "$2" = "--protocol" ] && [ "$3" = "zmx-control/v1" ]; then
+  printf 'env:PWD=%s\n' "$(pwd)" >> "{}"
+  printf 'env:HOME=%s\n' "${{HOME:-}}" >> "{}"
+  printf 'env:SHELL=%s\n' "${{SHELL:-}}" >> "{}"
+  printf 'env:USER=%s\n' "${{USER:-}}" >> "{}"
+  printf 'env:LOGNAME=%s\n' "${{LOGNAME:-}}" >> "{}"
+  printf 'env:TERM=%s\n' "${{TERM:-}}" >> "{}"
   if [ "$4" = "--rows" ] && [ "$6" = "--cols" ]; then
     session="$8"
   else
@@ -396,6 +441,12 @@ case "$1" in
   *) echo "unknown:$1" >&2; exit 64 ;;
 esac
 "#,
+            log.display(),
+            log.display(),
+            log.display(),
+            log.display(),
+            log.display(),
+            log.display(),
             log.display()
         ),
     )?;

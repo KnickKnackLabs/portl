@@ -12,7 +12,7 @@ description  = "Wire protocols and ALPNs for portl: ticket/v1, meta/v1, shell/v1
 workspace = true
 
 [dependencies]
-portl-core = { version = "0.6.7", path = "../portl-core" }
+portl-core = { version = "0.6.8", path = "../portl-core" }
 iroh       = { workspace = true }
 tokio      = { workspace = true }
 bytes      = { workspace = true }

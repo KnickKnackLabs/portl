@@ -226,8 +226,7 @@ fn fetch_ipc_info(socket: String) -> IpcInfo {
         Ok(status) => {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(status.agent.started_at_unix);
+                .map_or(status.agent.started_at_unix, |d| d.as_secs());
             IpcInfo {
                 ok: true,
                 socket,

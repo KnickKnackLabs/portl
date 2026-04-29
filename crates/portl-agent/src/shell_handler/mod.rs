@@ -13,7 +13,6 @@ use crate::caps_enforce::shell_permits;
 use crate::session::Session;
 use crate::stream_io::BufferedRecv;
 
-mod env;
 mod exec_capture;
 pub(crate) mod pty_master;
 pub(crate) mod pumps;

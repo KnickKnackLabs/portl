@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -31,12 +31,20 @@ pub mod shell_handler;
 pub mod shell_registry;
 pub mod status_schema;
 pub mod stream_io;
+mod target_context;
 pub mod tcp_handler;
 pub mod ticket_handler;
 pub mod udp_handler;
 pub mod udp_registry;
 
 pub use config::{AgentConfig, AgentMode, DiscoveryConfig, RateLimitConfig};
+
+#[must_use]
+pub fn session_provider_discovery_info(
+    configured_path: Option<&Path>,
+) -> status_schema::SessionProvidersInfo {
+    session_handler::provider::provider_discovery_info(configured_path)
+}
 pub use pipeline::{AcceptanceInput, AcceptanceOutcome, evaluate_offer};
 pub use rate_limit::OfferRateLimiter;
 pub use revocations::{RevocationRecord, RevocationSet};
@@ -201,6 +209,10 @@ impl metrics::StatusSource for AgentState {
         }
     }
 
+    fn session_providers_info(&self) -> status_schema::SessionProvidersInfo {
+        session_handler::provider::provider_discovery_info(self.session_provider_path.as_deref())
+    }
+
     fn relay_status(&self) -> relay::RelayStatus {
         self.relay_status
             .read()
@@ -277,7 +289,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
         home: cfg
             .peers_path
             .as_ref()
-            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+            .and_then(|p| p.parent().map(Path::to_path_buf))
             .unwrap_or_else(std::env::temp_dir),
         metrics_socket: cfg
             .metrics_socket_path
@@ -286,8 +298,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
         session_provider_path: cfg.session_provider_path.clone(),
         started_at_unix: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
+            .map_or(0, |d| d.as_secs()),
         relay_status: std::sync::RwLock::new(relay::RelayStatus::disabled()),
     });
 

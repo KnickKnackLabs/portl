@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -10,10 +11,34 @@ use tokio::process::Command;
 
 pub(crate) const ZMX_CONTROL_PROTOCOL: &str = "zmx-control/v1";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderPathSource {
+    Config,
+    StablePath,
+    UserBin,
+    MiseShim,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ProviderPathProbe {
+    pub(crate) path: PathBuf,
+    pub(crate) source: ProviderPathSource,
+    pub(crate) exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ProviderPathDiscovery {
+    pub(crate) path: Option<PathBuf>,
+    pub(crate) source: Option<ProviderPathSource>,
+    pub(crate) probes: Vec<ProviderPathProbe>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ZmxProvider {
     path: Option<PathBuf>,
     env: Vec<(String, String)>,
+    target_home: Option<PathBuf>,
 }
 
 impl ZmxProvider {
@@ -21,7 +46,13 @@ impl ZmxProvider {
         Self {
             path,
             env: Vec::new(),
+            target_home: default_target_home(),
         }
+    }
+
+    pub(crate) fn with_target_home(mut self, target_home: Option<PathBuf>) -> Self {
+        self.target_home = target_home;
+        self
     }
 
     #[cfg(test)]
@@ -123,11 +154,18 @@ impl ZmxProvider {
         cwd: Option<&str>,
         pty: Option<&portl_proto::shell_v1::PtyCfg>,
         argv: Option<&[String]>,
+        workload_env: Option<&[(String, String)]>,
     ) -> Result<Command> {
         let path = self
             .resolve_path()
             .ok_or_else(|| anyhow!("zmx is not installed on the target"))?;
         let mut command = self.command(&path);
+        if let Some(env) = workload_env {
+            command.envs(env.iter().cloned());
+            for (key, value) in &self.env {
+                command.env(key, value);
+            }
+        }
         command.args(["control", "--protocol", ZMX_CONTROL_PROTOCOL]);
         if let Some(pty) = pty {
             command
@@ -184,7 +222,7 @@ impl ZmxProvider {
         path: &Path,
     ) -> Result<Option<(String, Vec<String>, Option<String>)>> {
         let output = tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(5),
             self.command(path)
                 .args(["control", "--protocol", ZMX_CONTROL_PROTOCOL, "--probe"])
                 .stdin(Stdio::null())
@@ -249,11 +287,12 @@ impl ZmxProvider {
         })
     }
 
+    pub(crate) fn path_discovery(&self) -> ProviderPathDiscovery {
+        discover_provider_path("zmx", self.path.clone(), self.target_home.as_deref())
+    }
+
     fn resolve_path(&self) -> Option<PathBuf> {
-        if let Some(path) = self.path.as_ref() {
-            return path.exists().then_some(path.clone());
-        }
-        find_on_safe_path("zmx")
+        self.path_discovery().path
     }
 
     fn command(&self, path: &Path) -> Command {
@@ -263,16 +302,127 @@ impl ZmxProvider {
     }
 }
 
-fn find_on_safe_path(program: &str) -> Option<PathBuf> {
-    ["/usr/local/bin", "/usr/bin", "/bin"]
-        .into_iter()
-        .map(|dir| Path::new(dir).join(program))
-        .find(|candidate| candidate.exists())
+fn discover_provider_path(
+    program: &str,
+    configured: Option<PathBuf>,
+    target_home: Option<&Path>,
+) -> ProviderPathDiscovery {
+    discover_provider_path_with_dirs(
+        program,
+        configured,
+        &stable_provider_dirs(),
+        target_home,
+        None,
+    )
+}
+
+fn discover_provider_path_with_dirs(
+    program: &str,
+    configured: Option<PathBuf>,
+    stable_dirs: &[PathBuf],
+    target_home: Option<&Path>,
+    xdg_data_home: Option<&Path>,
+) -> ProviderPathDiscovery {
+    let mut probes = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(path) = configured {
+        push_probe(
+            &mut probes,
+            &mut seen,
+            path.clone(),
+            ProviderPathSource::Config,
+        );
+        return ProviderPathDiscovery {
+            path: path.exists().then_some(path),
+            source: probes
+                .first()
+                .and_then(|probe| probe.exists.then_some(probe.source)),
+            probes,
+        };
+    }
+
+    for dir in stable_dirs {
+        push_probe(
+            &mut probes,
+            &mut seen,
+            dir.join(program),
+            ProviderPathSource::StablePath,
+        );
+    }
+    if let Some(home) = target_home {
+        for relative in [".local/bin", "bin", ".cargo/bin"] {
+            push_probe(
+                &mut probes,
+                &mut seen,
+                home.join(relative).join(program),
+                ProviderPathSource::UserBin,
+            );
+        }
+        let mise_data = xdg_data_home.map_or_else(|| home.join(".local/share"), Path::to_path_buf);
+        push_probe(
+            &mut probes,
+            &mut seen,
+            mise_data.join("mise/shims").join(program),
+            ProviderPathSource::MiseShim,
+        );
+    }
+
+    let selected = probes.iter().find(|probe| probe.exists);
+    ProviderPathDiscovery {
+        path: selected.map(|probe| probe.path.clone()),
+        source: selected.map(|probe| probe.source),
+        probes,
+    }
+}
+
+fn push_probe(
+    probes: &mut Vec<ProviderPathProbe>,
+    seen: &mut HashSet<PathBuf>,
+    path: PathBuf,
+    source: ProviderPathSource,
+) {
+    if seen.insert(path.clone()) {
+        probes.push(ProviderPathProbe {
+            exists: path.exists(),
+            path,
+            source,
+        });
+    }
+}
+
+fn stable_provider_dirs() -> Vec<PathBuf> {
+    [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        "/usr/bin",
+        "/bin",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect()
+}
+
+fn default_target_home() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        nix::unistd::User::from_uid(nix::unistd::geteuid())
+            .ok()
+            .flatten()
+            .map(|user| user.dir)
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
 }
 
 fn apply_provider_env(command: &mut Command, extra_env: &[(String, String)]) {
     command.env_clear();
-    command.env("PATH", "/usr/local/bin:/usr/bin:/bin");
+    command.env("PATH", crate::target_context::default_target_path());
     for (key, value) in extra_env {
         command.env(key, value);
     }
@@ -282,6 +432,7 @@ fn apply_provider_env(command: &mut Command, extra_env: &[(String, String)]) {
 pub(crate) struct TmuxProvider {
     path: Option<PathBuf>,
     env: Vec<(String, String)>,
+    target_home: Option<PathBuf>,
 }
 
 pub(crate) struct TmuxSpawnConfig {
@@ -295,7 +446,13 @@ impl TmuxProvider {
         Self {
             path,
             env: Vec::new(),
+            target_home: default_target_home(),
         }
+    }
+
+    pub(crate) fn with_target_home(mut self, target_home: Option<PathBuf>) -> Self {
+        self.target_home = target_home;
+        self
     }
 
     #[cfg(test)]
@@ -388,12 +545,13 @@ impl TmuxProvider {
         ensure_success("tmux kill-session", &output)
     }
 
-    pub(crate) fn control_spawn_config(
+    pub(crate) fn control_spawn_config_with_env(
         &self,
         session: &str,
         cwd: Option<&str>,
         pty: Option<&portl_proto::shell_v1::PtyCfg>,
         argv: Option<&[String]>,
+        workload_env: Option<&[(String, String)]>,
     ) -> Result<TmuxSpawnConfig> {
         let path = self
             .resolve_path()
@@ -419,7 +577,15 @@ impl TmuxProvider {
         if let Some(argv) = argv {
             command_args.extend(argv.iter().cloned());
         }
-        let mut env = vec![("PATH".to_owned(), "/usr/local/bin:/usr/bin:/bin".to_owned())];
+        let mut env = workload_env.map_or_else(
+            || {
+                vec![(
+                    "PATH".to_owned(),
+                    crate::target_context::default_target_path(),
+                )]
+            },
+            <[(String, String)]>::to_vec,
+        );
         env.extend(self.env.iter().cloned());
         Ok(TmuxSpawnConfig {
             program: path,
@@ -447,11 +613,12 @@ impl TmuxProvider {
         })
     }
 
+    pub(crate) fn path_discovery(&self) -> ProviderPathDiscovery {
+        discover_provider_path("tmux", self.path.clone(), self.target_home.as_deref())
+    }
+
     fn resolve_path(&self) -> Option<PathBuf> {
-        if let Some(path) = self.path.as_ref() {
-            return path.exists().then_some(path.clone());
-        }
-        find_on_safe_path("tmux")
+        self.path_discovery().path
     }
 
     fn command(&self, path: &Path) -> Command {
@@ -522,6 +689,114 @@ fn ensure_success(action: &str, result: &SessionRunResult) -> Result<()> {
     }
 }
 
+pub(crate) fn provider_discovery_info(
+    configured_path: Option<&Path>,
+) -> crate::status_schema::SessionProvidersInfo {
+    let target_home = default_target_home();
+    let default_user = default_user_info();
+    let tmux_config = configured_path.and_then(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "tmux")
+            .then(|| path.to_path_buf())
+    });
+    let zmx_config = if tmux_config.is_some() {
+        None
+    } else {
+        configured_path.map(Path::to_path_buf)
+    };
+    let zmx = discover_provider_path("zmx", zmx_config, target_home.as_deref());
+    let tmux = discover_provider_path("tmux", tmux_config, target_home.as_deref());
+    let default_provider = if zmx.path.is_some() {
+        Some("zmx".to_owned())
+    } else if tmux.path.is_some() {
+        Some("tmux".to_owned())
+    } else {
+        None
+    };
+    let mut providers = vec![provider_info("zmx", &zmx), provider_info("tmux", &tmux)];
+    providers.push(crate::status_schema::SessionProviderInfo {
+        name: "raw".to_owned(),
+        detected: true,
+        path: None,
+        source: Some("builtin".to_owned()),
+        notes: Some("one-shot PTY fallback".to_owned()),
+    });
+    let mut search_paths = Vec::new();
+    append_search_paths("zmx", &zmx, &mut search_paths);
+    append_search_paths("tmux", &tmux, &mut search_paths);
+
+    crate::status_schema::SessionProvidersInfo {
+        default_provider,
+        default_user,
+        providers,
+        search_paths,
+    }
+}
+
+fn provider_info(
+    name: &str,
+    discovery: &ProviderPathDiscovery,
+) -> crate::status_schema::SessionProviderInfo {
+    crate::status_schema::SessionProviderInfo {
+        name: name.to_owned(),
+        detected: discovery.path.is_some(),
+        path: discovery
+            .path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        source: discovery.source.map(source_name),
+        notes: None,
+    }
+}
+
+fn append_search_paths(
+    provider: &str,
+    discovery: &ProviderPathDiscovery,
+    out: &mut Vec<crate::status_schema::SessionProviderSearchPath>,
+) {
+    out.extend(discovery.probes.iter().map(|probe| {
+        crate::status_schema::SessionProviderSearchPath {
+            provider: provider.to_owned(),
+            path: probe.path.display().to_string(),
+            source: source_name(probe.source),
+            exists: probe.exists,
+        }
+    }));
+}
+
+fn source_name(source: ProviderPathSource) -> String {
+    match source {
+        ProviderPathSource::Config => "config",
+        ProviderPathSource::StablePath => "stable_path",
+        ProviderPathSource::UserBin => "user_bin",
+        ProviderPathSource::MiseShim => "mise_shim",
+    }
+    .to_owned()
+}
+
+fn default_user_info() -> Option<crate::status_schema::DefaultUserInfo> {
+    #[cfg(unix)]
+    {
+        nix::unistd::User::from_uid(nix::unistd::geteuid())
+            .ok()
+            .flatten()
+            .map(|user| crate::status_schema::DefaultUserInfo {
+                name: user.name,
+                home: user.dir.display().to_string(),
+                shell: user.shell.display().to_string(),
+            })
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::var_os("HOME").map(|home| crate::status_schema::DefaultUserInfo {
+            name: std::env::var("USER").unwrap_or_default(),
+            home: PathBuf::from(home).display().to_string(),
+            shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned()),
+        })
+    }
+}
+
 pub(crate) async fn provider_report(
     zmx: &ZmxProvider,
     tmux: &TmuxProvider,
@@ -561,6 +836,104 @@ mod tests {
     use anyhow::Result;
 
     use super::*;
+
+    #[test]
+    fn provider_discovery_prefers_configured_path() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let configured = temp.path().join("configured-zmx");
+        let stable = temp.path().join("stable");
+        fs::create_dir_all(&stable)?;
+        fs::write(&configured, "")?;
+        fs::write(stable.join("zmx"), "")?;
+
+        let discovery = discover_provider_path_with_dirs(
+            "zmx",
+            Some(configured.clone()),
+            &[stable],
+            None,
+            None,
+        );
+
+        assert_eq!(discovery.path.as_deref(), Some(configured.as_path()));
+        assert_eq!(discovery.source, Some(ProviderPathSource::Config));
+        assert_eq!(discovery.probes[0].source, ProviderPathSource::Config);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_discovery_searches_homebrew_before_usr_local() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let homebrew = temp.path().join("opt-homebrew-bin");
+        let usr_local = temp.path().join("usr-local-bin");
+        fs::create_dir_all(&homebrew)?;
+        fs::create_dir_all(&usr_local)?;
+        fs::write(homebrew.join("tmux"), "")?;
+        fs::write(usr_local.join("tmux"), "")?;
+
+        let discovery = discover_provider_path_with_dirs(
+            "tmux",
+            None,
+            &[homebrew.clone(), usr_local],
+            None,
+            None,
+        );
+
+        assert_eq!(
+            discovery.path.as_deref(),
+            Some(homebrew.join("tmux").as_path())
+        );
+        assert_eq!(discovery.source, Some(ProviderPathSource::StablePath));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_discovery_searches_mise_shims_under_target_home() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().join("home");
+        let shims = home.join(".local/share/mise/shims");
+        fs::create_dir_all(&shims)?;
+        fs::write(shims.join("zmx"), "")?;
+
+        let discovery = discover_provider_path_with_dirs("zmx", None, &[], Some(&home), None);
+
+        assert_eq!(discovery.path.as_deref(), Some(shims.join("zmx").as_path()));
+        assert_eq!(discovery.source, Some(ProviderPathSource::MiseShim));
+        assert!(
+            discovery
+                .probes
+                .iter()
+                .any(|probe| probe.source == ProviderPathSource::MiseShim)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_discovery_records_missing_candidates() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let stable = temp.path().join("stable");
+        let home = temp.path().join("home");
+
+        let discovery = discover_provider_path_with_dirs(
+            "zmx",
+            None,
+            std::slice::from_ref(&stable),
+            Some(&home),
+            None,
+        );
+
+        assert!(discovery.path.is_none());
+        assert!(discovery.probes.iter().any(|probe| {
+            probe.path == stable.join("zmx")
+                && probe.source == ProviderPathSource::StablePath
+                && !probe.exists
+        }));
+        assert!(discovery.probes.iter().any(|probe| {
+            probe.path == home.join(".local/share/mise/shims/zmx")
+                && probe.source == ProviderPathSource::MiseShim
+                && !probe.exists
+        }));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn zmx_provider_maps_commands_to_target_cli() -> Result<()> {

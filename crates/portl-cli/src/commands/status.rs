@@ -99,8 +99,7 @@ fn render_dashboard_human(snap: &portl_agent::status_schema::StatusResponse) -> 
     let mut s = String::new();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(snap.agent.started_at_unix);
+        .map_or(snap.agent.started_at_unix, |d| d.as_secs());
     let up = now.saturating_sub(snap.agent.started_at_unix);
     let _ = writeln!(
         s,
@@ -126,6 +125,8 @@ fn render_dashboard_human(snap: &portl_agent::status_schema::StatusResponse) -> 
             snap.network.relays.join(", ")
         );
     }
+    let _ = writeln!(s);
+    render_provider_summary(&mut s, &snap.session_providers);
     let _ = writeln!(s);
     if snap.relay.enabled {
         let addr = snap.relay.http_addr.as_deref().unwrap_or("(bind pending)");
@@ -159,6 +160,45 @@ fn render_dashboard_human(snap: &portl_agent::status_schema::StatusResponse) -> 
         );
     }
     s
+}
+
+fn render_provider_summary(
+    out: &mut String,
+    providers: &portl_agent::status_schema::SessionProvidersInfo,
+) {
+    use std::fmt::Write;
+    let default = providers.default_provider.as_deref().unwrap_or("-");
+    let _ = writeln!(out, "providers:      default={default}");
+    if let Some(user) = &providers.default_user {
+        let _ = writeln!(
+            out,
+            "                user={} home={} shell={}",
+            user.name, user.home, user.shell
+        );
+    }
+    for provider in &providers.providers {
+        let state = if provider.detected {
+            "detected"
+        } else {
+            "missing"
+        };
+        let source = provider.source.as_deref().unwrap_or("-");
+        let path = provider.path.as_deref().unwrap_or("-");
+        let notes = provider.notes.as_deref().unwrap_or("");
+        if notes.is_empty() {
+            let _ = writeln!(
+                out,
+                "                {}: {state} source={source} path={path}",
+                provider.name
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "                {}: {state} source={source} path={path} ({notes})",
+                provider.name
+            );
+        }
+    }
 }
 
 fn run_target_count(
@@ -462,4 +502,63 @@ struct InfoView {
 struct MetaEnvelope {
     preamble: StreamPreamble,
     req: MetaReq,
+}
+
+#[cfg(test)]
+mod tests {
+    use portl_agent::status_schema::{
+        AgentInfo, DefaultUserInfo, DiscoveryInfo, NetworkInfo, SessionProviderInfo,
+        SessionProviderSearchPath, SessionProvidersInfo, StatusResponse,
+    };
+
+    #[test]
+    fn dashboard_renders_session_provider_discovery() {
+        let snap = StatusResponse::new(
+            AgentInfo {
+                pid: 42,
+                version: "0.6.7".to_owned(),
+                started_at_unix: 1_704_067_200,
+                home: "/Users/demo/.local/share/portl".to_owned(),
+                metrics_socket: "/Users/demo/.local/share/portl/metrics.sock".to_owned(),
+            },
+            Vec::new(),
+            NetworkInfo {
+                relays: Vec::new(),
+                discovery: DiscoveryInfo {
+                    dns: true,
+                    pkarr: true,
+                    local: true,
+                },
+            },
+            SessionProvidersInfo {
+                default_provider: Some("zmx".to_owned()),
+                default_user: Some(DefaultUserInfo {
+                    name: "demo".to_owned(),
+                    home: "/Users/demo".to_owned(),
+                    shell: "/bin/zsh".to_owned(),
+                }),
+                providers: vec![SessionProviderInfo {
+                    name: "zmx".to_owned(),
+                    detected: true,
+                    path: Some("/Users/demo/.local/share/mise/shims/zmx".to_owned()),
+                    source: Some("mise_shim".to_owned()),
+                    notes: None,
+                }],
+                search_paths: vec![SessionProviderSearchPath {
+                    provider: "zmx".to_owned(),
+                    path: "/Users/demo/.local/share/mise/shims/zmx".to_owned(),
+                    source: "mise_shim".to_owned(),
+                    exists: true,
+                }],
+            },
+            portl_agent::relay::RelayStatus::disabled(),
+        );
+
+        let rendered = super::render_dashboard_human(&snap);
+
+        assert!(rendered.contains("providers:"));
+        assert!(rendered.contains("default=zmx"));
+        assert!(rendered.contains("zmx: detected"));
+        assert!(rendered.contains("mise_shim"));
+    }
 }

@@ -103,8 +103,7 @@ pub(crate) fn handle_pair(
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
 
     let peers_path = state
         .peers_path

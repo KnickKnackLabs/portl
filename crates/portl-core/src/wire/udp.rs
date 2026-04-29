@@ -71,9 +71,7 @@ pub fn encode_datagram(datagram: &UdpDatagram) -> Result<Vec<u8>, postcard::Erro
 
 #[must_use]
 pub fn datagram_fits(datagram: &UdpDatagram) -> bool {
-    encode_datagram(datagram)
-        .map(|bytes| bytes.len() <= MAX_UDP_DATAGRAM_BYTES)
-        .unwrap_or(false)
+    encode_datagram(datagram).is_ok_and(|bytes| bytes.len() <= MAX_UDP_DATAGRAM_BYTES)
 }
 
 #[cfg(test)]

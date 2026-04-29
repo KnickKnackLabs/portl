@@ -5,6 +5,25 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.6.8 — 2026-04-29
+
+### Added
+
+- `portl status` and `portl doctor` now surface persistent-session
+  provider discovery, including detected `zmx`/`tmux` paths, the source
+  of the match, and the target user context used for discovery.
+
+### Changed
+
+- Remote shell, exec, and session attach workloads now share a
+  target-user execution context: absent `--cwd` defaults to the target
+  user's home directory, PTYs get a sane `TERM`, and provider workloads
+  receive `HOME`, `USER`, `LOGNAME`, and `SHELL` instead of inheriting
+  launchd/systemd's sparse service context.
+- Session provider discovery now searches common Homebrew locations,
+  user-local tool directories, Cargo bins, and mise shims before falling
+  back to the raw PTY provider.
+
 ## 0.6.7 — 2026-04-29
 
 ### Fixed

@@ -100,8 +100,7 @@ impl ConnectionRegistry {
         let key = (peer_eid, connection.stable_id());
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         self.inner.insert(
             key,
             Entry {

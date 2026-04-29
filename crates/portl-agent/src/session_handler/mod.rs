@@ -15,12 +15,13 @@ use crate::caps_enforce::shell_permits;
 use crate::session::Session;
 use crate::shell_handler::pumps::{pump_exit, pump_output, pump_resizes, pump_signals, pump_stdin};
 use crate::shell_handler::spawn::spawn_process;
-use crate::shell_handler::user::resolve_requested_user;
+use crate::shell_handler::user::{RequestedUser, resolve_requested_user};
 use crate::shell_registry::{PtyCommand, ShellProcess, StdinMessage};
 use crate::stream_io::BufferedRecv;
+use crate::target_context::TargetProcessContext;
 use crate::{AgentState, audit};
 
-mod provider;
+pub(crate) mod provider;
 mod tmux_control;
 
 const MAX_CONTROL_BYTES: usize = 256 * 1024;
@@ -323,6 +324,12 @@ async fn serve_attach(
             return Ok(());
         }
     };
+    let target_home = requested_user
+        .as_ref()
+        .map(|user| std::path::PathBuf::from(&user.home_dir));
+    let zmx = zmx.with_target_home(target_home.clone());
+    let tmux = tmux.with_target_home(target_home);
+    let workload_context = session_workload_context(&session, &req, requested_user.as_ref());
     audit::session_event(
         &session,
         "audit.session_attach",
@@ -330,7 +337,7 @@ async fn serve_attach(
         Some(name),
         "attach",
         req.user.as_deref(),
-        req.cwd.as_deref(),
+        workload_context.cwd.as_deref(),
         req.argv.as_ref(),
     );
     if selected == SelectedProvider::Tmux {
@@ -347,12 +354,32 @@ async fn serve_attach(
             return Ok(());
         }
         let name = name.to_owned();
-        return serve_tmux_control_attach(session, state, send, recv, req, tmux, &name).await;
+        return serve_tmux_control_attach(
+            session,
+            state,
+            send,
+            recv,
+            req,
+            tmux,
+            &name,
+            &workload_context,
+        )
+        .await;
     }
 
     if req.user.is_none() && zmx.control_available().await? {
         let name = name.to_owned();
-        return serve_control_attach(session, state, send, recv, req, zmx, &name).await;
+        return serve_control_attach(
+            session,
+            state,
+            send,
+            recv,
+            req,
+            zmx,
+            &name,
+            &workload_context,
+        )
+        .await;
     }
 
     let provider_argv = zmx.attach_argv(name, req.argv.as_deref())?;
@@ -364,7 +391,7 @@ async fn serve_attach(
         mode: portl_proto::shell_v1::ShellMode::Shell,
         argv: Some(provider_argv),
         env_patch: Vec::new(),
-        cwd: req.cwd,
+        cwd: workload_context.cwd,
         pty: req.pty,
         user: req.user,
     };
@@ -422,6 +449,7 @@ async fn serve_attach(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_control_attach(
     session: Session,
     state: Arc<AgentState>,
@@ -430,6 +458,7 @@ async fn serve_control_attach(
     req: SessionReq,
     zmx: provider::ZmxProvider,
     name: &str,
+    context: &TargetProcessContext,
 ) -> Result<()> {
     let session_id = rand::random::<[u8; 16]>();
     let audit_session_id = hex::encode(session_id);
@@ -437,9 +466,10 @@ async fn serve_control_attach(
         &session,
         &zmx,
         name,
-        req.cwd.as_deref(),
+        context.cwd.as_deref(),
         req.pty.as_ref(),
         req.argv.as_deref(),
+        &context.env,
         &audit_session_id,
     ) {
         Ok(process) => process,
@@ -488,7 +518,7 @@ async fn serve_control_attach(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn serve_tmux_control_attach(
     session: Session,
     state: Arc<AgentState>,
@@ -497,6 +527,7 @@ async fn serve_tmux_control_attach(
     req: SessionReq,
     tmux: provider::TmuxProvider,
     name: &str,
+    context: &TargetProcessContext,
 ) -> Result<()> {
     let session_id = rand::random::<[u8; 16]>();
     let audit_session_id = hex::encode(session_id);
@@ -504,9 +535,10 @@ async fn serve_tmux_control_attach(
         &session,
         &tmux,
         name,
-        req.cwd.as_deref(),
+        context.cwd.as_deref(),
         req.pty.as_ref(),
         req.argv.as_deref(),
+        &context.env,
         &audit_session_id,
     ) {
         Ok(process) => process,
@@ -555,7 +587,7 @@ async fn serve_tmux_control_attach(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn spawn_tmux_control_process(
     session: &Session,
     tmux: &provider::TmuxProvider,
@@ -563,11 +595,12 @@ fn spawn_tmux_control_process(
     cwd: Option<&str>,
     pty: Option<&portl_proto::shell_v1::PtyCfg>,
     argv: Option<&[String]>,
+    workload_env: &[(String, String)],
     audit_session_id: &str,
 ) -> Result<Arc<ShellProcess>> {
     use std::sync::Mutex;
 
-    let spawn = tmux.control_spawn_config(name, cwd, pty, argv)?;
+    let spawn = tmux.control_spawn_config_with_env(name, cwd, pty, argv, Some(workload_env))?;
     let pty_cfg = pty.ok_or_else(|| anyhow!("tmux -CC attach requires pty dimensions"))?;
     let winsize = nix::libc::winsize {
         ws_row: pty_cfg.rows,
@@ -638,7 +671,7 @@ fn spawn_tmux_control_process(
     }))
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn spawn_zmx_control_process(
     session: &Session,
     zmx: &provider::ZmxProvider,
@@ -646,11 +679,12 @@ fn spawn_zmx_control_process(
     cwd: Option<&str>,
     pty: Option<&portl_proto::shell_v1::PtyCfg>,
     argv: Option<&[String]>,
+    workload_env: &[(String, String)],
     audit_session_id: &str,
 ) -> Result<Arc<ShellProcess>> {
     use std::sync::Mutex;
 
-    let mut command = zmx.control_command(name, cwd, pty, argv)?;
+    let mut command = zmx.control_command(name, cwd, pty, argv, Some(workload_env))?;
     command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -867,6 +901,26 @@ async fn serve_substream(
         SessionStreamKind::Resize => pump_resizes(recv, &process).await,
         SessionStreamKind::Exit => pump_exit(send, &process).await,
     }
+}
+
+fn session_workload_context(
+    session: &Session,
+    req: &SessionReq,
+    requested_user: Option<&RequestedUser>,
+) -> TargetProcessContext {
+    let shell_req = portl_proto::shell_v1::ShellReq {
+        preamble: portl_proto::wire::StreamPreamble {
+            peer_token: session.peer_token,
+            alpn: String::from_utf8_lossy(portl_proto::shell_v1::ALPN_SHELL_V1).into_owned(),
+        },
+        mode: portl_proto::shell_v1::ShellMode::Shell,
+        argv: None,
+        env_patch: Vec::new(),
+        cwd: req.cwd.clone(),
+        pty: req.pty.clone(),
+        user: req.user.clone(),
+    };
+    TargetProcessContext::new(session.caps.shell.as_ref(), &shell_req, requested_user)
 }
 
 fn session_permits(session: &Session, req: &SessionReq) -> Result<(), SessionReason> {

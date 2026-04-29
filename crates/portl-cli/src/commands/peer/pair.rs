@@ -23,8 +23,7 @@ pub fn run(code: &str, yes: bool) -> Result<ExitCode> {
     let invite = InviteCode::decode(code).context("decode invite code")?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     if invite.not_after_unix <= now {
         bail!(
             "invite code expired {} seconds ago",
@@ -171,8 +170,7 @@ fn apply_response(
             );
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_secs());
             peers
                 .insert_or_update(PeerEntry {
                     label: label.clone(),

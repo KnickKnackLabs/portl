@@ -25,6 +25,8 @@ pub struct StatusResponse {
     pub agent: AgentInfo,
     pub connections: Vec<ConnectionSnapshot>,
     pub network: NetworkInfo,
+    #[serde(default)]
+    pub session_providers: SessionProvidersInfo,
     /// Embedded-relay snapshot. Always present; `enabled=false` when
     /// the agent is not acting as a relay.
     #[serde(default = "RelayStatus::disabled")]
@@ -37,6 +39,7 @@ impl StatusResponse {
         agent: AgentInfo,
         connections: Vec<ConnectionSnapshot>,
         network: NetworkInfo,
+        session_providers: SessionProvidersInfo,
         relay: RelayStatus,
     ) -> Self {
         Self {
@@ -46,6 +49,7 @@ impl StatusResponse {
             agent,
             connections,
             network,
+            session_providers,
             relay,
         }
     }
@@ -143,6 +147,38 @@ pub struct DiscoveryInfo {
     pub local: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionProvidersInfo {
+    pub default_provider: Option<String>,
+    pub default_user: Option<DefaultUserInfo>,
+    pub providers: Vec<SessionProviderInfo>,
+    pub search_paths: Vec<SessionProviderSearchPath>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DefaultUserInfo {
+    pub name: String,
+    pub home: String,
+    pub shell: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionProviderInfo {
+    pub name: String,
+    pub detected: bool,
+    pub path: Option<String>,
+    pub source: Option<String>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionProviderSearchPath {
+    pub provider: String,
+    pub path: String,
+    pub source: String,
+    pub exists: bool,
+}
+
 /// JSON error envelope used for 4xx/5xx replies.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
@@ -175,8 +211,7 @@ fn rfc3339_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     // Minimal RFC3339 without pulling in chrono/time: render UTC
     // from unix seconds. Good enough for "observability timestamp"
     // (sub-second precision isn't needed for a dashboard).
@@ -251,12 +286,35 @@ mod tests {
                     local: false,
                 },
             },
+            SessionProvidersInfo {
+                default_provider: Some("zmx".to_owned()),
+                default_user: Some(DefaultUserInfo {
+                    name: "demo".to_owned(),
+                    home: "/Users/demo".to_owned(),
+                    shell: "/bin/zsh".to_owned(),
+                }),
+                providers: vec![SessionProviderInfo {
+                    name: "zmx".to_owned(),
+                    detected: true,
+                    path: Some("/Users/demo/.local/share/mise/shims/zmx".to_owned()),
+                    source: Some("mise_shim".to_owned()),
+                    notes: None,
+                }],
+                search_paths: vec![SessionProviderSearchPath {
+                    provider: "zmx".to_owned(),
+                    path: "/Users/demo/.local/share/mise/shims/zmx".to_owned(),
+                    source: "mise_shim".to_owned(),
+                    exists: true,
+                }],
+            },
             RelayStatus::disabled(),
         );
         let json = serde_json::to_string(&r).expect("serialize");
         assert!(json.contains("\"schema\":1"));
         assert!(json.contains("\"kind\":\"status\""));
         assert!(json.contains("\"version\":\"0.3.2\""));
+        assert!(json.contains("\"default_provider\":\"zmx\""));
+        assert!(json.contains("\"source\":\"mise_shim\""));
     }
 
     #[test]

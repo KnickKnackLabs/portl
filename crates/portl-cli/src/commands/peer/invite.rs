@@ -106,8 +106,7 @@ pub fn list(json: bool) -> Result<ExitCode> {
     let store = PairStore::load(PairStore::default_path())?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
 
     if json {
         let invites: Vec<_> = store

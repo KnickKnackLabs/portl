@@ -1,5 +1,5 @@
 use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{ExitCode, Stdio};
 use std::time::Duration;
 
@@ -640,9 +640,27 @@ fn local_zmx_path_opt() -> Option<PathBuf> {
 }
 
 fn find_on_safe_path(program: &str) -> Option<PathBuf> {
-    ["/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"]
-        .into_iter()
-        .map(|dir| Path::new(dir).join(program))
+    let mut dirs = [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        "/usr/bin",
+        "/bin",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect::<Vec<_>>();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        dirs.extend([
+            home.join(".local/bin"),
+            home.join("bin"),
+            home.join(".cargo/bin"),
+            home.join(".local/share/mise/shims"),
+        ]);
+    }
+    dirs.into_iter()
+        .map(|dir| dir.join(program))
         .find(|candidate| candidate.exists())
 }
 

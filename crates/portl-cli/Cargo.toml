@@ -19,11 +19,11 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
-portl-core  = { version = "0.6.7", path = "../portl-core" }
-portl-proto = { version = "0.6.7", path = "../portl-proto" }
-portl-agent  = { version = "0.6.7", path = "../portl-agent" }
-docker-portl = { version = "0.6.7", path = "../../adapters/docker-portl" }
-slicer-portl = { version = "0.6.7", path = "../../adapters/slicer-portl" }
+portl-core  = { version = "0.6.8", path = "../portl-core" }
+portl-proto = { version = "0.6.8", path = "../portl-proto" }
+portl-agent  = { version = "0.6.8", path = "../portl-agent" }
+docker-portl = { version = "0.6.8", path = "../../adapters/docker-portl" }
+slicer-portl = { version = "0.6.8", path = "../../adapters/slicer-portl" }
 clap         = { workspace = true }
 clap_complete = "4"
 clap_mangen = "0.2"
@@ -59,7 +59,7 @@ async-trait = { workspace = true }
 bollard     = { workspace = true }
 
 [dev-dependencies]
-portl-core = { version = "0.6.7", path = "../portl-core", features = ["test-util"] }
+portl-core = { version = "0.6.8", path = "../portl-core", features = ["test-util"] }
 assert_cmd = { workspace = true }
 tempfile   = { workspace = true }
 iroh-tickets = { workspace = true }

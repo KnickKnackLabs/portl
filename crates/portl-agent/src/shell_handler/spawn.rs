@@ -16,13 +16,13 @@ use crate::session::Session;
 use crate::shell_registry::ShellProcess;
 
 use super::PTY_DRAIN_TIMEOUT;
-use super::env::{apply_env_to_command, effective_env};
 use super::exec_capture::{exec_stdin_task, output_reader_task};
 #[cfg(unix)]
 use super::pty_master::pty_master_task;
 use super::reject::SpawnReject;
 use super::shutdown::process_group_signal_target_from_pid;
 use super::user::{RequestedUser, install_exec_user_switch};
+use crate::target_context::TargetProcessContext;
 
 pub(crate) fn spawn_process(
     session: &Session,
@@ -57,13 +57,12 @@ fn spawn_exec_process(
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    if let Some(cwd) = req.cwd.as_deref() {
+    let context = TargetProcessContext::new(session.caps.shell.as_ref(), req, requested_user);
+    if let Some(cwd) = context.cwd.as_deref() {
         command.current_dir(cwd);
     }
-    apply_env_to_command(
-        &mut command,
-        effective_env(session.caps.shell.as_ref(), req, requested_user),
-    );
+    command.env_clear();
+    command.envs(context.env);
     #[cfg(unix)]
     install_exec_session_pre_exec(&mut command);
     #[cfg(unix)]
@@ -188,27 +187,28 @@ fn spawn_pty_process(
         ws_ypixel: 0,
     };
 
+    let context = TargetProcessContext::new(shell_caps(&session.caps), req, requested_user);
     let (program, argv): (String, Vec<String>) = req.argv.as_ref().map_or_else(
-        || {
-            (
-                std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned()),
-                vec!["-l".to_owned()],
-            )
-        },
+        || (context.shell_program.clone(), vec!["-l".to_owned()]),
         |requested| {
             let mut args = requested.clone();
             let program = args.remove(0);
             (program, args)
         },
     );
-    let env = effective_env(shell_caps(&session.caps), req, requested_user);
 
-    let (master, mut child) = spawn_pty_blocking(&program, &argv, winsize, env, req.cwd.as_deref())
-        .map_err(|err| {
-            SpawnReject::pty_allocation_failed(portl_proto::shell_v1::ShellReason::SpawnFailed(
-                err.to_string(),
-            ))
-        })?;
+    let (master, mut child) = spawn_pty_blocking(
+        &program,
+        &argv,
+        winsize,
+        context.env,
+        context.cwd.as_deref(),
+    )
+    .map_err(|err| {
+        SpawnReject::pty_allocation_failed(portl_proto::shell_v1::ShellReason::SpawnFailed(
+            err.to_string(),
+        ))
+    })?;
 
     let pid = child.id().ok_or_else(|| {
         SpawnReject::pty_allocation_failed(portl_proto::shell_v1::ShellReason::SpawnFailed(

@@ -25,7 +25,7 @@ use tracing::{debug, warn};
 
 use crate::status_schema::{
     AgentInfo, ConnectionsResponse, ErrorResponse, NetworkInfo, NetworkResponse, RelayResponse,
-    StatusResponse,
+    SessionProvidersInfo, StatusResponse,
 };
 
 #[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
@@ -162,6 +162,7 @@ pub trait StatusSource: Send + Sync + 'static {
     fn agent_info(&self) -> AgentInfo;
     fn connections(&self) -> Vec<crate::conn_registry::ConnectionSnapshot>;
     fn network_info(&self) -> NetworkInfo;
+    fn session_providers_info(&self) -> SessionProvidersInfo;
     fn relay_status(&self) -> crate::relay::RelayStatus;
     /// Number of live QUIC connections. Drives the
     /// `portl_active_connections` gauge at scrape time.
@@ -286,6 +287,7 @@ async fn serve_one<S: StatusSource>(
                 s.agent_info(),
                 s.connections(),
                 s.network_info(),
+                s.session_providers_info(),
                 s.relay_status(),
             ))?,
             None => render_error(
@@ -404,6 +406,9 @@ impl StatusSource for NoStatus {
         unreachable!("NoStatus is never invoked")
     }
     fn network_info(&self) -> NetworkInfo {
+        unreachable!("NoStatus is never invoked")
+    }
+    fn session_providers_info(&self) -> SessionProvidersInfo {
         unreachable!("NoStatus is never invoked")
     }
     fn relay_status(&self) -> crate::relay::RelayStatus {

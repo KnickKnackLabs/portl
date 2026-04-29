@@ -58,6 +58,7 @@ pub fn run(opts: RunOpts) -> ExitCode {
         check_stored_ticket_expiry(),
         check_package_manager(),
         check_binary_drift(),
+        check_session_providers(),
         check_service_drift(),
     ];
 
@@ -308,8 +309,7 @@ fn check_stored_ticket_expiry() -> CheckResult {
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let warn_threshold = now + 24 * 3600;
 
     let mut expired = Vec::new();
@@ -442,8 +442,7 @@ fn check_ticket_store() -> CheckResult {
     }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let expired: Vec<_> = tickets
         .iter()
         .filter(|(_, e)| e.expires_at <= now)
@@ -599,6 +598,52 @@ fn check_binary_drift() -> CheckResult {
     }
 }
 
+fn check_session_providers() -> CheckResult {
+    let configured = std::env::var_os("PORTL_SESSION_PROVIDER_PATH").map(PathBuf::from);
+    let info = portl_agent::session_provider_discovery_info(configured.as_deref());
+    if let Some(broken_config) = info
+        .search_paths
+        .iter()
+        .find(|probe| probe.source == "config" && !probe.exists)
+    {
+        return CheckResult {
+            name: "session providers",
+            status: Status::Fail,
+            detail: format!(
+                "configured provider path does not exist: {}",
+                broken_config.path
+            ),
+        };
+    }
+
+    let detected = info
+        .providers
+        .iter()
+        .filter(|provider| provider.name != "raw" && provider.detected)
+        .map(|provider| {
+            format!(
+                "{} at {} ({})",
+                provider.name,
+                provider.path.as_deref().unwrap_or("-"),
+                provider.source.as_deref().unwrap_or("unknown")
+            )
+        })
+        .collect::<Vec<_>>();
+    if detected.is_empty() {
+        CheckResult {
+            name: "session providers",
+            status: Status::Warn,
+            detail: "no zmx or tmux provider found; shell/exec still work, persistent sessions need zmx or tmux".to_owned(),
+        }
+    } else {
+        CheckResult {
+            name: "session providers",
+            status: Status::Ok,
+            detail: detected.join(", "),
+        }
+    }
+}
+
 /// v0.3.1: surface multi-service-loaded state (the user-level
 /// `LaunchAgent` + system `LaunchDaemon` footgun from the v0.3.0
 /// install thread). Non-fatal — this is common during migrations
@@ -686,8 +731,7 @@ fn launchctl_is_loaded(target: &str) -> bool {
     ProcessCommand::new("launchctl")
         .args(["print", target])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 #[cfg(target_os = "linux")]

@@ -155,6 +155,5 @@ pub(super) fn set_mode_0755(path: &Path) -> Result<()> {
 pub(super) fn inside_docker() -> bool {
     Path::new("/.dockerenv").exists()
         || std::fs::read_to_string("/proc/1/cgroup")
-            .map(|contents| contents.contains("docker") || contents.contains("containerd"))
-            .unwrap_or(false)
+            .is_ok_and(|contents| contents.contains("docker") || contents.contains("containerd"))
 }
