@@ -130,10 +130,10 @@ impl ZmxProvider {
 
     pub(crate) async fn list_detailed(&self) -> Result<Vec<SessionInfo>> {
         let json_output = self.run_capture(&["list", "--json"]).await?;
-        if json_output.code == 0 {
-            if let Ok(sessions) = parse_zmx_session_json(&json_output.stdout) {
-                return Ok(sessions);
-            }
+        if json_output.code == 0
+            && let Ok(sessions) = parse_zmx_session_json(&json_output.stdout)
+        {
+            return Ok(sessions);
         }
 
         let output = self.run_capture(&["list"]).await?;
@@ -876,8 +876,7 @@ fn stringify_json_object(
         .map(|(key, value)| {
             let value = value
                 .as_str()
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| value.to_string());
+                .map_or_else(|| value.to_string(), ToOwned::to_owned);
             (key.clone(), value)
         })
         .collect()

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::{ExitCode, Stdio};
@@ -151,7 +152,7 @@ fn render_session_listing_human(listing: &SessionListing) -> String {
         out.push_str("PROVIDER  NAME\n");
         for (provider_name, provider) in &listing.providers {
             for session in &provider.sessions {
-                out.push_str(&format!("{provider_name:<8}  {}\n", session.name));
+                let _ = writeln!(out, "{provider_name:<8}  {}", session.name);
             }
         }
     }
@@ -732,10 +733,10 @@ async fn local_tmux_session_group(is_default: bool) -> Result<SessionProviderSes
 
 async fn local_zmx_sessions_detailed() -> Result<Vec<SessionInfo>> {
     let output = run_local_zmx_capture(&["list", "--json"]).await?;
-    if output.code == 0 {
-        if let Some(sessions) = parse_local_zmx_json_sessions(&output.stdout) {
-            return Ok(sessions);
-        }
+    if output.code == 0
+        && let Some(sessions) = parse_local_zmx_json_sessions(&output.stdout)
+    {
+        return Ok(sessions);
     }
     Ok(local_zmx_list()
         .await?
@@ -864,8 +865,7 @@ fn stringify_local_json_object(
         .map(|(key, value)| {
             let value = value
                 .as_str()
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| value.to_string());
+                .map_or_else(|| value.to_string(), ToOwned::to_owned);
             (key.clone(), value)
         })
         .collect()
@@ -1730,24 +1730,34 @@ mod tests {
 
     #[test]
     fn provider_aware_list_formatting_and_json_are_structured() {
-        let entries = ListedSessions::Entries(vec![SessionEntry {
-            provider: "zmx".to_owned(),
-            name: "dev".to_owned(),
-        }]);
-        assert_eq!(
-            listed_sessions_human(&entries),
-            "PROVIDER  SESSION\nzmx       dev\n"
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "zmx".to_owned(),
+            SessionProviderListing {
+                available: true,
+                is_default: true,
+                count: 1,
+                sessions: vec![SessionListingEntry {
+                    provider: "zmx".to_owned(),
+                    name: "dev".to_owned(),
+                    metadata: serde_json::json!({}),
+                }],
+            },
         );
-        assert_eq!(
-            serde_json::to_value(&entries).unwrap(),
-            serde_json::json!([{ "provider": "zmx", "name": "dev" }])
-        );
+        let listing = SessionListing {
+            target: "max-b265".to_owned(),
+            provider_filter: None,
+            total: 1,
+            providers,
+        };
 
-        let names = ListedSessions::Names(vec!["dev".to_owned()]);
-        assert_eq!(listed_sessions_human(&names), "dev\n");
         assert_eq!(
-            serde_json::to_value(&names).unwrap(),
-            serde_json::json!(["dev"])
+            render_session_listing_human(&listing),
+            "PROVIDER  NAME\nzmx       dev\n"
+        );
+        assert_eq!(
+            serde_json::to_value(&listing).unwrap()["providers"]["zmx"]["sessions"][0]["name"],
+            "dev"
         );
     }
 

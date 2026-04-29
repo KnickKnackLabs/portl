@@ -608,9 +608,7 @@ fn effective_session_provider_path() -> Option<PathBuf> {
     std::env::var_os("PORTL_SESSION_PROVIDER_PATH")
         .map(PathBuf::from)
         .or_else(|| {
-            let home = std::env::var_os("PORTL_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(default_home_dir);
+            let home = std::env::var_os("PORTL_HOME").map_or_else(default_home_dir, PathBuf::from);
             let path = PortlConfig::default_path(&home);
             PortlConfig::load(&path)
                 .ok()
