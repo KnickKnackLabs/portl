@@ -149,7 +149,7 @@ def main() -> int:
     for rel in changed + ["CHANGELOG.md", "Cargo.lock"]:
         print(f"  {rel}")
     print(changelog_msg)
-    print(f"Next: mise run release:verify -- {args.version} --full")
+    print(f"Next: mise run release:verify -- {args.version} --local")
     return 0
 
 

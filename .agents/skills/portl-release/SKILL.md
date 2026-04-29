@@ -19,10 +19,10 @@ Portl releases combine deterministic mise tasks with agent judgment. Let scripts
    - raw commit-speak → rewrite into user-facing bullets, merging related commits and dropping implementation-only noise,
    - stale or duplicated historical references → preserve true historical statements like “v0.5.0 shipped”, but do not update them as current-version examples.
 4. Run `mise run release:prep -- VERSION` once the changelog is ready. Use `--dry-run` first if you want a non-mutating preview.
-5. Run `mise run release:verify -- VERSION --full` before commit/tag unless the user explicitly requests a lighter check. The `--full` path mirrors CI with `cargo nextest run --profile ci --workspace --all-features --lib --bins --tests`, runs workspace clippy, and opts into the ignored release smoke tests via nextest. Do not tag a release until these pass locally.
+5. Run `mise run release:verify -- VERSION --local` before committing the release bump. This keeps local verification fast by checking metadata/fmt/diff, focused nextest suites for the core crates, and focused clippy. Use `--full` only when you intentionally want to reproduce CI plus ignored smoke tests locally.
 6. Commit with subject `Release vVERSION` and a body explaining the bump.
 7. Push `main`.
-8. Before tagging, verify the pushed release commit's CI with `mise run release:watch -- VERSION --ci-only`; before the tag exists this requires local `HEAD` to match upstream, and it refuses a stale existing `vVERSION` tag unless `--allow-existing-tag` is explicit. Then run `mise run release:tag -- VERSION`.
+8. Before tagging, verify the pushed release commit's comprehensive CI with `mise run release:watch -- VERSION --ci-only`; before the tag exists this requires local `HEAD` to match upstream, and it refuses a stale existing `vVERSION` tag unless `--allow-existing-tag` is explicit. Then run `mise run release:tag -- VERSION`.
 9. After tagging, watch/report CI and release publishing with `mise run release:watch -- VERSION`. Avoid raw `gh run watch` unless debugging interactively; it repeats large job tables and annotations.
 
 ## Changelog Rules
@@ -39,9 +39,10 @@ Portl releases combine deterministic mise tasks with agent judgment. Let scripts
 
 - `mise run release:prep -- VERSION` — bump manifests/README, finalize populated Unreleased, and refresh release metadata. Requires a clean tree; supports `--dry-run`, `--allow-dirty`, and `--allow-empty-changelog`.
 - `mise run release:verify -- VERSION` — metadata checks, `cargo fmt --check`, and `git diff --check` without compiling just to check `portl --version`.
-- `mise run release:verify -- VERSION --ci` — default verification plus CI-equivalent `cargo nextest run --profile ci --workspace --all-features --lib --bins --tests` and workspace clippy.
+- `mise run release:verify -- VERSION --local` — default verification plus focused local nextest (`portl-cli`, `portl-core`, and `portl-agent` library tests) and focused clippy for `portl-cli`/`portl-core`. This is the normal pre-release local gate.
+- `mise run release:verify -- VERSION --ci` — default verification plus CI-equivalent `cargo nextest run --profile ci --workspace --all-features --lib --bins --tests` and workspace clippy. Prefer GitHub CI for this unless you explicitly need to reproduce it locally.
 - `mise run release:verify -- VERSION --smoke` — default verification plus ignored release smoke tests through nextest.
-- `mise run release:verify -- VERSION --full` — default verification plus `--ci --smoke`. Add `--allow-existing-tag` only when auditing an already-tagged release.
+- `mise run release:verify -- VERSION --full` — default verification plus `--ci --smoke`. Use sparingly for high-risk releases or CI debugging. Add `--allow-existing-tag` only when auditing an already-tagged release.
 - `mise run release:changelog:draft -- VERSION [--since TAG]` — write `scratch/release-vVERSION-changelog-draft.md` with raw commit subjects, commit links, and compare link for rewrite.
 - `mise run release:tag -- VERSION` — fetch remote tags, verify HEAD is pushed upstream, re-check changelog, then create and push annotated `vVERSION` tag. Supports `--no-push` and `--allow-unpushed`.
 - `mise run release:watch -- VERSION` — low-noise watcher for the tag commit's CI run and the tag's Release run. Prints compact status only when it changes and exits nonzero on terminal failure. Use `--once`, `--ci-only`, `--release-only`, `--poll`, `--timeout`, `--json`, `--verbose`, or `--allow-existing-tag` for focused checks. Exit `124` means the workflows were still pending at timeout, not necessarily failed; `--json` is snapshot-only.
