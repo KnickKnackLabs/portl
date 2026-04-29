@@ -5,6 +5,21 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Added
+
+- `PORTL_SESSION_PROVIDER` now acts as an environment-level default for
+  session provider selection when `--provider` is not supplied.
+- `tmux` session attaches understand native `session:window.pane` targets and
+  detach on `Ctrl+\`, including kitty keyboard protocol encodings.
+
+### Changed
+
+- Providerless session listing and existing-session resolution now aggregate
+  across detected persistent providers instead of only using the configured
+  creation provider.
+- Local `portl session providers` now reports the same detected `zmx`, `tmux`,
+  and raw providers surfaced by `portl status`.
+
 ## 0.7.0 — 2026-04-29
 
 ### Added

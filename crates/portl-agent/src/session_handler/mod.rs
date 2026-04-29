@@ -1,11 +1,12 @@
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::{Connection, SendStream};
 use portl_proto::session_v1::{
-    ALPN_SESSION_V1, SessionAck, SessionFirstFrame, SessionOp, SessionReason, SessionReq,
-    SessionStreamKind, SessionSubTail,
+    ALPN_SESSION_V1, SessionAck, SessionEntry, SessionFirstFrame, SessionOp, SessionReason,
+    SessionReq, SessionStreamKind, SessionSubTail,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Child;
@@ -112,6 +113,7 @@ async fn serve_control_stream(
                     provider: providers.default_provider.clone(),
                     providers: Some(providers),
                     sessions: None,
+                    session_entries: None,
                     run: None,
                     output: None,
                 },
@@ -121,6 +123,35 @@ async fn serve_control_stream(
             Ok(())
         }
         SessionOp::List => {
+            if req.provider.is_none() {
+                audit::session_event(
+                    &session,
+                    "audit.session_list",
+                    None,
+                    None,
+                    "list",
+                    req.user.as_deref(),
+                    req.cwd.as_deref(),
+                    req.argv.as_ref(),
+                );
+                let entries = match aggregate_session_entries(&zmx, &tmux).await {
+                    Ok(entries) => entries,
+                    Err(err) => {
+                        audit::session_reject(&session, "list", "provider_command_failed");
+                        write_ack(
+                            &mut send,
+                            reject(SessionReason::SpawnFailed(err.to_string())),
+                        )
+                        .await?;
+                        let _ = send.finish();
+                        return Ok(());
+                    }
+                };
+                write_ack(&mut send, ok_with_session_entries(entries)).await?;
+                let _ = send.finish();
+                return Ok(());
+            }
+
             let selected = match select_provider(&zmx, &tmux, req.provider.as_deref(), req.op).await
             {
                 Ok(selected) => selected,
@@ -132,7 +163,7 @@ async fn serve_control_stream(
             };
             audit::session_event(
                 &session,
-                "audit.session_providers",
+                "audit.session_list",
                 Some(selected.name()),
                 None,
                 "list",
@@ -205,7 +236,20 @@ async fn serve_control_stream(
             Ok(())
         }
         SessionOp::History => {
-            let selected = match select_provider(&zmx, &tmux, req.provider.as_deref(), req.op).await
+            let Some(name) = req.session_name.as_deref() else {
+                write_ack(&mut send, reject(SessionReason::MissingSessionName)).await?;
+                let _ = send.finish();
+                return Ok(());
+            };
+            let selected = match resolve_provider_for_session(
+                &zmx,
+                &tmux,
+                req.provider.as_deref(),
+                name,
+                req.op,
+                false,
+            )
+            .await
             {
                 Ok(selected) => selected,
                 Err(reason) => {
@@ -213,11 +257,6 @@ async fn serve_control_stream(
                     let _ = send.finish();
                     return Ok(());
                 }
-            };
-            let Some(name) = req.session_name.as_deref() else {
-                write_ack(&mut send, reject(SessionReason::MissingSessionName)).await?;
-                let _ = send.finish();
-                return Ok(());
             };
             audit::session_event(
                 &session,
@@ -247,7 +286,20 @@ async fn serve_control_stream(
             Ok(())
         }
         SessionOp::Kill => {
-            let selected = match select_provider(&zmx, &tmux, req.provider.as_deref(), req.op).await
+            let Some(name) = req.session_name.as_deref() else {
+                write_ack(&mut send, reject(SessionReason::MissingSessionName)).await?;
+                let _ = send.finish();
+                return Ok(());
+            };
+            let selected = match resolve_provider_for_session(
+                &zmx,
+                &tmux,
+                req.provider.as_deref(),
+                name,
+                req.op,
+                false,
+            )
+            .await
             {
                 Ok(selected) => selected,
                 Err(reason) => {
@@ -255,11 +307,6 @@ async fn serve_control_stream(
                     let _ = send.finish();
                     return Ok(());
                 }
-            };
-            let Some(name) = req.session_name.as_deref() else {
-                write_ack(&mut send, reject(SessionReason::MissingSessionName)).await?;
-                let _ = send.finish();
-                return Ok(());
             };
             audit::session_event(
                 &session,
@@ -289,6 +336,53 @@ async fn serve_control_stream(
     }
 }
 
+struct TmuxAttachPlan {
+    session: String,
+    target: String,
+    notice: Option<Vec<u8>>,
+}
+
+async fn plan_tmux_attach(tmux: &provider::TmuxProvider, requested: &str) -> TmuxAttachPlan {
+    let parsed = provider::parse_tmux_target(requested);
+    if parsed.has_selector {
+        return TmuxAttachPlan {
+            session: parsed.session,
+            target: parsed.target,
+            notice: None,
+        };
+    }
+
+    let panes = tmux.list_panes(&parsed.session).await.unwrap_or_default();
+    let target = panes
+        .iter()
+        .find(|pane| pane.active)
+        .or_else(|| panes.first())
+        .map_or_else(|| parsed.target.clone(), |pane| pane.target.clone());
+    let notice = if panes.len() > 1 {
+        let mut text = format!("portl: available tmux panes for {}:\n", parsed.session);
+        for pane in &panes {
+            let active = if pane.active { " active" } else { "" };
+            let _ = writeln!(
+                text,
+                "  {}  window={}({}) pane={}{}",
+                pane.target, pane.window_index, pane.window_name, pane.pane_index, active
+            );
+        }
+        let _ = writeln!(text, "portl: attaching to {target}");
+        Some(text.into_bytes())
+    } else if target != parsed.target {
+        Some(format!("portl: attaching to {target}\n").into_bytes())
+    } else {
+        None
+    };
+
+    TmuxAttachPlan {
+        session: parsed.session,
+        target,
+        notice,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn serve_attach(
     session: Session,
@@ -299,18 +393,27 @@ async fn serve_attach(
     zmx: provider::ZmxProvider,
     tmux: provider::TmuxProvider,
 ) -> Result<()> {
-    let selected = match select_provider(&zmx, &tmux, req.provider.as_deref(), req.op).await {
+    let Some(name) = req.session_name.as_deref() else {
+        write_ack(&mut send, reject(SessionReason::MissingSessionName)).await?;
+        let _ = send.finish();
+        return Ok(());
+    };
+    let selected = match resolve_provider_for_session(
+        &zmx,
+        &tmux,
+        req.provider.as_deref(),
+        name,
+        req.op,
+        true,
+    )
+    .await
+    {
         Ok(selected) => selected,
         Err(reason) => {
             write_ack(&mut send, reject(reason)).await?;
             let _ = send.finish();
             return Ok(());
         }
-    };
-    let Some(name) = req.session_name.as_deref() else {
-        write_ack(&mut send, reject(SessionReason::MissingSessionName)).await?;
-        let _ = send.finish();
-        return Ok(());
     };
     let requested_user = match resolve_requested_user(req.user.as_deref()) {
         Ok(user) => user,
@@ -356,8 +459,8 @@ async fn serve_attach(
             let _ = send.finish();
             return Ok(());
         }
-        let name = name.to_owned();
-        let initial_snapshot = tmux.viewport_snapshot(&name).await.ok();
+        let attach_plan = plan_tmux_attach(&tmux, name).await;
+        let initial_snapshot = tmux.viewport_snapshot(&attach_plan.target).await.ok();
         return serve_tmux_control_attach(
             session,
             state,
@@ -365,7 +468,9 @@ async fn serve_attach(
             recv,
             req,
             tmux,
-            &name,
+            &attach_plan.session,
+            Some(&attach_plan.target),
+            attach_plan.notice,
             &workload_context,
             initial_snapshot,
         )
@@ -436,6 +541,7 @@ async fn serve_attach(
             provider: Some("zmx".to_owned()),
             providers: None,
             sessions: None,
+            session_entries: None,
             run: None,
             output: None,
         },
@@ -505,6 +611,7 @@ async fn serve_control_attach(
             provider: Some("zmx".to_owned()),
             providers: None,
             sessions: None,
+            session_entries: None,
             run: None,
             output: None,
         },
@@ -532,6 +639,8 @@ async fn serve_tmux_control_attach(
     req: SessionReq,
     tmux: provider::TmuxProvider,
     name: &str,
+    tmux_target: Option<&str>,
+    initial_stderr: Option<Vec<u8>>,
     context: &TargetProcessContext,
     initial_snapshot: Option<Vec<u8>>,
 ) -> Result<()> {
@@ -541,12 +650,14 @@ async fn serve_tmux_control_attach(
         &session,
         &tmux,
         name,
+        tmux_target,
         context.cwd.as_deref(),
         req.pty.as_ref(),
         req.argv.as_deref(),
         &context.env,
         &audit_session_id,
         initial_snapshot,
+        initial_stderr,
     ) {
         Ok(process) => process,
         Err(err) => {
@@ -576,6 +687,7 @@ async fn serve_tmux_control_attach(
             provider: Some("tmux".to_owned()),
             providers: None,
             sessions: None,
+            session_entries: None,
             run: None,
             output: None,
         },
@@ -599,16 +711,19 @@ fn spawn_tmux_control_process(
     session: &Session,
     tmux: &provider::TmuxProvider,
     name: &str,
+    tmux_target: Option<&str>,
     cwd: Option<&str>,
     pty: Option<&portl_proto::shell_v1::PtyCfg>,
     argv: Option<&[String]>,
     workload_env: &[(String, String)],
     audit_session_id: &str,
     initial_snapshot: Option<Vec<u8>>,
+    initial_stderr: Option<Vec<u8>>,
 ) -> Result<Arc<ShellProcess>> {
     use std::sync::Mutex;
 
-    let spawn = tmux.control_spawn_config_with_env(name, cwd, pty, argv, Some(workload_env))?;
+    let spawn =
+        tmux.control_spawn_config_with_env(name, tmux_target, cwd, pty, argv, Some(workload_env))?;
     let pty_cfg = pty.ok_or_else(|| anyhow!("tmux -CC attach requires pty dimensions"))?;
     let winsize = nix::libc::winsize {
         ws_row: pty_cfg.rows,
@@ -641,10 +756,13 @@ fn spawn_tmux_control_process(
     if let Some(snapshot) = initial_snapshot.filter(|snapshot| !snapshot.is_empty()) {
         let _ = stdout_tx.try_send(snapshot);
     }
+    if let Some(stderr) = initial_stderr.filter(|stderr| !stderr.is_empty()) {
+        let _ = stderr_tx.try_send(stderr);
+    }
 
     let snapshot_tx = stdout_tx.clone();
     let snapshot_tmux = tmux.clone();
-    let snapshot_session = name.to_owned();
+    let snapshot_session = tmux_target.unwrap_or(name).to_owned();
     tokio::spawn(async move {
         while overflow_rx.recv().await.is_some() {
             match snapshot_tmux.viewport_snapshot(&snapshot_session).await {
@@ -667,6 +785,7 @@ fn spawn_tmux_control_process(
             stdin_rx,
             pty_rx,
             overflow_tx,
+            spawn.initial_commands,
         )
         .await
         {
@@ -1046,6 +1165,78 @@ impl SelectedProvider {
     }
 }
 
+async fn aggregate_session_entries(
+    zmx: &provider::ZmxProvider,
+    tmux: &provider::TmuxProvider,
+) -> Result<Vec<SessionEntry>> {
+    let mut entries = Vec::new();
+    for provider in [SelectedProvider::Zmx, SelectedProvider::Tmux] {
+        let status = match provider {
+            SelectedProvider::Zmx => zmx.probe().await?,
+            SelectedProvider::Tmux => tmux.probe().await?,
+        };
+        if !status.available {
+            continue;
+        }
+        for name in provider.list(zmx, tmux).await? {
+            entries.push(SessionEntry {
+                provider: provider.name().to_owned(),
+                name,
+            });
+        }
+    }
+    Ok(entries)
+}
+
+async fn resolve_provider_for_session(
+    zmx: &provider::ZmxProvider,
+    tmux: &provider::TmuxProvider,
+    requested: Option<&str>,
+    session_name: &str,
+    op: SessionOp,
+    create_if_missing: bool,
+) -> Result<SelectedProvider, SessionReason> {
+    if requested.is_some() {
+        return select_provider(zmx, tmux, requested, op).await;
+    }
+
+    let entries = aggregate_session_entries(zmx, tmux)
+        .await
+        .map_err(|err| SessionReason::SpawnFailed(err.to_string()))?;
+    let tmux_lookup = provider::tmux_lookup_session(session_name);
+    let mut providers = Vec::new();
+    for entry in entries.iter().filter(|entry| {
+        if entry.provider == "tmux" {
+            entry.name == tmux_lookup
+        } else {
+            entry.name == session_name
+        }
+    }) {
+        match entry.provider.as_str() {
+            "zmx" if !providers.contains(&SelectedProvider::Zmx) => {
+                providers.push(SelectedProvider::Zmx);
+            }
+            "tmux" if !providers.contains(&SelectedProvider::Tmux) => {
+                providers.push(SelectedProvider::Tmux);
+            }
+            _ => {}
+        }
+    }
+
+    match providers.as_slice() {
+        [provider] => Ok(*provider),
+        [] if create_if_missing => select_provider(zmx, tmux, None, op).await,
+        [] => Err(SessionReason::SessionNotFound(session_name.to_owned())),
+        _ => Err(SessionReason::SessionAmbiguous {
+            name: session_name.to_owned(),
+            providers: providers
+                .iter()
+                .map(|provider| provider.name().to_owned())
+                .collect(),
+        }),
+    }
+}
+
 async fn select_provider(
     zmx: &provider::ZmxProvider,
     tmux: &provider::TmuxProvider,
@@ -1132,6 +1323,7 @@ fn reject(reason: SessionReason) -> SessionAck {
         provider: None,
         providers: None,
         sessions: None,
+        session_entries: None,
         run: None,
         output: None,
     }
@@ -1145,6 +1337,7 @@ fn ok_empty(provider: &str) -> SessionAck {
         provider: Some(provider.to_owned()),
         providers: None,
         sessions: None,
+        session_entries: None,
         run: None,
         output: None,
     }
@@ -1154,6 +1347,13 @@ fn ok_with_sessions(provider: &str, sessions: Vec<String>) -> SessionAck {
     SessionAck {
         sessions: Some(sessions),
         ..ok_empty(provider)
+    }
+}
+fn ok_with_session_entries(entries: Vec<SessionEntry>) -> SessionAck {
+    SessionAck {
+        sessions: Some(entries.iter().map(|entry| entry.name.clone()).collect()),
+        session_entries: Some(entries),
+        ..ok_empty("aggregate")
     }
 }
 fn ok_with_run(provider: &str, run: portl_proto::session_v1::SessionRunResult) -> SessionAck {

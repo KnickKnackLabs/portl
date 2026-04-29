@@ -5,8 +5,8 @@ use crate::io::BufferedRecv;
 use crate::net::PeerSession;
 use crate::wire::StreamPreamble;
 use crate::wire::session::{
-    ALPN_SESSION_V1, ProviderReport, SessionAck, SessionFirstFrame, SessionOp, SessionReason,
-    SessionReqBody, SessionRunResult, SessionStreamKind, SessionSubTail,
+    ALPN_SESSION_V1, ProviderReport, SessionAck, SessionEntry, SessionFirstFrame, SessionOp,
+    SessionReason, SessionReqBody, SessionRunResult, SessionStreamKind, SessionSubTail,
 };
 use crate::wire::shell::{ExitFrame, PtyCfg, ResizeFrame, SignalFrame};
 
@@ -84,6 +84,32 @@ pub async fn open_session_list(
     )
     .await?;
     ack.sessions.context("session list response missing")
+}
+
+pub async fn open_session_entries(
+    connection: &Connection,
+    session: &PeerSession,
+    provider: Option<String>,
+) -> Result<Vec<SessionEntry>> {
+    let ack = request_ack(
+        connection,
+        session,
+        req(SessionOp::List, provider, None, None),
+    )
+    .await?;
+    if let Some(entries) = ack.session_entries {
+        Ok(entries)
+    } else {
+        let provider = ack.provider.unwrap_or_else(|| "unknown".to_owned());
+        let sessions = ack.sessions.context("session list response missing")?;
+        Ok(sessions
+            .into_iter()
+            .map(|name| SessionEntry {
+                provider: provider.clone(),
+                name,
+            })
+            .collect())
+    }
 }
 
 pub async fn open_session_run(
@@ -268,6 +294,15 @@ fn session_reason_message(reason: Option<&SessionReason>) -> String {
         }) => format!("persistent session provider '{provider}' does not support {capability}"),
         Some(SessionReason::MissingSessionName) => "persistent session name is required".to_owned(),
         Some(SessionReason::MissingArgv) => "session run requires a command after --".to_owned(),
+        Some(SessionReason::SessionNotFound(name)) => {
+            format!("persistent session '{name}' was not found on the target")
+        }
+        Some(SessionReason::SessionAmbiguous { name, providers }) => {
+            format!(
+                "persistent session '{name}' exists in multiple providers: {}; rerun with --provider or PORTL_SESSION_PROVIDER",
+                providers.join(", ")
+            )
+        }
         Some(SessionReason::SpawnFailed(message)) => {
             format!("failed to start persistent session provider: {message}")
         }

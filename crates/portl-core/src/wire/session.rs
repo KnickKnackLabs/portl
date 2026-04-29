@@ -137,6 +137,12 @@ pub struct SessionRunResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionEntry {
+    pub provider: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionAck {
     pub ok: bool,
     pub reason: Option<SessionReason>,
@@ -144,6 +150,8 @@ pub struct SessionAck {
     pub provider: Option<String>,
     pub providers: Option<ProviderReport>,
     pub sessions: Option<Vec<String>>,
+    #[serde(default)]
+    pub session_entries: Option<Vec<SessionEntry>>,
     pub run: Option<SessionRunResult>,
     pub output: Option<String>,
 }
@@ -159,6 +167,11 @@ pub enum SessionReason {
     },
     MissingSessionName,
     MissingArgv,
+    SessionNotFound(String),
+    SessionAmbiguous {
+        name: String,
+        providers: Vec<String>,
+    },
     SpawnFailed(String),
     InternalError(String),
 }
@@ -236,6 +249,10 @@ mod tests {
                 }],
             }),
             sessions: Some(vec!["dev".to_owned()]),
+            session_entries: Some(vec![SessionEntry {
+                provider: "zmx".to_owned(),
+                name: "dev".to_owned(),
+            }]),
             run: Some(SessionRunResult {
                 code: 0,
                 stdout: "ok".to_owned(),

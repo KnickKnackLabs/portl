@@ -439,6 +439,77 @@ pub(crate) struct TmuxSpawnConfig {
     pub(crate) program: PathBuf,
     pub(crate) args: Vec<String>,
     pub(crate) env: Vec<(String, String)>,
+    pub(crate) initial_commands: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TmuxTarget {
+    pub(crate) session: String,
+    pub(crate) target: String,
+    pub(crate) has_selector: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TmuxPane {
+    pub(crate) target: String,
+    pub(crate) window_index: String,
+    pub(crate) window_name: String,
+    pub(crate) pane_index: String,
+    pub(crate) active: bool,
+}
+
+pub(crate) fn parse_tmux_target(input: &str) -> TmuxTarget {
+    if let Some((session, _selector)) = input.split_once(':') {
+        TmuxTarget {
+            session: session.to_owned(),
+            target: input.to_owned(),
+            has_selector: true,
+        }
+    } else {
+        TmuxTarget {
+            session: input.to_owned(),
+            target: input.to_owned(),
+            has_selector: false,
+        }
+    }
+}
+
+pub(crate) fn tmux_lookup_session(input: &str) -> &str {
+    input.split_once(':').map_or(input, |(session, _)| session)
+}
+
+fn validate_tmux_control_target(target: &str) -> Result<()> {
+    if target.is_empty()
+        || !target.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b':' | b'.' | b'_' | b'-' | b'#' | b'@' | b'%' | b'$')
+        })
+    {
+        bail!("unsafe tmux target {target:?}");
+    }
+    Ok(())
+}
+
+fn parse_tmux_panes(stdout: &str) -> Vec<TmuxPane> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\t');
+            let target = parts.next()?.to_owned();
+            let window_index = parts.next()?.to_owned();
+            let window_name = parts.next()?.to_owned();
+            let pane_index = parts.next()?.to_owned();
+            let window_active = parts.next()? == "1";
+            let pane_active = parts.next()? == "1";
+            Some(TmuxPane {
+                target,
+                window_index,
+                window_name,
+                pane_index,
+                active: window_active && pane_active,
+            })
+        })
+        .collect()
 }
 
 impl TmuxProvider {
@@ -522,6 +593,21 @@ impl TmuxProvider {
             .collect())
     }
 
+    pub(crate) async fn list_panes(&self, session: &str) -> Result<Vec<TmuxPane>> {
+        let output = self
+            .run_capture(&[
+                "list-panes",
+                "-s",
+                "-F",
+                "#{session_name}:#{window_index}.#{pane_index}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{window_active}\t#{pane_active}",
+                "-t",
+                session,
+            ])
+            .await?;
+        ensure_success("tmux list-panes", &output)?;
+        Ok(parse_tmux_panes(&output.stdout))
+    }
+
     pub(crate) async fn history(&self, session: &str) -> Result<String> {
         let output = self
             .run_capture(&[
@@ -566,6 +652,7 @@ impl TmuxProvider {
     pub(crate) fn control_spawn_config_with_env(
         &self,
         session: &str,
+        target: Option<&str>,
         cwd: Option<&str>,
         pty: Option<&portl_proto::shell_v1::PtyCfg>,
         argv: Option<&[String]>,
@@ -605,10 +692,16 @@ impl TmuxProvider {
             <[(String, String)]>::to_vec,
         );
         env.extend(self.env.iter().cloned());
+        let mut initial_commands = Vec::new();
+        if let Some(target) = target.filter(|target| *target != session) {
+            validate_tmux_control_target(target)?;
+            initial_commands.push(format!("switch-client -t {target}\n").into_bytes());
+        }
         Ok(TmuxSpawnConfig {
             program: path,
             args: command_args,
             env,
+            initial_commands,
         })
     }
 
@@ -1127,6 +1220,70 @@ esac
             !leak_file.exists(),
             "provider inherited PORTL_IDENTITY_SECRET_HEX"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn tmux_target_parsing_uses_native_session_window_pane_suffix() {
+        assert_eq!(
+            parse_tmux_target("dev"),
+            TmuxTarget {
+                session: "dev".to_owned(),
+                target: "dev".to_owned(),
+                has_selector: false,
+            }
+        );
+        assert_eq!(
+            parse_tmux_target("dev:0.1"),
+            TmuxTarget {
+                session: "dev".to_owned(),
+                target: "dev:0.1".to_owned(),
+                has_selector: true,
+            }
+        );
+        assert_eq!(tmux_lookup_session("dev:editor.0"), "dev");
+    }
+
+    #[test]
+    fn parses_tmux_pane_list_and_marks_active_target() {
+        let panes = parse_tmux_panes(
+            "dev:0.0\t0\tshell\t0\t1\t0\ndev:0.1\t0\tshell\t1\t1\t1\ndev:1.0\t1\tlogs\t0\t0\t1\n",
+        );
+        assert_eq!(panes.len(), 3);
+        assert_eq!(panes[1].target, "dev:0.1");
+        assert!(panes[1].active);
+        assert!(!panes[2].active);
+    }
+
+    #[tokio::test]
+    async fn tmux_control_target_rejects_command_injection_bytes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let fake = temp.path().join("tmux");
+        fs::write(
+            &fake,
+            r#"#!/bin/sh
+case "$1" in
+  -V) echo "tmux 3.6" ;;
+esac
+"#,
+        )?;
+        let mut perms = fs::metadata(&fake)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake, perms)?;
+
+        let provider = TmuxProvider::with_path(fake);
+        let Err(err) = provider.control_spawn_config_with_env(
+            "dev",
+            Some("dev:0.1\nkill-server"),
+            None,
+            None,
+            None,
+            None,
+        ) else {
+            anyhow::bail!("tmux target with newline must be rejected");
+        };
+        assert!(err.to_string().contains("unsafe tmux target"), "{err:#}");
+
         Ok(())
     }
 

@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::{ExitCode, Stdio};
@@ -9,8 +10,8 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use iroh::endpoint::SendStream;
 use portl_core::io::BufferedRecv;
 use portl_core::net::{
-    SessionClient, open_session_attach, open_session_history, open_session_kill, open_session_list,
-    open_session_providers, open_session_run,
+    SessionClient, open_session_attach, open_session_entries, open_session_history,
+    open_session_kill, open_session_list, open_session_providers, open_session_run,
 };
 use portl_core::ticket::schema::{Capabilities, EnvPolicy, ShellCaps};
 use tokio::io::{AsyncWriteExt, copy};
@@ -26,7 +27,7 @@ use crate::commands::session_share::{
 use portl_core::peer_store::PeerStore;
 use portl_core::rendezvous::ws::WsRendezvousBackend;
 use portl_core::ticket_store::TicketStore;
-use portl_proto::session_v1::{ProviderCapabilities, ProviderReport, ProviderStatus};
+use portl_proto::session_v1::{ProviderCapabilities, ProviderReport, ProviderStatus, SessionEntry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SessionHistoryFormat {
@@ -41,6 +42,62 @@ impl SessionHistoryFormat {
             Self::Plain => "plain",
             Self::Vt => "vt",
             Self::Html => "html",
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(untagged)]
+enum ListedSessions {
+    Names(Vec<String>),
+    Entries(Vec<SessionEntry>),
+}
+
+fn effective_provider(provider: Option<&str>) -> Option<String> {
+    let env_provider = std::env::var("PORTL_SESSION_PROVIDER").ok();
+    effective_provider_from_env(provider, env_provider.as_deref())
+}
+
+fn effective_provider_from_env(
+    provider: Option<&str>,
+    env_provider: Option<&str>,
+) -> Option<String> {
+    provider
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            env_provider
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .map(ToOwned::to_owned)
+}
+
+fn print_listed_sessions(sessions: &ListedSessions, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(sessions)?);
+        return Ok(());
+    }
+
+    print!("{}", listed_sessions_human(sessions));
+    Ok(())
+}
+
+fn listed_sessions_human(sessions: &ListedSessions) -> String {
+    match sessions {
+        ListedSessions::Names(names) => {
+            let mut out = String::new();
+            for name in names {
+                let _ = writeln!(out, "{name}");
+            }
+            out
+        }
+        ListedSessions::Entries(entries) => {
+            let mut out = "PROVIDER  SESSION\n".to_owned();
+            for entry in entries {
+                let _ = writeln!(out, "{:<8}  {}", entry.provider, entry.name);
+            }
+            out
         }
     }
 }
@@ -94,28 +151,27 @@ pub fn providers(target: Option<&str>, json: bool) -> Result<ExitCode> {
 
 pub fn ls(target: Option<&str>, provider: Option<&str>, json: bool) -> Result<ExitCode> {
     let target = resolve_target_only(target)?;
+    let provider = effective_provider(provider);
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
         let sessions = if resolved_target_is_local(&target)? {
-            local_session_list(provider).await?
+            local_session_list(provider.as_deref()).await?
         } else {
             let connected = connect_peer(&target, session_caps()).await?;
-            let sessions = open_session_list(
-                &connected.connection,
-                &connected.session,
-                provider.map(ToOwned::to_owned),
-            )
-            .await?;
+            let sessions = if let Some(provider) = provider {
+                ListedSessions::Names(
+                    open_session_list(&connected.connection, &connected.session, Some(provider))
+                        .await?,
+                )
+            } else {
+                ListedSessions::Entries(
+                    open_session_entries(&connected.connection, &connected.session, None).await?,
+                )
+            };
             close_connected(connected, b"session complete").await;
             sessions
         };
-        if json {
-            println!("{}", serde_json::to_string_pretty(&sessions)?);
-        } else {
-            for session in sessions {
-                println!("{session}");
-            }
-        }
+        print_listed_sessions(&sessions, json)?;
         Ok(ExitCode::SUCCESS)
     });
     runtime.shutdown_background();
@@ -128,17 +184,18 @@ pub fn run(
     provider: Option<&str>,
     argv: &[String],
 ) -> Result<ExitCode> {
+    let provider = effective_provider(provider);
     let resolved = resolve_session_ref(session, target)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
         let run = if resolved_target_is_local(&resolved.target)? {
-            local_session_run(provider, &resolved.session, argv).await?
+            local_session_run(provider.as_deref(), &resolved.session, argv).await?
         } else {
             let connected = connect_peer(&resolved.target, session_caps()).await?;
             let run = open_session_run(
                 &connected.connection,
                 &connected.session,
-                provider.map(ToOwned::to_owned),
+                provider.clone(),
                 resolved.session,
                 argv.to_vec(),
             )
@@ -166,17 +223,18 @@ pub fn history(
             format.as_str()
         );
     }
+    let provider = effective_provider(provider);
     let resolved = resolve_session_ref(session, target)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
         let output = if resolved_target_is_local(&resolved.target)? {
-            local_session_history(provider, &resolved.session).await?
+            local_session_history(provider.as_deref(), &resolved.session).await?
         } else {
             let connected = connect_peer(&resolved.target, session_caps()).await?;
             let output = open_session_history(
                 &connected.connection,
                 &connected.session,
-                provider.map(ToOwned::to_owned),
+                provider.clone(),
                 resolved.session,
             )
             .await?;
@@ -195,17 +253,18 @@ pub fn kill(
     target: Option<&str>,
     provider: Option<&str>,
 ) -> Result<ExitCode> {
+    let provider = effective_provider(provider);
     let resolved = resolve_session_ref(session, target)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
         if resolved_target_is_local(&resolved.target)? {
-            local_session_kill(provider, &resolved.session).await?;
+            local_session_kill(provider.as_deref(), &resolved.session).await?;
         } else {
             let connected = connect_peer(&resolved.target, session_caps()).await?;
             open_session_kill(
                 &connected.connection,
                 &connected.session,
-                provider.map(ToOwned::to_owned),
+                provider.clone(),
                 resolved.session,
             )
             .await?;
@@ -229,6 +288,7 @@ pub fn share(
     _yes: bool,
     allow_bearer_fallback: bool,
 ) -> Result<ExitCode> {
+    let provider = effective_provider(provider);
     let raw_session = session.trim();
     if raw_session.is_empty() {
         anyhow::bail!("session name cannot be empty");
@@ -361,7 +421,7 @@ pub fn share(
                         target_addr: target_addr.clone(),
                         hello,
                         session_name: &session_name,
-                        provider,
+                        provider: provider.as_deref(),
                         origin_label_hint: origin_label_hint.clone(),
                         target_label_hint: target_label_hint.clone(),
                         workspace_id: workspace_id.clone(),
@@ -499,24 +559,98 @@ fn target_hints_for_locality(target: &str) -> Vec<&str> {
 }
 
 fn local_session_providers() -> ProviderReport {
-    let status = local_zmx_status();
+    let configured = crate::client_endpoint::load_client_config()
+        .ok()
+        .and_then(|cfg| cfg.session_provider_path);
+    let discovery = portl_agent::session_provider_discovery_info(configured.as_deref());
     ProviderReport {
-        default_provider: status.available.then(|| "zmx".to_owned()),
-        providers: vec![status],
+        default_provider: discovery.default_provider,
+        providers: discovery
+            .providers
+            .into_iter()
+            .map(|provider| ProviderStatus {
+                capabilities: provider_capabilities(&provider.name),
+                available: provider.detected,
+                path: provider.path.clone(),
+                notes: provider.notes.or(provider.path),
+                tier: Some(
+                    if provider.name == "raw" {
+                        "raw"
+                    } else {
+                        "local"
+                    }
+                    .to_owned(),
+                ),
+                features: Vec::new(),
+                name: provider.name,
+            })
+            .collect(),
     }
 }
 
-async fn local_session_list(provider: Option<&str>) -> Result<Vec<String>> {
-    ensure_local_provider(provider)?;
+fn provider_capabilities(provider: &str) -> ProviderCapabilities {
+    match provider {
+        "zmx" => ProviderCapabilities::zmx(),
+        "tmux" => ProviderCapabilities::tmux(),
+        _ => ProviderCapabilities::raw(),
+    }
+}
+
+async fn local_session_list(provider: Option<&str>) -> Result<ListedSessions> {
+    match provider {
+        Some("zmx") => Ok(ListedSessions::Names(local_zmx_list().await?)),
+        Some("tmux") => Ok(ListedSessions::Names(local_tmux_list().await?)),
+        Some(other) => {
+            anyhow::bail!("unsupported local session provider '{other}' (supported: zmx, tmux)")
+        }
+        None => {
+            let mut entries = Vec::new();
+            if local_zmx_path_opt().is_some() {
+                for name in local_zmx_list().await? {
+                    entries.push(SessionEntry {
+                        provider: "zmx".to_owned(),
+                        name,
+                    });
+                }
+            }
+            if local_tmux_path_opt().is_some() {
+                for name in local_tmux_list().await? {
+                    entries.push(SessionEntry {
+                        provider: "tmux".to_owned(),
+                        name,
+                    });
+                }
+            }
+            Ok(ListedSessions::Entries(entries))
+        }
+    }
+}
+
+async fn local_zmx_list() -> Result<Vec<String>> {
     let output = run_local_zmx_capture(&["list"]).await?;
-    ensure_local_zmx_success("zmx list", &output)?;
-    Ok(output
-        .stdout
+    ensure_local_provider_success("zmx list", &output)?;
+    Ok(session_names_from_stdout(&output.stdout))
+}
+
+async fn local_tmux_list() -> Result<Vec<String>> {
+    let output = run_local_tmux_capture(&["list-sessions", "-F", "#{session_name}"]).await?;
+    if output.code != 0 {
+        let stderr = output.stderr.to_lowercase();
+        if stderr.contains("no server running") || stderr.contains("no sessions") {
+            return Ok(Vec::new());
+        }
+        ensure_local_provider_success("tmux list-sessions", &output)?;
+    }
+    Ok(session_names_from_stdout(&output.stdout))
+}
+
+fn session_names_from_stdout(stdout: &str) -> Vec<String> {
+    stdout
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(ToOwned::to_owned)
-        .collect())
+        .collect()
 }
 
 async fn local_session_run(
@@ -524,23 +658,64 @@ async fn local_session_run(
     session: &str,
     argv: &[String],
 ) -> Result<portl_proto::session_v1::SessionRunResult> {
-    ensure_local_provider(provider)?;
-    let mut zmx_args = vec!["run", session];
-    zmx_args.extend(argv.iter().map(String::as_str));
-    run_local_zmx_capture(&zmx_args).await
+    match provider {
+        None | Some("zmx") => {
+            let mut zmx_args = vec!["run", session];
+            zmx_args.extend(argv.iter().map(String::as_str));
+            run_local_zmx_capture(&zmx_args).await
+        }
+        Some("tmux") => anyhow::bail!("persistent session provider 'tmux' does not support run"),
+        Some(other) => {
+            anyhow::bail!("unsupported local session provider '{other}' (supported: zmx, tmux)")
+        }
+    }
 }
 
 async fn local_session_history(provider: Option<&str>, session: &str) -> Result<String> {
-    ensure_local_provider(provider)?;
-    let output = run_local_zmx_capture(&["history", session]).await?;
-    ensure_local_zmx_success("zmx history", &output)?;
-    Ok(output.stdout)
+    match resolve_local_provider_for_session(provider, session, false)
+        .await?
+        .as_str()
+    {
+        "zmx" => {
+            let output = run_local_zmx_capture(&["history", session]).await?;
+            ensure_local_provider_success("zmx history", &output)?;
+            Ok(output.stdout)
+        }
+        "tmux" => {
+            let output = run_local_tmux_capture(&[
+                "capture-pane",
+                "-p",
+                "-e",
+                "-S",
+                "-",
+                "-E",
+                "-",
+                "-t",
+                session,
+            ])
+            .await?;
+            ensure_local_provider_success("tmux capture-pane", &output)?;
+            Ok(output.stdout)
+        }
+        other => unreachable!("unsupported provider {other}"),
+    }
 }
 
 async fn local_session_kill(provider: Option<&str>, session: &str) -> Result<()> {
-    ensure_local_provider(provider)?;
-    let output = run_local_zmx_capture(&["kill", session]).await?;
-    ensure_local_zmx_success("zmx kill", &output)
+    match resolve_local_provider_for_session(provider, session, false)
+        .await?
+        .as_str()
+    {
+        "zmx" => {
+            let output = run_local_zmx_capture(&["kill", session]).await?;
+            ensure_local_provider_success("zmx kill", &output)
+        }
+        "tmux" => {
+            let output = run_local_tmux_capture(&["kill-session", "-t", session]).await?;
+            ensure_local_provider_success("tmux kill-session", &output)
+        }
+        other => unreachable!("unsupported provider {other}"),
+    }
 }
 
 async fn local_session_attach(
@@ -550,12 +725,22 @@ async fn local_session_attach(
     cwd: Option<&str>,
     argv: &[String],
 ) -> Result<ExitCode> {
-    ensure_local_provider(provider)?;
     if let Some(user) = user {
         anyhow::bail!(
             "--user is only supported for remote session targets, not local attach ({user})"
         );
     }
+    match resolve_local_provider_for_session(provider, session, true)
+        .await?
+        .as_str()
+    {
+        "zmx" => local_zmx_attach(session, cwd, argv).await,
+        "tmux" => local_tmux_attach(session, argv).await,
+        other => unreachable!("unsupported provider {other}"),
+    }
+}
+
+async fn local_zmx_attach(session: &str, cwd: Option<&str>, argv: &[String]) -> Result<ExitCode> {
     let path = local_zmx_path()?;
     eprintln!("portl: using local session provider zmx");
     eprintln!("portl: attaching to local session \"{session}\"");
@@ -572,25 +757,93 @@ async fn local_session_attach(
     Ok(exit_code_from_i32(status.code().unwrap_or(1)))
 }
 
-fn local_zmx_status() -> ProviderStatus {
-    let path = local_zmx_path_opt();
-    ProviderStatus {
-        name: "zmx".to_owned(),
-        available: path.is_some(),
-        path: path.as_ref().map(|path| path.display().to_string()),
-        notes: path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .or_else(|| Some("not found".to_owned())),
-        capabilities: ProviderCapabilities::zmx(),
-        tier: Some("local".to_owned()),
-        features: Vec::new(),
+async fn local_tmux_attach(session: &str, argv: &[String]) -> Result<ExitCode> {
+    let path = local_tmux_path()?;
+    eprintln!("portl: using local session provider tmux");
+    eprintln!("portl: attaching to local session \"{session}\"");
+    let mut command = Command::new(path);
+    if argv.is_empty() {
+        command.args(["attach-session", "-t", session]);
+    } else {
+        command
+            .args(["new-session", "-A", "-s", session])
+            .args(argv);
+    }
+    command
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let status = command.status().await.context("run tmux attach")?;
+    Ok(exit_code_from_i32(status.code().unwrap_or(1)))
+}
+
+async fn resolve_local_provider_for_session(
+    provider: Option<&str>,
+    session: &str,
+    create_if_missing: bool,
+) -> Result<String> {
+    if let Some(provider) = provider {
+        match provider {
+            "zmx" | "tmux" => return Ok(provider.to_owned()),
+            other => {
+                anyhow::bail!("unsupported local session provider '{other}' (supported: zmx, tmux)")
+            }
+        }
+    }
+
+    let mut providers = Vec::new();
+    if local_zmx_path_opt().is_some() && local_zmx_list().await?.iter().any(|name| name == session)
+    {
+        providers.push("zmx".to_owned());
+    }
+    let tmux_session = session.split_once(':').map_or(session, |(name, _)| name);
+    if local_tmux_path_opt().is_some()
+        && local_tmux_list()
+            .await?
+            .iter()
+            .any(|name| name == tmux_session)
+    {
+        providers.push("tmux".to_owned());
+    }
+
+    match providers.as_slice() {
+        [provider] => Ok(provider.clone()),
+        [] if create_if_missing => local_default_provider(),
+        [] => anyhow::bail!("persistent session '{session}' was not found locally"),
+        _ => anyhow::bail!(
+            "persistent session '{session}' exists in multiple providers: {}; rerun with --provider or PORTL_SESSION_PROVIDER",
+            providers.join(", ")
+        ),
+    }
+}
+
+fn local_default_provider() -> Result<String> {
+    if local_zmx_path_opt().is_some() {
+        Ok("zmx".to_owned())
+    } else if local_tmux_path_opt().is_some() {
+        Ok("tmux".to_owned())
+    } else {
+        anyhow::bail!("no local persistent session provider is installed")
     }
 }
 
 async fn run_local_zmx_capture(args: &[&str]) -> Result<portl_proto::session_v1::SessionRunResult> {
     let path = local_zmx_path()?;
-    let output = Command::new(&path)
+    run_local_capture(&path, args).await
+}
+
+async fn run_local_tmux_capture(
+    args: &[&str],
+) -> Result<portl_proto::session_v1::SessionRunResult> {
+    let path = local_tmux_path()?;
+    run_local_capture(&path, args).await
+}
+
+async fn run_local_capture(
+    path: &PathBuf,
+    args: &[&str],
+) -> Result<portl_proto::session_v1::SessionRunResult> {
+    let output = Command::new(path)
         .args(args)
         .stdin(Stdio::null())
         .output()
@@ -603,7 +856,7 @@ async fn run_local_zmx_capture(args: &[&str]) -> Result<portl_proto::session_v1:
     })
 }
 
-fn ensure_local_zmx_success(
+fn ensure_local_provider_success(
     context: &str,
     output: &portl_proto::session_v1::SessionRunResult,
 ) -> Result<()> {
@@ -618,25 +871,38 @@ fn ensure_local_zmx_success(
     }
 }
 
-fn ensure_local_provider(provider: Option<&str>) -> Result<()> {
-    match provider {
-        None | Some("zmx") => Ok(()),
-        Some(other) => {
-            anyhow::bail!("unsupported local session provider '{other}' (supported: zmx)")
-        }
-    }
-}
-
 fn local_zmx_path() -> Result<PathBuf> {
     local_zmx_path_opt().ok_or_else(|| anyhow!("zmx is not installed locally"))
 }
 
 fn local_zmx_path_opt() -> Option<PathBuf> {
+    configured_session_provider_path()
+        .filter(|path| !path_is_program(path, "tmux"))
+        .filter(|path| path.exists())
+        .or_else(|| find_on_safe_path("zmx"))
+}
+
+fn local_tmux_path() -> Result<PathBuf> {
+    local_tmux_path_opt().ok_or_else(|| anyhow!("tmux is not installed locally"))
+}
+
+fn local_tmux_path_opt() -> Option<PathBuf> {
+    configured_session_provider_path()
+        .filter(|path| path_is_program(path, "tmux"))
+        .filter(|path| path.exists())
+        .or_else(|| find_on_safe_path("tmux"))
+}
+
+fn configured_session_provider_path() -> Option<PathBuf> {
     crate::client_endpoint::load_client_config()
         .ok()
         .and_then(|cfg| cfg.session_provider_path)
-        .filter(|path| path.exists())
-        .or_else(|| find_on_safe_path("zmx"))
+}
+
+fn path_is_program(path: &std::path::Path, program: &str) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == program)
 }
 
 fn find_on_safe_path(program: &str) -> Option<PathBuf> {
@@ -711,9 +977,13 @@ pub fn attach(
     cwd: Option<&str>,
     argv: &[String],
 ) -> Result<ExitCode> {
+    let provider = effective_provider(provider);
     let resolved = resolve_session_ref(session, target)?;
-    let (session_name, provider_name) =
-        attach_session_defaults(&resolved.target, Some(&resolved.session), provider)?;
+    let (session_name, provider_name) = attach_session_defaults(
+        &resolved.target,
+        Some(&resolved.session),
+        provider.as_deref(),
+    )?;
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
         if resolved_target_is_local(&resolved.target)? {
@@ -1224,6 +1494,43 @@ mod tests {
 
         assert_eq!(session, "dotfiles");
         assert_eq!(provider.as_deref(), Some("zmx"));
+    }
+
+    #[test]
+    fn provider_env_precedence_matches_provider_flag_semantics() {
+        assert_eq!(
+            effective_provider_from_env(Some("zmx"), Some("tmux")).as_deref(),
+            Some("zmx")
+        );
+        assert_eq!(
+            effective_provider_from_env(None, Some("tmux")).as_deref(),
+            Some("tmux")
+        );
+        assert_eq!(effective_provider_from_env(None, Some("  ")), None);
+        assert_eq!(effective_provider_from_env(None, None), None);
+    }
+
+    #[test]
+    fn provider_aware_list_formatting_and_json_are_structured() {
+        let entries = ListedSessions::Entries(vec![SessionEntry {
+            provider: "zmx".to_owned(),
+            name: "dev".to_owned(),
+        }]);
+        assert_eq!(
+            listed_sessions_human(&entries),
+            "PROVIDER  SESSION\nzmx       dev\n"
+        );
+        assert_eq!(
+            serde_json::to_value(&entries).unwrap(),
+            serde_json::json!([{ "provider": "zmx", "name": "dev" }])
+        );
+
+        let names = ListedSessions::Names(vec!["dev".to_owned()]);
+        assert_eq!(listed_sessions_human(&names), "dev\n");
+        assert_eq!(
+            serde_json::to_value(&names).unwrap(),
+            serde_json::json!(["dev"])
+        );
     }
 
     #[test]

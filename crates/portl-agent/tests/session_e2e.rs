@@ -10,7 +10,8 @@ use portl_agent::{AgentConfig, DiscoveryConfig, run_task};
 use portl_core::id::Identity;
 use portl_core::net::shell_client::PtyCfg;
 use portl_core::net::{
-    open_session_attach, open_session_history, open_session_list, open_session_run, open_ticket_v1,
+    open_session_attach, open_session_entries, open_session_history, open_session_list,
+    open_session_run, open_ticket_v1,
 };
 use portl_core::test_util::pair;
 use portl_core::ticket::mint::mint_root;
@@ -45,13 +46,13 @@ async fn session_zmx_provider_maps_core_ops_over_session_protocol() -> Result<()
             .any(|p| p.name == "raw" && p.available)
     );
 
-    let listed = open_session_list(&connection, &session, None).await?;
+    let listed = open_session_list(&connection, &session, Some("zmx".to_owned())).await?;
     assert_eq!(listed, vec!["dev".to_owned(), "frontend".to_owned()]);
 
     let run = open_session_run(
         &connection,
         &session,
-        None,
+        Some("zmx".to_owned()),
         "dev".to_owned(),
         vec!["echo".to_owned(), "hi".to_owned()],
     )
@@ -59,13 +60,19 @@ async fn session_zmx_provider_maps_core_ops_over_session_protocol() -> Result<()
     assert_eq!(run.code, 0);
     assert_eq!(run.stdout.trim(), "run:dev:echo hi");
 
-    let history = open_session_history(&connection, &session, None, "dev".to_owned()).await?;
+    let history = open_session_history(
+        &connection,
+        &session,
+        Some("zmx".to_owned()),
+        "dev".to_owned(),
+    )
+    .await?;
     assert_eq!(history.trim(), "history:dev");
 
     let mut attach = open_session_attach(
         &connection,
         &session,
-        None,
+        Some("zmx".to_owned()),
         "dev".to_owned(),
         Some(vec!["top".to_owned()]),
         None,
@@ -169,6 +176,158 @@ async fn session_attach_prefers_zmx_control_when_probe_succeeds() -> Result<()> 
         "calls were {calls:?}"
     );
     assert!(!calls.contains("attach\ndev\n"));
+
+    shutdown(connection, client, server, agent).await
+}
+
+#[tokio::test]
+async fn session_list_aggregates_available_providers_and_resolves_unique_attach() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let fake_provider = temp.path().join("tmux");
+    let log = temp.path().join("provider.log");
+    write_fake_dual_session_provider(&fake_provider, &log)?;
+
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator, Some(fake_provider)).await?;
+    let ticket = root_ticket(&operator, server.addr(), shell_caps(true));
+
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+
+    let entries = open_session_entries(&connection, &session, None).await?;
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| (entry.provider.as_str(), entry.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("zmx", "dev"),
+            ("zmx", "frontend"),
+            ("tmux", "ops"),
+            ("tmux", "scratch"),
+            ("tmux", "dev"),
+        ]
+    );
+
+    let tmux_only = open_session_list(&connection, &session, Some("tmux".to_owned())).await?;
+    assert_eq!(
+        tmux_only,
+        vec!["ops".to_owned(), "scratch".to_owned(), "dev".to_owned()]
+    );
+
+    let mut attach = open_session_attach(
+        &connection,
+        &session,
+        None,
+        "ops".to_owned(),
+        None,
+        None,
+        None,
+        PtyCfg {
+            term: "xterm-256color".to_owned(),
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await?;
+    attach.close_stdin()?;
+    let mut attached = Vec::new();
+    AsyncReadExt::read_to_end(&mut attach.stdout, &mut attached).await?;
+    assert_eq!(
+        String::from_utf8_lossy(&attached),
+        "viewport:ops\ntmux:ops\n"
+    );
+    assert_eq!(attach.wait_exit().await?, 0);
+
+    let calls = fs::read_to_string(log)?;
+    assert!(calls.contains("zmx:list\n"));
+    assert!(calls.contains("tmux:list-sessions\n"));
+    assert!(
+        calls.contains("tmux:-CC\n-CC\nnew-session\n-A\n-s\nops\n"),
+        "calls were {calls:?}"
+    );
+
+    shutdown(connection, client, server, agent).await
+}
+
+#[tokio::test]
+async fn session_providerless_attach_falls_back_to_default_for_new_session() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let fake_provider = temp.path().join("tmux");
+    let log = temp.path().join("provider.log");
+    write_fake_dual_session_provider(&fake_provider, &log)?;
+
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator, Some(fake_provider)).await?;
+    let ticket = root_ticket(&operator, server.addr(), shell_caps(true));
+
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let mut attach = open_session_attach(
+        &connection,
+        &session,
+        None,
+        "new".to_owned(),
+        None,
+        None,
+        None,
+        PtyCfg {
+            term: "xterm-256color".to_owned(),
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await?;
+    attach.close_stdin()?;
+    let mut attached = Vec::new();
+    AsyncReadExt::read_to_end(&mut attach.stdout, &mut attached).await?;
+    assert_eq!(
+        String::from_utf8_lossy(&attached),
+        "viewport:new\nlive:new\n"
+    );
+    assert_eq!(attach.wait_exit().await?, 0);
+
+    let calls = fs::read_to_string(log)?;
+    assert!(calls.contains("zmx:control\n"), "calls were {calls:?}");
+
+    shutdown(connection, client, server, agent).await
+}
+
+#[tokio::test]
+async fn session_providerless_attach_rejects_ambiguous_names() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let fake_provider = temp.path().join("tmux");
+    let log = temp.path().join("provider.log");
+    write_fake_dual_session_provider(&fake_provider, &log)?;
+
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator, Some(fake_provider)).await?;
+    let ticket = root_ticket(&operator, server.addr(), shell_caps(true));
+
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let Err(err) = open_session_attach(
+        &connection,
+        &session,
+        None,
+        "dev".to_owned(),
+        None,
+        None,
+        None,
+        PtyCfg {
+            term: "xterm-256color".to_owned(),
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    else {
+        anyhow::bail!("duplicate provider session name should be ambiguous");
+    };
+    let message = err.to_string();
+    assert!(message.contains("multiple providers"), "{message}");
+    assert!(message.contains("zmx"), "{message}");
+    assert!(message.contains("tmux"), "{message}");
 
     shutdown(connection, client, server, agent).await
 }
@@ -359,6 +518,76 @@ case "$1" in
   list) echo "list exploded" >&2; exit 77 ;;
 esac
 "#,
+    )?;
+    let mut perms = fs::metadata(path)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+fn write_fake_dual_session_provider(path: &std::path::Path, log: &std::path::Path) -> Result<()> {
+    fs::write(
+        path,
+        format!(
+            r#"#!/bin/sh
+case "$1" in
+  control)
+    if [ "$2" = "--protocol" ] && [ "$3" = "zmx-control/v1" ] && [ "$4" = "--probe" ]; then
+      printf 'protocol=zmx-control/v1\n'
+      printf 'tier=control\n'
+      printf 'features=viewport_snapshot.v1,live_output.v1\n'
+      exit 0
+    fi
+    printf 'zmx:control\n' >> "{}"
+    if [ "$4" = "--rows" ] && [ "$6" = "--cols" ]; then
+      session="$8"
+    else
+      session="$4"
+    fi
+    case "$session" in
+      dev|frontend|new) printf '\016\015\000\000\000viewport:%s\n\017\011\000\000\000live:%s\n' "$session" "$session" ;;
+      *) exit 65 ;;
+    esac
+    ;;
+  version) echo "zmx 0.0.fake" ;;
+  list) printf 'zmx:list\n' >> "{}"; printf 'dev\nfrontend\n' ;;
+  history) echo "history:$2" ;;
+  kill) echo "killed:$2" ;;
+  -V) echo "tmux 3.6" ;;
+  list-sessions) printf 'tmux:list-sessions\n' >> "{}"; printf 'ops\nscratch\ndev\n' ;;
+  capture-pane)
+    if [ "$5" = "0" ]; then
+      echo "viewport:$9"
+    else
+      echo "history:$9"
+    fi
+    ;;
+  kill-session) echo "killed:$3" ;;
+  -CC)
+    printf 'tmux:-CC\n' >> "{}"
+    printf '%s\n' "$@" >> "{}"
+    session=""
+    prev=""
+    for arg in "$@"; do
+      if [ "$prev" = "-s" ]; then session="$arg"; fi
+      prev="$arg"
+    done
+    printf '\033P1000p%%output %%1 tmux:%s\\012\r\n' "$session"
+    while IFS= read -r line; do
+      printf 'stdin:%s\n' "$line" >> "{}"
+      [ "$line" = "detach-client" ] && exit 0
+    done
+    ;;
+  *) echo "unknown:$1" >&2; exit 64 ;;
+esac
+"#,
+            log.display(),
+            log.display(),
+            log.display(),
+            log.display(),
+            log.display(),
+            log.display()
+        ),
     )?;
     let mut perms = fs::metadata(path)?.permissions();
     perms.set_mode(0o755);

@@ -120,6 +120,7 @@ pub(crate) async fn pump_tmux_cc_pty(
     mut stdin_rx: mpsc::Receiver<StdinMessage>,
     mut pty_rx: mpsc::UnboundedReceiver<PtyCommand>,
     overflow_tx: mpsc::Sender<()>,
+    initial_commands: Vec<Vec<u8>>,
 ) -> Result<()> {
     set_nonblocking(&master)?;
     let master = tokio::io::unix::AsyncFd::new(master).context("register tmux -CC pty")?;
@@ -127,6 +128,7 @@ pub(crate) async fn pump_tmux_cc_pty(
     let mut read_buf = vec![0_u8; 16 * 1024];
     let mut line_buf = Vec::new();
     let mut drain_deadline = None;
+    let mut pending_initial_commands = Some(initial_commands);
 
     loop {
         let drain_sleep = async {
@@ -142,7 +144,12 @@ pub(crate) async fn pump_tmux_cc_pty(
             Some(message) = stdin_rx.recv(), if drain_deadline.is_none() => {
                 match message {
                     StdinMessage::Data(data) => {
-                        write_pty_all(&master, &send_keys_command(&data)).await.context("write tmux -CC input")?;
+                        if is_ctrl_backslash(&data) {
+                            write_pty_all(&master, b"detach-client\n").await.context("detach tmux -CC client")?;
+                            drain_deadline = Some(tokio::time::Instant::now() + TMUX_CC_DRAIN_TIMEOUT);
+                        } else {
+                            write_pty_all(&master, &send_keys_command(&data)).await.context("write tmux -CC input")?;
+                        }
                     }
                     StdinMessage::Close => {
                         write_pty_all(&master, b"detach-client\n").await.context("detach tmux -CC client")?;
@@ -167,6 +174,15 @@ pub(crate) async fn pump_tmux_cc_pty(
                     return Ok(());
                 };
                 let control_bytes = decoder.decode(&chunk);
+                if !control_bytes.is_empty()
+                    && let Some(commands) = pending_initial_commands.take()
+                {
+                    for command in commands {
+                        write_pty_all(&master, &command)
+                            .await
+                            .context("write initial tmux -CC command")?;
+                    }
+                }
                 pump_control_bytes(&control_bytes, &mut line_buf, &stdout_tx, &stderr_tx, &overflow_tx).await?;
             }
             else => return Ok(()),
@@ -215,6 +231,78 @@ async fn pump_control_bytes(
         }
     }
     Ok(())
+}
+
+fn is_ctrl_backslash(data: &[u8]) -> bool {
+    data.first().is_some_and(|byte| *byte == 0x1c) || is_key_pressed(data, 0x5c, 0b100)
+}
+
+fn is_key_pressed(data: &[u8], expected_key: u32, expected_mods: u32) -> bool {
+    data.windows(2).enumerate().any(|(index, window)| {
+        window == b"\x1b[" && keypress_with_mod(&data[index + 2..], expected_key, expected_mods)
+    })
+}
+
+fn keypress_with_mod(data: &[u8], expected_key: u32, expected_mods: u32) -> bool {
+    let mut pos = 0;
+    let Some(key_code) = parse_decimal(data, &mut pos) else {
+        return false;
+    };
+    if key_code != expected_key {
+        return false;
+    }
+
+    while data.get(pos).is_some_and(|byte| *byte == b':') {
+        pos += 1;
+        let _ = parse_decimal(data, &mut pos);
+    }
+
+    if data.get(pos).is_none_or(|byte| *byte != b';') {
+        return false;
+    }
+    pos += 1;
+
+    let Some(mod_encoded) = parse_decimal(data, &mut pos) else {
+        return false;
+    };
+    if mod_encoded < 1 {
+        return false;
+    }
+    let intentional_mods = (mod_encoded - 1) & 0b0011_1111;
+    if intentional_mods != expected_mods {
+        return false;
+    }
+
+    if data.get(pos).is_some_and(|byte| *byte == b':') {
+        pos += 1;
+        if parse_decimal(data, &mut pos) == Some(3) {
+            return false;
+        }
+    }
+
+    if data.get(pos).is_some_and(|byte| *byte == b';') {
+        pos += 1;
+        while data
+            .get(pos)
+            .is_some_and(|byte| byte.is_ascii_digit() || *byte == b':')
+        {
+            pos += 1;
+        }
+    }
+
+    data.get(pos).is_some_and(|byte| *byte == b'u')
+}
+
+fn parse_decimal(data: &[u8], pos: &mut usize) -> Option<u32> {
+    let start = *pos;
+    let mut value = 0_u32;
+    while let Some(byte) = data.get(*pos).filter(|byte| byte.is_ascii_digit()) {
+        value = value
+            .saturating_mul(10)
+            .saturating_add(u32::from(*byte - b'0'));
+        *pos += 1;
+    }
+    (*pos != start).then_some(value)
 }
 
 fn send_keys_command(data: &[u8]) -> Vec<u8> {
@@ -285,6 +373,22 @@ mod tests {
             assert_eq!(stdout_rx.recv().await.expect("first output"), b"first");
             assert!(overflow_rx.recv().await.is_some());
         });
+    }
+
+    #[test]
+    fn detects_raw_and_kitty_ctrl_backslash_detach() {
+        assert!(is_ctrl_backslash(b"\x1c"));
+        assert!(is_ctrl_backslash(b"\x1b[92;5u"));
+        assert!(is_ctrl_backslash(b"\x1b[92;5:1u"));
+        assert!(is_ctrl_backslash(b"\x1b[92;5:2u"));
+        assert!(is_ctrl_backslash(b"\x1b[92;69u"));
+        assert!(is_ctrl_backslash(b"\x1b[92:124;5u"));
+
+        assert!(!is_ctrl_backslash(b"\x1b[92;5:3u"));
+        assert!(!is_ctrl_backslash(b"\x1b[92;6u"));
+        assert!(!is_ctrl_backslash(b"\x1b[92;7u"));
+        assert!(!is_ctrl_backslash(b"\x1b[91;5u"));
+        assert!(!is_ctrl_backslash(b"not-detach"));
     }
 
     #[test]
