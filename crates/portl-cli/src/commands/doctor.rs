@@ -12,6 +12,8 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use iroh_tickets::Ticket;
+use portl_agent::config::default_home_dir;
+use portl_agent::config_file::PortlConfig;
 use portl_core::id::store;
 use portl_core::peer_store::PeerStore;
 use portl_core::ticket::schema::PortlTicket;
@@ -599,8 +601,25 @@ fn check_binary_drift() -> CheckResult {
 }
 
 fn check_session_providers() -> CheckResult {
-    let configured = std::env::var_os("PORTL_SESSION_PROVIDER_PATH").map(PathBuf::from);
-    let info = portl_agent::session_provider_discovery_info(configured.as_deref());
+    check_session_providers_with_config(effective_session_provider_path().as_deref())
+}
+
+fn effective_session_provider_path() -> Option<PathBuf> {
+    std::env::var_os("PORTL_SESSION_PROVIDER_PATH")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let home = std::env::var_os("PORTL_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(default_home_dir);
+            let path = PortlConfig::default_path(&home);
+            PortlConfig::load(&path)
+                .ok()
+                .and_then(|config| config.agent.session_provider_path)
+        })
+}
+
+fn check_session_providers_with_config(configured: Option<&Path>) -> CheckResult {
+    let info = portl_agent::session_provider_discovery_info(configured);
     if let Some(broken_config) = info
         .search_paths
         .iter()
@@ -610,7 +629,9 @@ fn check_session_providers() -> CheckResult {
             name: "session providers",
             status: Status::Fail,
             detail: format!(
-                "configured provider path does not exist: {}",
+                "configured session_provider_path does not exist: {}. \
+                 Remove session_provider_path from portl.toml to let Portl discover zmx/tmux, \
+                 or update it to an existing provider binary if you intentionally need an override.",
                 broken_config.path
             ),
         };
@@ -874,5 +895,26 @@ mod tests {
     fn listener_check_returns_ok_on_unrestricted_env() {
         let r = check_listener_bind();
         assert_eq!(r.status, Status::Ok, "unexpected: {}", r.detail);
+    }
+
+    #[test]
+    fn session_provider_check_fails_for_missing_file_configured_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing = temp.path().join("missing-zmx");
+        let result = check_session_providers_with_config(Some(missing.as_path()));
+
+        assert_eq!(result.status, Status::Fail);
+        assert!(
+            result
+                .detail
+                .contains("configured session_provider_path does not exist"),
+            "detail was {}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains("Remove session_provider_path"),
+            "detail was {}",
+            result.detail
+        );
     }
 }
