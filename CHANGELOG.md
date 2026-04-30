@@ -5,6 +5,22 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.7.4 — 2026-05-01
+
+### Changed
+
+- Reduced cold build iteration overhead for contributors working on Portl.
+
+### Fixed
+
+- Remote `zmx` and `tmux` session commands now preserve runtime socket
+  directory environment such as `TMPDIR`, `XDG_RUNTIME_DIR`, and `ZMX_DIR`,
+  so remote session listing and attaches use the same provider sockets as
+  local commands.
+- Short-lived test or ad-hoc agents no longer unlink the running agent's
+  `metrics.sock`, preventing `portl status` from losing contact with an
+  otherwise healthy local agent.
+
 ## 0.7.3 — 2026-04-30
 
 ### Fixed
