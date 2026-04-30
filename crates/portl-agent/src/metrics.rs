@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
@@ -193,8 +193,10 @@ pub async fn serve_with_status<S: StatusSource>(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create metrics socket parent {}", parent.display()))?;
     }
-    // Clean up any stale socket left behind by a prior agent.
-    let _ = std::fs::remove_file(&path);
+    // Clean up stale sockets left behind by a prior agent, but never
+    // unlink a live listener: unlinking it makes the existing agent's
+    // metrics/status server unreachable until restart.
+    remove_stale_socket(&path)?;
 
     let listener = UnixListener::bind(&path)
         .with_context(|| format!("bind metrics socket at {}", path.display()))?;
@@ -240,6 +242,29 @@ pub async fn serve_with_status<S: StatusSource>(
     }
     drop(socket_guard);
     Ok(())
+}
+
+fn remove_stale_socket(path: &std::path::Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => bail!(
+            "metrics socket {} already has a live listener",
+            path.display()
+        ),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            std::fs::remove_file(path)
+                .with_context(|| format!("remove stale metrics socket {}", path.display()))?;
+            Ok(())
+        }
+        Err(err) => Err(err).with_context(|| format!("probe metrics socket {}", path.display())),
+    }
 }
 
 struct SocketGuard {
@@ -471,6 +496,29 @@ mod ipc_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn serve_refuses_to_replace_live_socket() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("metrics.sock");
+        let _existing = UnixListener::bind(&path).expect("bind existing socket");
+        let shutdown = CancellationToken::new();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            serve(Arc::new(Metrics::default()), path.clone(), shutdown),
+        )
+        .await;
+
+        let err = result
+            .expect("serve should fail promptly instead of replacing live socket")
+            .expect_err("live socket should not be replaced");
+        assert!(
+            err.to_string().contains("already has a live listener"),
+            "unexpected error: {err:#}"
+        );
+        assert!(path.exists(), "existing socket path should remain linked");
+    }
 
     #[test]
     fn default_socket_path_ends_with_expected_name() {

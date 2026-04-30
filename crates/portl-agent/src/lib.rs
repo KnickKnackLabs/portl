@@ -515,7 +515,7 @@ fn spawn_metrics_server(
     shutdown: CancellationToken,
     cfg: &AgentConfig,
 ) -> Option<JoinHandle<()>> {
-    if !cfg.metrics_enabled.unwrap_or(true) {
+    if !metrics_enabled(cfg) {
         return None;
     }
     let path = cfg
@@ -529,6 +529,10 @@ fn spawn_metrics_server(
             warn!(?err, "metrics server exited with error");
         }
     }))
+}
+
+fn metrics_enabled(cfg: &AgentConfig) -> bool {
+    cfg.metrics_enabled.unwrap_or(false)
 }
 
 /// Spawn the in-process iroh-relay if `cfg.relay_server` is
@@ -771,6 +775,15 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{AgentConfig, DiscoveryConfig, run_task, run_with_shutdown};
+
+    #[test]
+    fn ad_hoc_agent_config_does_not_enable_metrics_by_default() {
+        assert!(!super::metrics_enabled(&AgentConfig::default()));
+        assert!(super::metrics_enabled(&AgentConfig {
+            metrics_enabled: Some(true),
+            ..AgentConfig::default()
+        }));
+    }
 
     #[tokio::test]
     async fn run_task_returns_and_stops_when_endpoint_closes() {

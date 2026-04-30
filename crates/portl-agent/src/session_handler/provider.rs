@@ -318,7 +318,7 @@ impl ZmxProvider {
 
     fn command(&self, path: &Path) -> Command {
         let mut command = Command::new(path);
-        apply_provider_env(&mut command, &self.env);
+        apply_provider_env(&mut command, &self.env, self.target_home.as_deref());
         command
     }
 }
@@ -441,9 +441,21 @@ fn default_target_home() -> Option<PathBuf> {
     }
 }
 
-fn apply_provider_env(command: &mut Command, extra_env: &[(String, String)]) {
+fn apply_provider_env(
+    command: &mut Command,
+    extra_env: &[(String, String)],
+    target_home: Option<&Path>,
+) {
     command.env_clear();
     command.env("PATH", crate::target_context::default_target_path());
+    for key in ["TMPDIR", "XDG_RUNTIME_DIR", "ZMX_DIR", "TMUX_TMPDIR"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    if let Some(home) = target_home {
+        command.env("HOME", home);
+    }
     for (key, value) in extra_env {
         command.env(key, value);
     }
@@ -819,7 +831,7 @@ impl TmuxProvider {
 
     fn command(&self, path: &Path) -> Command {
         let mut command = Command::new(path);
-        apply_provider_env(&mut command, &self.env);
+        apply_provider_env(&mut command, &self.env, self.target_home.as_deref());
         command
     }
 }
@@ -1337,6 +1349,77 @@ esac
         let calls = fs::read_to_string(log)?;
         assert!(calls.contains("control\n--protocol\nzmx-control/v1\n--probe\n"));
         assert!(calls.contains("version\n"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn zmx_provider_preserves_runtime_directory_env_for_socket_discovery() -> Result<()> {
+        let Some(tmpdir) = std::env::var_os("TMPDIR") else {
+            return Ok(());
+        };
+        let tmpdir = PathBuf::from(tmpdir);
+        let temp = tempfile::tempdir()?;
+        let fake = temp.path().join("zmx");
+        fs::write(
+            &fake,
+            format!(
+                r#"#!/bin/sh
+case "$1" in
+  list)
+    if [ "${{TMPDIR:-}}" != "{}" ]; then
+      echo "TMPDIR was '${{TMPDIR:-}}'" >&2
+      exit 66
+    fi
+    echo "alpha"
+    ;;
+esac
+"#,
+                tmpdir.display()
+            ),
+        )?;
+        let mut perms = fs::metadata(&fake)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake, perms)?;
+
+        let result = ZmxProvider::with_path(fake).list().await;
+
+        assert_eq!(result?, vec!["alpha".to_owned()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn zmx_provider_passes_target_home_to_provider_commands() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let fake = temp.path().join("zmx");
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home)?;
+        fs::write(
+            &fake,
+            format!(
+                r#"#!/bin/sh
+case "$1" in
+  list)
+    if [ "${{HOME:-}}" != "{}" ]; then
+      echo "HOME was '${{HOME:-}}'" >&2
+      exit 66
+    fi
+    echo "alpha"
+    ;;
+esac
+"#,
+                home.display()
+            ),
+        )?;
+        let mut perms = fs::metadata(&fake)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake, perms)?;
+
+        let result = ZmxProvider::with_path(fake)
+            .with_target_home(Some(home))
+            .list()
+            .await;
+
+        assert_eq!(result?, vec!["alpha".to_owned()]);
         Ok(())
     }
 
