@@ -20,7 +20,7 @@ rust-version = "1.89"
 
 [workspace.dependencies]
 # transport
-iroh         = { version = "0.98", features = ["address-lookup-mdns"] }
+iroh         = { version = "0.98.2", features = ["address-lookup-mdns"] }
 iroh-base    = "0.98"
 iroh-relay   = { version = "0.98", default-features = false, features = ["server"] }
 iroh-tickets = "0.5"
