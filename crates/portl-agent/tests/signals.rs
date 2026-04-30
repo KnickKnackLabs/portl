@@ -13,6 +13,7 @@ use portl_core::test_util::{self, pair};
 use portl_core::ticket::mint::mint_root;
 use portl_core::ticket::schema::{Capabilities, EnvPolicy, PortlTicket, ShellCaps};
 use tempfile::tempdir;
+use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
@@ -231,13 +232,13 @@ async fn run_signal_child_with_live_shell(signal_name: &str, stuck: bool) -> Res
     )
     .await?;
     let script = if stuck {
-        b"trap '' HUP TERM\nwhile :; do sleep 1; done\n".as_slice()
+        b"printf '\\137\\137PORTL_SIGNAL_READY\\137\\137\\n'\ntrap '' HUP TERM\nwhile :; do sleep 1; done\n".as_slice()
     } else {
-        b"trap 'exit 0' HUP TERM\nwhile :; do sleep 1; done\n".as_slice()
+        b"printf '\\137\\137PORTL_SIGNAL_READY\\137\\137\\n'\ntrap 'exit 0' HUP TERM\nwhile :; do sleep 1; done\n".as_slice()
     };
     shell.stdin.write_all(script).await?;
+    wait_for_shell_ready(&mut shell.stdout).await?;
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
     let signal = match signal_name {
         "TERM" => Signal::SIGTERM,
         "INT" => Signal::SIGINT,
@@ -262,6 +263,28 @@ async fn run_signal_child_with_live_shell(signal_name: &str, stuck: bool) -> Res
     } else {
         run_result.context("signal child agent run failed")
     }
+}
+
+#[cfg(unix)]
+async fn wait_for_shell_ready(stdout: &mut portl_core::io::BufferedRecv) -> Result<()> {
+    const MARKER: &str = "__PORTL_SIGNAL_READY__";
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut output = Vec::new();
+        let mut buf = [0_u8; 256];
+        loop {
+            let read = stdout.read(&mut buf).await?;
+            if read == 0 {
+                anyhow::bail!("shell exited before emitting signal readiness marker")
+            }
+            output.extend_from_slice(&buf[..read]);
+            if String::from_utf8_lossy(&output).contains(MARKER) {
+                return Ok(());
+            }
+        }
+    })
+    .await
+    .context("shell readiness marker timeout")?
 }
 
 #[cfg(unix)]
