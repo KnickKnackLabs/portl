@@ -724,7 +724,6 @@ fn spawn_tmux_control_process(
     let (pty_tx, pty_rx) = mpsc::unbounded_channel();
     let (stdout_tx, stdout_rx) = mpsc::channel(32);
     let (stderr_tx, stderr_rx) = mpsc::channel(32);
-    let (overflow_tx, mut overflow_rx) = mpsc::channel(1);
     let exit_code = Arc::new(Mutex::new(None));
     let (exit_tx, _) = watch::channel(None);
 
@@ -735,23 +734,6 @@ fn spawn_tmux_control_process(
         let _ = stderr_tx.try_send(stderr);
     }
 
-    let snapshot_tx = stdout_tx.clone();
-    let snapshot_tmux = tmux.clone();
-    let snapshot_session = tmux_target.unwrap_or(name).to_owned();
-    tokio::spawn(async move {
-        while overflow_rx.recv().await.is_some() {
-            match snapshot_tmux.viewport_snapshot(&snapshot_session).await {
-                Ok(snapshot) if !snapshot.is_empty() => {
-                    if snapshot_tx.send(snapshot).await.is_err() {
-                        break;
-                    }
-                }
-                Ok(_) => {}
-                Err(err) => tracing::debug!(%err, "tmux viewport snapshot refresh failed"),
-            }
-        }
-    });
-
     tokio::spawn(async move {
         if let Err(err) = tmux_control::pump_tmux_cc_pty(
             master,
@@ -759,7 +741,6 @@ fn spawn_tmux_control_process(
             stderr_tx,
             stdin_rx,
             pty_rx,
-            overflow_tx,
             spawn.initial_commands,
         )
         .await

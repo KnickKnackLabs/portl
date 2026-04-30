@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::{ExitCode, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -16,7 +17,7 @@ use portl_core::net::{
 };
 use portl_core::ticket::schema::{Capabilities, EnvPolicy, ShellCaps};
 use portl_core::wire::session::{SessionControlAction, SessionControlFrame};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, copy};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tracing::debug;
 
@@ -1572,31 +1573,33 @@ async fn bridge_attach(
         resize,
         control,
     } = session;
+    let display = AttachDisplay::new(cols, rows);
     let stdin_task = maybe_spawn_stdin_task(
         stdin,
         control,
         AttachControlUi {
             canonical_ref: canonical_ref.clone(),
-            cols,
-            rows,
             supports_kick_others: provider == "tmux",
+            display: display.clone(),
         },
     )?;
+    let stdout_display = display.clone();
     let stdout_task = tokio::spawn(async move {
-        let mut stdout = tokio::io::stdout();
-        copy(&mut stdout_recv, &mut stdout)
-            .await
-            .context("copy remote stdout")?;
-        stdout.flush().await.context("flush local stdout")?;
-        Ok::<_, anyhow::Error>(())
+        copy_remote_output(
+            &mut stdout_recv,
+            &stdout_display,
+            AttachOutputStream::Stdout,
+        )
+        .await
     });
+    let stderr_display = display.clone();
     let stderr_task = tokio::spawn(async move {
-        let mut stderr = tokio::io::stderr();
-        copy(&mut stderr_recv, &mut stderr)
-            .await
-            .context("copy remote stderr")?;
-        stderr.flush().await.context("flush local stderr")?;
-        Ok::<_, anyhow::Error>(())
+        copy_remote_output(
+            &mut stderr_recv,
+            &stderr_display,
+            AttachOutputStream::Stderr,
+        )
+        .await
     });
     let resize_task = tokio::spawn(async move {
         let mut resize = resize;
@@ -1620,29 +1623,50 @@ async fn bridge_attach(
         #[allow(unreachable_code)]
         Ok::<_, anyhow::Error>(())
     });
-    let code = read_exit(&mut exit).await?;
+    let (code, detached) = wait_attach_completion(&mut exit, stdin_task).await?;
     resize_task.abort();
-    let detached = if let Some(stdin_task) = stdin_task {
-        if stdin_task.is_finished() {
-            matches!(stdin_task.await?, Ok(StdinTaskResult::Detached))
-        } else {
-            stdin_task.abort();
-            let _ = stdin_task.await;
-            false
-        }
-    } else {
-        false
-    };
-    await_output_task(stdout_task, "stdout").await?;
-    await_output_task(stderr_task, "stderr").await?;
-    drop(raw_guard);
     if detached {
+        stdout_task.abort();
+        stderr_task.abort();
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+        display.clear_bar().await?;
+        drop(raw_guard);
         eprintln!("portl: detached from session \"{canonical_ref}\"");
         eprintln!();
         eprintln!("The session is still running. To reconnect, run:");
         eprintln!("  portl attach {canonical_ref}");
+    } else {
+        await_output_task(stdout_task, "stdout").await?;
+        await_output_task(stderr_task, "stderr").await?;
+        display.clear_bar().await?;
+        drop(raw_guard);
     }
     Ok(code)
+}
+
+async fn wait_attach_completion(
+    exit: &mut BufferedRecv,
+    stdin_task: Option<tokio::task::JoinHandle<Result<StdinTaskResult>>>,
+) -> Result<(i32, bool)> {
+    let mut exit_fut = Box::pin(read_exit(exit));
+    let Some(mut stdin_task) = stdin_task else {
+        return Ok((exit_fut.await?, false));
+    };
+
+    tokio::select! {
+        code = &mut exit_fut => {
+            stdin_task.abort();
+            let _ = stdin_task.await;
+            Ok((code?, false))
+        }
+        stdin_result = &mut stdin_task => {
+            match stdin_result.context("join stdin task")?? {
+                StdinTaskResult::Detached => Ok((0, true)),
+                StdinTaskResult::Closed => Ok((exit_fut.await?, false)),
+            }
+        }
+    }
 }
 
 fn session_caps() -> Capabilities {
@@ -1700,6 +1724,133 @@ impl Drop for RawModeGuard {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum AttachOutputStream {
+    Stdout,
+    Stderr,
+}
+
+async fn copy_remote_output(
+    recv: &mut BufferedRecv,
+    display: &AttachDisplay,
+    stream: AttachOutputStream,
+) -> Result<()> {
+    let mut buf = vec![0_u8; 16 * 1024];
+    loop {
+        let read = recv.read(&mut buf).await.context("read remote output")?;
+        if read == 0 {
+            display.flush(stream).await?;
+            return Ok(());
+        }
+        display.write_output(stream, &buf[..read]).await?;
+    }
+}
+
+#[derive(Clone)]
+struct AttachDisplay {
+    inner: Arc<tokio::sync::Mutex<AttachDisplayState>>,
+}
+
+struct AttachDisplayState {
+    cols: u16,
+    rows: u16,
+    bar: Option<String>,
+    stdout: tokio::io::Stdout,
+    stderr: tokio::io::Stderr,
+}
+
+impl AttachDisplay {
+    fn new(cols: u16, rows: u16) -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::Mutex::new(AttachDisplayState {
+                cols,
+                rows,
+                bar: None,
+                stdout: tokio::io::stdout(),
+                stderr: tokio::io::stderr(),
+            })),
+        }
+    }
+
+    async fn write_output(&self, stream: AttachOutputStream, bytes: &[u8]) -> Result<()> {
+        let mut state = self.inner.lock().await;
+        let had_bar = state.bar.is_some();
+        if had_bar {
+            state.clear_bar().await?;
+        }
+        match stream {
+            AttachOutputStream::Stdout => state
+                .stdout
+                .write_all(bytes)
+                .await
+                .context("copy remote stdout")?,
+            AttachOutputStream::Stderr => state
+                .stderr
+                .write_all(bytes)
+                .await
+                .context("copy remote stderr")?,
+        }
+        state.flush(stream).await?;
+        if had_bar {
+            state.redraw_bar().await?;
+        }
+        Ok(())
+    }
+
+    async fn flush(&self, stream: AttachOutputStream) -> Result<()> {
+        let mut state = self.inner.lock().await;
+        state.flush(stream).await
+    }
+
+    async fn set_bar(&self, text: String) -> Result<()> {
+        let mut state = self.inner.lock().await;
+        state.bar = Some(text);
+        state.redraw_bar().await
+    }
+
+    async fn clear_bar(&self) -> Result<()> {
+        let mut state = self.inner.lock().await;
+        state.bar = None;
+        state.clear_bar().await
+    }
+
+    async fn print_message(&self, message: &str) -> Result<()> {
+        let mut state = self.inner.lock().await;
+        state.clear_bar().await?;
+        state
+            .stderr
+            .write_all(format!("\r\n{message}\r\n").as_bytes())
+            .await
+            .context("write attach control message")?;
+        state
+            .stderr
+            .flush()
+            .await
+            .context("flush attach control message")?;
+        state.redraw_bar().await
+    }
+}
+
+impl AttachDisplayState {
+    async fn flush(&mut self, stream: AttachOutputStream) -> Result<()> {
+        match stream {
+            AttachOutputStream::Stdout => self.stdout.flush().await.context("flush local stdout"),
+            AttachOutputStream::Stderr => self.stderr.flush().await.context("flush local stderr"),
+        }
+    }
+
+    async fn clear_bar(&mut self) -> Result<()> {
+        draw_attach_control_bar_to(&mut self.stderr, self.rows, self.cols, "").await
+    }
+
+    async fn redraw_bar(&mut self) -> Result<()> {
+        if let Some(text) = self.bar.as_deref() {
+            draw_attach_control_bar_to(&mut self.stderr, self.rows, self.cols, text).await?;
+        }
+        Ok(())
+    }
+}
+
 async fn await_output_task(
     mut task: tokio::task::JoinHandle<Result<()>>,
     stream_name: &str,
@@ -1722,12 +1873,11 @@ enum StdinTaskResult {
     Detached,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct AttachControlUi {
     canonical_ref: String,
-    cols: u16,
-    rows: u16,
     supports_kick_others: bool,
+    display: AttachDisplay,
 }
 
 fn maybe_spawn_stdin_task(
@@ -1827,7 +1977,7 @@ async fn run_attach_control_mode<R>(
 where
     R: AsyncRead + Unpin,
 {
-    const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
+    const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
     const CONTROL_TICK: Duration = Duration::from_millis(100);
 
     let started = Instant::now();
@@ -1864,11 +2014,12 @@ where
                     .write_all(&postcard::to_stdvec(&frame).context("encode kick-others frame")?)
                     .await
                     .context("send kick-others frame")?;
-                print_attach_control_message(&format!(
-                    "portl: detached other clients from session \"{}\"",
-                    ui.canonical_ref
-                ))
-                .await?;
+                ui.display
+                    .print_message(&format!(
+                        "portl: detached other clients from session \"{}\"",
+                        ui.canonical_ref
+                    ))
+                    .await?;
                 return Ok(AttachControlOutcome::Continue);
             }
             if command == b"\x1b" {
@@ -1889,67 +2040,161 @@ where
 }
 
 async fn render_attach_control_bar(ui: &AttachControlUi, remaining: Duration) -> Result<()> {
-    let tenths = remaining.as_millis().div_ceil(100).min(99);
-    let seconds = tenths / 10;
-    let tenth = tenths % 10;
-    let actions = if ui.supports_kick_others {
-        format!(
-            "[ Portl: {} ]  d detach   k kick-others   Ctrl+\\ literal   Esc cancel   {seconds}.{tenth}s",
-            ui.canonical_ref
-        )
-    } else {
-        format!(
-            "[ Portl: {} ]  d detach   Ctrl+\\ literal   Esc cancel   {seconds}.{tenth}s",
-            ui.canonical_ref
-        )
-    };
-    draw_attach_control_bar(ui.rows, ui.cols, &actions).await
+    ui.display
+        .set_bar(attach_control_bar_text(
+            &ui.canonical_ref,
+            ui.supports_kick_others,
+            remaining,
+        ))
+        .await
 }
 
 async fn clear_attach_control_bar(ui: &AttachControlUi) -> Result<()> {
-    draw_attach_control_bar(ui.rows, ui.cols, "").await
+    ui.display.clear_bar().await
 }
 
-async fn print_attach_control_message(message: &str) -> Result<()> {
-    let mut stderr = tokio::io::stderr();
-    stderr
-        .write_all(format!("\r\n{message}\r\n").as_bytes())
-        .await
-        .context("write attach control message")?;
-    stderr.flush().await.context("flush attach control message")
-}
-
-async fn draw_attach_control_bar(row: u16, cols: u16, text: &str) -> Result<()> {
-    let mut stderr = tokio::io::stderr();
+async fn draw_attach_control_bar_to(
+    stderr: &mut tokio::io::Stderr,
+    row: u16,
+    cols: u16,
+    text: &str,
+) -> Result<()> {
     let row = row.max(1);
     if text.is_empty() {
         stderr
-            .write_all(format!("\x1b7\x1b[{row};1H\x1b[2K\x1b8").as_bytes())
+            .write_all(format!("\x1b[0m\x1b7\x1b[{row};1H\x1b[2K\x1b8\x1b[0m").as_bytes())
             .await
             .context("clear attach control bar")?;
     } else {
         let text = fit_attach_control_bar(text, cols);
         stderr
-            .write_all(format!("\x1b7\x1b[{row};1H\x1b[2K\x1b[7m{text}\x1b[0m\x1b8").as_bytes())
+            .write_all(
+                format!("\x1b[0m\x1b7\x1b[{row};1H\x1b[2K{text}\x1b[0m\x1b8\x1b[0m").as_bytes(),
+            )
             .await
             .context("draw attach control bar")?;
     }
     stderr.flush().await.context("flush attach control bar")
 }
 
+fn attach_control_bar_text(
+    canonical_ref: &str,
+    supports_kick_others: bool,
+    remaining: Duration,
+) -> String {
+    let tenths = remaining.as_millis().div_ceil(100).min(99);
+    let seconds = tenths / 10;
+    let tenth = tenths % 10;
+    let time = format!("{seconds}.{tenth}s");
+    let unicode = terminal_locale_supports_unicode();
+    let color = terminal_color_enabled();
+    let (lead, arrow, sep, send_key) = if unicode {
+        ("▌", "›", "·", "^\\")
+    } else {
+        ("|", ">", "|", "^\\")
+    };
+    let prefix = styled(&format!("{lead} Portl {arrow}"), "\x1b[1;36m", color);
+    let sep = styled(sep, "\x1b[2m", color);
+    let key = |value: &str| styled(value, "\x1b[1;33m", color);
+    let label = |value: &str| styled(value, "\x1b[2m", color);
+    let timer = styled(&time, "\x1b[2m", color);
+
+    let mut parts = vec![format!(
+        "{} {}  {}  {} {}",
+        prefix,
+        canonical_ref,
+        sep,
+        key("d"),
+        label("detach")
+    )];
+    if supports_kick_others {
+        parts.push(format!("{} {} {}", sep, key("k"), label("kick")));
+    }
+    parts.push(format!("{} {} {}", sep, key(send_key), label("send")));
+    parts.push(format!("{} {} {}", sep, key("Esc"), label("cancel")));
+    parts.push(format!("{sep} {timer}"));
+    parts.join(" ")
+}
+
+fn styled(text: &str, sgr: &str, color: bool) -> String {
+    if color {
+        format!("{sgr}{text}\x1b[0m")
+    } else {
+        text.to_owned()
+    }
+}
+
+fn terminal_color_enabled() -> bool {
+    std::env::var_os("NO_COLOR").is_none()
+        && std::env::var("TERM").map_or(true, |term| term != "dumb")
+}
+
+fn terminal_locale_supports_unicode() -> bool {
+    let locale = std::env::var("LC_ALL")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("LC_CTYPE")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| std::env::var("LANG").ok().filter(|value| !value.is_empty()));
+    locale.is_none_or(|value| {
+        let upper = value.to_ascii_uppercase();
+        upper.contains("UTF-8") || upper.contains("UTF8")
+    })
+}
+
 fn fit_attach_control_bar(text: &str, cols: u16) -> String {
     let max = usize::from(cols.max(1));
-    let count = text.chars().count();
-    if count <= max {
+    let visible = ansi_visible_width(text);
+    if visible <= max {
         return text.to_owned();
     }
     if max <= 1 {
         return "…".to_owned();
     }
-    text.chars()
-        .take(max - 1)
-        .chain(std::iter::once('…'))
-        .collect()
+
+    let mut out = String::new();
+    let mut width = 0_usize;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            out.push(ch);
+            for next in chars.by_ref() {
+                out.push(next);
+                if next == 'm' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if width >= max - 1 {
+            break;
+        }
+        out.push(ch);
+        width += 1;
+    }
+    out.push('…');
+    out.push_str("\x1b[0m");
+    out
+}
+
+fn ansi_visible_width(text: &str) -> usize {
+    let mut width = 0_usize;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            for next in chars.by_ref() {
+                if next == 'm' {
+                    break;
+                }
+            }
+        } else {
+            width += 1;
+        }
+    }
+    width
 }
 
 fn is_attach_detach_sequence(data: &[u8]) -> bool {
@@ -2042,8 +2287,18 @@ mod tests {
     #[test]
     fn attach_control_bar_fits_terminal_width() {
         assert_eq!(fit_attach_control_bar("abcdef", 10), "abcdef");
-        assert_eq!(fit_attach_control_bar("abcdef", 4), "abc…");
+        assert_eq!(fit_attach_control_bar("abcdef", 4), "abc…\x1b[0m");
         assert_eq!(fit_attach_control_bar("abcdef", 1), "…");
+    }
+
+    #[test]
+    fn attach_control_bar_fits_ansi_styled_text_by_visible_width() {
+        let text = "\x1b[1;36mPortl ›\x1b[0m abcdef";
+        assert_eq!(ansi_visible_width(text), "Portl › abcdef".chars().count());
+        assert_eq!(
+            fit_attach_control_bar(text, 10),
+            "\x1b[1;36mPortl ›\x1b[0m a…\x1b[0m"
+        );
     }
 
     #[test]

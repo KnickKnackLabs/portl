@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TrySendError;
 
 use crate::shell_handler::pty_master::{read_pty_chunk, set_nonblocking, write_pty_all};
 use crate::shell_registry::{PtyCommand, StdinMessage};
@@ -119,7 +118,6 @@ pub(crate) async fn pump_tmux_cc_pty(
     stderr_tx: mpsc::Sender<Vec<u8>>,
     mut stdin_rx: mpsc::Receiver<StdinMessage>,
     mut pty_rx: mpsc::UnboundedReceiver<PtyCommand>,
-    overflow_tx: mpsc::Sender<()>,
     initial_commands: Vec<Vec<u8>>,
 ) -> Result<()> {
     set_nonblocking(&master)?;
@@ -186,26 +184,15 @@ pub(crate) async fn pump_tmux_cc_pty(
                             .context("write initial tmux -CC command")?;
                     }
                 }
-                pump_control_bytes(&control_bytes, &mut line_buf, &stdout_tx, &stderr_tx, &overflow_tx).await?;
+                pump_control_bytes(&control_bytes, &mut line_buf, &stdout_tx, &stderr_tx).await?;
             }
             else => return Ok(()),
         }
     }
 }
 
-fn queue_tmux_output(
-    stdout_tx: &mpsc::Sender<Vec<u8>>,
-    overflow_tx: &mpsc::Sender<()>,
-    bytes: Vec<u8>,
-) -> bool {
-    match stdout_tx.try_send(bytes) {
-        Ok(()) => true,
-        Err(TrySendError::Full(_bytes)) => {
-            let _ = overflow_tx.try_send(());
-            false
-        }
-        Err(TrySendError::Closed(_bytes)) => false,
-    }
+async fn queue_tmux_output(stdout_tx: &mpsc::Sender<Vec<u8>>, bytes: Vec<u8>) -> bool {
+    stdout_tx.send(bytes).await.is_ok()
 }
 
 async fn pump_control_bytes(
@@ -213,7 +200,6 @@ async fn pump_control_bytes(
     line_buf: &mut Vec<u8>,
     stdout_tx: &mpsc::Sender<Vec<u8>>,
     stderr_tx: &mpsc::Sender<Vec<u8>>,
-    overflow_tx: &mpsc::Sender<()>,
 ) -> Result<()> {
     for byte in bytes {
         line_buf.push(*byte);
@@ -222,7 +208,7 @@ async fn pump_control_bytes(
             line_buf.clear();
             match parse_control_line(&line) {
                 TmuxControlEvent::Output(bytes) => {
-                    queue_tmux_output(stdout_tx, overflow_tx, bytes);
+                    queue_tmux_output(stdout_tx, bytes).await;
                 }
                 TmuxControlEvent::Error(error) => {
                     let _ = stderr_tx
@@ -356,25 +342,28 @@ mod tests {
     }
 
     #[test]
-    fn tmux_output_overflow_requests_snapshot_refresh() {
+    fn tmux_output_backpressure_preserves_split_utf8() {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         rt.block_on(async {
             let (stdout_tx, mut stdout_rx) = mpsc::channel(1);
-            let (overflow_tx, mut overflow_rx) = mpsc::channel(1);
+            let (stderr_tx, _stderr_rx) = mpsc::channel(1);
+            let mut line_buf = Vec::new();
+            let pump = tokio::spawn(async move {
+                pump_control_bytes(
+                    b"%output %1 \\342\r\n%output %1 \\224\\200\r\n",
+                    &mut line_buf,
+                    &stdout_tx,
+                    &stderr_tx,
+                )
+                .await
+            });
 
-            assert!(queue_tmux_output(
-                &stdout_tx,
-                &overflow_tx,
-                b"first".to_vec()
-            ));
-            assert!(!queue_tmux_output(
-                &stdout_tx,
-                &overflow_tx,
-                b"second".to_vec()
-            ));
-
-            assert_eq!(stdout_rx.recv().await.expect("first output"), b"first");
-            assert!(overflow_rx.recv().await.is_some());
+            assert_eq!(stdout_rx.recv().await.expect("first output"), vec![0xe2]);
+            assert_eq!(
+                stdout_rx.recv().await.expect("second output"),
+                vec![0x94, 0x80]
+            );
+            pump.await.expect("join pump").expect("pump output");
         });
     }
 
