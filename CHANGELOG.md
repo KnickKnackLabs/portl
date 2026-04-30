@@ -5,6 +5,16 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.7.3 — 2026-04-30
+
+### Fixed
+
+- `tmux` session attaches now restore the pane viewport as a complete terminal
+  redraw, including cursor position, so completed prompts clear stale spinner or
+  in-progress lines instead of leaving old live-output fragments behind.
+- Local in-process endpoint tests now avoid production DNS/relay setup, reducing
+  platform-specific hangs and noisy resolver behavior during the test suite.
+
 ## 0.7.2 — 2026-04-30
 
 ### Changed
