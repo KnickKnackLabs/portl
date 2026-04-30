@@ -539,6 +539,33 @@ fn parse_tmux_panes(stdout: &str) -> Vec<TmuxPane> {
         .collect()
 }
 
+fn parse_tmux_cursor_line(line: &str) -> Option<(u16, u16)> {
+    let mut parts = line.split_whitespace();
+    if parts.next()? != "PORTL_CURSOR" {
+        return None;
+    }
+    let x = parts.next()?.parse().ok()?;
+    let y = parts.next()?.parse().ok()?;
+    Some((x, y))
+}
+
+fn render_tmux_viewport_snapshot(snapshot: &[u8], cursor_x: u16, cursor_y: u16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(snapshot.len() + 32);
+    out.extend_from_slice(b"\x1b[H\x1b[2J");
+
+    let mut lines = snapshot.split(|byte| *byte == b'\n').collect::<Vec<_>>();
+    if lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    for (index, line) in lines.into_iter().enumerate() {
+        out.extend_from_slice(format!("\x1b[{};1H", index + 1).as_bytes());
+        out.extend_from_slice(line.strip_suffix(b"\r").unwrap_or(line));
+        out.extend_from_slice(b"\x1b[K");
+    }
+    out.extend_from_slice(format!("\x1b[{};{}H", cursor_y + 1, cursor_x + 1).as_bytes());
+    out
+}
+
 impl TmuxProvider {
     pub(crate) fn new(path: Option<PathBuf>) -> Self {
         Self {
@@ -670,9 +697,16 @@ impl TmuxProvider {
     pub(crate) async fn viewport_snapshot(&self, session: &str) -> Result<Vec<u8>> {
         let output = self
             .run_capture(&[
+                "display-message",
+                "-p",
+                "-t",
+                session,
+                "PORTL_CURSOR #{cursor_x} #{cursor_y}",
+                ";",
                 "capture-pane",
                 "-p",
                 "-e",
+                "-N",
                 "-S",
                 "0",
                 "-E",
@@ -682,7 +716,17 @@ impl TmuxProvider {
             ])
             .await?;
         ensure_success("tmux capture-pane", &output)?;
-        Ok(output.stdout.into_bytes())
+        let mut lines = output.stdout.lines();
+        let (cursor_x, cursor_y) = lines
+            .next()
+            .and_then(parse_tmux_cursor_line)
+            .unwrap_or((0, 0));
+        let snapshot = lines.collect::<Vec<_>>().join("\n");
+        Ok(render_tmux_viewport_snapshot(
+            snapshot.as_bytes(),
+            cursor_x,
+            cursor_y,
+        ))
     }
 
     pub(crate) async fn kill(&self, session: &str) -> Result<()> {
@@ -1360,6 +1404,16 @@ esac
         assert_eq!(panes[1].target, "dev:0.1");
         assert!(panes[1].active);
         assert!(!panes[2].active);
+    }
+
+    #[test]
+    fn tmux_viewport_snapshot_restores_cursor_for_live_deltas() {
+        let rendered = render_tmux_viewport_snapshot(b"old spinner\nnext\n", 4, 0);
+
+        assert_eq!(
+            rendered,
+            b"\x1b[H\x1b[2J\x1b[1;1Hold spinner\x1b[K\x1b[2;1Hnext\x1b[K\x1b[1;5H"
+        );
     }
 
     #[tokio::test]

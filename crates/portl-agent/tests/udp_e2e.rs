@@ -11,7 +11,7 @@ use portl_agent::{AgentConfig, DiscoveryConfig, run_task};
 use portl_core::endpoint::Endpoint;
 use portl_core::id::Identity;
 use portl_core::net::{open_ticket_v1, open_udp, run_local_udp_forward};
-use portl_core::test_util::pair;
+use portl_core::test_util::{self, pair};
 use portl_core::ticket::mint::mint_root;
 use portl_core::ticket::schema::{Capabilities, PortRule, PortlTicket};
 use portl_proto::udp_v1::{UdpBind, UdpDatagram};
@@ -406,7 +406,7 @@ async fn udp_reattach_from_different_peer_rejected() -> Result<()> {
     control1.close()?;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let other_client = Endpoint::bind().await?;
+    let other_client = test_util::endpoint().await?;
     let other_identity = Identity::new();
     let (connection2, session2) =
         open_ticket_v1(&other_client, &ticket, &[], &other_identity).await?;

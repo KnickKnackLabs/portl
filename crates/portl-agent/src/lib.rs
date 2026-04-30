@@ -752,14 +752,14 @@ fn revocations_path(cfg: &AgentConfig) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use portl_core::endpoint::Endpoint;
+    use portl_core::test_util;
     use tokio_util::sync::CancellationToken;
 
     use super::{AgentConfig, DiscoveryConfig, run_task, run_with_shutdown};
 
     #[tokio::test]
     async fn run_task_returns_and_stops_when_endpoint_closes() {
-        let endpoint = Endpoint::bind().await.expect("bind endpoint");
+        let endpoint = test_util::endpoint().await.expect("bind endpoint");
         let runtime_endpoint = endpoint.clone();
         let handle = run_task(AgentConfig {
             discovery: DiscoveryConfig::in_process(),
@@ -775,7 +775,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_with_shutdown_stops_when_token_is_cancelled() {
-        let endpoint = Endpoint::bind().await.expect("bind endpoint");
+        let endpoint = test_util::endpoint().await.expect("bind endpoint");
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(run_with_shutdown(
             AgentConfig {

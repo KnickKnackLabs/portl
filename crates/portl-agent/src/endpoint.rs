@@ -1,11 +1,18 @@
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
 use anyhow::Result;
 use iroh::address_lookup::{DnsAddressLookup, MdnsAddressLookup, PkarrPublisher, PkarrResolver};
+use iroh::dns::DnsResolver;
 use iroh::endpoint::{RelayMode, presets};
 use iroh_base::SecretKey;
 use portl_core::id::Identity;
 use tracing::instrument;
 
 use crate::config::AgentConfig;
+
+fn local_only_dns_resolver() -> DnsResolver {
+    DnsResolver::with_nameserver(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9)))
+}
 
 #[instrument(skip_all)]
 pub async fn bind(cfg: &AgentConfig, identity: &Identity) -> Result<iroh::Endpoint> {
@@ -21,6 +28,10 @@ pub async fn bind(cfg: &AgentConfig, identity: &Identity) -> Result<iroh::Endpoi
     } else {
         builder.relay_mode(RelayMode::custom(cfg.discovery.relays.iter().cloned()))
     };
+
+    if cfg.discovery.relays.is_empty() && !cfg.discovery.dns && !cfg.discovery.pkarr {
+        builder = builder.dns_resolver(local_only_dns_resolver());
+    }
 
     if cfg.discovery.pkarr {
         builder = builder

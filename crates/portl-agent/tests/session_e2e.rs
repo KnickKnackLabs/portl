@@ -242,7 +242,7 @@ async fn session_list_aggregates_available_providers_and_resolves_unique_attach(
     AsyncReadExt::read_to_end(&mut attach.stdout, &mut attached).await?;
     assert_eq!(
         String::from_utf8_lossy(&attached),
-        "viewport:ops\ntmux:ops\n"
+        "\x1b[H\x1b[2J\x1b[1;1Hviewport:ops\x1b[K\x1b[1;1Htmux:ops\n"
     );
     assert_eq!(attach.wait_exit().await?, 0);
 
@@ -404,7 +404,7 @@ async fn session_tmux_provider_attaches_with_control_mode() -> Result<()> {
     AsyncReadExt::read_to_end(&mut attach.stdout, &mut attached).await?;
     assert_eq!(
         String::from_utf8_lossy(&attached),
-        "viewport:dev\ntmux:dev\n"
+        "\x1b[H\x1b[2J\x1b[1;1Hviewport:dev\x1b[K\x1b[1;1Htmux:dev\n"
     );
     assert_eq!(attach.wait_exit().await?, 0);
 
@@ -562,6 +562,11 @@ case "$1" in
   kill) echo "killed:$2" ;;
   -V) echo "tmux 3.6" ;;
   list-sessions) printf 'tmux:list-sessions\n' >> "{}"; printf 'ops\nscratch\ndev\n' ;;
+  display-message)
+    printf 'PORTL_CURSOR 0 0\n'
+    target="${{16:-$4}}"
+    echo "viewport:$target"
+    ;;
   capture-pane)
     if [ "$5" = "0" ]; then
       echo "viewport:$9"
@@ -612,6 +617,11 @@ printf '%s\n' "$@" >> "{}"
 case "$1" in
   -V) echo "tmux 3.6" ;;
   list-sessions) printf 'dev\nfrontend\n' ;;
+  display-message)
+    printf 'PORTL_CURSOR 0 0\n'
+    target="${{16:-$4}}"
+    echo "viewport:$target"
+    ;;
   capture-pane)
     if [ "$5" = "0" ]; then
       echo "viewport:$9"

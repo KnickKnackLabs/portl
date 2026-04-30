@@ -6,11 +6,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use portl_agent::{AgentConfig, DiscoveryConfig, run_with_shutdown};
-use portl_core::endpoint::Endpoint;
 use portl_core::id::Identity;
 use portl_core::net::shell_client::PtyCfg;
 use portl_core::net::{open_shell, open_ticket_v1};
-use portl_core::test_util::pair;
+use portl_core::test_util::{self, pair};
 use portl_core::ticket::mint::mint_root;
 use portl_core::ticket::schema::{Capabilities, EnvPolicy, PortlTicket, ShellCaps};
 use tempfile::tempdir;
@@ -18,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
 async fn agent_run_returns_promptly_when_shutdown_token_is_cancelled() -> Result<()> {
-    let endpoint = Endpoint::bind().await?;
+    let endpoint = test_util::endpoint().await?;
     let shutdown = CancellationToken::new();
     let task = tokio::spawn(run_with_shutdown(
         AgentConfig {
@@ -168,7 +167,7 @@ async fn run_signal_child(signal_name: &str) -> Result<()> {
         Ok("live-shell") => run_signal_child_with_live_shell(signal_name, false).await,
         Ok("stuck-shell") => run_signal_child_with_live_shell(signal_name, true).await,
         _ => {
-            let endpoint = Endpoint::bind().await?;
+            let endpoint = test_util::endpoint().await?;
             let task = tokio::spawn(run_with_shutdown(
                 AgentConfig {
                     discovery: DiscoveryConfig::in_process(),
