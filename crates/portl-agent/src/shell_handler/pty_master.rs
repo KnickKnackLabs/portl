@@ -52,6 +52,7 @@ pub(super) async fn pty_master_task(
                         drain_deadline
                             .get_or_insert_with(|| tokio::time::Instant::now() + drain_timeout);
                     }
+                    PtyCommand::KickOthers => {}
                 }
             }
             Some(message) = stdin_rx.recv(), if stdin_open && drain_deadline.is_none() => {

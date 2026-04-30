@@ -5,9 +5,9 @@ use crate::io::BufferedRecv;
 use crate::net::PeerSession;
 use crate::wire::StreamPreamble;
 use crate::wire::session::{
-    ALPN_SESSION_V1, ProviderReport, SessionAck, SessionEntry, SessionFirstFrame, SessionOp,
-    SessionProviderSessions, SessionReason, SessionReqBody, SessionRunResult, SessionStreamKind,
-    SessionSubTail,
+    ALPN_SESSION_V1, ProviderReport, SessionAck, SessionControlAction, SessionControlFrame,
+    SessionEntry, SessionFirstFrame, SessionOp, SessionProviderSessions, SessionReason,
+    SessionReqBody, SessionRunResult, SessionStreamKind, SessionSubTail,
 };
 use crate::wire::shell::{ExitFrame, PtyCfg, ResizeFrame, SignalFrame};
 
@@ -15,6 +15,7 @@ const MAX_ACK_BYTES: usize = 256 * 1024;
 const MAX_EXIT_BYTES: usize = 1024;
 
 pub struct SessionClient {
+    pub provider: String,
     pub control_send: SendStream,
     #[allow(dead_code)]
     pub control_recv: BufferedRecv,
@@ -24,6 +25,7 @@ pub struct SessionClient {
     pub exit: BufferedRecv,
     pub signal: SendStream,
     pub resize: SendStream,
+    pub control: SendStream,
 }
 
 impl SessionClient {
@@ -47,6 +49,17 @@ impl SessionClient {
 
     pub fn close_stdin(&mut self) -> Result<()> {
         self.stdin.finish().context("finish remote stdin")?;
+        Ok(())
+    }
+
+    pub async fn kick_others(&mut self) -> Result<()> {
+        let frame = SessionControlFrame {
+            action: SessionControlAction::KickOthers,
+        };
+        self.control
+            .write_all(&postcard::to_stdvec(&frame).context("encode session control frame")?)
+            .await
+            .context("write session control frame")?;
         Ok(())
     }
 
@@ -214,6 +227,7 @@ pub async fn open_session_attach(
         .await?
         .context("missing session attach ack")?;
     ensure_ok(&ack)?;
+    let provider = ack.provider.clone().unwrap_or_else(|| "unknown".to_owned());
     let session_id = ack.session_id.context("session ack missing session id")?;
 
     let exit = open_recv_stream(connection, session, session_id, SessionStreamKind::Exit).await?;
@@ -227,8 +241,11 @@ pub async fn open_session_attach(
         open_send_stream(connection, session, session_id, SessionStreamKind::Signal).await?;
     let (resize, _) =
         open_send_stream(connection, session, session_id, SessionStreamKind::Resize).await?;
+    let (control, _) =
+        open_send_stream(connection, session, session_id, SessionStreamKind::Control).await?;
 
     Ok(SessionClient {
+        provider,
         control_send,
         control_recv,
         stdin,
@@ -237,6 +254,7 @@ pub async fn open_session_attach(
         exit,
         signal,
         resize,
+        control,
     })
 }
 

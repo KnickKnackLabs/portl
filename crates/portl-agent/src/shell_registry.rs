@@ -47,4 +47,5 @@ pub(crate) enum StdinMessage {
 pub(crate) enum PtyCommand {
     Resize { rows: u16, cols: u16 },
     Close { force: bool },
+    KickOthers,
 }

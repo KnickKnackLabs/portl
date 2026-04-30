@@ -166,6 +166,9 @@ pub(crate) async fn pump_tmux_cc_pty(
                         write_pty_all(&master, b"detach-client\n").await.context("detach tmux -CC client")?;
                         drain_deadline = Some(tokio::time::Instant::now() + TMUX_CC_DRAIN_TIMEOUT);
                     }
+                    PtyCommand::KickOthers => {
+                        write_pty_all(&master, b"detach-client -a\n").await.context("detach other tmux -CC clients")?;
+                    }
                 }
             }
             () = drain_sleep => return Ok(()),

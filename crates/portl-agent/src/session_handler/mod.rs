@@ -866,6 +866,7 @@ fn spawn_zmx_control_process(
                             let _ = stdin.shutdown().await;
                             break;
                         }
+                        PtyCommand::KickOthers => {}
                     }
                 }
                 else => {
@@ -1035,7 +1036,27 @@ async fn serve_substream(
         SessionStreamKind::Signal => pump_signals(recv, &process).await,
         SessionStreamKind::Resize => pump_resizes(recv, &process).await,
         SessionStreamKind::Exit => pump_exit(send, &process).await,
+        SessionStreamKind::Control => pump_session_controls(recv, &process).await,
     }
+}
+
+async fn pump_session_controls(mut recv: BufferedRecv, process: &ShellProcess) -> Result<()> {
+    while let Some(frame) = recv
+        .read_frame::<portl_proto::session_v1::SessionControlFrame>(MAX_CONTROL_BYTES)
+        .await?
+    {
+        match frame.action {
+            portl_proto::session_v1::SessionControlAction::KickOthers => {
+                if let Some(pty_tx) = process.pty_tx.as_ref() {
+                    pty_tx
+                        .send(PtyCommand::KickOthers)
+                        .map_err(|_| anyhow!("pty control channel closed"))
+                        .context("forward kick-others control")?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn session_workload_context(

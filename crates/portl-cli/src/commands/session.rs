@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::{ExitCode, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use clap::ValueEnum;
@@ -15,7 +15,8 @@ use portl_core::net::{
     open_session_list_detailed, open_session_providers, open_session_run,
 };
 use portl_core::ticket::schema::{Capabilities, EnvPolicy, ShellCaps};
-use tokio::io::{AsyncWriteExt, copy};
+use portl_core::wire::session::{SessionControlAction, SessionControlFrame};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, copy};
 use tokio::process::Command;
 use tracing::debug;
 
@@ -60,6 +61,7 @@ struct SessionProviderListing {
 struct SessionListingEntry {
     name: String,
     provider: String,
+    reference: String,
     metadata: serde_json::Value,
 }
 
@@ -77,7 +79,7 @@ impl SessionListing {
                 let sessions = group
                     .sessions
                     .into_iter()
-                    .map(SessionListingEntry::from)
+                    .map(|session| SessionListingEntry::from_session(target, session))
                     .collect::<Vec<_>>();
                 (
                     provider,
@@ -99,11 +101,13 @@ impl SessionListing {
     }
 }
 
-impl From<SessionInfo> for SessionListingEntry {
-    fn from(session: SessionInfo) -> Self {
+impl SessionListingEntry {
+    fn from_session(target: &str, session: SessionInfo) -> Self {
+        let reference = canonical_session_ref(target, &session.provider, &session.name);
         Self {
             name: session.name,
             provider: session.provider,
+            reference,
             metadata: metadata_map_to_json(session.metadata),
         }
     }
@@ -144,15 +148,15 @@ fn render_session_listing_human(listing: &SessionListing) -> String {
     if listing.provider_filter.is_some() && listing.providers.len() == 1 {
         for provider in listing.providers.values() {
             for session in &provider.sessions {
-                out.push_str(&session.name);
+                out.push_str(&session.reference);
                 out.push('\n');
             }
         }
     } else {
-        out.push_str("PROVIDER  NAME\n");
+        out.push_str("PROVIDER  REF\n");
         for (provider_name, provider) in &listing.providers {
             for session in &provider.sessions {
-                let _ = writeln!(out, "{provider_name:<8}  {}", session.name);
+                let _ = writeln!(out, "{provider_name:<8}  {}", session.reference);
             }
         }
     }
@@ -186,7 +190,7 @@ fn effective_provider_from_env(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
         })
-        .map(ToOwned::to_owned)
+        .map(normalize_session_provider_alias)
 }
 
 pub fn providers(target: Option<&str>, json: bool) -> Result<ExitCode> {
@@ -274,6 +278,7 @@ pub fn run(
 ) -> Result<ExitCode> {
     let provider = effective_provider(provider);
     let resolved = resolve_session_ref(session, target)?;
+    let provider = merge_session_providers(provider, resolved.provider.clone())?;
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
         let run = if resolved_target_is_local(&resolved.target)? {
@@ -313,6 +318,7 @@ pub fn history(
     }
     let provider = effective_provider(provider);
     let resolved = resolve_session_ref(session, target)?;
+    let provider = merge_session_providers(provider, resolved.provider.clone())?;
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
         let output = if resolved_target_is_local(&resolved.target)? {
@@ -343,6 +349,7 @@ pub fn kill(
 ) -> Result<ExitCode> {
     let provider = effective_provider(provider);
     let resolved = resolve_session_ref(session, target)?;
+    let provider = merge_session_providers(provider, resolved.provider.clone())?;
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
         if resolved_target_is_local(&resolved.target)? {
@@ -381,7 +388,7 @@ pub fn share(
     if raw_session.is_empty() {
         anyhow::bail!("session name cannot be empty");
     }
-    let (target_from_ref, session_name) = split_session_ref(Some(raw_session))?;
+    let (target_from_ref, _provider_from_ref, session_name) = split_session_ref(Some(raw_session))?;
     let session_name = session_name.expect("split_session_ref returns a session for Some input");
 
     let target_form = {
@@ -1197,6 +1204,7 @@ pub fn attach(
 ) -> Result<ExitCode> {
     let provider = effective_provider(provider);
     let resolved = resolve_session_ref(session, target)?;
+    let provider = merge_session_providers(provider, resolved.provider.clone())?;
     let (session_name, provider_name) = attach_session_defaults(
         &resolved.target,
         Some(&resolved.session),
@@ -1212,23 +1220,31 @@ pub fn attach(
         let connected = connect_peer(&resolved.target, session_caps()).await?;
         let (cols, rows) = size().unwrap_or((80, 24));
         let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_owned());
-        eprintln!(
-            "portl: using session provider {}",
-            provider_name.as_deref().unwrap_or("target default")
-        );
-        eprintln!("portl: attaching to session \"{session_name}\"");
+        if let Some(provider) = provider_name.as_deref() {
+            eprintln!(
+                "portl: attaching to session \"{}\"",
+                canonical_session_ref(&resolved.target, provider, &session_name)
+            );
+        } else {
+            eprintln!(
+                "portl: attaching to session \"{}\"",
+                target_session_ref(&resolved.target, &session_name)
+            );
+        }
         let session = open_session_attach(
             &connected.connection,
             &connected.session,
             provider_name,
-            session_name,
+            session_name.clone(),
             (!argv.is_empty()).then_some(argv.to_vec()),
             user.map(ToOwned::to_owned),
             cwd.map(ToOwned::to_owned),
             portl_core::net::shell_client::PtyCfg { term, cols, rows },
         )
         .await?;
-        let code = bridge_attach(session, cols, rows).await?;
+        let provider = session.provider.clone();
+        let canonical_ref = canonical_session_ref(&resolved.target, &provider, &session_name);
+        let code = bridge_attach(session, cols, rows, canonical_ref).await?;
         close_connected(connected, b"session complete").await;
         Ok(exit_code_from_i32(code))
     });
@@ -1239,6 +1255,7 @@ pub fn attach(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedSessionRef {
     target: String,
+    provider: Option<String>,
     session: String,
 }
 
@@ -1298,11 +1315,12 @@ fn resolve_session_ref_with_stores(
     {
         return Ok(ResolvedSessionRef {
             target: session_ref.to_owned(),
+            provider: metadata.provider.clone(),
             session: metadata.provider_session.clone(),
         });
     }
 
-    let (host_from_ref, session_name) = split_session_ref(session_ref)?;
+    let (host_from_ref, provider_from_ref, session_name) = split_session_ref(session_ref)?;
     let target_from_ref = host_from_ref
         .map(|hint| resolve_target_hint_with_stores(hint, peers, tickets, aliases))
         .transpose()?;
@@ -1342,22 +1360,50 @@ fn resolve_session_ref_with_stores(
         local_target_label()?
     };
 
-    Ok(ResolvedSessionRef { target, session })
+    Ok(ResolvedSessionRef {
+        target,
+        provider: provider_from_ref,
+        session,
+    })
 }
 
-fn split_session_ref(session_ref: Option<&str>) -> Result<(Option<&str>, Option<String>)> {
+fn split_session_ref(
+    session_ref: Option<&str>,
+) -> Result<(Option<&str>, Option<String>, Option<String>)> {
     let Some(session_ref) = session_ref else {
-        return Ok((None, None));
+        return Ok((None, None, None));
     };
-    if let Some((host, session)) = session_ref.split_once('/') {
-        let host = host.trim();
-        let session = session.trim();
-        if host.is_empty() || session.is_empty() || session.contains('/') {
-            anyhow::bail!("session refs must use HOST/SESSION with non-empty host and session");
+    let parts = session_ref.split('/').map(str::trim).collect::<Vec<_>>();
+    if parts.iter().any(|part| part.is_empty()) {
+        anyhow::bail!("session refs must use non-empty path components");
+    }
+    match parts.as_slice() {
+        [session] => Ok((None, None, Some((*session).to_owned()))),
+        [host, session] => Ok((Some(*host), None, Some((*session).to_owned()))),
+        [host, provider, session] => Ok((
+            Some(*host),
+            Some(normalize_session_provider(provider)?),
+            Some((*session).to_owned()),
+        )),
+        _ => anyhow::bail!("session refs must use SESSION, HOST/SESSION, or HOST/PROVIDER/SESSION"),
+    }
+}
+
+fn normalize_session_provider(provider: &str) -> Result<String> {
+    let normalized = normalize_session_provider_alias(provider);
+    match normalized.as_str() {
+        "tmux" | "zmx" | "raw" => Ok(normalized),
+        other => {
+            anyhow::bail!("unsupported session provider '{other}' (supported: zmx, tmux, raw)")
         }
-        Ok((Some(host), Some(session.to_owned())))
-    } else {
-        Ok((None, Some(session_ref.to_owned())))
+    }
+}
+
+fn normalize_session_provider_alias(provider: &str) -> String {
+    match provider.trim() {
+        "t" => "tmux".to_owned(),
+        "z" => "zmx".to_owned(),
+        other => other.to_owned(),
     }
 }
 
@@ -1476,13 +1522,46 @@ fn session_share_ticket_label(
         .map(|_| label)
 }
 
-async fn bridge_attach(session: SessionClient, cols: u16, rows: u16) -> Result<i32> {
+fn merge_session_providers(
+    explicit: Option<String>,
+    from_ref: Option<String>,
+) -> Result<Option<String>> {
+    match (explicit, from_ref) {
+        (Some(left), Some(right)) if left != right => {
+            anyhow::bail!(
+                "conflicting session providers: option selects '{left}' but ref selects '{right}'"
+            )
+        }
+        (Some(provider), _) | (_, Some(provider)) => Ok(Some(provider)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn canonical_session_ref(target: &str, provider: &str, session: &str) -> String {
+    format!("{}/{provider}/{session}", canonical_target_label(target))
+}
+
+fn target_session_ref(target: &str, session: &str) -> String {
+    format!("{}/{session}", canonical_target_label(target))
+}
+
+fn canonical_target_label(target: &str) -> &str {
+    target.split_once('/').map_or(target, |(host, _)| host)
+}
+
+async fn bridge_attach(
+    session: SessionClient,
+    cols: u16,
+    rows: u16,
+    canonical_ref: String,
+) -> Result<i32> {
     let raw_guard = if std::io::stdin().is_terminal() {
         Some(RawModeGuard::new()?)
     } else {
         None
     };
     let SessionClient {
+        provider,
         control_send: _control_send,
         control_recv: _control_recv,
         stdin,
@@ -1491,8 +1570,18 @@ async fn bridge_attach(session: SessionClient, cols: u16, rows: u16) -> Result<i
         mut exit,
         signal: _signal,
         resize,
+        control,
     } = session;
-    let stdin_task = maybe_spawn_stdin_task(stdin)?;
+    let stdin_task = maybe_spawn_stdin_task(
+        stdin,
+        control,
+        AttachControlUi {
+            canonical_ref: canonical_ref.clone(),
+            cols,
+            rows,
+            supports_kick_others: provider == "tmux",
+        },
+    )?;
     let stdout_task = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
         copy(&mut stdout_recv, &mut stdout)
@@ -1533,13 +1622,26 @@ async fn bridge_attach(session: SessionClient, cols: u16, rows: u16) -> Result<i
     });
     let code = read_exit(&mut exit).await?;
     resize_task.abort();
-    if let Some(stdin_task) = stdin_task {
-        stdin_task.abort();
-        let _ = stdin_task.await;
-    }
+    let detached = if let Some(stdin_task) = stdin_task {
+        if stdin_task.is_finished() {
+            matches!(stdin_task.await?, Ok(StdinTaskResult::Detached))
+        } else {
+            stdin_task.abort();
+            let _ = stdin_task.await;
+            false
+        }
+    } else {
+        false
+    };
     await_output_task(stdout_task, "stdout").await?;
     await_output_task(stderr_task, "stderr").await?;
     drop(raw_guard);
+    if detached {
+        eprintln!("portl: detached from session \"{canonical_ref}\"");
+        eprintln!();
+        eprintln!("The session is still running. To reconnect, run:");
+        eprintln!("  portl attach {canonical_ref}");
+    }
     Ok(code)
 }
 
@@ -1614,7 +1716,25 @@ async fn await_output_task(
     Ok(())
 }
 
-fn maybe_spawn_stdin_task(mut send: SendStream) -> Result<Option<tokio::task::JoinHandle<()>>> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StdinTaskResult {
+    Closed,
+    Detached,
+}
+
+#[derive(Debug, Clone)]
+struct AttachControlUi {
+    canonical_ref: String,
+    cols: u16,
+    rows: u16,
+    supports_kick_others: bool,
+}
+
+fn maybe_spawn_stdin_task(
+    mut send: SendStream,
+    mut control: SendStream,
+    ui: AttachControlUi,
+) -> Result<Option<tokio::task::JoinHandle<Result<StdinTaskResult>>>> {
     if should_close_idle_stdin()? {
         if let Err(err) = send.finish().context("finish remote stdin") {
             debug!(%err, "remote stdin already closed");
@@ -1623,7 +1743,7 @@ fn maybe_spawn_stdin_task(mut send: SendStream) -> Result<Option<tokio::task::Jo
     }
     Ok(Some(tokio::spawn(async move {
         let mut stdin_src = tokio::io::stdin();
-        let _ = stdin_loop(&mut send, &mut stdin_src).await;
+        Box::pin(stdin_loop(&mut send, &mut control, &mut stdin_src, &ui)).await
     })))
 }
 
@@ -1659,15 +1779,249 @@ fn stdin_ready_within(timeout: Duration) -> Result<bool> {
     Ok(events.intersects(PollFlags::POLLIN | PollFlags::POLLHUP))
 }
 
-async fn stdin_loop(send: &mut SendStream, stdin: &mut tokio::io::Stdin) -> Result<()> {
-    if let Err(err) = copy(stdin, send).await.context("copy local stdin") {
-        debug!(%err, "stdin loop ended after remote stdin closed");
-        return Ok(());
+async fn stdin_loop<R>(
+    send: &mut SendStream,
+    control: &mut SendStream,
+    stdin: &mut R,
+    ui: &AttachControlUi,
+) -> Result<StdinTaskResult>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buf = [0_u8; 8192];
+    loop {
+        let read = stdin.read(&mut buf).await.context("read local stdin")?;
+        if read == 0 {
+            if let Err(err) = send.finish().context("finish remote stdin") {
+                debug!(%err, "remote stdin already closed");
+            }
+            return Ok(StdinTaskResult::Closed);
+        }
+        let chunk = &buf[..read];
+        if is_attach_detach_sequence(chunk) {
+            match run_attach_control_mode(send, control, stdin, ui, chunk).await? {
+                AttachControlOutcome::Continue => continue,
+                AttachControlOutcome::Detached => return Ok(StdinTaskResult::Detached),
+            }
+        }
+        if let Err(err) = send.write_all(chunk).await.context("copy local stdin") {
+            debug!(%err, "stdin loop ended after remote stdin closed");
+            return Ok(StdinTaskResult::Closed);
+        }
     }
-    if let Err(err) = send.finish().context("finish remote stdin") {
-        debug!(%err, "remote stdin already closed");
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachControlOutcome {
+    Continue,
+    Detached,
+}
+
+async fn run_attach_control_mode<R>(
+    send: &mut SendStream,
+    control: &mut SendStream,
+    stdin: &mut R,
+    ui: &AttachControlUi,
+    _literal_sequence: &[u8],
+) -> Result<AttachControlOutcome>
+where
+    R: AsyncRead + Unpin,
+{
+    const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
+    const CONTROL_TICK: Duration = Duration::from_millis(100);
+
+    let started = Instant::now();
+    let mut buf = [0_u8; 8192];
+    loop {
+        let elapsed = started.elapsed();
+        if elapsed >= CONTROL_TIMEOUT {
+            clear_attach_control_bar(ui).await?;
+            return Ok(AttachControlOutcome::Continue);
+        }
+        render_attach_control_bar(ui, CONTROL_TIMEOUT.saturating_sub(elapsed)).await?;
+        if let Ok(read) = tokio::time::timeout(CONTROL_TICK, stdin.read(&mut buf)).await {
+            let read = read.context("read local stdin in attach control mode")?;
+            if read == 0 {
+                clear_attach_control_bar(ui).await?;
+                if let Err(err) = send.finish().context("finish remote stdin") {
+                    debug!(%err, "remote stdin already closed");
+                }
+                return Ok(AttachControlOutcome::Continue);
+            }
+            let command = &buf[..read];
+            clear_attach_control_bar(ui).await?;
+            if command == b"d" {
+                if let Err(err) = send.finish().context("finish remote stdin for detach") {
+                    debug!(%err, "remote stdin already closed during detach");
+                }
+                return Ok(AttachControlOutcome::Detached);
+            }
+            if command == b"k" && ui.supports_kick_others {
+                let frame = SessionControlFrame {
+                    action: SessionControlAction::KickOthers,
+                };
+                control
+                    .write_all(&postcard::to_stdvec(&frame).context("encode kick-others frame")?)
+                    .await
+                    .context("send kick-others frame")?;
+                print_attach_control_message(&format!(
+                    "portl: detached other clients from session \"{}\"",
+                    ui.canonical_ref
+                ))
+                .await?;
+                return Ok(AttachControlOutcome::Continue);
+            }
+            if command == b"\x1b" {
+                return Ok(AttachControlOutcome::Continue);
+            }
+            if is_attach_detach_sequence(command) {
+                send.write_all(command)
+                    .await
+                    .context("send literal attach detach sequence")?;
+                return Ok(AttachControlOutcome::Continue);
+            }
+            send.write_all(command)
+                .await
+                .context("forward attach control command as stdin")?;
+            return Ok(AttachControlOutcome::Continue);
+        }
     }
-    Ok(())
+}
+
+async fn render_attach_control_bar(ui: &AttachControlUi, remaining: Duration) -> Result<()> {
+    let tenths = remaining.as_millis().div_ceil(100).min(99);
+    let seconds = tenths / 10;
+    let tenth = tenths % 10;
+    let actions = if ui.supports_kick_others {
+        format!(
+            "[ Portl: {} ]  d detach   k kick-others   Ctrl+\\ literal   Esc cancel   {seconds}.{tenth}s",
+            ui.canonical_ref
+        )
+    } else {
+        format!(
+            "[ Portl: {} ]  d detach   Ctrl+\\ literal   Esc cancel   {seconds}.{tenth}s",
+            ui.canonical_ref
+        )
+    };
+    draw_attach_control_bar(ui.rows, ui.cols, &actions).await
+}
+
+async fn clear_attach_control_bar(ui: &AttachControlUi) -> Result<()> {
+    draw_attach_control_bar(ui.rows, ui.cols, "").await
+}
+
+async fn print_attach_control_message(message: &str) -> Result<()> {
+    let mut stderr = tokio::io::stderr();
+    stderr
+        .write_all(format!("\r\n{message}\r\n").as_bytes())
+        .await
+        .context("write attach control message")?;
+    stderr.flush().await.context("flush attach control message")
+}
+
+async fn draw_attach_control_bar(row: u16, cols: u16, text: &str) -> Result<()> {
+    let mut stderr = tokio::io::stderr();
+    let row = row.max(1);
+    if text.is_empty() {
+        stderr
+            .write_all(format!("\x1b7\x1b[{row};1H\x1b[2K\x1b8").as_bytes())
+            .await
+            .context("clear attach control bar")?;
+    } else {
+        let text = fit_attach_control_bar(text, cols);
+        stderr
+            .write_all(format!("\x1b7\x1b[{row};1H\x1b[2K\x1b[7m{text}\x1b[0m\x1b8").as_bytes())
+            .await
+            .context("draw attach control bar")?;
+    }
+    stderr.flush().await.context("flush attach control bar")
+}
+
+fn fit_attach_control_bar(text: &str, cols: u16) -> String {
+    let max = usize::from(cols.max(1));
+    let count = text.chars().count();
+    if count <= max {
+        return text.to_owned();
+    }
+    if max <= 1 {
+        return "…".to_owned();
+    }
+    text.chars()
+        .take(max - 1)
+        .chain(std::iter::once('…'))
+        .collect()
+}
+
+fn is_attach_detach_sequence(data: &[u8]) -> bool {
+    data.first().is_some_and(|byte| *byte == 0x1c) || is_key_pressed(data, 0x5c, 0b100)
+}
+
+fn is_key_pressed(data: &[u8], expected_key: u32, expected_mods: u32) -> bool {
+    data.windows(2).enumerate().any(|(index, window)| {
+        window == b"\x1b[" && keypress_with_mod(&data[index + 2..], expected_key, expected_mods)
+    })
+}
+
+fn keypress_with_mod(data: &[u8], expected_key: u32, expected_mods: u32) -> bool {
+    let mut pos = 0;
+    let Some(key_code) = parse_decimal(data, &mut pos) else {
+        return false;
+    };
+    if key_code != expected_key {
+        return false;
+    }
+
+    while data.get(pos).is_some_and(|byte| *byte == b':') {
+        pos += 1;
+        let _ = parse_decimal(data, &mut pos);
+    }
+
+    if data.get(pos).is_none_or(|byte| *byte != b';') {
+        return false;
+    }
+    pos += 1;
+
+    let Some(mod_encoded) = parse_decimal(data, &mut pos) else {
+        return false;
+    };
+    if mod_encoded < 1 {
+        return false;
+    }
+    let intentional_mods = (mod_encoded - 1) & 0b0011_1111;
+    if intentional_mods != expected_mods {
+        return false;
+    }
+
+    if data.get(pos).is_some_and(|byte| *byte == b':') {
+        pos += 1;
+        if parse_decimal(data, &mut pos) == Some(3) {
+            return false;
+        }
+    }
+
+    if data.get(pos).is_some_and(|byte| *byte == b';') {
+        pos += 1;
+        while data
+            .get(pos)
+            .is_some_and(|byte| byte.is_ascii_digit() || *byte == b':')
+        {
+            pos += 1;
+        }
+    }
+
+    data.get(pos).is_some_and(|byte| *byte == b'u')
+}
+
+fn parse_decimal(data: &[u8], pos: &mut usize) -> Option<u32> {
+    let start = *pos;
+    let mut value = 0_u32;
+    while let Some(byte) = data.get(*pos).filter(|byte| byte.is_ascii_digit()) {
+        value = value
+            .saturating_mul(10)
+            .saturating_add(u32::from(*byte - b'0'));
+        *pos += 1;
+    }
+    (*pos != start).then_some(value)
 }
 
 async fn read_exit(recv: &mut BufferedRecv) -> Result<i32> {
@@ -1684,6 +2038,26 @@ mod tests {
     use portl_core::peer_store::{PeerEntry, PeerOrigin, PeerStore};
     use portl_core::ticket_store::{SessionShareMetadata, TicketEntry};
     use tempfile::TempDir;
+
+    #[test]
+    fn attach_control_bar_fits_terminal_width() {
+        assert_eq!(fit_attach_control_bar("abcdef", 10), "abcdef");
+        assert_eq!(fit_attach_control_bar("abcdef", 4), "abc…");
+        assert_eq!(fit_attach_control_bar("abcdef", 1), "…");
+    }
+
+    #[test]
+    fn detects_raw_and_kitty_ctrl_backslash_attach_detach() {
+        assert!(is_attach_detach_sequence(b"\x1c"));
+        assert!(is_attach_detach_sequence(b"\x1b[92;5u"));
+        assert!(is_attach_detach_sequence(b"prefix\x1b[92;5:1usuffix"));
+        assert!(is_attach_detach_sequence(b"\x1b[92:124;5u"));
+
+        assert!(!is_attach_detach_sequence(b"\\"));
+        assert!(!is_attach_detach_sequence(b"\x1b[92;6u"));
+        assert!(!is_attach_detach_sequence(b"\x1b[92;5:3u"));
+        assert!(!is_attach_detach_sequence(b"not-detach"));
+    }
 
     #[test]
     fn attach_defaults_infer_session_share_metadata() {
@@ -1721,6 +2095,14 @@ mod tests {
             Some("zmx")
         );
         assert_eq!(
+            effective_provider_from_env(Some("t"), Some("zmx")).as_deref(),
+            Some("tmux")
+        );
+        assert_eq!(
+            effective_provider_from_env(None, Some("z")).as_deref(),
+            Some("zmx")
+        );
+        assert_eq!(
             effective_provider_from_env(None, Some("tmux")).as_deref(),
             Some("tmux")
         );
@@ -1740,6 +2122,7 @@ mod tests {
                 sessions: vec![SessionListingEntry {
                     provider: "zmx".to_owned(),
                     name: "dev".to_owned(),
+                    reference: "max-b265/zmx/dev".to_owned(),
                     metadata: serde_json::json!({}),
                 }],
             },
@@ -1753,7 +2136,7 @@ mod tests {
 
         assert_eq!(
             render_session_listing_human(&listing),
-            "PROVIDER  NAME\nzmx       dev\n"
+            "PROVIDER  REF\nzmx       max-b265/zmx/dev\n"
         );
         assert_eq!(
             serde_json::to_value(&listing).unwrap()["providers"]["zmx"]["sessions"][0]["name"],
@@ -1861,6 +2244,35 @@ mod tests {
     }
 
     #[test]
+    fn session_ref_accepts_provider_qualified_canonical_form() {
+        let fixture = seed_peer_and_share();
+        let resolved = resolve_session_ref_with_stores(
+            Some("max/t/dotfiles"),
+            None,
+            None,
+            &fixture.peers,
+            &fixture.tickets,
+            &fixture.aliases,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.target, "max-b265/dotfiles");
+        assert_eq!(resolved.provider.as_deref(), Some("tmux"));
+        assert_eq!(resolved.session, "dotfiles");
+    }
+
+    #[test]
+    fn session_provider_refs_conflict_with_explicit_provider() {
+        let err =
+            merge_session_providers(Some("zmx".to_owned()), Some("tmux".to_owned())).unwrap_err();
+
+        assert!(
+            err.to_string().contains("conflicting session providers"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
     fn session_ref_and_target_may_duplicate_same_target() {
         let fixture = seed_peer_and_share();
         let resolved = resolve_session_ref_with_stores(
@@ -1943,6 +2355,7 @@ mod tests {
                     SessionListingEntry {
                         name: "dev".to_owned(),
                         provider: "tmux".to_owned(),
+                        reference: "max-b265/tmux/dev".to_owned(),
                         metadata: serde_json::json!({
                             "id": "$1",
                             "attached": false,
@@ -1952,6 +2365,7 @@ mod tests {
                     SessionListingEntry {
                         name: "frontend".to_owned(),
                         provider: "tmux".to_owned(),
+                        reference: "max-b265/tmux/frontend".to_owned(),
                         metadata: serde_json::json!({}),
                     },
                 ],
@@ -1970,6 +2384,10 @@ mod tests {
         assert_eq!(value["total"], 2);
         assert_eq!(value["providers"]["tmux"]["count"], 2);
         assert_eq!(value["providers"]["tmux"]["sessions"][0]["name"], "dev");
+        assert_eq!(
+            value["providers"]["tmux"]["sessions"][0]["reference"],
+            "max-b265/tmux/dev"
+        );
         assert_eq!(
             value["providers"]["tmux"]["sessions"][0]["metadata"]["attached"],
             false

@@ -205,6 +205,17 @@ pub enum SessionStreamKind {
     Signal,
     Resize,
     Exit,
+    Control,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionControlAction {
+    KickOthers,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionControlFrame {
+    pub action: SessionControlAction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,6 +258,17 @@ mod tests {
 
         let encoded = postcard::to_stdvec(&value).expect("encode");
         let decoded: SessionReq = postcard::from_bytes(&encoded).expect("decode");
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn session_control_frame_roundtrips_via_postcard() {
+        let value = SessionControlFrame {
+            action: SessionControlAction::KickOthers,
+        };
+
+        let encoded = postcard::to_stdvec(&value).expect("encode");
+        let decoded: SessionControlFrame = postcard::from_bytes(&encoded).expect("decode");
         assert_eq!(decoded, value);
     }
 
