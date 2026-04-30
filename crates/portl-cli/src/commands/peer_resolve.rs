@@ -125,11 +125,16 @@ pub(crate) async fn close_connected(connected: ConnectedPeer, reason: &'static [
 }
 
 pub(crate) async fn close_client_endpoint(endpoint: iroh::Endpoint, context: &'static str) {
-    if tokio::time::timeout(Duration::from_secs(5), endpoint.close())
+    if tokio::time::timeout(Duration::from_millis(500), endpoint.close())
         .await
         .is_err()
     {
         debug!(context, "timed out closing CLI endpoint");
+        // Short-lived CLI commands should not hang for several seconds after
+        // printing their result. If iroh's graceful QUIC close does not finish
+        // quickly, let process exit reclaim the socket instead of dropping the
+        // still-closing endpoint and emitting an alarming user-facing error.
+        std::mem::forget(endpoint);
     }
 }
 
