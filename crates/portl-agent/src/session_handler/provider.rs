@@ -900,26 +900,83 @@ fn parse_zmx_session_json(stdout: &str) -> Result<Vec<SessionInfo>> {
 }
 
 fn parse_tmux_session_line(line: &str) -> SessionInfo {
-    let mut parts = line.split('\t');
-    let name = parts.next().unwrap_or_default().to_owned();
-    let id = parts.next().unwrap_or_default();
-    let attached = parts.next().unwrap_or_default();
-    let created = parts.next().unwrap_or_default();
-    let windows = parts.next().unwrap_or_default();
-    let width = parts.next().unwrap_or_default();
-    let height = parts.next().unwrap_or_default();
+    let fields = parse_tmux_session_fields(line);
     SessionInfo {
-        name,
+        name: fields.name.to_owned(),
         provider: "tmux".to_owned(),
         metadata: BTreeMap::from([
-            ("id".to_owned(), id.to_owned()),
-            ("attached".to_owned(), (attached == "1").to_string()),
-            ("created_unix".to_owned(), created.to_owned()),
-            ("windows".to_owned(), windows.to_owned()),
-            ("width".to_owned(), width.to_owned()),
-            ("height".to_owned(), height.to_owned()),
+            ("id".to_owned(), fields.id.to_owned()),
+            ("attached".to_owned(), (fields.attached == "1").to_string()),
+            ("created_unix".to_owned(), fields.created.to_owned()),
+            ("windows".to_owned(), fields.windows.to_owned()),
+            ("width".to_owned(), fields.width.to_owned()),
+            ("height".to_owned(), fields.height.to_owned()),
         ]),
     }
+}
+
+struct TmuxSessionFields<'a> {
+    name: &'a str,
+    id: &'a str,
+    attached: &'a str,
+    created: &'a str,
+    windows: &'a str,
+    width: &'a str,
+    height: &'a str,
+}
+
+fn parse_tmux_session_fields(line: &str) -> TmuxSessionFields<'_> {
+    let parts = line.split('\t').collect::<Vec<_>>();
+    if parts.len() >= 7 {
+        return TmuxSessionFields {
+            name: parts[0],
+            id: parts[1],
+            attached: parts[2],
+            created: parts[3],
+            windows: parts[4],
+            width: parts[5],
+            height: parts[6],
+        };
+    }
+
+    parse_tmux_underscore_session_fields(line).unwrap_or(TmuxSessionFields {
+        name: line,
+        id: "",
+        attached: "",
+        created: "",
+        windows: "",
+        width: "",
+        height: "",
+    })
+}
+
+fn parse_tmux_underscore_session_fields(line: &str) -> Option<TmuxSessionFields<'_>> {
+    let mut parts = line.rsplitn(7, '_').collect::<Vec<_>>();
+    if parts.len() != 7 {
+        return None;
+    }
+    parts.reverse();
+    let [name, id, attached, created, windows, width, height] = parts.as_slice() else {
+        return None;
+    };
+    if name.is_empty()
+        || !id.starts_with('$')
+        || !matches!(*attached, "0" | "1")
+        || [*created, *windows, *width, *height]
+            .into_iter()
+            .any(|field| field.parse::<u64>().is_err())
+    {
+        return None;
+    }
+    Some(TmuxSessionFields {
+        name,
+        id,
+        attached,
+        created,
+        windows,
+        width,
+        height,
+    })
 }
 
 fn stringify_json_object(
@@ -1476,6 +1533,27 @@ esac
             }
         );
         assert_eq!(tmux_lookup_session("dev:editor.0"), "dev");
+    }
+
+    #[test]
+    fn parses_tmux_session_lines_with_tab_or_underscore_separators() {
+        let tab = parse_tmux_session_line("dotfiles\t$3\t0\t1777557300\t1\t58\t30");
+        assert_eq!(tab.name, "dotfiles");
+        assert_eq!(tab.metadata["id"], "$3");
+        assert_eq!(tab.metadata["attached"], "false");
+        assert_eq!(tab.metadata["created_unix"], "1777557300");
+        assert_eq!(tab.metadata["windows"], "1");
+        assert_eq!(tab.metadata["width"], "58");
+        assert_eq!(tab.metadata["height"], "30");
+
+        let underscore = parse_tmux_session_line("aircover_hep_$0_1_1777575845_1_138_72");
+        assert_eq!(underscore.name, "aircover_hep");
+        assert_eq!(underscore.metadata["id"], "$0");
+        assert_eq!(underscore.metadata["attached"], "true");
+        assert_eq!(underscore.metadata["created_unix"], "1777575845");
+        assert_eq!(underscore.metadata["windows"], "1");
+        assert_eq!(underscore.metadata["width"], "138");
+        assert_eq!(underscore.metadata["height"], "72");
     }
 
     #[test]
