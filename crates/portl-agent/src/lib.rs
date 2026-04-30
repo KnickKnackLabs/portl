@@ -366,11 +366,21 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
     }
 
     state.udp_registry.shutdown().await;
+    let signal_shutdown_requested = signal_shutdown.load(Ordering::SeqCst);
+    let shell_processes = if signal_shutdown_requested {
+        collect_shell_processes(&state)
+    } else {
+        Vec::new()
+    };
     if shutdown.is_cancelled() {
         graceful_close_endpoint(&endpoint).await;
     }
-    let all_sessions_reaped = if signal_shutdown.load(Ordering::SeqCst) {
-        graceful_shutdown_shell_sessions(&state).await
+    let all_sessions_reaped = if signal_shutdown_requested {
+        // Snapshot live shell sessions before closing the endpoint. Endpoint
+        // close tears down control streams, whose guards remove entries from
+        // the shell registry; if collection happens afterward, signal shutdown
+        // can miss a live child and skip its audit.shell_exit record.
+        graceful_shutdown_shell_processes(shell_processes).await
     } else {
         true
     };
@@ -606,12 +616,17 @@ async fn graceful_close_endpoint(endpoint: &iroh::Endpoint) {
     }
 }
 
-async fn graceful_shutdown_shell_sessions(state: &AgentState) -> bool {
-    let processes = state
+fn collect_shell_processes(state: &AgentState) -> Vec<Arc<shell_registry::ShellProcess>> {
+    state
         .shell_registry
         .iter()
         .map(|entry| Arc::clone(entry.value()))
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>()
+}
+
+async fn graceful_shutdown_shell_processes(
+    processes: Vec<Arc<shell_registry::ShellProcess>>,
+) -> bool {
     if processes.is_empty() {
         return true;
     }
