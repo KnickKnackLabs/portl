@@ -5,6 +5,29 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.7.5 — 2026-05-01
+
+### Added
+
+- Remote session attaches now use a `Ctrl+\\` leader mode: press `d` to detach,
+  `Esc` to cancel, or `Ctrl+\\` again to pass a literal control character
+  through to the session.
+- `tmux` remote attaches can detach other clients from the same session with
+  `Ctrl+\\`, then `k`.
+- Session refs now accept provider-qualified forms such as
+  `max-b265/tmux/dotfiles`, with `t` and `z` accepted as `tmux` and `zmx`
+  input aliases.
+
+### Changed
+
+- Session listings and remote attach messages now display copy-pasteable
+  provider-qualified refs such as `max-b265/zmx/dev`.
+
+### Fixed
+
+- Cross-machine `tmux` session listings now show clean session names when
+  target agents receive tmux metadata with underscore separators.
+
 ## 0.7.4 — 2026-05-01
 
 ### Changed
