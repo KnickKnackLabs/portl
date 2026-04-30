@@ -5,6 +5,27 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.7.6 — 2026-05-01
+
+### Changed
+
+- Remote attach control mode now uses a compact, color-coded status bar and
+  gives a longer window to choose detach, kick, literal send, or cancel.
+- Short-lived remote CLI probes such as `portl status <peer>` now return more
+  promptly after printing results instead of waiting several seconds for
+  transport cleanup.
+- Updated the direct `iroh` transport dependency to 0.98.2.
+
+### Fixed
+
+- Remote `tmux` attaches now preserve high-volume output under backpressure,
+  preventing split UTF-8 box-drawing characters from rendering as replacement
+  glyphs.
+- Remote attach control bars are cleared and redrawn around incoming output so
+  they remain readable and do not leave terminal color/style bleed behind.
+- Detaching from a remote session now returns to the local shell immediately
+  rather than waiting for provider-side attach cleanup.
+
 ## 0.7.5 — 2026-05-01
 
 ### Added
