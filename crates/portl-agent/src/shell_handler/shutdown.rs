@@ -468,7 +468,7 @@ pub(super) mod tests {
             ForkResult::Parent { child } => {
                 let _ = waitpid(child, Some(WaitPidFlag::empty()));
                 loop {
-                    thread::sleep(Duration::from_secs(60));
+                    thread::sleep(Duration::from_mins(1));
                 }
             }
             ForkResult::Child => {
@@ -479,7 +479,7 @@ pub(super) mod tests {
                         std::fs::write(pid_file, std::process::id().to_string())
                             .expect("write daemon pid file");
                         loop {
-                            thread::sleep(Duration::from_secs(60));
+                            thread::sleep(Duration::from_mins(1));
                         }
                     }
                 }

@@ -16,10 +16,14 @@ yanked  = "warn"
 # no safe alternative on the iroh side yet; the upstream migration
 # to `pastey` or similar is tracked by netlink-packet-*.
 # Revisit when iroh updates its netwatch dep chain.
-# `portable-pty` currently pulls in the unmaintained `serial` crate on
-# Unix. We need `portable-pty` for M3 shell support, and there is no safe
-# replacement in its 0.8 line yet.
-ignore  = ["RUSTSEC-2024-0436", "RUSTSEC-2017-0008"]
+# Hickory 0.26.0-beta.4 is pulled in by the current latest iroh release
+# (0.98.2). Hickory has fixed releases, but there is no iroh version that
+# allows them yet; revisit when iroh updates its hickory dependency chain.
+ignore  = [
+    "RUSTSEC-2024-0436",
+    "RUSTSEC-2026-0119",
+    "RUSTSEC-2026-0120",
+]
 
 [licenses]
 version    = 2

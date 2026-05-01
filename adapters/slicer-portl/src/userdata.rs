@@ -130,7 +130,10 @@ fn config_from_agent_env(agent_env: &str) -> Result<portl_agent::AgentConfig> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    with_agent_env(&vars, portl_agent::AgentConfig::from_env)
+    with_agent_env(
+        &vars,
+        portl_agent::AgentConfig::from_env_without_layout_migration,
+    )
 }
 
 #[allow(unsafe_code)]
@@ -236,7 +239,7 @@ mod tests {
         assert_eq!(config.trust_roots.len(), 1);
         assert_eq!(
             config.identity_path.as_deref(),
-            Some(std::path::Path::new("/var/lib/portl/identity.bin"))
+            Some(std::path::Path::new("/var/lib/portl/data/identity.bin"))
         );
     }
 }
