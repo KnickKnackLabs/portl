@@ -41,6 +41,8 @@ impl From<InitiatorMode> for portl_core::pair_code::InitiatorMode {
 
 use std::{ffi::OsString, path::Path, path::PathBuf, process::ExitCode};
 
+#[cfg(feature = "ghostty-vt")]
+use anyhow::Context as _;
 use clap::{Parser, Subcommand, ValueEnum};
 
 pub fn load_agent_config() -> anyhow::Result<portl_agent::AgentConfig> {
@@ -288,6 +290,16 @@ pub enum Command {
         out_dir: Option<PathBuf>,
         section: String,
     },
+    GhosttySessionHelper {
+        name: String,
+        socket_path: PathBuf,
+        state_root: PathBuf,
+        cwd: Option<String>,
+        rows: u16,
+        cols: u16,
+        argv: Vec<String>,
+    },
+    GhosttySmoke,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -343,6 +355,10 @@ pub enum ParseError {
 /// daemon entrypoint, while `portl-gateway` rewrites to the top-level
 /// `gateway` subcommand.
 pub fn parse(argv: Vec<OsString>) -> Result<Command, ParseError> {
+    if is_hidden_ghostty_command_invocation(&argv)? {
+        let cli = Cli::try_parse_from(argv)?;
+        return Ok(cli.into_command());
+    }
     if is_portl_agent_invocation(&argv)? {
         let cli = AgentCli::try_parse_from(argv)?;
         return Ok(agent_cli_to_command(&cli));
@@ -379,24 +395,36 @@ fn validate_bool_env(name: &str) -> Result<(), String> {
 
 pub fn run(argv: Vec<OsString>) -> ExitCode {
     portl_core::tls::install_default_crypto_provider();
-    match is_portl_agent_invocation(&argv) {
-        Ok(true) => {
-            return match AgentCli::try_parse_from(argv).map(|cli| agent_cli_to_command(&cli)) {
-                Ok(command) => match dispatch(command) {
-                    Ok(code) => code,
+    match is_hidden_ghostty_command_invocation(&argv) {
+        Ok(true) => {}
+        Ok(false) => match is_portl_agent_invocation(&argv) {
+            Ok(true) => {
+                return match AgentCli::try_parse_from(argv).map(|cli| agent_cli_to_command(&cli)) {
+                    Ok(command) => match dispatch(command) {
+                        Ok(code) => code,
+                        Err(err) => {
+                            eprintln!("{err:#}");
+                            ExitCode::FAILURE
+                        }
+                    },
                     Err(err) => {
-                        eprintln!("{err:#}");
-                        ExitCode::FAILURE
+                        let code = clap_exit_code(&err);
+                        let _ = err.print();
+                        code
                     }
-                },
-                Err(err) => {
-                    let code = clap_exit_code(&err);
-                    let _ = err.print();
-                    code
-                }
-            };
-        }
-        Ok(false) => {}
+                };
+            }
+            Ok(false) => {}
+            Err(ParseError::EmptyArgv) => {
+                eprintln!("portl: argv is empty");
+                return ExitCode::from(EX_USAGE);
+            }
+            Err(ParseError::Clap(err)) => {
+                let code = clap_exit_code(&err);
+                let _ = err.print();
+                return code;
+            }
+        },
         Err(ParseError::EmptyArgv) => {
             eprintln!("portl: argv is empty");
             return ExitCode::from(EX_USAGE);
@@ -485,6 +513,16 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
         Command::Shell { peer, cwd, user } => {
             commands::shell::run(&peer, cwd.as_deref(), user.as_deref())
         }
+        Command::GhosttySessionHelper {
+            name,
+            socket_path,
+            state_root,
+            cwd,
+            rows,
+            cols,
+            argv,
+        } => run_ghostty_session_helper(name, socket_path, state_root, cwd, rows, cols, argv),
+        Command::GhosttySmoke => commands::ghostty_smoke::run(),
         Command::SessionProviders { target, json } => {
             commands::session::providers(target.as_deref(), json)
         }
@@ -729,6 +767,53 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
     }
 }
 
+#[cfg(feature = "ghostty-vt")]
+fn run_ghostty_session_helper(
+    name: String,
+    socket_path: PathBuf,
+    state_root: PathBuf,
+    cwd: Option<String>,
+    rows: u16,
+    cols: u16,
+    argv: Vec<String>,
+) -> anyhow::Result<ExitCode> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("spawn ghostty helper runtime")?;
+    runtime.block_on(portl_agent::run_ghostty_session_helper(
+        name,
+        socket_path,
+        state_root,
+        cwd,
+        rows,
+        cols,
+        argv,
+    ))?;
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(feature = "ghostty-vt"))]
+fn run_ghostty_session_helper(
+    _name: String,
+    _socket_path: PathBuf,
+    _state_root: PathBuf,
+    _cwd: Option<String>,
+    _rows: u16,
+    _cols: u16,
+    _argv: Vec<String>,
+) -> anyhow::Result<ExitCode> {
+    anyhow::bail!("ghostty-vt support is not built into this portl binary")
+}
+
+fn is_hidden_ghostty_command_invocation(argv: &[OsString]) -> Result<bool, ParseError> {
+    let _ = argv.first().ok_or(ParseError::EmptyArgv)?;
+    Ok(argv
+        .get(1)
+        .and_then(|arg| arg.to_str())
+        .is_some_and(|arg| matches!(arg, "__ghostty-session" | "__ghostty-smoke")))
+}
+
 fn is_portl_agent_invocation(argv: &[OsString]) -> Result<bool, ParseError> {
     let first = argv.first().ok_or(ParseError::EmptyArgv)?;
     let basename = Path::new(first)
@@ -910,6 +995,25 @@ enum TopLevel {
     Integrations(IntegrationsTopLevel),
     #[command(flatten, next_help_heading = "Utility", next_display_order = 400)]
     Utility(UtilityTopLevel),
+    #[command(name = "__ghostty-session", hide = true)]
+    GhosttySessionHelper {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long = "state-dir")]
+        state_dir: PathBuf,
+        #[arg(long)]
+        cwd: Option<String>,
+        #[arg(long, default_value_t = 24)]
+        rows: u16,
+        #[arg(long, default_value_t = 80)]
+        cols: u16,
+        #[arg(last = true)]
+        argv: Vec<String>,
+    },
+    #[command(name = "__ghostty-smoke", hide = true)]
+    GhosttySmoke,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1665,6 +1769,24 @@ impl Cli {
             TopLevel::Utility(UtilityTopLevel::Man { out_dir, section }) => {
                 Command::Man { out_dir, section }
             }
+            TopLevel::GhosttySessionHelper {
+                name,
+                socket,
+                state_dir,
+                cwd,
+                rows,
+                cols,
+                argv,
+            } => Command::GhosttySessionHelper {
+                name,
+                socket_path: socket,
+                state_root: state_dir,
+                cwd,
+                rows,
+                cols,
+                argv,
+            },
+            TopLevel::GhosttySmoke => Command::GhosttySmoke,
         }
     }
 }

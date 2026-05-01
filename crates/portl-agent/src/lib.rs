@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+#[cfg(feature = "ghostty-vt")]
+use anyhow::Context as _;
 use anyhow::Result;
 use portl_core::id::{Identity, store};
 use portl_core::ticket::verify::TrustRoots;
@@ -38,6 +40,173 @@ pub mod udp_handler;
 pub mod udp_registry;
 
 pub use config::{AgentConfig, AgentMode, DiscoveryConfig, RateLimitConfig};
+
+#[cfg(feature = "ghostty-vt")]
+pub enum GhosttyAttachInput {
+    Data(Vec<u8>),
+    Close,
+}
+
+#[cfg(feature = "ghostty-vt")]
+pub enum GhosttyAttachControl {
+    Resize { rows: u16, cols: u16 },
+    Close,
+}
+
+#[cfg(feature = "ghostty-vt")]
+pub struct GhosttyAttachChannels {
+    pub pid: u32,
+    pub stdin_tx: tokio::sync::mpsc::Sender<GhosttyAttachInput>,
+    pub control_tx: tokio::sync::mpsc::UnboundedSender<GhosttyAttachControl>,
+    pub stdout_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    pub stderr_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    pub exit_rx: tokio::sync::watch::Receiver<Option<i32>>,
+}
+
+#[cfg(feature = "ghostty-vt")]
+pub fn ghostty_provider_status() -> portl_proto::session_v1::ProviderStatus {
+    session_handler::ghostty::GhosttyProvider::new().status()
+}
+
+#[cfg(feature = "ghostty-vt")]
+pub async fn ghostty_session_list() -> Result<Vec<portl_proto::session_v1::SessionInfo>> {
+    session_handler::ghostty::GhosttyProvider::new()
+        .list_detailed()
+        .await
+}
+
+#[cfg(feature = "ghostty-vt")]
+pub async fn ghostty_session_run(
+    session: &str,
+    cwd: Option<&str>,
+    argv: &[String],
+) -> Result<portl_proto::session_v1::SessionRunResult> {
+    session_handler::ghostty::GhosttyProvider::new()
+        .run(session, cwd, argv, Some(std::env::vars().collect()))
+        .await
+}
+
+#[cfg(feature = "ghostty-vt")]
+pub async fn ghostty_session_history(session: &str) -> Result<String> {
+    session_handler::ghostty::GhosttyProvider::new()
+        .history(session)
+        .await
+}
+
+#[cfg(feature = "ghostty-vt")]
+pub async fn ghostty_session_kill(session: &str) -> Result<()> {
+    session_handler::ghostty::GhosttyProvider::new()
+        .kill(session)
+        .await
+}
+
+#[cfg(feature = "ghostty-vt")]
+pub async fn ghostty_session_attach(
+    session: &str,
+    cwd: Option<&str>,
+    rows: u16,
+    cols: u16,
+    argv: &[String],
+) -> Result<GhosttyAttachChannels> {
+    let pty = portl_proto::shell_v1::PtyCfg {
+        term: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_owned()),
+        cols,
+        rows,
+    };
+    let argv = (!argv.is_empty()).then_some(argv);
+    let process = session_handler::ghostty::GhosttyProvider::new()
+        .attach_process(
+            session,
+            cwd,
+            Some(&pty),
+            argv,
+            Some(std::env::vars().collect()),
+        )
+        .await?;
+    process.set_started_at(Instant::now());
+    let stdout_rx = process
+        .stdout_rx
+        .lock()
+        .await
+        .take()
+        .context("ghostty stdout already attached")?;
+    let stderr_rx = process
+        .stderr_rx
+        .lock()
+        .await
+        .take()
+        .context("ghostty stderr already attached")?;
+    let exit_rx = process.exit_rx();
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel(32);
+    let process_stdin_tx = process.stdin_tx.clone();
+    tokio::spawn(async move {
+        while let Some(message) = stdin_rx.recv().await {
+            let forwarded = match message {
+                GhosttyAttachInput::Data(bytes) => {
+                    process_stdin_tx
+                        .send(shell_registry::StdinMessage::Data(bytes))
+                        .await
+                }
+                GhosttyAttachInput::Close => {
+                    process_stdin_tx
+                        .send(shell_registry::StdinMessage::Close)
+                        .await
+                }
+            };
+            if forwarded.is_err() {
+                break;
+            }
+        }
+    });
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
+    if let Some(pty_tx) = process.pty_tx.clone() {
+        tokio::spawn(async move {
+            while let Some(command) = control_rx.recv().await {
+                let forwarded = match command {
+                    GhosttyAttachControl::Resize { rows, cols } => {
+                        pty_tx.send(shell_registry::PtyCommand::Resize { rows, cols })
+                    }
+                    GhosttyAttachControl::Close => {
+                        pty_tx.send(shell_registry::PtyCommand::Close { force: false })
+                    }
+                };
+                if forwarded.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    Ok(GhosttyAttachChannels {
+        pid: process.pid,
+        stdin_tx,
+        control_tx,
+        stdout_rx,
+        stderr_rx,
+        exit_rx,
+    })
+}
+
+#[cfg(feature = "ghostty-vt")]
+pub async fn run_ghostty_session_helper(
+    name: String,
+    socket_path: PathBuf,
+    state_root: PathBuf,
+    cwd: Option<String>,
+    rows: u16,
+    cols: u16,
+    argv: Vec<String>,
+) -> Result<()> {
+    session_handler::ghostty::run_helper_command(
+        name,
+        socket_path,
+        state_root,
+        cwd,
+        rows,
+        cols,
+        argv,
+    )
+    .await
+}
 
 #[must_use]
 pub fn session_provider_discovery_info(
@@ -433,7 +602,7 @@ fn spawn_udp_gc_task(state: Arc<AgentState>, shutdown: CancellationToken) -> Joi
 /// agent restart.
 fn spawn_revocation_gc_task(state: Arc<AgentState>, shutdown: CancellationToken) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+        let mut interval = tokio::time::interval(std::time::Duration::from_hours(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Skip the immediate first tick; GC already ran at load time.
         interval.tick().await;

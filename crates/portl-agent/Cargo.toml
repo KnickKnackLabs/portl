@@ -14,6 +14,8 @@ description  = "portl agent runtime: handshake, discovery, and session acceptanc
 # by `tests/panic_abort.rs` to verify release-profile `panic = "abort"`
 # actually aborts. Never enable in production builds.
 test-panic-trigger = []
+ghostty-vt = ["dep:libghostty-vt", "libghostty-vt/link-static"]
+ghostty-vt-static = ["ghostty-vt"]
 
 [lints]
 workspace = true
@@ -48,6 +50,9 @@ url         = { workspace = true }
 prometheus-client = { workspace = true }
 directories = { workspace = true }
 uuid        = { workspace = true }
+# Keep default-features off: upstream defaults enable Kitty graphics support,
+# which is not needed for the native session provider MVP or static smoke.
+libghostty-vt = { version = "0.1.1", git = "https://github.com/Uzaaft/libghostty-rs", rev = "5ac47e9eb166add2c00c432bc65c279133629712", package = "libghostty-vt", default-features = false, optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 tracing-journald = { workspace = true }
 

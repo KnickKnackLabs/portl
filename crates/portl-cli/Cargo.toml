@@ -11,6 +11,10 @@ description  = "portl CLI — multicall surface for `portl`, `portl-agent`, and 
 [lints]
 workspace = true
 
+[features]
+ghostty-vt = ["dep:libghostty-vt", "libghostty-vt/link-static", "portl-agent/ghostty-vt"]
+ghostty-vt-static = ["ghostty-vt", "portl-agent/ghostty-vt-static"]
+
 [[bin]]
 name = "portl"
 path = "src/main.rs"
@@ -57,6 +61,9 @@ nix         = { workspace = true }
 reqwest     = { workspace = true }
 async-trait = { workspace = true }
 bollard     = { workspace = true }
+# Keep default-features off for the portability spike: upstream defaults enable
+# Kitty graphics support, which is not needed for the minimal static-link smoke.
+libghostty-vt = { version = "0.1.1", git = "https://github.com/Uzaaft/libghostty-rs", rev = "5ac47e9eb166add2c00c432bc65c279133629712", package = "libghostty-vt", default-features = false, optional = true }
 
 [dev-dependencies]
 portl-core = { version = "0.7.8", path = "../portl-core", features = ["test-util"] }

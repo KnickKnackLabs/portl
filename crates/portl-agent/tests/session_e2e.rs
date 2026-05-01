@@ -32,6 +32,9 @@ async fn session_zmx_provider_maps_core_ops_over_session_protocol() -> Result<()
     let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
 
     let providers = portl_core::net::open_session_providers(&connection, &session).await?;
+    #[cfg(feature = "ghostty-vt")]
+    assert_eq!(providers.default_provider.as_deref(), Some("ghostty"));
+    #[cfg(not(feature = "ghostty-vt"))]
     assert_eq!(providers.default_provider.as_deref(), Some("zmx"));
     assert!(
         providers
@@ -257,6 +260,7 @@ async fn session_list_aggregates_available_providers_and_resolves_unique_attach(
     shutdown(connection, client, server, agent).await
 }
 
+#[cfg(not(feature = "ghostty-vt"))]
 #[tokio::test]
 async fn session_providerless_attach_falls_back_to_default_for_new_session() -> Result<()> {
     let temp = tempfile::tempdir()?;
@@ -353,6 +357,9 @@ async fn session_tmux_provider_attaches_with_control_mode() -> Result<()> {
 
     let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
     let providers = portl_core::net::open_session_providers(&connection, &session).await?;
+    #[cfg(feature = "ghostty-vt")]
+    assert_eq!(providers.default_provider.as_deref(), Some("ghostty"));
+    #[cfg(not(feature = "ghostty-vt"))]
     assert_eq!(providers.default_provider.as_deref(), Some("tmux"));
     assert!(
         providers

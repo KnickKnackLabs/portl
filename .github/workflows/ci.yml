@@ -32,7 +32,7 @@ env:
 
 # Caching strategy (see docs/specs/ for context):
 #  - `actions-rust-lang/setup-rust-toolchain` installs the toolchain
-#    pinned in rust-toolchain.toml (1.89.0) and wraps
+#    pinned in rust-toolchain.toml (1.93.0) and wraps
 #    `Swatinem/rust-cache` so we get bulk dep caching (~/.cargo +
 #    target/) keyed by Cargo.lock + rustc version. Fast restore on
 #    the same lockfile.
@@ -62,6 +62,7 @@ jobs:
   test:
     name: cargo nextest
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: mozilla-actions/sccache-action@v0.0.9
@@ -76,13 +77,13 @@ jobs:
       #
       # taiki-e/install-action downloads prebuilt nextest binaries
       # from the nexte.st CDN — no `cargo install` compile step, so
-      # no MSRV coupling between our pinned 1.89 toolchain and
+      # no MSRV coupling between our pinned 1.93 toolchain and
       # nextest's own MSRV. Takes ~5 s vs minutes for a cold
       # source build.
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --profile ci --workspace --all-features --lib --bins --tests
+      - run: cargo nextest run --profile ci --workspace --lib --bins --tests
 
   fmt:
     name: rustfmt
@@ -100,6 +101,7 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: mozilla-actions/sccache-action@v0.0.9
@@ -108,7 +110,12 @@ jobs:
           components: clippy
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
-      - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Check non-Ghostty optional features
+        run: |
+          set -euo pipefail
+          cargo check -p portl-agent --features test-panic-trigger --all-targets
+          cargo check -p portl-core --features test-util --all-targets
       - name: Forbid unwrapped spawn_blocking in portl-agent
         run: |
           set -u
@@ -132,6 +139,93 @@ jobs:
               sys.exit(1)
           print("OK: all portl-agent spawn_blocking callsites are wrapped with slow_task")
           PY
+
+  ghostty-smoke:
+    name: ghostty smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-shared-key: "ghostty-smoke"
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+      - name: Install Zig for Ghostty static smoke
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.1
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --profile ci -p portl-agent --features ghostty-vt-static --lib --tests
+      - run: cargo nextest run --profile ci -p portl-cli --features ghostty-vt-static -E 'binary(=ghostty_smoke)'
+      - run: cargo clippy -p portl-agent -p portl-cli --features ghostty-vt-static --all-targets -- -D warnings
+
+  ghostty-musl-smoke:
+    name: ghostty musl smoke (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            platform: linux/amd64
+          - target: aarch64-unknown-linux-musl
+            platform: linux/arm64
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64,amd64
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-shared-key: "ghostty-musl-smoke-${{ matrix.target }}"
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+      - name: Install Zig for Ghostty musl static smoke
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.1
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - run: rustup target add ${{ matrix.target }}
+      - name: Build static musl binary
+        run: |
+          cargo zigbuild \
+            --release \
+            --package portl-cli \
+            --target "${{ matrix.target }}" \
+            --features ghostty-vt-static \
+            --bin portl
+      - name: Inspect static binary
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/portl"
+          test -x "${binary}"
+          file "${binary}"
+          if ldd_output=$(ldd "${binary}" 2>&1); then
+            printf '%s\n' "${ldd_output}"
+            grep -Eiq 'statically linked|not a dynamic executable' <<<"${ldd_output}"
+          else
+            printf '%s\n' "${ldd_output}"
+            grep -Eiq 'statically linked|not a dynamic executable' <<<"${ldd_output}"
+          fi
+      - name: Run in scratch container
+        run: |
+          set -euo pipefail
+          tmpdir=$(mktemp -d)
+          trap 'rm -rf "${tmpdir}"' EXIT
+          cp "target/${{ matrix.target }}/release/portl" "${tmpdir}/portl"
+          printf 'FROM scratch\nCOPY portl /portl\nENTRYPOINT ["/portl"]\n' > "${tmpdir}/Dockerfile"
+          image="portl-ghostty-scratch-smoke:${{ matrix.target }}"
+          docker build --platform "${{ matrix.platform }}" -t "${image}" "${tmpdir}"
+          docker run --rm --platform "${{ matrix.platform }}" "${image}" --version
+          docker run --rm --platform "${{ matrix.platform }}" "${image}" __ghostty-smoke
 
   deny:
     name: cargo deny

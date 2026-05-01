@@ -14,9 +14,9 @@
 portl/
 ├── Cargo.toml                     [workspace]
 ├── Cargo.lock
-├── rust-toolchain.toml            stable pinned (≥ 1.89; bumped from the
-│                                   1.85 baseline to match iroh 0.98's
-│                                   transitive dependency requirements)
+├── rust-toolchain.toml            stable pinned (≥ 1.93; bumped from the
+│                                   1.85 baseline to match iroh 0.98 and
+│                                   libghostty-rs dependency requirements)
 ├── rustfmt.toml
 ├── clippy.toml
 ├── deny.toml                      cargo-deny config
@@ -203,7 +203,7 @@ edition      = "2024"
 license      = "MIT"
 repository   = "https://github.com/KnickKnackLabs/portl"
 authors      = ["KnickKnackLabs and portl contributors"]
-rust-version = "1.89"    # iroh 0.98 transitive deps (time, vergen, ...)
+rust-version = "1.93"    # libghostty-rs and iroh 0.98 transitive deps
 
 [workspace.dependencies]
 # transport

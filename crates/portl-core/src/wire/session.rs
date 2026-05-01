@@ -110,6 +110,24 @@ impl ProviderCapabilities {
             exact_argv_spawn: false,
         }
     }
+
+    #[must_use]
+    pub const fn ghostty() -> Self {
+        Self {
+            persistent: true,
+            multi_attach: true,
+            create_on_attach: true,
+            attach_command: true,
+            run: true,
+            detached_run: false,
+            history: true,
+            tail: false,
+            kill: true,
+            terminal_state_restore: true,
+            external_direct_attach: false,
+            exact_argv_spawn: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,6 +253,27 @@ mod tests {
     use super::*;
     use crate::wire::StreamPreamble;
     use crate::wire::shell::PtyCfg;
+
+    #[test]
+    fn ghostty_capabilities_match_native_persistent_provider_contract() {
+        assert_eq!(
+            ProviderCapabilities::ghostty(),
+            ProviderCapabilities {
+                persistent: true,
+                multi_attach: true,
+                create_on_attach: true,
+                attach_command: true,
+                run: true,
+                detached_run: false,
+                history: true,
+                tail: false,
+                kill: true,
+                terminal_state_restore: true,
+                external_direct_attach: false,
+                exact_argv_spawn: true,
+            }
+        );
+    }
 
     #[test]
     fn session_req_roundtrips_via_postcard() {

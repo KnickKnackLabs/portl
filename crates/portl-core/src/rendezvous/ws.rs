@@ -36,7 +36,7 @@ use super::short_code::ShortCode;
 /// Default exchange timeout (~2 minutes) applied to the encrypted
 /// rendezvous flow when no override is supplied via
 /// [`WsRendezvousBackend::with_timeout`].
-pub const DEFAULT_WS_TIMEOUT: Duration = Duration::from_secs(120);
+pub const DEFAULT_WS_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// Maximum websocket payload length accepted from the mailbox server.
 /// One mebibyte is well above any plausible control-plane frame size

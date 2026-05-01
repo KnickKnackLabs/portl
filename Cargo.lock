@@ -2460,6 +2460,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "int-enum"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e366a1634cccc76b4cfd3e7580de9b605e4d93f1edac48d786c1f867c0def495"
+dependencies = [
+ "proc-macro2",
+ "proc-macro2-diagnostics",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "intl-memoizer"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2860,6 +2872,21 @@ name = "libc"
 version = "0.2.185"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52ff2c0fe9bc6cb6b14a0592c2ff4fa9ceb83eea9db979b0487cd054946a2b8f"
+
+[[package]]
+name = "libghostty-vt"
+version = "0.1.1"
+source = "git+https://github.com/Uzaaft/libghostty-rs?rev=5ac47e9eb166add2c00c432bc65c279133629712#5ac47e9eb166add2c00c432bc65c279133629712"
+dependencies = [
+ "bitflags",
+ "int-enum",
+ "libghostty-vt-sys",
+]
+
+[[package]]
+name = "libghostty-vt-sys"
+version = "0.1.1"
+source = "git+https://github.com/Uzaaft/libghostty-rs?rev=5ac47e9eb166add2c00c432bc65c279133629712#5ac47e9eb166add2c00c432bc65c279133629712"
 
 [[package]]
 name = "libredox"
@@ -3703,6 +3730,7 @@ dependencies = [
  "iroh",
  "iroh-base",
  "iroh-relay",
+ "libghostty-vt",
  "n0-future",
  "nix",
  "portl-core",
@@ -3749,6 +3777,7 @@ dependencies = [
  "iroh",
  "iroh-base",
  "iroh-tickets",
+ "libghostty-vt",
  "n0-future",
  "nix",
  "portl-agent",
@@ -3996,6 +4025,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "proc-macro2-diagnostics"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af066a9c399a26e020ada66a034357a868728e72cd426f3adcd35f80d88d88c8"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+ "version_check",
 ]
 
 [[package]]

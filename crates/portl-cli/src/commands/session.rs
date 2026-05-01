@@ -666,33 +666,40 @@ fn local_session_providers() -> ProviderReport {
         .ok()
         .and_then(|cfg| cfg.session_provider_path);
     let discovery = portl_agent::session_provider_discovery_info(configured.as_deref());
+    let mut providers = Vec::new();
+    #[cfg(feature = "ghostty-vt")]
+    providers.push(portl_agent::ghostty_provider_status());
+    providers.extend(discovery.providers.into_iter().map(|provider| {
+        ProviderStatus {
+            capabilities: provider_capabilities(&provider.name),
+            available: provider.detected,
+            path: provider.path.clone(),
+            notes: provider.notes.or(provider.path),
+            tier: Some(
+                if provider.name == "raw" {
+                    "raw"
+                } else {
+                    "local"
+                }
+                .to_owned(),
+            ),
+            features: Vec::new(),
+            name: provider.name,
+        }
+    }));
     ProviderReport {
+        #[cfg(feature = "ghostty-vt")]
+        default_provider: Some("ghostty".to_owned()),
+        #[cfg(not(feature = "ghostty-vt"))]
         default_provider: discovery.default_provider,
-        providers: discovery
-            .providers
-            .into_iter()
-            .map(|provider| ProviderStatus {
-                capabilities: provider_capabilities(&provider.name),
-                available: provider.detected,
-                path: provider.path.clone(),
-                notes: provider.notes.or(provider.path),
-                tier: Some(
-                    if provider.name == "raw" {
-                        "raw"
-                    } else {
-                        "local"
-                    }
-                    .to_owned(),
-                ),
-                features: Vec::new(),
-                name: provider.name,
-            })
-            .collect(),
+        providers,
     }
 }
 
 fn provider_capabilities(provider: &str) -> ProviderCapabilities {
     match provider {
+        #[cfg(feature = "ghostty-vt")]
+        "ghostty" => ProviderCapabilities::ghostty(),
         "zmx" => ProviderCapabilities::zmx(),
         "tmux" => ProviderCapabilities::tmux(),
         _ => ProviderCapabilities::raw(),
@@ -703,16 +710,24 @@ async fn local_session_list_detailed(
     provider: Option<&str>,
 ) -> Result<Vec<SessionProviderSessions>> {
     match provider {
+        #[cfg(feature = "ghostty-vt")]
+        Some("ghostty") => Ok(vec![local_ghostty_session_group(true).await?]),
         Some("zmx") => Ok(vec![local_zmx_session_group(true).await?]),
         Some("tmux") => Ok(vec![
             local_tmux_session_group(local_zmx_path_opt().is_none()).await?,
         ]),
         Some(other) => {
-            anyhow::bail!("unsupported local session provider '{other}' (supported: zmx, tmux)")
+            anyhow::bail!(
+                "unsupported local session provider '{other}' (supported: ghostty, zmx, tmux)"
+            )
         }
         None => {
             let default_provider = local_default_provider().ok();
             let mut groups = Vec::new();
+            #[cfg(feature = "ghostty-vt")]
+            groups.push(
+                local_ghostty_session_group(default_provider.as_deref() == Some("ghostty")).await?,
+            );
             if local_zmx_path_opt().is_some() {
                 groups.push(
                     local_zmx_session_group(default_provider.as_deref() == Some("zmx")).await?,
@@ -726,6 +741,16 @@ async fn local_session_list_detailed(
             Ok(groups)
         }
     }
+}
+
+#[cfg(feature = "ghostty-vt")]
+async fn local_ghostty_session_group(is_default: bool) -> Result<SessionProviderSessions> {
+    Ok(SessionProviderSessions {
+        provider: "ghostty".to_owned(),
+        available: true,
+        default: is_default,
+        sessions: portl_agent::ghostty_session_list().await?,
+    })
 }
 
 async fn local_zmx_session_group(is_default: bool) -> Result<SessionProviderSessions> {
@@ -891,16 +916,31 @@ async fn local_session_run(
     session: &str,
     argv: &[String],
 ) -> Result<portl_proto::session_v1::SessionRunResult> {
+    if provider.is_none() {
+        #[cfg(feature = "ghostty-vt")]
+        return portl_agent::ghostty_session_run(session, None, argv).await;
+        #[cfg(not(feature = "ghostty-vt"))]
+        {
+            let mut zmx_args = vec!["run", session];
+            zmx_args.extend(argv.iter().map(String::as_str));
+            return run_local_zmx_capture(&zmx_args).await;
+        }
+    }
     match provider {
-        None | Some("zmx") => {
+        #[cfg(feature = "ghostty-vt")]
+        Some("ghostty") => portl_agent::ghostty_session_run(session, None, argv).await,
+        Some("zmx") => {
             let mut zmx_args = vec!["run", session];
             zmx_args.extend(argv.iter().map(String::as_str));
             run_local_zmx_capture(&zmx_args).await
         }
         Some("tmux") => anyhow::bail!("persistent session provider 'tmux' does not support run"),
         Some(other) => {
-            anyhow::bail!("unsupported local session provider '{other}' (supported: zmx, tmux)")
+            anyhow::bail!(
+                "unsupported local session provider '{other}' (supported: ghostty, zmx, tmux)"
+            )
         }
+        None => unreachable!("handled above"),
     }
 }
 
@@ -909,6 +949,8 @@ async fn local_session_history(provider: Option<&str>, session: &str) -> Result<
         .await?
         .as_str()
     {
+        #[cfg(feature = "ghostty-vt")]
+        "ghostty" => portl_agent::ghostty_session_history(session).await,
         "zmx" => {
             let output = run_local_zmx_capture(&["history", session]).await?;
             ensure_local_provider_success("zmx history", &output)?;
@@ -939,6 +981,8 @@ async fn local_session_kill(provider: Option<&str>, session: &str) -> Result<()>
         .await?
         .as_str()
     {
+        #[cfg(feature = "ghostty-vt")]
+        "ghostty" => portl_agent::ghostty_session_kill(session).await,
         "zmx" => {
             let output = run_local_zmx_capture(&["kill", session]).await?;
             ensure_local_provider_success("zmx kill", &output)
@@ -968,10 +1012,75 @@ async fn local_session_attach(
         .await?
         .as_str()
     {
+        #[cfg(feature = "ghostty-vt")]
+        "ghostty" => local_ghostty_attach(target, session, cwd, argv).await,
         "zmx" => local_zmx_attach(target, session, cwd, argv).await,
         "tmux" => local_tmux_attach(target, session, cwd, argv).await,
         other => unreachable!("unsupported provider {other}"),
     }
+}
+
+#[cfg(feature = "ghostty-vt")]
+async fn local_ghostty_attach(
+    target: &str,
+    session: &str,
+    cwd: Option<&str>,
+    argv: &[String],
+) -> Result<ExitCode> {
+    let (cols, rows) = size().unwrap_or((80, 24));
+    let canonical_ref = canonical_session_ref(target, "ghostty", session);
+    eprintln!("portl: using local session provider ghostty");
+    eprintln!("portl: attaching to local session \"{canonical_ref}\"");
+    let mut attach = portl_agent::ghostty_session_attach(session, cwd, rows, cols, argv).await?;
+    let raw_guard = if std::io::stdin().is_terminal() {
+        Some(RawModeGuard::new()?)
+    } else {
+        None
+    };
+    let display = AttachDisplay::new(cols, rows);
+    let stdin_task = maybe_spawn_stdin_task(
+        AttachInputSink {
+            kind: AttachInputSinkKind::Ghostty {
+                stdin: attach.stdin_tx.clone(),
+                control: attach.control_tx.clone(),
+            },
+        },
+        AttachControlUi {
+            canonical_ref: canonical_ref.clone(),
+            supports_kick_others: false,
+            display: display.clone(),
+        },
+    )
+    .await?;
+    let stdout_display = display.clone();
+    let mut stdout_rx = attach.stdout_rx;
+    let stdout_task = tokio::spawn(async move {
+        copy_mpsc_output(&mut stdout_rx, &stdout_display, AttachOutputStream::Stdout).await
+    });
+    let stderr_display = display.clone();
+    let mut stderr_rx = attach.stderr_rx;
+    let stderr_task = tokio::spawn(async move {
+        copy_mpsc_output(&mut stderr_rx, &stderr_display, AttachOutputStream::Stderr).await
+    });
+    let (code, detached) = wait_ghostty_attach_completion(&mut attach.exit_rx, stdin_task).await?;
+    if detached {
+        stdout_task.abort();
+        stderr_task.abort();
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+        display.clear_bar().await?;
+        drop(raw_guard);
+        eprintln!("portl: detached from session \"{canonical_ref}\"");
+        eprintln!();
+        eprintln!("The session is still running. To reconnect, run:");
+        eprintln!("  portl attach {canonical_ref}");
+    } else {
+        await_output_task(stdout_task, "stdout").await?;
+        await_output_task(stderr_task, "stderr").await?;
+        display.clear_bar().await?;
+        drop(raw_guard);
+    }
+    Ok(exit_code_from_i32(code))
 }
 
 async fn local_zmx_attach(
@@ -1223,14 +1332,26 @@ async fn resolve_local_provider_for_session(
 ) -> Result<String> {
     if let Some(provider) = provider {
         match provider {
+            #[cfg(feature = "ghostty-vt")]
+            "ghostty" => return Ok(provider.to_owned()),
             "zmx" | "tmux" => return Ok(provider.to_owned()),
             other => {
-                anyhow::bail!("unsupported local session provider '{other}' (supported: zmx, tmux)")
+                anyhow::bail!(
+                    "unsupported local session provider '{other}' (supported: ghostty, zmx, tmux)"
+                )
             }
         }
     }
 
     let mut providers = Vec::new();
+    #[cfg(feature = "ghostty-vt")]
+    if portl_agent::ghostty_session_list()
+        .await?
+        .iter()
+        .any(|entry| entry.name == session)
+    {
+        providers.push("ghostty".to_owned());
+    }
     if local_zmx_path_opt().is_some() && local_zmx_list().await?.iter().any(|name| name == session)
     {
         providers.push("zmx".to_owned());
@@ -1256,13 +1377,21 @@ async fn resolve_local_provider_for_session(
     }
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn local_default_provider() -> Result<String> {
-    if local_zmx_path_opt().is_some() {
-        Ok("zmx".to_owned())
-    } else if local_tmux_path_opt().is_some() {
-        Ok("tmux".to_owned())
-    } else {
-        anyhow::bail!("no local persistent session provider is installed")
+    #[cfg(feature = "ghostty-vt")]
+    {
+        Ok("ghostty".to_owned())
+    }
+    #[cfg(not(feature = "ghostty-vt"))]
+    {
+        if local_zmx_path_opt().is_some() {
+            Ok("zmx".to_owned())
+        } else if local_tmux_path_opt().is_some() {
+            Ok("tmux".to_owned())
+        } else {
+            anyhow::bail!("no local persistent session provider is installed")
+        }
     }
 }
 
@@ -1674,15 +1803,23 @@ fn split_session_ref(
 fn normalize_session_provider(provider: &str) -> Result<String> {
     let normalized = normalize_session_provider_alias(provider);
     match normalized.as_str() {
+        #[cfg(feature = "ghostty-vt")]
+        "ghostty" => Ok(normalized),
         "tmux" | "zmx" | "raw" => Ok(normalized),
         other => {
-            anyhow::bail!("unsupported session provider '{other}' (supported: zmx, tmux, raw)")
+            #[cfg(feature = "ghostty-vt")]
+            anyhow::bail!(
+                "unsupported session provider '{other}' (supported: ghostty, zmx, tmux, raw)"
+            );
+            #[cfg(not(feature = "ghostty-vt"))]
+            anyhow::bail!("unsupported session provider '{other}' (supported: zmx, tmux, raw)");
         }
     }
 }
 
 fn normalize_session_provider_alias(provider: &str) -> String {
     match provider.trim() {
+        "g" => "ghostty".to_owned(),
         "t" => "tmux".to_owned(),
         "z" => "zmx".to_owned(),
         other => other.to_owned(),
@@ -1947,6 +2084,42 @@ async fn wait_local_attach_completion(
     }
 }
 
+#[cfg(feature = "ghostty-vt")]
+async fn wait_ghostty_attach_completion(
+    exit: &mut tokio::sync::watch::Receiver<Option<i32>>,
+    stdin_task: Option<tokio::task::JoinHandle<Result<StdinTaskResult>>>,
+) -> Result<(i32, bool)> {
+    async fn wait_exit(exit: &mut tokio::sync::watch::Receiver<Option<i32>>) -> Result<i32> {
+        loop {
+            if let Some(code) = *exit.borrow_and_update() {
+                return Ok(code);
+            }
+            if exit.changed().await.is_err() {
+                return Ok(0);
+            }
+        }
+    }
+
+    let mut exit_fut = Box::pin(wait_exit(exit));
+    let Some(mut stdin_task) = stdin_task else {
+        return Ok((exit_fut.await?, false));
+    };
+
+    tokio::select! {
+        code = &mut exit_fut => {
+            stdin_task.abort();
+            let _ = stdin_task.await;
+            Ok((code?, false))
+        }
+        stdin_result = &mut stdin_task => {
+            match stdin_result.context("join stdin task")?? {
+                StdinTaskResult::Detached => Ok((0, true)),
+                StdinTaskResult::Closed => Ok((exit_fut.await?, false)),
+            }
+        }
+    }
+}
+
 async fn wait_attach_completion(
     exit: &mut BufferedRecv,
     stdin_task: Option<tokio::task::JoinHandle<Result<StdinTaskResult>>>,
@@ -2030,6 +2203,21 @@ impl Drop for RawModeGuard {
 enum AttachOutputStream {
     Stdout,
     Stderr,
+}
+
+#[cfg(feature = "ghostty-vt")]
+async fn copy_mpsc_output(
+    recv: &mut mpsc::Receiver<Vec<u8>>,
+    display: &AttachDisplay,
+    stream: AttachOutputStream,
+) -> Result<()> {
+    while let Some(bytes) = recv.recv().await {
+        if bytes.is_empty() {
+            break;
+        }
+        display.write_output(stream, &bytes).await?;
+    }
+    display.flush(stream).await
 }
 
 async fn copy_remote_output<R>(
@@ -2445,6 +2633,11 @@ impl AttachInputSink {
             AttachInputSinkKind::TmuxPty { tx } => tx
                 .send(tmux_cc::send_keys_command(bytes))
                 .map_err(|_| anyhow!("tmux -CC pty closed")),
+            #[cfg(feature = "ghostty-vt")]
+            AttachInputSinkKind::Ghostty { stdin, .. } => stdin
+                .send(portl_agent::GhosttyAttachInput::Data(bytes.to_vec()))
+                .await
+                .map_err(|_| anyhow!("ghostty attach stdin closed")),
         }
     }
 
@@ -2460,6 +2653,11 @@ impl AttachInputSink {
             AttachInputSinkKind::TmuxPty { tx } => tx
                 .send(b"detach-client\n".to_vec())
                 .map_err(|_| anyhow!("tmux -CC pty closed")),
+            #[cfg(feature = "ghostty-vt")]
+            AttachInputSinkKind::Ghostty { stdin, .. } => stdin
+                .send(portl_agent::GhosttyAttachInput::Close)
+                .await
+                .map_err(|_| anyhow!("ghostty attach stdin closed")),
         }
     }
 
@@ -2481,6 +2679,10 @@ impl AttachInputSink {
             AttachInputSinkKind::TmuxPty { tx } => tx
                 .send(tmux_cc::resize_commands(rows, cols))
                 .map_err(|_| anyhow!("tmux -CC pty closed")),
+            #[cfg(feature = "ghostty-vt")]
+            AttachInputSinkKind::Ghostty { control, .. } => control
+                .send(portl_agent::GhosttyAttachControl::Resize { rows, cols })
+                .map_err(|_| anyhow!("ghostty attach control closed")),
         }
     }
 
@@ -2499,6 +2701,8 @@ impl AttachInputSink {
             AttachInputSinkKind::TmuxPty { tx } => tx
                 .send(b"detach-client -a\n".to_vec())
                 .map_err(|_| anyhow!("tmux -CC pty closed")),
+            #[cfg(feature = "ghostty-vt")]
+            AttachInputSinkKind::Ghostty { .. } => Ok(()),
         }
     }
 }
@@ -2514,6 +2718,11 @@ enum AttachInputSinkKind {
     },
     TmuxPty {
         tx: mpsc::UnboundedSender<Vec<u8>>,
+    },
+    #[cfg(feature = "ghostty-vt")]
+    Ghostty {
+        stdin: mpsc::Sender<portl_agent::GhosttyAttachInput>,
+        control: mpsc::UnboundedSender<portl_agent::GhosttyAttachControl>,
     },
 }
 
@@ -2868,6 +3077,23 @@ mod tests {
 
         assert_eq!(session, "dotfiles");
         assert_eq!(provider.as_deref(), Some("zmx"));
+    }
+
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn local_provider_report_prefers_ghostty_when_feature_enabled() {
+        let report = local_session_providers();
+
+        assert_eq!(report.default_provider.as_deref(), Some("ghostty"));
+        let ghostty = report
+            .providers
+            .iter()
+            .find(|provider| provider.name == "ghostty")
+            .expect("ghostty provider reported");
+        assert!(ghostty.available);
+        assert!(ghostty.capabilities.create_on_attach);
+        assert!(ghostty.capabilities.run);
+        assert_eq!(ghostty.tier.as_deref(), Some("native"));
     }
 
     #[test]

@@ -21,7 +21,7 @@ docker run --rm \
   -v "$ROOT":/src \
   -w /src \
   -e CARGO_TARGET_DIR="/src/target-linux-$TARGETARCH" \
-  rust:1.89-slim \
+  rust:1.93-slim \
   bash -c 'apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates cmake && cargo build --release --bin portl'
 
 mkdir -p adapters/docker-portl/images/bin

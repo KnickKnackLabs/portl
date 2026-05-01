@@ -15,6 +15,8 @@ use tokio::sync::{mpsc, watch};
 
 use crate::caps_enforce::shell_permits;
 use crate::session::Session;
+#[cfg(feature = "ghostty-vt")]
+use crate::session_handler::ghostty::GhosttyProvider;
 use crate::shell_handler::pumps::{pump_exit, pump_output, pump_resizes, pump_signals, pump_stdin};
 use crate::shell_handler::spawn::spawn_process;
 use crate::shell_handler::user::{RequestedUser, resolve_requested_user};
@@ -23,6 +25,8 @@ use crate::stream_io::BufferedRecv;
 use crate::target_context::TargetProcessContext;
 use crate::{AgentState, audit};
 
+#[cfg(feature = "ghostty-vt")]
+pub(crate) mod ghostty;
 pub(crate) mod provider;
 mod tmux_control;
 
@@ -186,7 +190,7 @@ async fn serve_control_stream(
                 req.cwd.as_deref(),
                 req.argv.as_ref(),
             );
-            let run = match selected.run(&zmx, name, argv).await {
+            let run = match selected.run(&zmx, name, req.cwd.as_deref(), argv).await {
                 Ok(run) => run,
                 Err(err) => {
                     audit::session_reject(&session, "run", "provider_command_failed");
@@ -414,6 +418,25 @@ async fn serve_attach(
         workload_context.cwd.as_deref(),
         req.argv.as_ref(),
     );
+    #[cfg(feature = "ghostty-vt")]
+    if selected == SelectedProvider::Ghostty {
+        if req.user.is_some() {
+            write_ack(
+                &mut send,
+                reject(SessionReason::CapabilityUnsupported {
+                    provider: "ghostty".to_owned(),
+                    capability: "user".to_owned(),
+                }),
+            )
+            .await?;
+            let _ = send.finish();
+            return Ok(());
+        }
+        let name = name.to_owned();
+        return serve_ghostty_attach(session, state, send, recv, req, &name, &workload_context)
+            .await;
+    }
+
     if selected == SelectedProvider::Tmux {
         if req.user.is_some() {
             write_ack(
@@ -507,6 +530,75 @@ async fn serve_attach(
             reason: None,
             session_id: Some(session_id),
             provider: Some("zmx".to_owned()),
+            providers: None,
+            sessions: None,
+            session_entries: None,
+            session_groups: None,
+            run: None,
+            output: None,
+        },
+    )
+    .await?;
+    let mut control_buffer = [0_u8; 1024];
+    loop {
+        let read = recv
+            .read(&mut control_buffer)
+            .await
+            .context("read session control")?;
+        if read == 0 {
+            let _ = send.finish();
+            return Ok(());
+        }
+    }
+}
+
+#[cfg(feature = "ghostty-vt")]
+async fn serve_ghostty_attach(
+    _session: Session,
+    state: Arc<AgentState>,
+    mut send: SendStream,
+    mut recv: BufferedRecv,
+    req: SessionReq,
+    name: &str,
+    context: &TargetProcessContext,
+) -> Result<()> {
+    let session_id = rand::random::<[u8; 16]>();
+    let process = match GhosttyProvider::new()
+        .attach_process(
+            name,
+            context.cwd.as_deref(),
+            req.pty.as_ref(),
+            req.argv.as_deref(),
+            Some(context.env.clone()),
+        )
+        .await
+    {
+        Ok(process) => process,
+        Err(err) => {
+            write_ack(
+                &mut send,
+                reject(SessionReason::SpawnFailed(err.to_string())),
+            )
+            .await?;
+            let _ = send.finish();
+            return Ok(());
+        }
+    };
+    process.set_started_at(Instant::now());
+    state
+        .shell_registry
+        .insert(session_id, Arc::clone(&process));
+    let _guard = SessionRegistryGuard {
+        state: Arc::clone(&state),
+        session_id,
+    };
+    write_ack(
+        &mut send,
+        SessionAck {
+            ok: true,
+            reason: None,
+            session_id: Some(session_id),
+            provider: Some("ghostty".to_owned()),
             providers: None,
             sessions: None,
             session_entries: None,
@@ -1041,6 +1133,8 @@ fn session_permits(session: &Session, req: &SessionReq) -> Result<(), SessionRea
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelectedProvider {
+    #[cfg(feature = "ghostty-vt")]
+    Ghostty,
     Zmx,
     Tmux,
 }
@@ -1048,6 +1142,8 @@ enum SelectedProvider {
 impl SelectedProvider {
     const fn name(self) -> &'static str {
         match self {
+            #[cfg(feature = "ghostty-vt")]
+            Self::Ghostty => "ghostty",
             Self::Zmx => "zmx",
             Self::Tmux => "tmux",
         }
@@ -1059,6 +1155,8 @@ impl SelectedProvider {
         tmux: &provider::TmuxProvider,
     ) -> Result<Vec<portl_proto::session_v1::SessionInfo>> {
         match self {
+            #[cfg(feature = "ghostty-vt")]
+            Self::Ghostty => GhosttyProvider::new().list_detailed().await,
             Self::Zmx => zmx.list_detailed().await,
             Self::Tmux => tmux.list_detailed().await,
         }
@@ -1068,9 +1166,14 @@ impl SelectedProvider {
         self,
         zmx: &provider::ZmxProvider,
         session: &str,
+        cwd: Option<&str>,
         argv: &[String],
     ) -> Result<portl_proto::session_v1::SessionRunResult> {
+        #[cfg(not(feature = "ghostty-vt"))]
+        let _ = cwd;
         match self {
+            #[cfg(feature = "ghostty-vt")]
+            Self::Ghostty => GhosttyProvider::new().run(session, cwd, argv, None).await,
             Self::Zmx => zmx.run(session, argv).await,
             Self::Tmux => bail!("tmux provider does not support run"),
         }
@@ -1083,6 +1186,8 @@ impl SelectedProvider {
         session: &str,
     ) -> Result<String> {
         match self {
+            #[cfg(feature = "ghostty-vt")]
+            Self::Ghostty => GhosttyProvider::new().history(session).await,
             Self::Zmx => zmx.history(session).await,
             Self::Tmux => tmux.history(session).await,
         }
@@ -1095,6 +1200,8 @@ impl SelectedProvider {
         session: &str,
     ) -> Result<()> {
         match self {
+            #[cfg(feature = "ghostty-vt")]
+            Self::Ghostty => GhosttyProvider::new().kill(session).await,
             Self::Zmx => zmx.kill(session).await,
             Self::Tmux => tmux.kill(session).await,
         }
@@ -1106,8 +1213,18 @@ async fn aggregate_session_entries(
     tmux: &provider::TmuxProvider,
 ) -> Result<Vec<SessionEntry>> {
     let mut entries = Vec::new();
-    for provider in [SelectedProvider::Zmx, SelectedProvider::Tmux] {
+    #[cfg(feature = "ghostty-vt")]
+    let providers = [
+        SelectedProvider::Ghostty,
+        SelectedProvider::Zmx,
+        SelectedProvider::Tmux,
+    ];
+    #[cfg(not(feature = "ghostty-vt"))]
+    let providers = [SelectedProvider::Zmx, SelectedProvider::Tmux];
+    for provider in providers {
         let status = match provider {
+            #[cfg(feature = "ghostty-vt")]
+            SelectedProvider::Ghostty => GhosttyProvider::new().status(),
             SelectedProvider::Zmx => zmx.probe().await?,
             SelectedProvider::Tmux => tmux.probe().await?,
         };
@@ -1149,6 +1266,10 @@ async fn resolve_provider_for_session(
         }
     }) {
         match entry.provider.as_str() {
+            #[cfg(feature = "ghostty-vt")]
+            "ghostty" if !providers.contains(&SelectedProvider::Ghostty) => {
+                providers.push(SelectedProvider::Ghostty);
+            }
             "zmx" if !providers.contains(&SelectedProvider::Zmx) => {
                 providers.push(SelectedProvider::Zmx);
             }
@@ -1181,6 +1302,10 @@ async fn select_provider(
 ) -> Result<SelectedProvider, SessionReason> {
     if let Some(provider) = requested {
         return match provider {
+            #[cfg(feature = "ghostty-vt")]
+            "ghostty" => Ok(SelectedProvider::Ghostty),
+            #[cfg(not(feature = "ghostty-vt"))]
+            "ghostty" => Err(SessionReason::ProviderNotFound(provider.to_owned())),
             "zmx" => ensure_available(zmx.probe().await, "zmx", SelectedProvider::Zmx),
             "tmux" => {
                 if op == SessionOp::Run {
@@ -1198,6 +1323,11 @@ async fn select_provider(
             }),
             other => Err(SessionReason::ProviderNotFound(other.to_owned())),
         };
+    }
+
+    #[cfg(feature = "ghostty-vt")]
+    if GhosttyProvider::new().status().available {
+        return Ok(SelectedProvider::Ghostty);
     }
 
     let zmx_status = zmx
@@ -1248,6 +1378,8 @@ async fn list_session_groups(
         }]);
     }
 
+    #[cfg(feature = "ghostty-vt")]
+    let ghostty_status = GhosttyProvider::new().status();
     let zmx_status = zmx
         .probe()
         .await
@@ -1256,7 +1388,9 @@ async fn list_session_groups(
         .probe()
         .await
         .map_err(|err| SessionReason::InternalError(err.to_string()))?;
-    let default_provider = if zmx_status.available {
+    let default_provider = if cfg!(feature = "ghostty-vt") {
+        Some("ghostty")
+    } else if zmx_status.available {
         Some("zmx")
     } else if tmux_status.available {
         Some("tmux")
@@ -1264,6 +1398,18 @@ async fn list_session_groups(
         None
     };
     let mut groups = Vec::new();
+    #[cfg(feature = "ghostty-vt")]
+    if ghostty_status.available {
+        groups.push(SessionProviderSessions {
+            provider: "ghostty".to_owned(),
+            available: true,
+            default: default_provider == Some("ghostty"),
+            sessions: GhosttyProvider::new()
+                .list_detailed()
+                .await
+                .map_err(|err| SessionReason::SpawnFailed(err.to_string()))?,
+        });
+    }
     if zmx_status.available {
         groups.push(SessionProviderSessions {
             provider: "zmx".to_owned(),
@@ -1399,5 +1545,55 @@ struct SessionRegistryGuard {
 impl Drop for SessionRegistryGuard {
     fn drop(&mut self) {
         self.state.shell_registry.remove(&self.session_id);
+    }
+}
+
+#[cfg(all(test, feature = "ghostty-vt"))]
+mod tests {
+    use anyhow::Result;
+
+    use super::*;
+
+    #[cfg(feature = "ghostty-vt")]
+    #[tokio::test]
+    async fn select_provider_prefers_ghostty_when_feature_enabled() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let missing = temp.path().join("missing-provider");
+        let zmx = provider::ZmxProvider::with_path(missing.clone());
+        let tmux = provider::TmuxProvider::with_path(missing);
+
+        let selected = select_provider(&zmx, &tmux, None, SessionOp::Attach)
+            .await
+            .map_err(|reason| anyhow::anyhow!("unexpected rejection: {reason:?}"))?;
+
+        assert_eq!(selected.name(), "ghostty");
+        Ok(())
+    }
+
+    #[cfg(feature = "ghostty-vt")]
+    #[tokio::test]
+    async fn explicit_zmx_still_selects_zmx_when_available() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let fake = temp.path().join("zmx");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\ncase \"$1\" in version) echo zmx;; control) exit 64;; esac\n",
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake, perms)?;
+        }
+        let zmx = provider::ZmxProvider::with_path(fake);
+        let tmux = provider::TmuxProvider::new(None);
+
+        let selected = select_provider(&zmx, &tmux, Some("zmx"), SessionOp::Attach)
+            .await
+            .map_err(|reason| anyhow::anyhow!("unexpected rejection: {reason:?}"))?;
+
+        assert_eq!(selected.name(), "zmx");
+        Ok(())
     }
 }

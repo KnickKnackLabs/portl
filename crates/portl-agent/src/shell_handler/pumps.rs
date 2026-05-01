@@ -80,7 +80,7 @@ pub(crate) async fn pump_resizes(mut recv: BufferedRecv, process: &ShellProcess)
 }
 
 #[cfg(unix)]
-pub(super) fn resize_pty(master: &impl AsRawFd, rows: u16, cols: u16) -> std::io::Result<()> {
+pub(crate) fn resize_pty(master: &impl AsRawFd, rows: u16, cols: u16) -> std::io::Result<()> {
     let ws = nix::libc::winsize {
         ws_row: rows,
         ws_col: cols,

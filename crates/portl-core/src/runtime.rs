@@ -34,10 +34,12 @@ where
     loop {
         tokio::select! {
             output = &mut fut => {
-                SLOW_TASKS_TOTAL.get_or_create(&SlowTaskLabel { label }).inc();
+                if warned {
+                    SLOW_TASKS_TOTAL.get_or_create(&SlowTaskLabel { label }).inc();
+                }
                 return output;
             }
-            () = tokio::time::sleep(Duration::from_secs(60)), if !warned => {
+            () = tokio::time::sleep(Duration::from_mins(1)), if !warned => {
                 warned = true;
                 warn!(label, elapsed_ms = started_at.elapsed().as_millis(), "slow task exceeded 60s");
             }
@@ -72,7 +74,7 @@ mod tests {
         }));
 
         tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::advance(Duration::from_mins(1)).await;
         tokio::task::yield_now().await;
 
         let warnings = warnings.lock().expect("warnings mutex").clone();
@@ -87,9 +89,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slow_task_increments_counter_on_return() {
+    async fn fast_task_does_not_increment_slow_counter() {
+        let before = slow_task_count("fast_counter");
+        slow_task("fast_counter", async {}).await;
+        assert_eq!(slow_task_count("fast_counter"), before);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn slow_task_increments_counter_on_return_after_warning() {
         let before = slow_task_count("counter_increment");
-        slow_task("counter_increment", async {}).await;
+        let task = tokio::spawn(slow_task("counter_increment", async {
+            tokio::time::sleep(Duration::from_secs(61)).await;
+        }));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_mins(1)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        task.await.expect("slow_task join");
+
         assert_eq!(slow_task_count("counter_increment"), before + 1);
     }
 

@@ -48,6 +48,8 @@ shown in user-facing help, may change without notice, and should only
 be set by portl itself or by portl's test harness.
 
 - `PORTL_ZMX_BINARY` — local path used by `portl docker run --session-provider zmx` and `portl docker bake --session-provider zmx` to copy a zmx binary into managed Docker targets.
+- `PORTL_GHOSTTY_RUNTIME_DIR` — override the native Ghostty provider socket directory during tests and smoke validation.
+- `PORTL_GHOSTTY_STATE_DIR` — override the native Ghostty provider metadata/history directory during tests and smoke validation.
 - `PORTL_IDENTITY_KEY`
 - `PORTL_IDENTITY_SECRET_HEX`
 - `PORTL_AUDIT_SHELL_EXIT_PATH`

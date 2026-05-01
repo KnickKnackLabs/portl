@@ -1117,29 +1117,45 @@ pub(crate) async fn provider_report(
 ) -> Result<ProviderReport> {
     let zmx_status = zmx.probe().await?;
     let tmux_status = tmux.probe().await?;
-    let default_provider = if zmx_status.available {
-        Some("zmx".to_owned())
-    } else if tmux_status.available {
-        Some("tmux".to_owned())
-    } else {
-        None
-    };
+    let ghostty_status = ghostty_provider_status();
+    let default_provider = ghostty_status
+        .as_ref()
+        .filter(|status| status.available)
+        .map(|status| status.name.clone())
+        .or_else(|| zmx_status.available.then(|| "zmx".to_owned()))
+        .or_else(|| tmux_status.available.then(|| "tmux".to_owned()));
+    let mut providers = Vec::new();
+    if let Some(status) = ghostty_status {
+        providers.push(status);
+    }
+    providers.extend([
+        zmx_status,
+        tmux_status,
+        ProviderStatus {
+            name: "raw".to_owned(),
+            available: true,
+            path: None,
+            notes: Some("one-shot PTY fallback".to_owned()),
+            capabilities: ProviderCapabilities::raw(),
+            tier: Some("raw".to_owned()),
+            features: Vec::new(),
+        },
+    ]);
     Ok(ProviderReport {
         default_provider,
-        providers: vec![
-            zmx_status,
-            tmux_status,
-            ProviderStatus {
-                name: "raw".to_owned(),
-                available: true,
-                path: None,
-                notes: Some("one-shot PTY fallback".to_owned()),
-                capabilities: ProviderCapabilities::raw(),
-                tier: Some("raw".to_owned()),
-                features: Vec::new(),
-            },
-        ],
+        providers,
     })
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[allow(clippy::unnecessary_wraps)]
+fn ghostty_provider_status() -> Option<ProviderStatus> {
+    Some(crate::session_handler::ghostty::GhosttyProvider::new().status())
+}
+
+#[cfg(not(feature = "ghostty-vt"))]
+fn ghostty_provider_status() -> Option<ProviderStatus> {
+    None
 }
 
 #[cfg(test)]
@@ -1661,6 +1677,34 @@ esac
         Ok(())
     }
 
+    #[cfg(feature = "ghostty-vt")]
+    #[tokio::test]
+    async fn provider_report_prefers_builtin_ghostty_when_feature_enabled() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let missing = temp.path().join("missing-provider");
+        let zmx = ZmxProvider::with_path(missing.clone());
+        let tmux = TmuxProvider::with_path(missing);
+
+        let report = provider_report(&zmx, &tmux).await?;
+
+        assert_eq!(report.default_provider.as_deref(), Some("ghostty"));
+        assert_eq!(
+            report
+                .providers
+                .iter()
+                .map(|status| status.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ghostty", "zmx", "tmux", "raw"]
+        );
+        let ghostty = &report.providers[0];
+        assert!(ghostty.available);
+        assert_eq!(ghostty.tier.as_deref(), Some("native"));
+        assert_eq!(ghostty.capabilities, ProviderCapabilities::ghostty());
+        assert!(ghostty.features.contains(&"ghostty-vt.v1".to_owned()));
+        Ok(())
+    }
+
+    #[cfg(not(feature = "ghostty-vt"))]
     #[tokio::test]
     async fn provider_report_includes_tmux_and_falls_back_to_it() -> Result<()> {
         let temp = tempfile::tempdir()?;

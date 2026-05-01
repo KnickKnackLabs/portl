@@ -4,9 +4,9 @@
 
 # Pin MSRV so MSRV-sensitive lints (e.g. manual_let_else,
 # option_if_let_else, unnested_or_patterns) don't suggest syntax
-# that isn't available on 1.89. Defaults to rust-version in
+# that isn't available on 1.93. Defaults to rust-version in
 # Cargo.toml, but setting it explicitly is the documented idiom.
-msrv = "1.89"
+msrv = "1.93"
 
 # Keep the default for cognitive-complexity / type-complexity
 # thresholds; no call sites currently trigger them.

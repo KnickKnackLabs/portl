@@ -200,6 +200,88 @@ fn invite_accept_surface_matches_spec() {
 }
 
 #[test]
+fn hidden_ghostty_smoke_command_parses() {
+    assert_eq!(
+        parse_args(&["__ghostty-smoke"]).expect("parse"),
+        ParsedCommand::GhosttySmoke
+    );
+}
+
+#[test]
+fn hidden_ghostty_session_helper_command_parses() {
+    assert_eq!(
+        parse_args(&[
+            "__ghostty-session",
+            "--name",
+            "dev/main",
+            "--socket",
+            "/tmp/portl-ghostty.sock",
+            "--state-dir",
+            "/tmp/portl-ghostty-state",
+            "--cwd",
+            "/work",
+            "--rows",
+            "40",
+            "--cols",
+            "120",
+            "--",
+            "/bin/sh",
+            "-lc",
+            "echo hi",
+        ])
+        .expect("parse"),
+        ParsedCommand::GhosttySessionHelper {
+            name: "dev/main".to_owned(),
+            socket_path: "/tmp/portl-ghostty.sock".into(),
+            state_root: "/tmp/portl-ghostty-state".into(),
+            cwd: Some("/work".to_owned()),
+            rows: 40,
+            cols: 120,
+            argv: vec!["/bin/sh".to_owned(), "-lc".to_owned(), "echo hi".to_owned()],
+        }
+    );
+}
+
+#[test]
+fn hidden_ghostty_smoke_parses_under_portl_agent_symlink_name() {
+    assert_eq!(
+        parse(vec!["portl-agent".into(), "__ghostty-smoke".into()]).expect("parse"),
+        ParsedCommand::GhosttySmoke
+    );
+}
+
+#[test]
+fn hidden_ghostty_session_helper_parses_under_portl_agent_symlink_name() {
+    assert!(matches!(
+        parse(vec![
+            "portl-agent".into(),
+            "__ghostty-session".into(),
+            "--name".into(),
+            "dev".into(),
+            "--socket".into(),
+            "/tmp/portl-ghostty.sock".into(),
+            "--state-dir".into(),
+            "/tmp/portl-ghostty-state".into(),
+            "--".into(),
+            "/bin/sh".into(),
+        ])
+        .expect("parse"),
+        ParsedCommand::GhosttySessionHelper { .. }
+    ));
+}
+
+#[test]
+fn hidden_ghostty_commands_are_not_in_top_level_help() {
+    let help = help_output(&["--help"]);
+    for hidden in ["__ghostty-smoke", "__ghostty-session"] {
+        assert!(
+            !help.contains(hidden),
+            "hidden command {hidden} leaked into help:\n{help}"
+        );
+    }
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn session_surface_matches_spec() {
     assert_eq!(

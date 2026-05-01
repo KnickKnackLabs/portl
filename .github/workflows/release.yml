@@ -45,6 +45,9 @@ jobs:
           - cargo nextest
           - rustfmt
           - clippy
+          - ghostty smoke
+          - ghostty musl smoke (x86_64-unknown-linux-musl)
+          - ghostty musl smoke (aarch64-unknown-linux-musl)
           - cargo deny
           - dep-guard
           - docker integration smoke
@@ -108,25 +111,24 @@ jobs:
           cache-shared-key: "release-${{ matrix.target }}"
           cache-save-if: true
           cache-on-failure: true
-      - name: Install zig (linux only)
-        if: matrix.linux
+      - name: Install zig for Ghostty static link
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.13.0
+          version: 0.15.1
       - name: Install cargo-zigbuild (linux only)
         # taiki-e/install-action downloads the prebuilt cargo-zigbuild
         # binary — ~5 s vs ~1 min source build, decoupled from our
-        # pinned 1.89 toolchain.
+        # pinned 1.93 toolchain.
         if: matrix.linux
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-zigbuild
       - name: Build (linux musl via zigbuild)
         if: matrix.linux
-        run: cargo zigbuild --release --target ${{ matrix.target }} --bin portl
+        run: cargo zigbuild --release --package portl-cli --target ${{ matrix.target }} --features ghostty-vt-static --bin portl
       - name: Build (macOS native)
         if: matrix.linux != true
-        run: cargo build --release --target ${{ matrix.target }} --bin portl
+        run: cargo build --release --package portl-cli --target ${{ matrix.target }} --features ghostty-vt-static --bin portl
       - name: Package (tar.zst level 19)
         env:
           # Disable macOS AppleDouble metadata so tarballs produced on
