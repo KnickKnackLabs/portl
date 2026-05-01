@@ -390,6 +390,59 @@ fn dispatch_command(command: Command) -> ExitCode {
     }
 }
 
+fn command_needs_pre_migration_agent_stop(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Install {
+            apply: true,
+            yes: true,
+            detect: false,
+            dry_run: false,
+            ..
+        }
+    )
+}
+
+#[cfg(test)]
+mod service_safe_upgrade_tests {
+    use super::{Command, command_needs_pre_migration_agent_stop};
+
+    #[test]
+    fn pre_migration_stop_only_applies_to_confirmed_install_apply() {
+        assert!(command_needs_pre_migration_agent_stop(&Command::Install {
+            target: None,
+            apply: true,
+            yes: true,
+            detect: false,
+            dry_run: false,
+            output: None,
+        }));
+        assert!(!command_needs_pre_migration_agent_stop(&Command::Install {
+            target: None,
+            apply: true,
+            yes: false,
+            detect: false,
+            dry_run: false,
+            output: None,
+        }));
+        assert!(!command_needs_pre_migration_agent_stop(&Command::Install {
+            target: None,
+            apply: false,
+            yes: true,
+            detect: false,
+            dry_run: false,
+            output: None,
+        }));
+        assert!(!command_needs_pre_migration_agent_stop(&Command::Doctor {
+            fix: false,
+            yes: false,
+            verbose: false,
+            json: false,
+            quiet: false,
+        }));
+    }
+}
+
 fn dispatch_parse_result(parsed: Result<Command, clap::Error>) -> ExitCode {
     match parsed {
         Ok(command) => dispatch_command(command),
@@ -483,6 +536,13 @@ pub fn run(argv: Vec<OsString>) -> ExitCode {
     };
 
     logging::init(cli.log_verbose, cli.log.as_deref());
+    let command = cli.into_command();
+    if command_needs_pre_migration_agent_stop(&command)
+        && let Err(err) = commands::install::stop_existing_agent_for_upgrade()
+    {
+        eprintln!("portl: stop existing agent before install: {err:#}");
+        return ExitCode::FAILURE;
+    }
 
     match portl_core::paths::ensure_layout_migrated() {
         Ok(report) => {
@@ -500,7 +560,7 @@ pub fn run(argv: Vec<OsString>) -> ExitCode {
         }
     }
 
-    dispatch_command(cli.into_command())
+    dispatch_command(command)
 }
 
 #[allow(clippy::too_many_lines)]

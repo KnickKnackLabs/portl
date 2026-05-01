@@ -251,6 +251,11 @@ fn legacy_home_dirs_for(new_root: &Path, include_platform_default: bool) -> Vec<
     dirs
 }
 
+#[must_use]
+pub fn previous_project_dirs_home() -> Option<PathBuf> {
+    legacy_project_dirs_home()
+}
+
 fn legacy_project_dirs_home() -> Option<PathBuf> {
     ProjectDirs::from("computer", "KnickKnackLabs", "portl")
         .map(|dirs| dirs.data_dir().to_path_buf())

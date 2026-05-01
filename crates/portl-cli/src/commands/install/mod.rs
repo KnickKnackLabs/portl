@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use portl_core::peer_store::{PeerEntry, PeerOrigin, PeerStore};
@@ -11,7 +11,9 @@ mod detect;
 mod render;
 mod resolve;
 
-use self::apply::{apply_install_target, set_mode_0755, validate_install_target};
+use self::apply::{
+    apply_install_target, set_mode_0755, stop_install_target, validate_install_target,
+};
 use self::detect::{DetectionContext, detect_host_with};
 use self::render::render_target;
 use self::resolve::{
@@ -43,6 +45,25 @@ pub type DetectMatch = InstallTarget;
 
 pub fn detect_host() -> DetectResult {
     detect_host_with(&DetectionContext::from_host())
+}
+
+pub fn stop_existing_agent_for_upgrade() -> Result<()> {
+    let detect_result = detect_host();
+    if detect_result.inside_docker {
+        return Ok(());
+    }
+    let target = resolve_target(None, &detect_result)?;
+    if matches!(target, InstallTarget::Dockerfile) {
+        return Ok(());
+    }
+    let service_path = install_service_path(
+        target,
+        detect_result.root,
+        detect_result.home.as_deref(),
+        None,
+    )?;
+    stop_install_target(target, detect_result.root, &service_path);
+    Ok(())
 }
 
 /// v0.3.1: expose self-row seeding so `portl init` can call it.
@@ -185,8 +206,34 @@ pub fn run(
     seed_peer_store_self_row_with_reporting();
 
     apply_install_target(target, detect_result.root, &service_path)?;
+    verify_agent_ready_after_apply(target)?;
     println!("installed {}", service_path.display());
     Ok(ExitCode::SUCCESS)
+}
+
+fn verify_agent_ready_after_apply(target: InstallTarget) -> Result<()> {
+    if matches!(target, InstallTarget::Dockerfile) {
+        return Ok(());
+    }
+    let socket = crate::agent_ipc::default_socket_path();
+    let runtime =
+        tokio::runtime::Runtime::new().context("create runtime for agent readiness check")?;
+    let mut last_error = None;
+    for _ in 0..20 {
+        match runtime.block_on(crate::agent_ipc::fetch_status(&socket)) {
+            Ok(_) => {
+                println!("agent service is ready at {}", socket.display());
+                return Ok(());
+            }
+            Err(err) => last_error = Some(err),
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let detail = last_error.map_or_else(|| "status unavailable".to_owned(), |err| err.to_string());
+    bail!(
+        "portl-agent did not become ready at {} after install: {detail}",
+        socket.display()
+    )
 }
 
 /// Write the local identity to `peers.json` as `label="self"`,

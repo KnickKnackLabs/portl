@@ -59,8 +59,10 @@ pub fn run(opts: RunOpts) -> ExitCode {
         check_stored_ticket_expiry(),
         check_package_manager(),
         check_binary_drift(),
+        check_home_layout(),
         check_session_providers(),
         check_service_drift(),
+        check_agent_runtime_socket(),
     ];
 
     let any_fail = results.iter().any(|r| r.status == Status::Fail);
@@ -599,6 +601,137 @@ fn check_binary_drift() -> CheckResult {
     }
 }
 
+fn check_home_layout() -> CheckResult {
+    let current = portl_core::paths::current();
+    let current_identity = current.identity_path();
+    let Some(previous) = portl_core::paths::previous_project_dirs_home() else {
+        return CheckResult {
+            name: "home layout",
+            status: Status::Ok,
+            detail: format!("using {}", current.root().display()),
+        };
+    };
+    let stale = stale_legacy_durable_files(&previous)
+        .into_iter()
+        .map(|path| {
+            path.strip_prefix(&previous)
+                .unwrap_or(&path)
+                .display()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    if current_identity.exists() && stale.is_empty() {
+        return CheckResult {
+            name: "home layout",
+            status: Status::Ok,
+            detail: format!(
+                "using {}; previous durable state migrated from {}",
+                current.root().display(),
+                previous.display()
+            ),
+        };
+    }
+    if current_identity.exists() {
+        return CheckResult {
+            name: "home layout",
+            status: Status::Warn,
+            detail: format!(
+                "using {}, but previous durable files remain in {}: {}. Back up, then move or remove these stale files before release validation.",
+                current.root().display(),
+                previous.display(),
+                stale.join(", ")
+            ),
+        };
+    }
+    if !stale.is_empty() {
+        return CheckResult {
+            name: "home layout",
+            status: Status::Fail,
+            detail: format!(
+                "new home {} has no identity but previous durable state exists in {}. Run the current `portl config path` before starting the service, or restore from backup.",
+                current.root().display(),
+                previous.display()
+            ),
+        };
+    }
+    CheckResult {
+        name: "home layout",
+        status: Status::Ok,
+        detail: format!("using {}", current.root().display()),
+    }
+}
+
+fn stale_legacy_durable_files(previous: &Path) -> Vec<PathBuf> {
+    let mut stale = [
+        "portl.toml",
+        "identity.bin",
+        "peers.json",
+        "tickets.json",
+        "aliases.json",
+        "revocations.jsonl",
+        "pending_invites.json",
+    ]
+    .into_iter()
+    .map(|relative| previous.join(relative))
+    .filter(|path| path.exists())
+    .collect::<Vec<_>>();
+    let sessions_dir = previous.join("ghostty/sessions");
+    if directory_has_entries(&sessions_dir) {
+        stale.push(sessions_dir);
+    }
+    stale
+}
+
+fn directory_has_entries(path: &Path) -> bool {
+    std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some())
+}
+
+fn check_agent_runtime_socket() -> CheckResult {
+    let socket = portl_core::paths::metrics_socket_path();
+    if socket.exists() {
+        return CheckResult {
+            name: "agent runtime",
+            status: Status::Ok,
+            detail: format!("metrics socket available at {}", socket.display()),
+        };
+    }
+    if service_is_loaded() {
+        return CheckResult {
+            name: "agent runtime",
+            status: Status::Fail,
+            detail: format!(
+                "managed portl-agent is loaded but current metrics socket is missing at {}. This usually means an old agent binary was restarted after state migrated; run the current installer or `portl-agent restart` after installing the new binary.",
+                socket.display()
+            ),
+        };
+    }
+    CheckResult {
+        name: "agent runtime",
+        status: Status::Warn,
+        detail: format!(
+            "agent service is not loaded; metrics socket absent at {}",
+            socket.display()
+        ),
+    }
+}
+
+fn service_is_loaded() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let uid_str = format!("{}", nix::unistd::getuid());
+        launchctl_is_loaded(&format!("gui/{uid_str}/com.portl.agent"))
+            || launchctl_is_loaded("system/com.portl.agent")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        systemctl_is_active(&["--user"]) || systemctl_is_active(&[])
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
+
 fn check_session_providers() -> CheckResult {
     check_session_providers_with_config(effective_session_provider_path().as_deref())
 }
@@ -891,6 +1024,35 @@ mod tests {
     fn listener_check_returns_ok_on_unrestricted_env() {
         let r = check_listener_bind();
         assert_eq!(r.status, Status::Ok, "unexpected: {}", r.detail);
+    }
+
+    #[test]
+    fn stale_legacy_durable_files_reports_only_migrated_inputs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let old = temp.path().join("old");
+        std::fs::create_dir_all(old.join("ghostty/runtime/sockets")).expect("runtime dirs");
+        std::fs::create_dir_all(old.join("ghostty/sessions")).expect("session dirs");
+        std::fs::write(old.join("ghostty/sessions/foo.json"), b"{}").expect("ghostty session");
+        std::fs::write(old.join("identity.bin"), b"id").expect("identity");
+        std::fs::write(old.join("metrics.sock"), b"runtime").expect("runtime leftover");
+
+        let stale = stale_legacy_durable_files(&old);
+
+        assert!(stale.contains(&old.join("identity.bin")));
+        assert!(stale.contains(&old.join("ghostty/sessions")));
+        assert!(!stale.contains(&old.join("metrics.sock")));
+        assert!(!stale.contains(&old.join("ghostty/runtime/sockets")));
+    }
+
+    #[test]
+    fn stale_legacy_durable_files_ignores_empty_session_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let old = temp.path().join("old");
+        std::fs::create_dir_all(old.join("ghostty/sessions")).expect("session dirs");
+
+        let stale = stale_legacy_durable_files(&old);
+
+        assert!(stale.is_empty(), "stale files were {stale:?}");
     }
 
     #[test]

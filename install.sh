@@ -283,6 +283,20 @@ do_install() {
     info "mode       : ${MODE:-preserve}"
     [ "$IS_CONTAINER" -eq 1 ] && info "container  : detected (service install will be skipped)"
 
+    local service_was_configured expected_service_running
+    service_was_configured=0
+    expected_service_running=0
+    if [ "$IS_CONTAINER" -eq 0 ] && service_configured; then
+        service_was_configured=1
+    fi
+    case "$MODE" in
+        agent) expected_service_running=1 ;;
+        "") [ "$service_was_configured" -eq 1 ] && expected_service_running=1 ;;
+    esac
+    if [ "$IS_CONTAINER" -eq 0 ] && { [ "$service_was_configured" -eq 1 ] || [ "$MODE" = "agent" ]; }; then
+        stop_existing_service_before_upgrade
+    fi
+
     local current
     current="$(installed_version || true)"
     if [ -n "$current" ] && [ "$current" = "$VER" ] && [ "$FORCE" -ne 1 ]; then
@@ -299,6 +313,7 @@ do_install() {
     ensure_in_path
     install_man_pages_best_effort
     install_completions_best_effort
+    ensure_home_layout_with_new_binary
 
     # init identity on fresh machines. Use a narrow identity probe —
     # `doctor` can fail for unrelated health issues (for example an
@@ -317,6 +332,9 @@ do_install() {
     fi
 
     apply_service_mode
+    if [ "$expected_service_running" -eq 1 ]; then
+        verify_agent_service_ready
+    fi
 
     echo
     if [ "$DRY_RUN" -eq 1 ]; then
@@ -462,6 +480,69 @@ service_configured() {
             ;;
     esac
     return 1
+}
+
+run_quiet_best_effort() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '\033[2m$ %s\033[0m\n' "$*" >&2
+        return 0
+    fi
+    "$@" >/dev/null 2>&1
+}
+
+stop_existing_service_before_upgrade() {
+    if [ "$IS_CONTAINER" -eq 1 ]; then
+        return 0
+    fi
+    info "stopping existing portl-agent service before upgrade"
+    case "$(uname -s)" in
+        Darwin)
+            local user_domain user_plist
+            user_domain="gui/$(id -u)"
+            user_plist="${HOME:-/root}/Library/LaunchAgents/com.portl.agent.plist"
+            run_quiet_best_effort launchctl bootout "$user_domain" "$user_plist" || true
+            run_quiet_best_effort launchctl bootout "${user_domain}/com.portl.agent" || true
+            if [ "$(id -u)" -eq 0 ]; then
+                run_quiet_best_effort launchctl bootout system /Library/LaunchDaemons/com.portl.agent.plist || true
+                run_quiet_best_effort launchctl bootout system/com.portl.agent || true
+            fi
+            ;;
+        Linux)
+            if has systemctl; then
+                run_quiet_best_effort systemctl --user stop portl-agent.service || true
+                if [ "$(id -u)" -eq 0 ]; then
+                    run_quiet_best_effort systemctl stop portl-agent.service || true
+                fi
+            fi
+            ;;
+    esac
+}
+
+ensure_home_layout_with_new_binary() {
+    info "ensuring Portl home layout"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        run "$INSTALL_DIR/portl" config path
+    else
+        "$INSTALL_DIR/portl" config path >/dev/null
+    fi
+}
+
+verify_agent_service_ready() {
+    info "waiting for portl-agent service readiness"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        run "$INSTALL_DIR/portl-agent" status
+        return 0
+    fi
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        if "$INSTALL_DIR/portl-agent" status >/dev/null 2>&1; then
+            ok "portl-agent service is running"
+            return 0
+        fi
+        sleep 0.5
+    done
+    "$INSTALL_DIR/portl-agent" status || true
+    err "portl-agent service did not become ready after upgrade"
 }
 
 apply_service_mode() {

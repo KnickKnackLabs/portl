@@ -1,10 +1,23 @@
 use std::path::Path;
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
 use nix::unistd::Uid;
 
 use super::InstallTarget;
+
+pub(super) fn stop_install_target(target: InstallTarget, root: bool, path: &Path) {
+    match target {
+        InstallTarget::Systemd => stop_systemd(root),
+        InstallTarget::Launchd => stop_launchd(root, path),
+        InstallTarget::Dockerfile => {}
+        InstallTarget::Openrc => {
+            let _ = ProcessCommand::new("rc-service")
+                .args(["portl-agent", "stop"])
+                .status();
+        }
+    }
+}
 
 pub(super) fn apply_install_target(target: InstallTarget, root: bool, path: &Path) -> Result<()> {
     match target {
@@ -19,6 +32,15 @@ pub(super) fn apply_install_target(target: InstallTarget, root: bool, path: &Pat
         }
         InstallTarget::Openrc => apply_openrc(path),
     }
+}
+
+fn stop_systemd(root: bool) {
+    let args = user_scoped_systemd_args(root);
+    let _ = ProcessCommand::new("systemctl")
+        .args(append_args(args, &["stop", "portl-agent.service"]))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 pub(super) fn apply_systemd(root: bool, _path: &Path) -> Result<()> {
@@ -47,6 +69,26 @@ pub(super) fn apply_systemd(root: bool, _path: &Path) -> Result<()> {
     run_checked("journalctl", &journal_args)
 }
 
+fn stop_launchd(root: bool, path: &Path) {
+    let domain = if root {
+        "system".to_owned()
+    } else {
+        format!("gui/{}", Uid::effective().as_raw())
+    };
+    if let Some(path_str) = path.to_str() {
+        let _ = ProcessCommand::new("launchctl")
+            .args(["bootout", &domain, path_str])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = ProcessCommand::new("launchctl")
+        .args(["bootout", &format!("{domain}/com.portl.agent")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 pub(super) fn apply_launchd(root: bool, path: &Path) -> Result<()> {
     let domain = if root {
         "system".to_owned()
@@ -56,16 +98,13 @@ pub(super) fn apply_launchd(root: bool, path: &Path) -> Result<()> {
     let path_str = path
         .to_str()
         .ok_or_else(|| anyhow!("launchd path is not valid UTF-8: {}", path.display()))?;
-    let _ = run_checked("launchctl", &["bootout", &domain, path_str]);
+    stop_launchd(root, path);
     run_checked("launchctl", &["bootstrap", &domain, path_str])?;
     run_checked(
         "launchctl",
         &["kickstart", "-k", &format!("{domain}/com.portl.agent")],
     )?;
-    run_checked(
-        "launchctl",
-        &["print", &format!("{domain}/com.portl.agent")],
-    )
+    Ok(())
 }
 
 pub(super) fn apply_openrc(_path: &Path) -> Result<()> {
