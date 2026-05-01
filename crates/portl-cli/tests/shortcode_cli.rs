@@ -20,7 +20,7 @@ fn accept_invite_still_parses() {
             yes: false,
             label: None,
             rendezvous_url: None,
-            timeout: std::time::Duration::from_secs(600),
+            timeout: std::time::Duration::from_mins(10),
         }
     );
 }
@@ -34,7 +34,7 @@ fn accept_short_code_parses() {
             yes: false,
             label: None,
             rendezvous_url: None,
-            timeout: std::time::Duration::from_secs(600),
+            timeout: std::time::Duration::from_mins(10),
         }
     );
 }

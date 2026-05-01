@@ -5,6 +5,29 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.8.0 — 2026-05-01
+
+### Added
+
+- Native `ghostty` persistent sessions are now available in release builds.
+  The provider is backed by `libghostty-vt`, becomes the default when built,
+  and supports session listing, attach/create, command runs, history, kill,
+  and provider-qualified refs alongside the existing `zmx` and `tmux`
+  providers.
+- Ghostty sessions use detached same-binary helper processes, so sessions can
+  survive CLI or agent restarts while keeping Portl's share-compatible session
+  metadata.
+- Linux release validation now builds static Ghostty-enabled musl binaries for
+  both x86_64 and aarch64 and exercises the provider in Docker/OrbStack
+  containers.
+
+### Changed
+
+- The minimum supported Rust version is now 1.93 to match the Ghostty VT
+  dependency stack.
+- Slow-task metrics now count only tasks that actually cross the slow-task
+  warning threshold.
+
 ## 0.7.8 — 2026-05-01
 
 ### Fixed

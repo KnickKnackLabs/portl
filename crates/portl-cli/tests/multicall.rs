@@ -125,7 +125,7 @@ fn global_verbose_flags_do_not_change_command_shape() {
             yes: false,
             label: None,
             rendezvous_url: None,
-            timeout: std::time::Duration::from_secs(600),
+            timeout: std::time::Duration::from_mins(10),
         }
     );
 

@@ -170,7 +170,7 @@ fn invite_accept_surface_matches_spec() {
             yes: true,
             label: None,
             rendezvous_url: None,
-            timeout: std::time::Duration::from_secs(600),
+            timeout: std::time::Duration::from_mins(10),
         }
     );
     assert_eq!(
@@ -180,7 +180,7 @@ fn invite_accept_surface_matches_spec() {
             yes: true,
             label: None,
             rendezvous_url: None,
-            timeout: std::time::Duration::from_secs(600),
+            timeout: std::time::Duration::from_mins(10),
         }
     );
 
@@ -516,8 +516,8 @@ fn session_share_parses_full_option_set() {
             assert_eq!(target.as_deref(), Some("shared-box"));
             assert_eq!(session, "dev");
             assert_eq!(provider.as_deref(), Some("zmx"));
-            assert_eq!(ttl, std::time::Duration::from_secs(300));
-            assert_eq!(access_ttl, std::time::Duration::from_secs(1_800));
+            assert_eq!(ttl, std::time::Duration::from_mins(5));
+            assert_eq!(access_ttl, std::time::Duration::from_mins(30));
             assert_eq!(label.as_deref(), Some("alice-laptop"));
             assert_eq!(
                 rendezvous_url.as_deref(),

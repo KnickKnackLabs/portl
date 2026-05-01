@@ -1913,7 +1913,7 @@ fn trust_into_command(action: TrustTopLevel) -> Command {
             yes,
             label: None,
             rendezvous_url: None,
-            timeout: std::time::Duration::from_secs(600),
+            timeout: std::time::Duration::from_mins(10),
         },
     }
 }

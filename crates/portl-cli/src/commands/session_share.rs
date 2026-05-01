@@ -52,7 +52,7 @@ pub(crate) const DEFAULT_RENDEZVOUS_URL: &str = "ws://relay.magic-wormhole.io:40
 /// Hard cap on bearer-fallback ticket TTL. Bearer tickets are
 /// uncountersigned by recipient identity, so they remain useful only
 /// long enough to bridge the immediate rendezvous.
-pub(crate) const BEARER_FALLBACK_MAX_TTL: Duration = Duration::from_secs(600);
+pub(crate) const BEARER_FALLBACK_MAX_TTL: Duration = Duration::from_mins(10);
 
 /// Resolved-target form supported by `portl session share`.
 ///
@@ -641,12 +641,12 @@ mod tests {
             workspace_id: "ws_abc".into(),
             conflict_handle: "1111".into(),
             now_unix: 1_000,
-            access_ttl: Duration::from_secs(7_200),
+            access_ttl: Duration::from_hours(2),
             allow_bearer_fallback: false,
         };
         let built = build_session_share_envelope(inputs).unwrap();
         assert!(built.bound_to_recipient);
-        assert_eq!(built.effective_access_ttl, Duration::from_secs(7_200));
+        assert_eq!(built.effective_access_ttl, Duration::from_hours(2));
         // Parse the embedded ticket and confirm the `to` field matches
         // the recipient hello.
         let portl_core::rendezvous::exchange::ExchangePayload::SessionShare(payload) =
@@ -670,7 +670,7 @@ mod tests {
             workspace_id: "ws_abc".into(),
             conflict_handle: "1111".into(),
             now_unix: 1_000,
-            access_ttl: Duration::from_secs(7_200),
+            access_ttl: Duration::from_hours(2),
             allow_bearer_fallback: false,
         };
         let err = build_session_share_envelope(inputs).unwrap_err();
@@ -692,7 +692,7 @@ mod tests {
             workspace_id: "ws_abc".into(),
             conflict_handle: "1111".into(),
             now_unix: 1_000,
-            access_ttl: Duration::from_secs(7_200),
+            access_ttl: Duration::from_hours(2),
             allow_bearer_fallback: true,
         };
         let built = build_session_share_envelope(inputs).unwrap();
@@ -726,11 +726,11 @@ mod tests {
             workspace_id: "ws_abc".into(),
             conflict_handle: "1111".into(),
             now_unix: 1_000,
-            access_ttl: Duration::from_secs(60),
+            access_ttl: Duration::from_mins(1),
             allow_bearer_fallback: true,
         };
         let built = build_session_share_envelope(inputs).unwrap();
-        assert_eq!(built.effective_access_ttl, Duration::from_secs(60));
+        assert_eq!(built.effective_access_ttl, Duration::from_mins(1));
     }
 
     #[test]
