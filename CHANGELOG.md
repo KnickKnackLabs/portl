@@ -5,6 +5,8 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.7.8 — 2026-05-01
+
 ### Fixed
 
 - Local `tmux` attaches now run the tmux control client behind a real PTY,
