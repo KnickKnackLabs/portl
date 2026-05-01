@@ -107,9 +107,10 @@ async fn push_to_peer(
     endpoint: &iroh::Endpoint,
     items: &[Vec<u8>],
 ) -> Result<(u32, Vec<(Vec<u8>, String)>)> {
+    let quiet = false;
     let connected = timeout(
         PUBLISH_TIMEOUT,
-        connect_peer_with_endpoint(peer, publish_meta_caps(), identity, endpoint),
+        connect_peer_with_endpoint(peer, publish_meta_caps(), identity, endpoint, quiet),
     )
     .await
     .with_context(|| format!("ticket handshake to {peer} timed out"))??;

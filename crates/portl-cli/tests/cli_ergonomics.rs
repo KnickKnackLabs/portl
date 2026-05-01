@@ -328,8 +328,18 @@ fn session_surface_matches_spec() {
     assert_eq!(
         parse_args(&["session", "ls", "--target", "dev", "--provider", "zmx"]).expect("parse"),
         ParsedCommand::SessionLs {
+            target_ref: None,
             target: Some("dev".to_owned()),
             provider: Some("zmx".to_owned()),
+            json: false,
+        }
+    );
+    assert_eq!(
+        parse_args(&["session", "ls", "max/tmux"]).expect("parse"),
+        ParsedCommand::SessionLs {
+            target_ref: Some("max/tmux".to_owned()),
+            target: None,
+            provider: None,
             json: false,
         }
     );
@@ -422,7 +432,26 @@ fn top_level_session_aliases_parse_like_session_subcommands() {
     assert_eq!(
         parse_args(&["ls", "--target", "max"]).expect("parse"),
         ParsedCommand::SessionLs {
+            target_ref: None,
             target: Some("max".to_owned()),
+            provider: None,
+            json: false,
+        }
+    );
+    assert_eq!(
+        parse_args(&["ls", "max"]).expect("parse"),
+        ParsedCommand::SessionLs {
+            target_ref: Some("max".to_owned()),
+            target: None,
+            provider: None,
+            json: false,
+        }
+    );
+    assert_eq!(
+        parse_args(&["ls", "max/tmux"]).expect("parse"),
+        ParsedCommand::SessionLs {
+            target_ref: Some("max/tmux".to_owned()),
+            target: None,
             provider: None,
             json: false,
         }

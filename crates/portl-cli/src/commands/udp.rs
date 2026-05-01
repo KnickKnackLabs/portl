@@ -42,11 +42,13 @@ pub fn run(peer: &str, specs: &[String]) -> Result<ExitCode> {
                         return Ok::<_, anyhow::Error>(());
                     }
 
+                    let quiet = false;
                     let connected = match connect_peer_with_endpoint(
                         &peer,
                         udp_caps(),
                         &identity,
                         &endpoint,
+                        quiet,
                     )
                     .await {
                         Ok(connected) => connected,

@@ -328,6 +328,7 @@ async fn run_with_endpoint(
             force_relay: relay,
             identity: &identity,
             endpoint: &raw_endpoint,
+            quiet: false,
         },
     )
     .await?;

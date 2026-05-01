@@ -100,6 +100,7 @@ pub enum Command {
         argv: Vec<String>,
     },
     SessionLs {
+        target_ref: Option<String>,
         target: Option<String>,
         provider: Option<String>,
         json: bool,
@@ -751,10 +752,16 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             &argv,
         ),
         Command::SessionLs {
+            target_ref,
             target,
             provider,
             json,
-        } => commands::session::ls(target.as_deref(), provider.as_deref(), json),
+        } => commands::session::ls(
+            target_ref.as_deref(),
+            target.as_deref(),
+            provider.as_deref(),
+            json,
+        ),
         Command::SessionRun {
             target,
             session,
@@ -1384,6 +1391,9 @@ enum SessionTopLevel {
     /// List persistent sessions.
     #[command(display_order = 102)]
     Ls {
+        /// Optional target/provider shorthand, e.g. `max` or `max/tmux`.
+        #[arg(value_name = "TARGET_REF")]
+        target_ref: Option<String>,
         /// Explicit remote target. Defaults to `PORTL_TARGET`, then local.
         #[arg(long, help = TARGET_HELP)]
         target: Option<String>,
@@ -1572,6 +1582,9 @@ enum SessionAction {
     },
     /// List persistent sessions.
     Ls {
+        /// Optional target/provider shorthand, e.g. `max` or `max/tmux`.
+        #[arg(value_name = "TARGET_REF")]
+        target_ref: Option<String>,
         /// Explicit remote target. Defaults to `PORTL_TARGET`, then local.
         #[arg(long, help = TARGET_HELP)]
         target: Option<String>,
@@ -2157,10 +2170,12 @@ fn session_top_level_into_command(action: SessionTopLevel) -> Command {
             argv,
         },
         SessionTopLevel::Ls {
+            target_ref,
             target,
             provider,
             json,
         } => Command::SessionLs {
+            target_ref,
             target,
             provider,
             json: json || env_flag("PORTL_JSON"),
@@ -2212,10 +2227,12 @@ fn session_action_into_command(action: SessionAction) -> Command {
             argv,
         },
         SessionAction::Ls {
+            target_ref,
             target,
             provider,
             json,
         } => Command::SessionLs {
+            target_ref,
             target,
             provider,
             json: json || env_flag("PORTL_JSON"),

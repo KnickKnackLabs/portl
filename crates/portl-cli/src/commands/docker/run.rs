@@ -175,6 +175,7 @@ pub(super) async fn finalize_connectable_ticket(
                     force_relay: false,
                     identity: operator,
                     endpoint: &endpoint,
+                    quiet: false,
                 },
             )
             .await

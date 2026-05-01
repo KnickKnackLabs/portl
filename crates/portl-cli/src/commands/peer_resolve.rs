@@ -91,6 +91,7 @@ pub(crate) struct ResolveOpts<'a> {
     pub(crate) force_relay: bool,
     pub(crate) identity: &'a Identity,
     pub(crate) endpoint: &'a iroh::Endpoint,
+    pub(crate) quiet: bool,
 }
 
 pub(crate) struct ConnectedPeer {
@@ -107,10 +108,22 @@ pub(crate) fn resolve_identity_path(explicit: Option<&Path>) -> PathBuf {
 }
 
 pub(crate) async fn connect_peer(peer: &str, caps: Capabilities) -> Result<ConnectedPeer> {
+    connect_peer_with_reporting(peer, caps, false).await
+}
+
+pub(crate) async fn connect_peer_quiet(peer: &str, caps: Capabilities) -> Result<ConnectedPeer> {
+    connect_peer_with_reporting(peer, caps, true).await
+}
+
+async fn connect_peer_with_reporting(
+    peer: &str,
+    caps: Capabilities,
+    quiet: bool,
+) -> Result<ConnectedPeer> {
     let identity_path = resolve_identity_path(None);
     let identity = store::load(&identity_path).context("load local identity")?;
     let endpoint = bind_client_endpoint(&identity).await?;
-    match connect_peer_with_endpoint(peer, caps, &identity, &endpoint).await {
+    match connect_peer_with_endpoint(peer, caps, &identity, &endpoint, quiet).await {
         Ok(connected) => Ok(connected),
         Err(err) => {
             close_client_endpoint(endpoint, "connect failure").await;
@@ -147,6 +160,7 @@ pub(crate) async fn connect_peer_with_endpoint(
     caps: Capabilities,
     identity: &Identity,
     endpoint: &iroh::Endpoint,
+    quiet: bool,
 ) -> Result<ConnectedPeer> {
     let endpoint_wrapper = Endpoint::from(endpoint.clone());
     let resolved = resolve_peer(
@@ -156,6 +170,7 @@ pub(crate) async fn connect_peer_with_endpoint(
             force_relay: false,
             identity,
             endpoint,
+            quiet,
         },
     )
     .await?;
@@ -183,7 +198,9 @@ pub(crate) async fn resolve_peer(peer: &str, opts: &ResolveOpts<'_>) -> Result<R
                  or pass --chain"
             );
         }
-        eprintln!("using inline ticket");
+        if !opts.quiet {
+            eprintln!("using inline ticket");
+        }
         return Ok(ResolvedPeer {
             ticket: maybe_force_relay_ticket(ticket, opts.force_relay)?,
             source: PeerSource::Inline,
@@ -217,7 +234,9 @@ pub(crate) async fn resolve_peer(peer: &str, opts: &ResolveOpts<'_>) -> Result<R
             );
         }
         if entry.they_accept_from_me {
-            eprintln!("using peer \"{peer}\"");
+            if !opts.quiet {
+                eprintln!("using peer \"{peer}\"");
+            }
             let eid = entry.endpoint_id_bytes()?;
             let endpoint_id =
                 EndpointId::from_bytes(&eid).context("peer endpoint_id is not a valid iroh id")?;
@@ -252,7 +271,9 @@ pub(crate) async fn resolve_peer(peer: &str, opts: &ResolveOpts<'_>) -> Result<R
                 ago = now - entry.expires_at
             );
         }
-        eprintln!("using ticket \"{peer}\"");
+        if !opts.quiet {
+            eprintln!("using ticket \"{peer}\"");
+        }
         let ticket = <PortlTicket as Ticket>::deserialize(&entry.ticket_string)
             .map_err(|err| anyhow!("stored ticket '{peer}' is malformed: {err}"))?;
         return Ok(ResolvedPeer {
@@ -273,7 +294,9 @@ pub(crate) async fn resolve_peer(peer: &str, opts: &ResolveOpts<'_>) -> Result<R
                 .with_context(|| format!("read stored ticket {}", ticket_path.display()))?;
             let ticket = <PortlTicket as Ticket>::deserialize(raw.trim())
                 .map_err(|err| anyhow!("parse stored ticket {}: {err}", ticket_path.display()))?;
-            eprintln!("using alias \"{peer}\" (stored ticket)");
+            if !opts.quiet {
+                eprintln!("using alias \"{peer}\" (stored ticket)");
+            }
             return Ok(ResolvedPeer {
                 ticket: maybe_force_relay_ticket(ticket, opts.force_relay)?,
                 source: PeerSource::AliasStoreTicket,
@@ -291,7 +314,9 @@ pub(crate) async fn resolve_peer(peer: &str, opts: &ResolveOpts<'_>) -> Result<R
             opts.force_relay,
         )
         .await?;
-        eprintln!("using alias \"{peer}\"");
+        if !opts.quiet {
+            eprintln!("using alias \"{peer}\"");
+        }
         let ticket = mint_fresh(opts.identity, addr, opts.caps.clone())?;
         return Ok(ResolvedPeer {
             ticket,
@@ -303,7 +328,9 @@ pub(crate) async fn resolve_peer(peer: &str, opts: &ResolveOpts<'_>) -> Result<R
     // 5) Endpoint-id token: full 64-char hex or middle-elided form.
     if let Ok(endpoint_id) = crate::eid::resolve(peer, Some(&peers), Some(&tickets)) {
         let short = crate::eid::format_short(&hex::encode(endpoint_id.as_bytes()));
-        eprintln!("using endpoint \"{short}\"");
+        if !opts.quiet {
+            eprintln!("using endpoint \"{short}\"");
+        }
         let configured_relay_hints = configured_relay_hints();
         let (addr, provenance) = resolve_endpoint_addr_with_relay_hints(
             opts.endpoint,
@@ -334,7 +361,9 @@ pub(crate) async fn resolve_peer(peer: &str, opts: &ResolveOpts<'_>) -> Result<R
             );
         }
         if entry.they_accept_from_me {
-            eprintln!("using peer \"{peer_label}\"");
+            if !opts.quiet {
+                eprintln!("using peer \"{peer_label}\"");
+            }
             let eid = entry.endpoint_id_bytes()?;
             let endpoint_id =
                 EndpointId::from_bytes(&eid).context("peer endpoint_id is not a valid iroh id")?;

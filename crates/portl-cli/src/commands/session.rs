@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use clap::ValueEnum;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use iroh::endpoint::SendStream;
 use portl_core::attach_control::{
     RenderBarOptions, fit_visible, is_ctrl_backslash_sequence, render_bar,
@@ -27,7 +28,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
 use tracing::debug;
 
-use crate::commands::peer_resolve::{close_connected, connect_peer};
+use crate::commands::peer_resolve::{close_connected, connect_peer, connect_peer_quiet};
 use crate::commands::session_share::{
     BuiltEnvelope, EnvelopeInputs, ResolveTargetError, ShareTargetForm,
     build_session_share_envelope, classify_share_target, fresh_workspace_handles, load_identity,
@@ -248,9 +249,15 @@ pub fn providers(target: Option<&str>, json: bool) -> Result<ExitCode> {
     result
 }
 
-pub fn ls(target: Option<&str>, provider: Option<&str>, json: bool) -> Result<ExitCode> {
-    let target = resolve_target_only(target)?;
-    let provider = effective_provider(provider);
+pub fn ls(
+    target_ref: Option<&str>,
+    target: Option<&str>,
+    provider: Option<&str>,
+    json: bool,
+) -> Result<ExitCode> {
+    let (target, provider) = resolve_ls_ref_filters(target_ref, target, provider)?;
+    let target = resolve_target_only(target.as_deref())?;
+    let provider = effective_provider(provider.as_deref());
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
         let groups = if resolved_target_is_local(&target)? {
@@ -276,6 +283,66 @@ pub fn ls(target: Option<&str>, provider: Option<&str>, json: bool) -> Result<Ex
     });
     runtime.shutdown_timeout(Duration::from_secs(2));
     result
+}
+
+fn resolve_ls_ref_filters(
+    target_ref: Option<&str>,
+    target: Option<&str>,
+    provider: Option<&str>,
+) -> Result<(Option<String>, Option<String>)> {
+    let peers = PeerStore::load(&PeerStore::default_path()).context("load peer store")?;
+    let tickets = TicketStore::load(&TicketStore::default_path()).context("load ticket store")?;
+    let aliases = crate::alias_store::AliasStore::default();
+    resolve_ls_ref_filters_with_stores(target_ref, target, provider, &peers, &tickets, &aliases)
+}
+
+fn resolve_ls_ref_filters_with_stores(
+    target_ref: Option<&str>,
+    target: Option<&str>,
+    provider: Option<&str>,
+    peers: &PeerStore,
+    tickets: &TicketStore,
+    aliases: &crate::alias_store::AliasStore,
+) -> Result<(Option<String>, Option<String>)> {
+    let (target_from_ref, provider_from_ref) = split_ls_ref(target_ref)?;
+    let target_from_flag = target
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    if let (Some(left), Some(right)) = (&target_from_ref, &target_from_flag) {
+        let left_target = resolve_target_hint_with_stores(left, peers, tickets, aliases)?;
+        let right_target = resolve_target_hint_with_stores(right, peers, tickets, aliases)?;
+        if !same_target(&left_target, &right_target) {
+            anyhow::bail!(
+                "conflicting session list targets: positional ref selects '{left}' but --target selects '{right}'"
+            );
+        }
+    }
+    let provider_from_flag = provider
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(normalize_session_provider)
+        .transpose()?;
+    let provider = merge_session_providers(provider_from_flag, provider_from_ref)?;
+    Ok((target_from_flag.or(target_from_ref), provider))
+}
+
+fn split_ls_ref(target_ref: Option<&str>) -> Result<(Option<String>, Option<String>)> {
+    let Some(target_ref) = target_ref.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok((None, None));
+    };
+    let parts = target_ref.split('/').map(str::trim).collect::<Vec<_>>();
+    if parts.iter().any(|part| part.is_empty()) {
+        anyhow::bail!("session list refs must use non-empty path components");
+    }
+    match parts.as_slice() {
+        [target] => Ok((Some((*target).to_owned()), None)),
+        [target, provider] => Ok((
+            Some((*target).to_owned()),
+            Some(normalize_session_provider(provider)?),
+        )),
+        _ => anyhow::bail!("session list refs must use TARGET or TARGET/PROVIDER"),
+    }
 }
 
 pub fn run(
@@ -1607,15 +1674,15 @@ pub fn attach(
     argv: &[String],
 ) -> Result<ExitCode> {
     let provider = effective_provider(provider);
-    let resolved = resolve_session_ref(session, target)?;
-    let provider = merge_session_providers(provider, resolved.provider.clone())?;
-    let (session_name, provider_name) = attach_session_defaults(
-        &resolved.target,
-        Some(&resolved.session),
-        provider.as_deref(),
-    )?;
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
+        let resolved = resolve_attach_session_ref(session, target, provider.as_deref()).await?;
+        let provider = merge_session_providers(provider, resolved.provider.clone())?;
+        let (session_name, provider_name) = attach_session_defaults(
+            &resolved.target,
+            Some(&resolved.session),
+            provider.as_deref(),
+        )?;
         if resolved_target_is_local(&resolved.target)? {
             return local_session_attach(
                 provider_name.as_deref(),
@@ -1691,22 +1758,206 @@ fn resolve_target_only(target: Option<&str>) -> Result<String> {
     local_target_label()
 }
 
+async fn resolve_attach_session_ref(
+    session_ref: Option<&str>,
+    target: Option<&str>,
+    provider: Option<&str>,
+) -> Result<ResolvedSessionRef> {
+    let env = env_target();
+    if should_discover_bare_attach(session_ref, target, provider, env.as_deref()) {
+        let peers = PeerStore::load(&PeerStore::default_path()).context("load peer store")?;
+        let tickets =
+            TicketStore::load(&TicketStore::default_path()).context("load ticket store")?;
+        let aliases = crate::alias_store::AliasStore::default();
+        if let Some(session_ref) = session_ref
+            && tickets
+                .get(session_ref)
+                .and_then(|entry| entry.session_share.as_ref())
+                .is_some()
+        {
+            return resolve_session_ref_with_stores(
+                Some(session_ref),
+                target,
+                env.as_deref(),
+                &peers,
+                &tickets,
+                &aliases,
+            );
+        }
+        let targets = session_discovery_targets(&peers, &tickets)?;
+        let groups_by_target = discover_session_groups_for_targets(&targets).await;
+        if let Some(session) = session_ref
+            && let Some(resolved) = resolve_existing_session_match(session, &groups_by_target)?
+        {
+            return Ok(resolved);
+        }
+        return resolve_session_ref_with_stores(
+            session_ref,
+            target,
+            env.as_deref(),
+            &peers,
+            &tickets,
+            &aliases,
+        );
+    }
+    resolve_session_ref_with_env(session_ref, target, env.as_deref())
+}
+
+fn should_discover_bare_attach(
+    session_ref: Option<&str>,
+    target: Option<&str>,
+    provider: Option<&str>,
+    env_target: Option<&str>,
+) -> bool {
+    if target.map(str::trim).is_some_and(|value| !value.is_empty())
+        || provider.is_some()
+        || env_target.is_some()
+    {
+        return false;
+    }
+    session_ref
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|value| !value.contains('/'))
+}
+
+fn session_discovery_targets(peers: &PeerStore, tickets: &TicketStore) -> Result<Vec<String>> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut targets = Vec::new();
+    push_discovery_target(&mut targets, &mut seen, local_target_label()?);
+    for entry in peers.iter() {
+        if entry.last_hold_at.is_none() && (entry.they_accept_from_me || entry.is_self) {
+            push_discovery_target(&mut targets, &mut seen, entry.label.clone());
+        }
+    }
+    for (label, entry) in tickets.iter() {
+        if entry.session_share.is_none() {
+            push_discovery_target(&mut targets, &mut seen, label.clone());
+        }
+    }
+    Ok(targets)
+}
+
+fn push_discovery_target(
+    targets: &mut Vec<String>,
+    seen: &mut std::collections::BTreeSet<String>,
+    target: String,
+) {
+    if seen.insert(target.clone()) {
+        targets.push(target);
+    }
+}
+
+async fn discover_session_groups_for_targets(
+    targets: &[String],
+) -> Vec<(String, Vec<SessionProviderSessions>)> {
+    let mut pending = FuturesUnordered::new();
+    for target in targets {
+        pending.push(discover_session_groups_for_target(target.clone()));
+    }
+    let mut groups_by_target = Vec::new();
+    while let Some(result) = pending.next().await {
+        if let Some(result) = result {
+            groups_by_target.push(result);
+        }
+    }
+    groups_by_target
+}
+
+async fn discover_session_groups_for_target(
+    target: String,
+) -> Option<(String, Vec<SessionProviderSessions>)> {
+    let list = async {
+        if resolved_target_is_local(&target)? {
+            local_session_list_detailed(None).await
+        } else {
+            let connected = connect_peer_quiet(&target, session_caps()).await?;
+            let groups =
+                open_session_list_detailed(&connected.connection, &connected.session, None).await?;
+            close_connected(connected, b"session complete").await;
+            Ok(groups)
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(2), list).await {
+        Ok(Ok(groups)) => Some((target, groups)),
+        Ok(Err(err)) => {
+            debug!(target, error = %err, "skip session discovery target");
+            None
+        }
+        Err(_) => {
+            debug!(target, "skip timed-out session discovery target");
+            None
+        }
+    }
+}
+
+fn resolve_existing_session_match(
+    session: &str,
+    groups_by_target: &[(String, Vec<SessionProviderSessions>)],
+) -> Result<Option<ResolvedSessionRef>> {
+    let tmux_lookup = session.split_once(':').map_or(session, |(name, _)| name);
+    let mut matches: Vec<ResolvedSessionRef> = Vec::new();
+    for (target, groups) in groups_by_target {
+        for group in groups.iter().filter(|group| group.available) {
+            let found = group.sessions.iter().any(|entry| {
+                if group.provider == "tmux" {
+                    entry.name == tmux_lookup
+                } else {
+                    entry.name == session
+                }
+            });
+            if found {
+                let candidate = ResolvedSessionRef {
+                    target: target.clone(),
+                    provider: Some(group.provider.clone()),
+                    session: session.to_owned(),
+                };
+                if !matches.contains(&candidate) {
+                    matches.push(candidate);
+                }
+            }
+        }
+    }
+
+    match matches.as_slice() {
+        [] => Ok(None),
+        [resolved] => Ok(Some(resolved.clone())),
+        many => {
+            let refs = many
+                .iter()
+                .map(|item| {
+                    canonical_session_ref(
+                        &item.target,
+                        item.provider.as_deref().unwrap_or("unknown"),
+                        &item.session,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n  ");
+            anyhow::bail!(
+                "ambiguous session name '{session}'\n\nMatches:\n  {refs}\n\nRerun with HOST/PROVIDER/SESSION."
+            )
+        }
+    }
+}
+
 fn resolve_session_ref(
     session_ref: Option<&str>,
     target: Option<&str>,
 ) -> Result<ResolvedSessionRef> {
+    let env = env_target();
+    resolve_session_ref_with_env(session_ref, target, env.as_deref())
+}
+
+fn resolve_session_ref_with_env(
+    session_ref: Option<&str>,
+    target: Option<&str>,
+    env: Option<&str>,
+) -> Result<ResolvedSessionRef> {
     let peers = PeerStore::load(&PeerStore::default_path()).context("load peer store")?;
     let tickets = TicketStore::load(&TicketStore::default_path()).context("load ticket store")?;
     let aliases = crate::alias_store::AliasStore::default();
-    let env = env_target();
-    resolve_session_ref_with_stores(
-        session_ref,
-        target,
-        env.as_deref(),
-        &peers,
-        &tickets,
-        &aliases,
-    )
+    resolve_session_ref_with_stores(session_ref, target, env, &peers, &tickets, &aliases)
 }
 
 fn resolve_session_ref_with_stores(
@@ -3116,6 +3367,189 @@ mod tests {
         );
         assert_eq!(effective_provider_from_env(None, Some("  ")), None);
         assert_eq!(effective_provider_from_env(None, None), None);
+    }
+
+    fn test_session_group(provider: &str, names: &[&str]) -> SessionProviderSessions {
+        SessionProviderSessions {
+            provider: provider.to_owned(),
+            available: true,
+            default: false,
+            sessions: names
+                .iter()
+                .map(|name| SessionInfo {
+                    name: (*name).to_owned(),
+                    provider: provider.to_owned(),
+                    metadata: BTreeMap::new(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn ls_ref_target_and_provider_prefixes() {
+        let fixture = seed_peer_and_share();
+        assert_eq!(
+            resolve_ls_ref_filters_with_stores(
+                Some("max"),
+                None,
+                None,
+                &fixture.peers,
+                &fixture.tickets,
+                &fixture.aliases,
+            )
+            .unwrap(),
+            (Some("max".to_owned()), None)
+        );
+        assert_eq!(
+            resolve_ls_ref_filters_with_stores(
+                Some("max/t"),
+                None,
+                None,
+                &fixture.peers,
+                &fixture.tickets,
+                &fixture.aliases,
+            )
+            .unwrap(),
+            (Some("max".to_owned()), Some("tmux".to_owned()))
+        );
+        assert_eq!(
+            resolve_ls_ref_filters_with_stores(
+                Some("max/zmx"),
+                None,
+                None,
+                &fixture.peers,
+                &fixture.tickets,
+                &fixture.aliases,
+            )
+            .unwrap(),
+            (Some("max".to_owned()), Some("zmx".to_owned()))
+        );
+    }
+
+    #[test]
+    fn ls_ref_accepts_equivalent_target_shorthand_and_flag() {
+        let fixture = seed_peer_and_share();
+        assert_eq!(
+            resolve_ls_ref_filters_with_stores(
+                Some("max"),
+                Some("max-b265"),
+                None,
+                &fixture.peers,
+                &fixture.tickets,
+                &fixture.aliases,
+            )
+            .unwrap(),
+            (Some("max-b265".to_owned()), None)
+        );
+    }
+
+    #[test]
+    fn ls_ref_rejects_conflicting_filters() {
+        let mut fixture = seed_peer_and_share();
+        fixture
+            .peers
+            .insert_or_update(PeerEntry {
+                label: "onyx-7310".to_owned(),
+                endpoint_id_hex: hex::encode([0x31; 32]),
+                accepts_from_them: true,
+                they_accept_from_me: true,
+                since: 1,
+                origin: PeerOrigin::Paired,
+                last_hold_at: None,
+                is_self: false,
+                relay_hint: None,
+                schema_version: PeerEntry::default_schema_version(),
+            })
+            .unwrap();
+        let target_err = resolve_ls_ref_filters_with_stores(
+            Some("max"),
+            Some("onyx"),
+            None,
+            &fixture.peers,
+            &fixture.tickets,
+            &fixture.aliases,
+        )
+        .unwrap_err();
+        assert!(
+            target_err
+                .to_string()
+                .contains("conflicting session list targets")
+        );
+
+        let provider_err = resolve_ls_ref_filters_with_stores(
+            Some("max/tmux"),
+            None,
+            Some("zmx"),
+            &fixture.peers,
+            &fixture.tickets,
+            &fixture.aliases,
+        )
+        .unwrap_err();
+        assert!(
+            provider_err
+                .to_string()
+                .contains("conflicting session providers")
+        );
+    }
+
+    #[test]
+    fn bare_attach_match_selects_unique_provider_qualified_session() {
+        let resolved = resolve_existing_session_match(
+            "session2",
+            &[
+                (
+                    "machine-a".to_owned(),
+                    vec![test_session_group("zmx", &["session2"])],
+                ),
+                (
+                    "machine-b".to_owned(),
+                    vec![test_session_group("tmux", &["other"])],
+                ),
+            ],
+        )
+        .unwrap()
+        .expect("unique match");
+
+        assert_eq!(resolved.target, "machine-a");
+        assert_eq!(resolved.provider.as_deref(), Some("zmx"));
+        assert_eq!(resolved.session, "session2");
+    }
+
+    #[test]
+    fn bare_attach_match_reports_ambiguous_targets_and_providers() {
+        let err = resolve_existing_session_match(
+            "session2",
+            &[
+                (
+                    "machine-a".to_owned(),
+                    vec![test_session_group("zmx", &["session2"])],
+                ),
+                (
+                    "machine-b".to_owned(),
+                    vec![test_session_group("tmux", &["session2"])],
+                ),
+            ],
+        )
+        .unwrap_err();
+
+        let text = err.to_string();
+        assert!(text.contains("ambiguous session name 'session2'"), "{text}");
+        assert!(text.contains("machine-a/zmx/session2"), "{text}");
+        assert!(text.contains("machine-b/tmux/session2"), "{text}");
+    }
+
+    #[test]
+    fn bare_attach_match_returns_none_for_missing_session() {
+        let resolved = resolve_existing_session_match(
+            "missing",
+            &[(
+                "machine-a".to_owned(),
+                vec![test_session_group("zmx", &["other"])],
+            )],
+        )
+        .unwrap();
+
+        assert!(resolved.is_none());
     }
 
     #[test]

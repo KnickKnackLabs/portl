@@ -190,14 +190,34 @@ fn check_identity() -> CheckResult {
                 detail,
             }
         }
-        Err(err) => CheckResult {
-            name: "identity",
-            status: Status::Fail,
-            detail: format!(
-                "cannot load identity at {}: {err}; run `portl init`",
-                path.display()
-            ),
-        },
+        Err(err) => {
+            let legacy_path = portl_core::paths::current().root().join("identity.bin");
+            if legacy_path != path
+                && let Ok(id) = store::load(&legacy_path)
+            {
+                let endpoint = hex::encode(id.verifying_key());
+                return CheckResult {
+                    name: "identity",
+                    status: Status::Warn,
+                    detail: format!(
+                        "endpoint_id={endpoint} at legacy path {}; run `portl config path` after stopping any old agent to migrate it",
+                        legacy_path.display()
+                    ),
+                };
+            }
+            CheckResult {
+                name: "identity",
+                status: if portl_core::paths::home_is_explicit() {
+                    Status::Warn
+                } else {
+                    Status::Fail
+                },
+                detail: format!(
+                    "cannot load identity at {}: {err}; run `portl init`",
+                    path.display()
+                ),
+            }
+        }
     }
 }
 
@@ -627,9 +647,10 @@ fn check_home_layout() -> CheckResult {
         };
     }
     if !stale.is_empty() {
+        let explicit = portl_core::paths::home_is_explicit();
         return CheckResult {
             name: "home layout",
-            status: Status::Fail,
+            status: if explicit { Status::Warn } else { Status::Fail },
             detail: format!(
                 "new home {} has no identity but previous durable state exists: {}. Run the current installer so it can stop any old agent, install the new binary, migrate state, and restart safely; or stop the agent first and run `portl config path` manually.",
                 current.root().display(),
@@ -712,7 +733,7 @@ fn check_agent_runtime_socket() -> CheckResult {
                 status.agent.version
             ),
         },
-        Err(err) if service_is_loaded() => CheckResult {
+        Err(err) if service_is_loaded() && !portl_core::paths::home_is_explicit() => CheckResult {
             name: "agent runtime",
             status: Status::Fail,
             detail: format!(
