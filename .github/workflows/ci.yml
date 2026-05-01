@@ -155,7 +155,7 @@ jobs:
       - name: Install Zig for Ghostty static smoke
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.1
+          version: 0.15.2
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
@@ -189,7 +189,7 @@ jobs:
       - name: Install Zig for Ghostty musl static smoke
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.1
+          version: 0.15.2
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-zigbuild
