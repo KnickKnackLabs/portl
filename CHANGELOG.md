@@ -5,6 +5,15 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Fixed
+
+- Local `tmux` attaches now run the tmux control client behind a real PTY,
+  avoiding immediate disconnects with `tcgetattr failed: Inappropriate ioctl
+  for device`.
+- Attach control bars now stay usable over fullscreen TUIs by briefly holding
+  incoming output while `Ctrl+\\` control mode is active, then replaying it
+  after the bar clears.
+
 ## 0.7.7 — 2026-05-01
 
 ### Added

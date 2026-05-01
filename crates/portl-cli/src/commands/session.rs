@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::IsTerminal;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::{ExitCode, Stdio};
 use std::sync::Arc;
@@ -37,6 +39,7 @@ use portl_core::ticket_store::TicketStore;
 use portl_proto::session_v1::{
     ProviderCapabilities, ProviderReport, ProviderStatus, SessionInfo, SessionProviderSessions,
 };
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SessionHistoryFormat {
@@ -1135,31 +1138,30 @@ async fn local_tmux_control_attach(
     eprintln!("portl: using local session provider tmux");
     eprintln!("portl: attaching to local session \"{canonical_ref}\"");
     let initial_viewport = local_tmux_viewport_snapshot(&path, session).await.ok();
-    let mut command = Command::new(path);
-    command.kill_on_drop(true);
-    command
-        .args(["-CC", "new-session", "-A", "-s", tmux_session])
-        .arg("-x")
-        .arg(cols.to_string())
-        .arg("-y")
-        .arg(rows.to_string())
-        .args(argv)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(cwd) = cwd {
-        command.current_dir(cwd);
-    }
-    let mut child = command.spawn().context("spawn tmux -CC attach")?;
-    let mut stdin = child.stdin.take().context("missing tmux -CC stdin")?;
-    if session != tmux_session {
-        stdin
-            .write_all(format!("switch-client -t {session}\n").as_bytes())
-            .await
-            .context("switch tmux -CC target")?;
-    }
-    let mut stdout = child.stdout.take().context("missing tmux -CC stdout")?;
-    let mut stderr = child.stderr.take().context("missing tmux -CC stderr")?;
+    let mut tmux_args = vec![
+        "-CC".to_owned(),
+        "new-session".to_owned(),
+        "-A".to_owned(),
+        "-s".to_owned(),
+        tmux_session.to_owned(),
+        "-x".to_owned(),
+        cols.to_string(),
+        "-y".to_owned(),
+        rows.to_string(),
+    ];
+    tmux_args.extend(argv.iter().cloned());
+    let winsize = nix::libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let program = path
+        .to_str()
+        .ok_or_else(|| anyhow!("tmux path is not valid UTF-8"))?;
+    let (master, mut child) =
+        spawn_local_pty_blocking(program, &tmux_args, winsize, Vec::new(), cwd)
+            .context("spawn tmux -CC attach pty")?;
 
     let raw_guard = if std::io::stdin().is_terminal() {
         Some(RawModeGuard::new()?)
@@ -1172,9 +1174,17 @@ async fn local_tmux_control_attach(
             .write_output(AttachOutputStream::Stdout, &initial_viewport)
             .await?;
     }
+    let (tmux_pty_tx, tmux_pty_rx) = mpsc::unbounded_channel();
+    if session != tmux_session {
+        tmux_pty_tx
+            .send(format!("switch-client -t {session}\n").into_bytes())
+            .context("queue tmux -CC target switch")?;
+    }
     let stdin_task = maybe_spawn_stdin_task(
         AttachInputSink {
-            kind: AttachInputSinkKind::Tmux { stdin },
+            kind: AttachInputSinkKind::TmuxPty {
+                tx: tmux_pty_tx.clone(),
+            },
         },
         AttachControlUi {
             canonical_ref: canonical_ref.clone(),
@@ -1184,22 +1194,16 @@ async fn local_tmux_control_attach(
     )
     .await?;
     let stdout_display = display.clone();
-    let stdout_task =
-        tokio::spawn(async move { copy_tmux_control_output(&mut stdout, &stdout_display).await });
-    let stderr_display = display.clone();
-    let stderr_task = tokio::spawn(async move {
-        copy_remote_output(&mut stderr, &stderr_display, AttachOutputStream::Stderr).await
+    let stdout_task = tokio::spawn(async move {
+        pump_local_tmux_control_pty(master, &stdout_display, tmux_pty_rx).await
     });
     let (code, detached) = wait_local_attach_completion(&mut child, stdin_task).await?;
     if detached {
         reap_local_child_after_detach(&mut child).await;
         stdout_task.abort();
-        stderr_task.abort();
         let _ = stdout_task.await;
-        let _ = stderr_task.await;
     } else {
         await_output_task(stdout_task, "stdout").await?;
-        await_output_task(stderr_task, "stderr").await?;
     }
     display.clear_bar().await?;
     drop(raw_guard);
@@ -2047,48 +2051,164 @@ where
     }
 }
 
-async fn copy_tmux_control_output<R>(recv: &mut R, display: &AttachDisplay) -> Result<()>
-where
-    R: AsyncRead + Unpin,
-{
+#[cfg(unix)]
+async fn pump_local_tmux_control_pty(
+    master: OwnedFd,
+    display: &AttachDisplay,
+    mut write_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+) -> Result<()> {
+    set_fd_nonblocking(&master)?;
+    let master = tokio::io::unix::AsyncFd::new(master).context("register tmux -CC pty")?;
     let mut decoder = tmux_cc::Decoder::default();
     let mut read_buf = vec![0_u8; 16 * 1024];
     let mut line_buf = Vec::new();
+
     loop {
-        let read = recv
-            .read(&mut read_buf)
-            .await
-            .context("read tmux -CC output")?;
-        if read == 0 {
-            display.flush(AttachOutputStream::Stdout).await?;
-            return Ok(());
-        }
-        let control_bytes = decoder.decode(&read_buf[..read]);
-        for byte in control_bytes {
-            line_buf.push(byte);
-            if byte == b'\n' {
-                let line = String::from_utf8_lossy(&line_buf).into_owned();
-                line_buf.clear();
-                match tmux_cc::parse_control_line(&line) {
-                    tmux_cc::TmuxControlEvent::Output(bytes) => {
-                        display
-                            .write_output(AttachOutputStream::Stdout, &bytes)
-                            .await?;
+        tokio::select! {
+            Some(command) = write_rx.recv() => {
+                write_pty_all(&master, &command).await.context("write tmux -CC pty")?;
+            }
+            read = read_pty_chunk(&master, &mut read_buf) => {
+                let Some(read) = read.context("read tmux -CC pty")? else {
+                    display.flush(AttachOutputStream::Stdout).await?;
+                    return Ok(());
+                };
+                let control_bytes = decoder.decode(&read_buf[..read]);
+                for byte in control_bytes {
+                    line_buf.push(byte);
+                    if byte == b'\n' {
+                        let line = String::from_utf8_lossy(&line_buf).into_owned();
+                        line_buf.clear();
+                        match tmux_cc::parse_control_line(&line) {
+                            tmux_cc::TmuxControlEvent::Output(bytes) => {
+                                display
+                                    .write_output(AttachOutputStream::Stdout, &bytes)
+                                    .await?;
+                            }
+                            tmux_cc::TmuxControlEvent::Error(error) => {
+                                display
+                                    .write_output(
+                                        AttachOutputStream::Stderr,
+                                        format!("tmux: {error}\n").as_bytes(),
+                                    )
+                                    .await?;
+                            }
+                            tmux_cc::TmuxControlEvent::Exit => return Ok(()),
+                            tmux_cc::TmuxControlEvent::Ignore => {}
+                        }
                     }
-                    tmux_cc::TmuxControlEvent::Error(error) => {
-                        display
-                            .write_output(
-                                AttachOutputStream::Stderr,
-                                format!("tmux: {error}\n").as_bytes(),
-                            )
-                            .await?;
-                    }
-                    tmux_cc::TmuxControlEvent::Exit => return Ok(()),
-                    tmux_cc::TmuxControlEvent::Ignore => {}
                 }
             }
+            else => return Ok(()),
         }
     }
+}
+
+#[cfg(unix)]
+fn set_fd_nonblocking(fd: &OwnedFd) -> Result<()> {
+    let flags = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFL)
+        .map(nix::fcntl::OFlag::from_bits_truncate)
+        .map_err(std::io::Error::from)?;
+    nix::fcntl::fcntl(
+        fd,
+        nix::fcntl::FcntlArg::F_SETFL(flags | nix::fcntl::OFlag::O_NONBLOCK),
+    )
+    .map_err(std::io::Error::from)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn read_pty_chunk(
+    fd: &tokio::io::unix::AsyncFd<OwnedFd>,
+    buf: &mut [u8],
+) -> std::io::Result<Option<usize>> {
+    loop {
+        let mut guard = fd.readable().await?;
+        match guard
+            .try_io(|inner| nix::unistd::read(inner.get_ref(), buf).map_err(std::io::Error::from))
+        {
+            Ok(Ok(0)) => return Ok(None),
+            Ok(Ok(read)) => return Ok(Some(read)),
+            Ok(Err(err)) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(Err(err)) => return Err(err),
+            Err(_would_block) => {}
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn write_pty_all(
+    fd: &tokio::io::unix::AsyncFd<OwnedFd>,
+    mut bytes: &[u8],
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        let mut guard = fd.writable().await?;
+        match guard.try_io(|inner| {
+            nix::unistd::write(inner.get_ref(), bytes).map_err(std::io::Error::from)
+        }) {
+            Ok(Ok(0)) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(Ok(written)) => bytes = &bytes[written..],
+            Ok(Err(err)) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(Err(err)) => return Err(err),
+            Err(_would_block) => {}
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn spawn_local_pty_blocking(
+    program: &str,
+    argv: &[String],
+    size: nix::libc::winsize,
+    env: Vec<(String, String)>,
+    cwd: Option<&str>,
+) -> std::io::Result<(OwnedFd, Child)> {
+    let nix::pty::OpenptyResult { master, slave } =
+        nix::pty::openpty(Some(&size), None).map_err(std::io::Error::from)?;
+    nix::fcntl::fcntl(
+        &master,
+        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+    )
+    .map_err(std::io::Error::from)?;
+    let slave_fd = slave.as_raw_fd();
+
+    let mut command = Command::new(program);
+    command.kill_on_drop(true);
+    command.args(argv);
+    command.envs(env);
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+
+    #[allow(unsafe_code)]
+    unsafe {
+        command.pre_exec(move || {
+            if nix::libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            #[allow(clippy::useless_conversion, clippy::unnecessary_fallible_conversions)]
+            let req = nix::libc::TIOCSCTTY
+                .try_into()
+                .expect("TIOCSCTTY fits in ioctl request type");
+            if nix::libc::ioctl(slave_fd, req, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for target in [0, 1, 2] {
+                if nix::libc::dup2(slave_fd, target) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            if slave_fd > 2 {
+                let _ = nix::libc::close(slave_fd);
+            }
+            Ok(())
+        });
+    }
+
+    let child = command.spawn()?;
+    drop(slave);
+    Ok((master, child))
 }
 
 async fn copy_zmx_control_output<R>(recv: &mut R, display: &AttachDisplay) -> Result<()>
@@ -2122,8 +2242,41 @@ struct AttachDisplayState {
     cols: u16,
     rows: u16,
     bar: Option<String>,
+    gate: AttachOutputGate,
     stdout: tokio::io::Stdout,
     stderr: tokio::io::Stderr,
+}
+
+#[derive(Debug, Default)]
+struct AttachOutputGate {
+    holding: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl AttachOutputGate {
+    fn set_holding(&mut self, holding: bool) {
+        self.holding = holding;
+    }
+
+    fn hold(&mut self, stream: AttachOutputStream, bytes: &[u8]) -> Option<&[u8]> {
+        if !self.holding {
+            return None;
+        }
+        match stream {
+            AttachOutputStream::Stdout => self.stdout.extend_from_slice(bytes),
+            AttachOutputStream::Stderr => self.stderr.extend_from_slice(bytes),
+        }
+        Some(&[])
+    }
+
+    fn take_stdout(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.stdout)
+    }
+
+    fn take_stderr(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.stderr)
+    }
 }
 
 impl AttachDisplay {
@@ -2133,6 +2286,7 @@ impl AttachDisplay {
                 cols,
                 rows,
                 bar: None,
+                gate: AttachOutputGate::default(),
                 stdout: tokio::io::stdout(),
                 stderr: tokio::io::stderr(),
             })),
@@ -2141,6 +2295,10 @@ impl AttachDisplay {
 
     async fn write_output(&self, stream: AttachOutputStream, bytes: &[u8]) -> Result<()> {
         let mut state = self.inner.lock().await;
+        if state.gate.hold(stream, bytes).is_some() {
+            state.redraw_bar().await?;
+            return Ok(());
+        }
         let had_bar = state.bar.is_some();
         if had_bar {
             state.clear_bar().await?;
@@ -2171,6 +2329,7 @@ impl AttachDisplay {
 
     async fn set_bar(&self, text: String) -> Result<()> {
         let mut state = self.inner.lock().await;
+        state.gate.set_holding(true);
         state.bar = Some(text);
         state.redraw_bar().await
     }
@@ -2178,7 +2337,9 @@ impl AttachDisplay {
     async fn clear_bar(&self) -> Result<()> {
         let mut state = self.inner.lock().await;
         state.bar = None;
-        state.clear_bar().await
+        state.clear_bar().await?;
+        state.gate.set_holding(false);
+        state.flush_held_output().await
     }
 
     async fn print_message(&self, message: &str) -> Result<()> {
@@ -2213,6 +2374,32 @@ impl AttachDisplayState {
     async fn redraw_bar(&mut self) -> Result<()> {
         if let Some(text) = self.bar.as_deref() {
             draw_attach_control_bar_to(&mut self.stderr, self.rows, self.cols, text).await?;
+        }
+        Ok(())
+    }
+
+    async fn flush_held_output(&mut self) -> Result<()> {
+        let stdout = self.gate.take_stdout();
+        if !stdout.is_empty() {
+            self.stdout
+                .write_all(&stdout)
+                .await
+                .context("flush held attach stdout")?;
+            self.stdout
+                .flush()
+                .await
+                .context("flush held attach stdout")?;
+        }
+        let stderr = self.gate.take_stderr();
+        if !stderr.is_empty() {
+            self.stderr
+                .write_all(&stderr)
+                .await
+                .context("flush held attach stderr")?;
+            self.stderr
+                .flush()
+                .await
+                .context("flush held attach stderr")?;
         }
         Ok(())
     }
@@ -2255,10 +2442,9 @@ impl AttachInputSink {
                     .await
                     .context("write zmx-control input")
             }
-            AttachInputSinkKind::Tmux { stdin } => stdin
-                .write_all(&tmux_cc::send_keys_command(bytes))
-                .await
-                .context("write tmux -CC input"),
+            AttachInputSinkKind::TmuxPty { tx } => tx
+                .send(tmux_cc::send_keys_command(bytes))
+                .map_err(|_| anyhow!("tmux -CC pty closed")),
         }
     }
 
@@ -2271,10 +2457,9 @@ impl AttachInputSink {
                 let _ = zmx_control::write_frame(stdin, zmx_control::TAG_CLOSE, &[]).await;
                 stdin.shutdown().await.context("shutdown zmx-control stdin")
             }
-            AttachInputSinkKind::Tmux { stdin } => {
-                let _ = stdin.write_all(b"detach-client\n").await;
-                stdin.shutdown().await.context("shutdown tmux -CC stdin")
-            }
+            AttachInputSinkKind::TmuxPty { tx } => tx
+                .send(b"detach-client\n".to_vec())
+                .map_err(|_| anyhow!("tmux -CC pty closed")),
         }
     }
 
@@ -2293,10 +2478,9 @@ impl AttachInputSink {
                     .await
                     .context("write zmx-control resize")
             }
-            AttachInputSinkKind::Tmux { stdin } => stdin
-                .write_all(&tmux_cc::resize_commands(rows, cols))
-                .await
-                .context("write tmux -CC resize"),
+            AttachInputSinkKind::TmuxPty { tx } => tx
+                .send(tmux_cc::resize_commands(rows, cols))
+                .map_err(|_| anyhow!("tmux -CC pty closed")),
         }
     }
 
@@ -2312,10 +2496,9 @@ impl AttachInputSink {
                     .context("write session control frame")
             }
             AttachInputSinkKind::Zmx { .. } => Ok(()),
-            AttachInputSinkKind::Tmux { stdin } => stdin
-                .write_all(b"detach-client -a\n")
-                .await
-                .context("write tmux -CC kick-others"),
+            AttachInputSinkKind::TmuxPty { tx } => tx
+                .send(b"detach-client -a\n".to_vec())
+                .map_err(|_| anyhow!("tmux -CC pty closed")),
         }
     }
 }
@@ -2329,8 +2512,8 @@ enum AttachInputSinkKind {
     Zmx {
         stdin: ChildStdin,
     },
-    Tmux {
-        stdin: ChildStdin,
+    TmuxPty {
+        tx: mpsc::UnboundedSender<Vec<u8>>,
     },
 }
 
@@ -2591,6 +2774,48 @@ mod tests {
         assert_eq!(fit_visible("abcdef", 10), "abcdef");
         assert_eq!(fit_visible("abcdef", 4), "abc…\x1b[0m");
         assert_eq!(fit_visible("abcdef", 1), "…");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_pty_spawn_gives_child_a_real_tty() {
+        let winsize = nix::libc::winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let (_master, mut child) = spawn_local_pty_blocking(
+            "/bin/sh",
+            &[
+                "-c".to_owned(),
+                "test -t 0 && test -t 1 && test -t 2".to_owned(),
+            ],
+            winsize,
+            Vec::new(),
+            None,
+        )
+        .expect("spawn pty child");
+
+        let status = child.wait().await.expect("wait child");
+        assert!(status.success(), "child stdio was not a tty: {status}");
+    }
+
+    #[test]
+    fn attach_output_gate_buffers_while_control_bar_is_visible() {
+        let mut gate = AttachOutputGate::default();
+
+        assert_eq!(gate.hold(AttachOutputStream::Stdout, b"frame1"), None);
+        gate.set_holding(true);
+        assert_eq!(
+            gate.hold(AttachOutputStream::Stdout, b"frame2"),
+            Some(&[][..])
+        );
+        assert_eq!(gate.hold(AttachOutputStream::Stderr, b"err"), Some(&[][..]));
+        assert_eq!(gate.take_stdout(), b"frame2".to_vec());
+        assert_eq!(gate.take_stderr(), b"err".to_vec());
+        gate.set_holding(false);
+        assert_eq!(gate.hold(AttachOutputStream::Stdout, b"frame3"), None);
     }
 
     #[test]
