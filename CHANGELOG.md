@@ -5,6 +5,37 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.8.1 — 2026-05-02
+
+### Changed
+
+- Portl now stores configuration, durable data, runtime sockets, and state under
+  a single CLI-friendly `~/.portl` home with `config/`, `data/`, `state/`, and
+  `run/` subdirectories. Existing installs migrate automatically without
+  overwriting already-structured files.
+- Install and upgrade flows now stop managed agents before layout migration,
+  install the new binaries first, restart the service, and verify the new agent
+  is reachable before reporting success.
+- `portl ls TARGET` and `portl ls TARGET/PROVIDER` now work as shorthand for
+  listing sessions on a target or provider, including `portl session ls ...`.
+
+### Fixed
+
+- New Ghostty sessions on macOS now use shorter runtime socket paths, avoiding
+  Unix socket path length failures in the old Application Support layout.
+- `portl status` now reports the built-in Ghostty provider consistently with
+  `portl session providers`, including using Ghostty as the default when it is
+  available.
+- `portl attach NAME` now finds an existing unique session with that name across
+  known targets and providers before creating a new local/default-provider
+  session. Ambiguous matches report copy-pasteable `HOST/PROVIDER/SESSION`
+  refs.
+- Diagnostic and preview commands such as `portl doctor` and install dry-runs no
+  longer migrate state as a side effect, and doctor checks live agent IPC rather
+  than only checking for a socket file.
+- Slicer userdata now writes identity files into the structured Portl home and
+  validates generated agent environment without mutating host state.
+
 ## 0.8.0 — 2026-05-01
 
 ### Added
