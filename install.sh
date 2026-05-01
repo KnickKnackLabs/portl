@@ -546,8 +546,16 @@ stop_existing_service_before_upgrade() {
             fi
             ;;
     esac
-    if [ "$DRY_RUN" -eq 0 ] && service_loaded; then
-        err "portl-agent service is still running; stop it with your service manager or rerun this installer with sufficient privileges before migrating state"
+    if [ "$DRY_RUN" -eq 0 ]; then
+        local stop_waits
+        stop_waits=0
+        while [ "$stop_waits" -lt 10 ] && service_loaded; do
+            sleep 0.5
+            stop_waits=$((stop_waits + 1))
+        done
+        if service_loaded; then
+            err "portl-agent service is still running after stop; stop it with your service manager or rerun this installer with sufficient privileges before migrating state"
+        fi
     fi
 }
 

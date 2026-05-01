@@ -108,6 +108,9 @@ fn systemd_is_active(extra: &[&str]) -> bool {
 
 #[cfg(target_os = "linux")]
 fn openrc_is_active() -> bool {
+    if !std::path::Path::new("/etc/init.d/portl-agent").exists() {
+        return false;
+    }
     ProcessCommand::new("rc-service")
         .args(["portl-agent", "status"])
         .output()
@@ -288,8 +291,8 @@ fn verify_agent_ready_after_apply(target: InstallTarget) -> Result<()> {
         std::thread::sleep(Duration::from_millis(500));
     }
     print_service_diagnostics(target);
-    let detail = first_error
-        .or(last_error)
+    let detail = last_error
+        .or(first_error)
         .unwrap_or_else(|| "status unavailable".to_owned());
     bail!(
         "portl-agent did not become ready at {} after install: {detail}",

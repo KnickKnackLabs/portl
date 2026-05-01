@@ -912,6 +912,9 @@ fn systemctl_is_active(extra: &[&str]) -> bool {
 
 #[cfg(target_os = "linux")]
 fn openrc_is_active() -> bool {
+    if !std::path::Path::new("/etc/init.d/portl-agent").exists() {
+        return false;
+    }
     ProcessCommand::new("rc-service")
         .args(["portl-agent", "status"])
         .output()
