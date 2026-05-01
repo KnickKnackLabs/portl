@@ -5,6 +5,30 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.7.7 — 2026-05-01
+
+### Added
+
+- Local `zmx` and `tmux` session attaches now use Portl's `Ctrl+\\` leader
+  mode, so `d` detaches, `Esc` cancels, and a second `Ctrl+\\` sends the
+  literal control character without requiring a local `portl-agent`.
+- Local `tmux` attaches now support the same `Ctrl+\\`, then `k` kick action
+  available for remote tmux sessions.
+
+### Changed
+
+- Local attach rendering now uses the same shared status-bar, resize, and
+  control-mode parsing logic as remote attaches.
+
+### Fixed
+
+- Local `zmx` attaches now recognize the current `zmx-control/v1` viewport and
+  live-output frame tags, preserving initial and live terminal output from
+  updated zmx providers.
+- Local `tmux` control-mode attaches now preserve native tmux targets such as
+  `session:window.pane`, honor `--cwd`, render an initial viewport, propagate
+  terminal resizes, and clean up provider processes promptly after detach.
+
 ## 0.7.6 — 2026-05-01
 
 ### Changed
