@@ -4,113 +4,14 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
+use portl_core::terminal::tmux_cc::{
+    self, Decoder as TmuxCcDecoder, TmuxControlEvent, parse_control_line,
+};
+
 use crate::shell_handler::pty_master::{read_pty_chunk, set_nonblocking, write_pty_all};
 use crate::shell_registry::{PtyCommand, StdinMessage};
 
 const TMUX_CC_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum TmuxControlEvent {
-    Output(Vec<u8>),
-    Error(String),
-    Exit,
-    Ignore,
-}
-
-pub(crate) fn parse_control_line(line: &str) -> TmuxControlEvent {
-    let line = line.trim_end_matches(['\r', '\n']);
-    if let Some(rest) = line.strip_prefix("%output ") {
-        let Some((_, escaped)) = rest.split_once(' ') else {
-            return TmuxControlEvent::Ignore;
-        };
-        return TmuxControlEvent::Output(unescape_tmux_bytes(escaped));
-    }
-    if let Some(rest) = line.strip_prefix("%extended-output ") {
-        let Some((_, escaped)) = rest.split_once(" : ") else {
-            return TmuxControlEvent::Ignore;
-        };
-        return TmuxControlEvent::Output(unescape_tmux_bytes(escaped));
-    }
-    if let Some(rest) = line.strip_prefix("%error") {
-        return TmuxControlEvent::Error(rest.trim().to_owned());
-    }
-    if line.starts_with("%exit") {
-        return TmuxControlEvent::Exit;
-    }
-    TmuxControlEvent::Ignore
-}
-
-pub(crate) fn unescape_tmux_bytes(input: &str) -> Vec<u8> {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'\\'
-            && index + 3 < bytes.len()
-            && bytes[index + 1].is_ascii_digit()
-            && bytes[index + 2].is_ascii_digit()
-            && bytes[index + 3].is_ascii_digit()
-        {
-            let value = (bytes[index + 1] - b'0') * 64
-                + (bytes[index + 2] - b'0') * 8
-                + (bytes[index + 3] - b'0');
-            out.push(value);
-            index += 4;
-        } else if bytes[index] == b'\\' && index + 1 < bytes.len() {
-            out.push(bytes[index + 1]);
-            index += 2;
-        } else {
-            out.push(bytes[index]);
-            index += 1;
-        }
-    }
-    out
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct TmuxCcDecoder {
-    state: TmuxCcState,
-}
-
-#[derive(Debug, Default)]
-enum TmuxCcState {
-    #[default]
-    Normal,
-    Escape,
-    DcsPrefix,
-}
-
-impl TmuxCcDecoder {
-    pub(crate) fn decode(&mut self, input: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(input.len());
-        for byte in input {
-            match self.state {
-                TmuxCcState::Normal => {
-                    if *byte == 0x1b {
-                        self.state = TmuxCcState::Escape;
-                    } else {
-                        out.push(*byte);
-                    }
-                }
-                TmuxCcState::Escape => match *byte {
-                    b'P' => self.state = TmuxCcState::DcsPrefix,
-                    b'\\' => self.state = TmuxCcState::Normal,
-                    other => {
-                        out.push(0x1b);
-                        out.push(other);
-                        self.state = TmuxCcState::Normal;
-                    }
-                },
-                TmuxCcState::DcsPrefix => {
-                    if *byte == b'p' {
-                        self.state = TmuxCcState::Normal;
-                    }
-                }
-            }
-        }
-        out
-    }
-}
 
 pub(crate) async fn pump_tmux_cc_pty(
     master: OwnedFd,
@@ -146,7 +47,7 @@ pub(crate) async fn pump_tmux_cc_pty(
                             write_pty_all(&master, b"detach-client\n").await.context("detach tmux -CC client")?;
                             drain_deadline = Some(tokio::time::Instant::now() + TMUX_CC_DRAIN_TIMEOUT);
                         } else {
-                            write_pty_all(&master, &send_keys_command(&data)).await.context("write tmux -CC input")?;
+                            write_pty_all(&master, &tmux_cc::send_keys_command(&data)).await.context("write tmux -CC input")?;
                         }
                     }
                     StdinMessage::Close => {
@@ -158,7 +59,7 @@ pub(crate) async fn pump_tmux_cc_pty(
             Some(command) = pty_rx.recv(), if drain_deadline.is_none() => {
                 match command {
                     PtyCommand::Resize { rows, cols } => {
-                        write_pty_all(&master, &resize_commands(rows, cols)).await.context("resize tmux -CC client")?;
+                        write_pty_all(&master, &tmux_cc::resize_commands(rows, cols)).await.context("resize tmux -CC client")?;
                     }
                     PtyCommand::Close { .. } => {
                         write_pty_all(&master, b"detach-client\n").await.context("detach tmux -CC client")?;
@@ -294,29 +195,13 @@ fn parse_decimal(data: &[u8], pos: &mut usize) -> Option<u32> {
     (*pos != start).then_some(value)
 }
 
-fn send_keys_command(data: &[u8]) -> Vec<u8> {
-    let mut command = Vec::new();
-    for chunk in data.chunks(128) {
-        command.extend_from_slice(b"send-keys -H");
-        for byte in chunk {
-            command.extend_from_slice(format!(" {byte:02x}").as_bytes());
-        }
-        command.push(b'\n');
-    }
-    command
-}
-
-fn resize_commands(rows: u16, cols: u16) -> Vec<u8> {
-    format!("refresh-client -C {cols},{rows}\nresize-window -x {cols} -y {rows}\n").into_bytes()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn unescapes_tmux_octal_bytes() {
-        assert_eq!(unescape_tmux_bytes(r"hi\012\\\033"), b"hi\n\\\x1b");
+        assert_eq!(tmux_cc::unescape_tmux_bytes(r"hi\012\\\033"), b"hi\n\\\x1b");
     }
 
     #[test]

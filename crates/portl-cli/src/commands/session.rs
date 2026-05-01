@@ -10,6 +10,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::ValueEnum;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use iroh::endpoint::SendStream;
+use portl_core::attach_control::{RenderBarOptions, fit_visible, render_bar};
 use portl_core::io::BufferedRecv;
 use portl_core::net::{
     SessionClient, open_session_attach, open_session_history, open_session_kill,
@@ -2041,11 +2042,13 @@ where
 
 async fn render_attach_control_bar(ui: &AttachControlUi, remaining: Duration) -> Result<()> {
     ui.display
-        .set_bar(attach_control_bar_text(
-            &ui.canonical_ref,
-            ui.supports_kick_others,
+        .set_bar(render_bar(RenderBarOptions {
+            canonical_ref: &ui.canonical_ref,
+            supports_kick_others: ui.supports_kick_others,
             remaining,
-        ))
+            unicode: terminal_locale_supports_unicode(),
+            color: terminal_color_enabled(),
+        }))
         .await
 }
 
@@ -2066,7 +2069,7 @@ async fn draw_attach_control_bar_to(
             .await
             .context("clear attach control bar")?;
     } else {
-        let text = fit_attach_control_bar(text, cols);
+        let text = fit_visible(text, cols);
         stderr
             .write_all(
                 format!("\x1b[0m\x1b7\x1b[{row};1H\x1b[2K{text}\x1b[0m\x1b8\x1b[0m").as_bytes(),
@@ -2075,53 +2078,6 @@ async fn draw_attach_control_bar_to(
             .context("draw attach control bar")?;
     }
     stderr.flush().await.context("flush attach control bar")
-}
-
-fn attach_control_bar_text(
-    canonical_ref: &str,
-    supports_kick_others: bool,
-    remaining: Duration,
-) -> String {
-    let tenths = remaining.as_millis().div_ceil(100).min(99);
-    let seconds = tenths / 10;
-    let tenth = tenths % 10;
-    let time = format!("{seconds}.{tenth}s");
-    let unicode = terminal_locale_supports_unicode();
-    let color = terminal_color_enabled();
-    let (lead, arrow, sep, send_key) = if unicode {
-        ("▌", "›", "·", "^\\")
-    } else {
-        ("|", ">", "|", "^\\")
-    };
-    let prefix = styled(&format!("{lead} Portl {arrow}"), "\x1b[1;36m", color);
-    let sep = styled(sep, "\x1b[2m", color);
-    let key = |value: &str| styled(value, "\x1b[1;33m", color);
-    let label = |value: &str| styled(value, "\x1b[2m", color);
-    let timer = styled(&time, "\x1b[2m", color);
-
-    let mut parts = vec![format!(
-        "{} {}  {}  {} {}",
-        prefix,
-        canonical_ref,
-        sep,
-        key("d"),
-        label("detach")
-    )];
-    if supports_kick_others {
-        parts.push(format!("{} {} {}", sep, key("k"), label("kick")));
-    }
-    parts.push(format!("{} {} {}", sep, key(send_key), label("send")));
-    parts.push(format!("{} {} {}", sep, key("Esc"), label("cancel")));
-    parts.push(format!("{sep} {timer}"));
-    parts.join(" ")
-}
-
-fn styled(text: &str, sgr: &str, color: bool) -> String {
-    if color {
-        format!("{sgr}{text}\x1b[0m")
-    } else {
-        text.to_owned()
-    }
 }
 
 fn terminal_color_enabled() -> bool {
@@ -2143,58 +2099,6 @@ fn terminal_locale_supports_unicode() -> bool {
         let upper = value.to_ascii_uppercase();
         upper.contains("UTF-8") || upper.contains("UTF8")
     })
-}
-
-fn fit_attach_control_bar(text: &str, cols: u16) -> String {
-    let max = usize::from(cols.max(1));
-    let visible = ansi_visible_width(text);
-    if visible <= max {
-        return text.to_owned();
-    }
-    if max <= 1 {
-        return "…".to_owned();
-    }
-
-    let mut out = String::new();
-    let mut width = 0_usize;
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            out.push(ch);
-            for next in chars.by_ref() {
-                out.push(next);
-                if next == 'm' {
-                    break;
-                }
-            }
-            continue;
-        }
-        if width >= max - 1 {
-            break;
-        }
-        out.push(ch);
-        width += 1;
-    }
-    out.push('…');
-    out.push_str("\x1b[0m");
-    out
-}
-
-fn ansi_visible_width(text: &str) -> usize {
-    let mut width = 0_usize;
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            for next in chars.by_ref() {
-                if next == 'm' {
-                    break;
-                }
-            }
-        } else {
-            width += 1;
-        }
-    }
-    width
 }
 
 fn is_attach_detach_sequence(data: &[u8]) -> bool {
@@ -2286,19 +2190,19 @@ mod tests {
 
     #[test]
     fn attach_control_bar_fits_terminal_width() {
-        assert_eq!(fit_attach_control_bar("abcdef", 10), "abcdef");
-        assert_eq!(fit_attach_control_bar("abcdef", 4), "abc…\x1b[0m");
-        assert_eq!(fit_attach_control_bar("abcdef", 1), "…");
+        assert_eq!(fit_visible("abcdef", 10), "abcdef");
+        assert_eq!(fit_visible("abcdef", 4), "abc…\x1b[0m");
+        assert_eq!(fit_visible("abcdef", 1), "…");
     }
 
     #[test]
     fn attach_control_bar_fits_ansi_styled_text_by_visible_width() {
         let text = "\x1b[1;36mPortl ›\x1b[0m abcdef";
-        assert_eq!(ansi_visible_width(text), "Portl › abcdef".chars().count());
         assert_eq!(
-            fit_attach_control_bar(text, 10),
-            "\x1b[1;36mPortl ›\x1b[0m a…\x1b[0m"
+            portl_core::attach_control::visible_width(text),
+            "Portl › abcdef".chars().count()
         );
+        assert_eq!(fit_visible(text, 10), "\x1b[1;36mPortl ›\x1b[0m a…\x1b[0m");
     }
 
     #[test]

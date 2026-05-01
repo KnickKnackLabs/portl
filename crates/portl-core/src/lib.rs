@@ -4,6 +4,7 @@
 //! and in-process test helpers. This crate is the bedrock all other
 //! portl crates build on.
 
+pub mod attach_control;
 pub mod bootstrap;
 pub mod caps;
 pub mod endpoint;
@@ -18,6 +19,7 @@ pub mod peer_store;
 pub mod rendezvous;
 pub mod runtime;
 pub mod store_index;
+pub mod terminal;
 pub mod ticket;
 pub mod ticket_store;
 pub mod tls;
