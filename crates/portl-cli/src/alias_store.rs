@@ -7,14 +7,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use fd_lock::RwLock;
-use portl_core::id::store;
 use portl_core::ticket::schema::Capabilities;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-const DB_FILE: &str = "aliases.json";
 const LOCK_FILE: &str = "aliases.json.lock";
 const CURRENT_VERSION: u32 = 1;
 
@@ -268,9 +266,7 @@ fn parent_dir(path: &Path) -> Option<&Path> {
 }
 
 pub fn default_db_path() -> PathBuf {
-    store::default_path()
-        .parent()
-        .map_or_else(|| PathBuf::from(DB_FILE), |parent| parent.join(DB_FILE))
+    portl_core::paths::aliases_path()
 }
 
 pub fn now_unix_secs() -> Result<i64> {

@@ -137,10 +137,7 @@ pub(super) fn ensure_rm_allowed(name: &str, status: &TargetStatus, force: bool) 
 }
 
 pub(super) fn local_revocations_path() -> PathBuf {
-    store::default_path().parent().map_or_else(
-        || PathBuf::from("revocations.jsonl"),
-        |parent| parent.join("revocations.jsonl"),
-    )
+    portl_core::paths::revocations_path()
 }
 
 pub(super) fn local_ticket_path(name: &str) -> PathBuf {

@@ -6,7 +6,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use iroh_tickets::Ticket;
 use portl_agent::revocations::RevocationRecord;
-use portl_core::id::store;
 use portl_core::ticket::hash::ticket_id;
 use portl_core::ticket::schema::PortlTicket;
 
@@ -114,10 +113,7 @@ fn render_list(path: &Path) -> Result<String> {
 }
 
 pub(crate) fn local_revocations_path() -> PathBuf {
-    store::default_path().parent().map_or_else(
-        || PathBuf::from("revocations.jsonl"),
-        |parent| parent.join("revocations.jsonl"),
-    )
+    portl_core::paths::revocations_path()
 }
 
 fn unix_now_secs() -> Result<u64> {

@@ -20,14 +20,14 @@ use tokio_util::sync::CancellationToken;
 async fn agent_run_returns_promptly_when_shutdown_token_is_cancelled() -> Result<()> {
     let endpoint = test_util::endpoint().await?;
     let shutdown = CancellationToken::new();
-    let task = tokio::spawn(run_with_shutdown(
-        AgentConfig {
-            discovery: DiscoveryConfig::in_process(),
-            endpoint: Some(endpoint.clone()),
-            ..AgentConfig::default()
-        },
-        shutdown.clone(),
-    ));
+    let home = tempdir()?;
+    let mut config = AgentConfig {
+        discovery: DiscoveryConfig::in_process(),
+        endpoint: Some(endpoint.clone()),
+        ..AgentConfig::default()
+    };
+    isolate_config_home(&mut config, home.path());
+    let task = tokio::spawn(run_with_shutdown(config, shutdown.clone()));
 
     tokio::time::sleep(Duration::from_millis(100)).await;
     shutdown.cancel();
@@ -121,13 +121,12 @@ fn signal_shutdown_subprocess_with_mode(
     expect_success: bool,
     audit_path: Option<&std::path::Path>,
 ) -> Result<()> {
+    let home = tempdir()?;
     let mut command = Command::new(std::env::current_exe().context("resolve current test binary")?);
-    command.env("PORTL_SIGNAL_CHILD", signal_name).args([
-        "--exact",
-        test_name,
-        "--nocapture",
-        "--test-threads=1",
-    ]);
+    command
+        .env("PORTL_HOME", home.path())
+        .env("PORTL_SIGNAL_CHILD", signal_name)
+        .args(["--exact", test_name, "--nocapture", "--test-threads=1"]);
     if !mode.is_empty() {
         command.env("PORTL_SIGNAL_CHILD_MODE", mode);
     }
@@ -169,14 +168,14 @@ async fn run_signal_child(signal_name: &str) -> Result<()> {
         Ok("stuck-shell") => run_signal_child_with_live_shell(signal_name, true).await,
         _ => {
             let endpoint = test_util::endpoint().await?;
-            let task = tokio::spawn(run_with_shutdown(
-                AgentConfig {
-                    discovery: DiscoveryConfig::in_process(),
-                    endpoint: Some(endpoint.clone()),
-                    ..AgentConfig::default()
-                },
-                CancellationToken::new(),
-            ));
+            let home = tempdir()?;
+            let mut config = AgentConfig {
+                discovery: DiscoveryConfig::in_process(),
+                endpoint: Some(endpoint.clone()),
+                ..AgentConfig::default()
+            };
+            isolate_config_home(&mut config, home.path());
+            let task = tokio::spawn(run_with_shutdown(config, CancellationToken::new()));
 
             tokio::time::sleep(Duration::from_millis(100)).await;
             let signal = match signal_name {
@@ -195,6 +194,12 @@ async fn run_signal_child(signal_name: &str) -> Result<()> {
     }
 }
 
+fn isolate_config_home(config: &mut AgentConfig, home: &std::path::Path) {
+    let paths = portl_core::paths::for_home(home);
+    config.peers_path = Some(paths.peers_path());
+    config.revocations_path = Some(paths.revocations_path());
+}
+
 #[cfg(unix)]
 async fn run_signal_child_with_live_shell(signal_name: &str, stuck: bool) -> Result<()> {
     use nix::sys::signal::{Signal, kill};
@@ -202,6 +207,8 @@ async fn run_signal_child_with_live_shell(signal_name: &str, stuck: bool) -> Res
 
     let (client, server) = pair().await?;
     let operator = Identity::new();
+    let home = tempdir()?;
+    let paths = portl_core::paths::for_home(home.path());
     let revocations_path = std::env::temp_dir().join(format!(
         "portl-agent-signal-revocations-{}.jsonl",
         rand::random::<u64>()
@@ -210,6 +217,7 @@ async fn run_signal_child_with_live_shell(signal_name: &str, stuck: bool) -> Res
         AgentConfig {
             discovery: DiscoveryConfig::in_process(),
             trust_roots: vec![operator.verifying_key()],
+            peers_path: Some(paths.peers_path()),
             revocations_path: Some(revocations_path),
             endpoint: Some(server.clone()),
             ..AgentConfig::default()

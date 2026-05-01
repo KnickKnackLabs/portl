@@ -1,6 +1,6 @@
 //! `portl.toml` — the single-file config story.
 //!
-//! Lives at `$PORTL_HOME/portl.toml`. All keys are optional; missing
+//! Lives at `$PORTL_HOME/config/portl.toml`. All keys are optional; missing
 //! keys fall back to env vars, then compiled defaults. The file
 //! itself is optional — a fresh install has no `portl.toml` and
 //! runs on compiled defaults alone.
@@ -49,7 +49,7 @@ use serde::{Deserialize, Serialize};
 /// Current schema version. Bump on breaking changes.
 pub const CURRENT_SCHEMA: u32 = 1;
 
-/// Conventional filename under `$PORTL_HOME`.
+/// Conventional filename under `$PORTL_HOME/config`.
 pub const FILENAME: &str = "portl.toml";
 
 /// Top-level shape of `portl.toml`.
@@ -150,7 +150,7 @@ impl PortlConfig {
     /// Resolve the conventional path under a given `PORTL_HOME`.
     #[must_use]
     pub fn default_path(home: &Path) -> PathBuf {
-        home.join(FILENAME)
+        portl_core::paths::for_home(home).config_path()
     }
 
     /// Parse from a TOML string. Separate from [`Self::load`] so
@@ -254,11 +254,11 @@ some_key = "some_value"
     }
 
     #[test]
-    fn default_path_is_portl_home_slash_portl_toml() {
+    fn default_path_is_portl_home_config_slash_portl_toml() {
         let home = Path::new("/opt/portl-home");
         assert_eq!(
             PortlConfig::default_path(home),
-            PathBuf::from("/opt/portl-home/portl.toml")
+            PathBuf::from("/opt/portl-home/config/portl.toml")
         );
     }
 

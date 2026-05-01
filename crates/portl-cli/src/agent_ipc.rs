@@ -1,5 +1,5 @@
 //! Client-side helpers for speaking to the agent's IPC surface
-//! (`$PORTL_HOME/metrics.sock`).
+//! (`$PORTL_HOME/run/metrics.sock`).
 //!
 //! v0.3.2 adds structured JSON routes on the same socket that
 //! previously served only `OpenMetrics`. This module is a thin
@@ -20,9 +20,7 @@ use tokio::net::UnixStream;
 /// back to the platform default home dir.
 #[must_use]
 pub fn default_socket_path() -> PathBuf {
-    let home = std::env::var_os("PORTL_HOME")
-        .map_or_else(portl_agent::config::default_home_dir, PathBuf::from);
-    home.join("metrics.sock")
+    portl_core::paths::metrics_socket_path()
 }
 
 /// Fetch `/status` from the agent's IPC socket.

@@ -458,8 +458,8 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
         home: cfg
             .peers_path
             .as_ref()
-            .and_then(|p| p.parent().map(Path::to_path_buf))
-            .unwrap_or_else(std::env::temp_dir),
+            .and_then(|path| home_from_peers_path(path))
+            .unwrap_or_else(portl_core::paths::home_dir),
         metrics_socket: cfg
             .metrics_socket_path
             .clone()
@@ -925,17 +925,19 @@ fn load_identity(cfg: &AgentConfig) -> Result<Identity> {
     store::load(&path).map_err(Into::into)
 }
 
+fn home_from_peers_path(path: &Path) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    if parent.file_name().and_then(|name| name.to_str()) == Some("data") {
+        parent.parent().map(Path::to_path_buf)
+    } else {
+        Some(parent.to_path_buf())
+    }
+}
+
 fn revocations_path(cfg: &AgentConfig) -> PathBuf {
-    cfg.revocations_path.clone().unwrap_or_else(|| {
-        cfg.identity_path
-            .clone()
-            .unwrap_or_else(store::default_path)
-            .parent()
-            .map_or_else(
-                || PathBuf::from("revocations.jsonl"),
-                |parent| parent.join("revocations.jsonl"),
-            )
-    })
+    cfg.revocations_path
+        .clone()
+        .unwrap_or_else(portl_core::paths::revocations_path)
 }
 
 #[cfg(test)]
@@ -944,6 +946,12 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{AgentConfig, DiscoveryConfig, run_task, run_with_shutdown};
+
+    fn isolate_config_home(config: &mut AgentConfig, home: &std::path::Path) {
+        let paths = portl_core::paths::for_home(home);
+        config.peers_path = Some(paths.peers_path());
+        config.revocations_path = Some(paths.revocations_path());
+    }
 
     #[test]
     fn ad_hoc_agent_config_does_not_enable_metrics_by_default() {
@@ -958,13 +966,14 @@ mod tests {
     async fn run_task_returns_and_stops_when_endpoint_closes() {
         let endpoint = test_util::endpoint().await.expect("bind endpoint");
         let runtime_endpoint = endpoint.clone();
-        let handle = run_task(AgentConfig {
+        let home = tempfile::tempdir().expect("temp home");
+        let mut config = AgentConfig {
             discovery: DiscoveryConfig::in_process(),
             endpoint: Some(runtime_endpoint),
             ..AgentConfig::default()
-        })
-        .await
-        .expect("spawn task");
+        };
+        isolate_config_home(&mut config, home.path());
+        let handle = run_task(config).await.expect("spawn task");
 
         endpoint.inner().close().await;
         handle.await.expect("join handle").expect("run result");
@@ -974,14 +983,14 @@ mod tests {
     async fn run_with_shutdown_stops_when_token_is_cancelled() {
         let endpoint = test_util::endpoint().await.expect("bind endpoint");
         let shutdown = CancellationToken::new();
-        let task = tokio::spawn(run_with_shutdown(
-            AgentConfig {
-                discovery: DiscoveryConfig::in_process(),
-                endpoint: Some(endpoint),
-                ..AgentConfig::default()
-            },
-            shutdown.clone(),
-        ));
+        let home = tempfile::tempdir().expect("temp home");
+        let mut config = AgentConfig {
+            discovery: DiscoveryConfig::in_process(),
+            endpoint: Some(endpoint),
+            ..AgentConfig::default()
+        };
+        isolate_config_home(&mut config, home.path());
+        let task = tokio::spawn(run_with_shutdown(config, shutdown.clone()));
 
         shutdown.cancel();
         tokio::time::timeout(std::time::Duration::from_secs(3), task)

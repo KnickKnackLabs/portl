@@ -12,7 +12,6 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use iroh_tickets::Ticket;
-use portl_agent::config::default_home_dir;
 use portl_agent::config_file::PortlConfig;
 use portl_core::id::store;
 use portl_core::peer_store::PeerStore;
@@ -608,8 +607,7 @@ fn effective_session_provider_path() -> Option<PathBuf> {
     std::env::var_os("PORTL_SESSION_PROVIDER_PATH")
         .map(PathBuf::from)
         .or_else(|| {
-            let home = std::env::var_os("PORTL_HOME").map_or_else(default_home_dir, PathBuf::from);
-            let path = PortlConfig::default_path(&home);
+            let path = portl_core::paths::config_path();
             PortlConfig::load(&path)
                 .ok()
                 .and_then(|config| config.agent.session_provider_path)

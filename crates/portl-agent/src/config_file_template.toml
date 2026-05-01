@@ -1,6 +1,6 @@
 # portl.toml — local agent + CLI configuration
 #
-# Lives at $PORTL_HOME/portl.toml. All values are optional; missing
+# Lives at $PORTL_HOME/config/portl.toml. All values are optional; missing
 # keys fall back to env vars (PORTL_*), then compiled defaults.
 #
 # Precedence (high → low):

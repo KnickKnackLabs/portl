@@ -28,6 +28,9 @@ use crate::shell_registry::{PtyCommand, ShellProcess, StdinMessage};
 
 pub(crate) const GHOSTTY_PROTOCOL_VERSION: u16 = 1;
 
+#[cfg(unix)]
+const MAX_UNIX_SOCKET_PATH_BYTES: usize = 104;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct GhosttySessionMetadata {
     pub(crate) name: String,
@@ -60,15 +63,9 @@ pub(crate) struct GhosttyRegistry {
 impl GhosttyRegistry {
     pub(crate) fn new() -> Self {
         let state_root = std::env::var_os("PORTL_GHOSTTY_STATE_DIR")
-            .map_or_else(default_state_root, PathBuf::from);
+            .map_or_else(portl_core::paths::ghostty_state_dir, PathBuf::from);
         let runtime_root = std::env::var_os("PORTL_GHOSTTY_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("XDG_RUNTIME_DIR")
-                    .map(PathBuf::from)
-                    .map(|dir| dir.join("portl/ghostty"))
-            })
-            .unwrap_or_else(|| state_root.join("runtime"));
+            .map_or_else(portl_core::paths::ghostty_runtime_dir, PathBuf::from);
         Self {
             runtime_root,
             state_root,
@@ -84,12 +81,13 @@ impl GhosttyRegistry {
     }
 
     pub(crate) fn paths_for(&self, session: &str) -> GhosttySessionPaths {
+        self.paths_for_with_socket(session, socket_path_for(&self.runtime_root, session))
+    }
+
+    fn paths_for_with_socket(&self, session: &str, socket_path: PathBuf) -> GhosttySessionPaths {
         let encoded = encode_session_component(session);
         GhosttySessionPaths {
-            socket_path: self
-                .runtime_root
-                .join("sockets")
-                .join(format!("{encoded}.sock")),
+            socket_path,
             metadata_path: self
                 .state_root
                 .join("sessions")
@@ -132,13 +130,6 @@ impl GhosttyRegistry {
     }
 }
 
-fn default_state_root() -> PathBuf {
-    directories::ProjectDirs::from("computer", "KnickKnackLabs", "portl").map_or_else(
-        || PathBuf::from(".portl/ghostty"),
-        |dirs| dirs.data_dir().join("ghostty"),
-    )
-}
-
 pub(crate) fn encode_session_component(input: &str) -> String {
     let mut encoded = String::new();
     for byte in input.bytes() {
@@ -150,6 +141,67 @@ pub(crate) fn encode_session_component(input: &str) -> String {
         }
     }
     encoded
+}
+
+fn socket_path_for(runtime_root: &Path, session: &str) -> PathBuf {
+    let socket_name = socket_file_name(session);
+    let preferred = runtime_root.join("sockets").join(&socket_name);
+    if unix_socket_path_fits(&preferred) {
+        preferred
+    } else {
+        short_runtime_root().join("sockets").join(socket_name)
+    }
+}
+
+fn socket_file_name(session: &str) -> String {
+    let encoded = encode_session_component(session);
+    let prefix = if encoded.is_empty() {
+        "session".to_owned()
+    } else {
+        encoded.chars().take(24).collect()
+    };
+    format!("{prefix}-{:016x}.sock", stable_session_hash(session))
+}
+
+fn stable_session_hash(session: &str) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    session.bytes().fold(FNV_OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
+    })
+}
+
+#[cfg(unix)]
+fn unix_socket_path_fits(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    path.as_os_str().as_bytes().len() < MAX_UNIX_SOCKET_PATH_BYTES
+}
+
+#[cfg(not(unix))]
+fn unix_socket_path_fits(_path: &Path) -> bool {
+    true
+}
+
+#[cfg(unix)]
+fn short_runtime_root() -> PathBuf {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let suffix = format!("portl-ghostty-{}", nix::unistd::Uid::current().as_raw());
+    let xdg_candidate = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|dir| dir.join(&suffix));
+    if let Some(candidate) = xdg_candidate
+        && candidate.as_os_str().as_bytes().len() <= 48
+    {
+        return candidate;
+    }
+    PathBuf::from("/tmp").join(suffix)
+}
+
+#[cfg(not(unix))]
+fn short_runtime_root() -> PathBuf {
+    std::env::temp_dir().join("portl-ghostty")
 }
 
 #[cfg(unix)]
@@ -243,7 +295,9 @@ impl GhosttyProvider {
                 Err(_) => false,
             };
             if !live {
-                let paths = self.registry.paths_for(&metadata.name);
+                let paths = self
+                    .registry
+                    .paths_for_with_socket(&metadata.name, metadata.socket_path.clone());
                 cleanup_helper_files(&paths).await;
                 continue;
             }
@@ -267,7 +321,10 @@ impl GhosttyProvider {
     }
 
     pub(crate) async fn history(&self, session: &str) -> Result<String> {
-        let paths = self.registry.paths_for(session);
+        let paths = self
+            .live_existing_paths(session)
+            .await?
+            .unwrap_or_else(|| self.registry.paths_for(session));
         GhosttyClient::connect(paths.socket_path)
             .await?
             .history()
@@ -275,11 +332,12 @@ impl GhosttyProvider {
     }
 
     pub(crate) async fn kill(&self, session: &str) -> Result<()> {
-        let paths = self.registry.paths_for(session);
-        if let Ok(client) = GhosttyClient::connect(paths.socket_path.clone()).await {
-            let _ = client.kill().await;
+        for paths in self.candidate_paths(session).await? {
+            if let Ok(client) = GhosttyClient::connect(paths.socket_path.clone()).await {
+                let _ = client.kill().await;
+            }
+            cleanup_helper_files(&paths).await;
         }
-        cleanup_helper_files(&paths).await;
         Ok(())
     }
 
@@ -321,9 +379,50 @@ impl GhosttyProvider {
         if live {
             return Ok(paths);
         }
+        if let Some(paths) = self.live_existing_paths(session).await? {
+            return Ok(paths);
+        }
         cleanup_helper_files(&paths).await;
         self.spawn_helper(session, &paths, cwd, pty, argv, env)
             .await?;
+        Ok(paths)
+    }
+
+    async fn live_existing_paths(&self, session: &str) -> Result<Option<GhosttySessionPaths>> {
+        for metadata in self.registry.list_metadata().await? {
+            if metadata.name != session {
+                continue;
+            }
+            let paths = self
+                .registry
+                .paths_for_with_socket(&metadata.name, metadata.socket_path.clone());
+            let live = match GhosttyClient::connect(paths.socket_path.clone()).await {
+                Ok(client) => client.probe().await.is_ok(),
+                Err(_) => false,
+            };
+            if live {
+                return Ok(Some(paths));
+            }
+            cleanup_helper_files(&paths).await;
+        }
+        Ok(None)
+    }
+
+    async fn candidate_paths(&self, session: &str) -> Result<Vec<GhosttySessionPaths>> {
+        let mut paths = vec![self.registry.paths_for(session)];
+        for metadata in self.registry.list_metadata().await? {
+            if metadata.name == session {
+                let metadata_paths = self
+                    .registry
+                    .paths_for_with_socket(&metadata.name, metadata.socket_path);
+                if !paths
+                    .iter()
+                    .any(|paths| paths.socket_path == metadata_paths.socket_path)
+                {
+                    paths.push(metadata_paths);
+                }
+            }
+        }
         Ok(paths)
     }
 
@@ -576,6 +675,47 @@ pub(crate) async fn run_helper_command(
 }
 
 #[cfg(unix)]
+async fn prepare_socket_dir(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    tokio::fs::create_dir_all(path).await?;
+    let link_meta = tokio::fs::symlink_metadata(path).await?;
+    if link_meta.file_type().is_symlink() {
+        bail!(
+            "ghostty socket directory must not be a symlink: {}",
+            path.display()
+        );
+    }
+    let meta = tokio::fs::metadata(path).await?;
+    if !meta.is_dir() {
+        bail!(
+            "ghostty socket path parent is not a directory: {}",
+            path.display()
+        );
+    }
+    let current_uid = nix::unistd::Uid::current().as_raw();
+    if meta.uid() != current_uid {
+        bail!(
+            "ghostty socket directory {} is owned by uid {}, expected {}",
+            path.display(),
+            meta.uid(),
+            current_uid
+        );
+    }
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn set_socket_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .await
+        .with_context(|| format!("set ghostty socket permissions on {}", path.display()))
+}
+
+#[cfg(unix)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum GhosttyRequest {
     Probe,
@@ -665,7 +805,10 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
         bail!("ghostty helper argv cannot be empty");
     }
     if let Some(parent) = config.paths.socket_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+        if let Some(runtime_root) = parent.parent() {
+            prepare_socket_dir(runtime_root).await?;
+        }
+        prepare_socket_dir(parent).await?;
     }
     if let Some(parent) = config.paths.metadata_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -677,6 +820,7 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
     }
 
     let listener = UnixListener::bind(&config.paths.socket_path).context("bind ghostty socket")?;
+    set_socket_permissions(&config.paths.socket_path).await?;
     let winsize = nix::libc::winsize {
         ws_row: config.rows,
         ws_col: config.cols,
@@ -1310,9 +1454,37 @@ mod tests {
     }
 
     #[test]
+    fn registry_socket_paths_fit_macos_unix_socket_limit() {
+        let runtime = PathBuf::from(
+            "/Users/thinh/Library/Application Support/computer.KnickKnackLabs.portl/ghostty/runtime",
+        );
+        let state = PathBuf::from(
+            "/Users/thinh/Library/Application Support/computer.KnickKnackLabs.portl/ghostty",
+        );
+        let registry = GhosttyRegistry::with_roots(runtime, state.clone());
+
+        let paths = registry.paths_for("ghostty-test");
+        let socket_len = paths.socket_path.to_string_lossy().len();
+
+        assert!(
+            socket_len < 104,
+            "macOS sockaddr_un paths must be shorter than SUN_LEN; got {socket_len}: {}",
+            paths.socket_path.display()
+        );
+        assert_eq!(
+            paths.metadata_path,
+            state.join("sessions").join("ghostty-test.json")
+        );
+        assert_eq!(
+            paths.history_path,
+            state.join("sessions").join("ghostty-test.history")
+        );
+    }
+
+    #[test]
     fn registry_paths_are_stable_and_separated_by_purpose() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let runtime = temp.path().join("runtime");
+        let runtime = PathBuf::from("/tmp/portl-ghostty-test-runtime");
         let state = temp.path().join("state");
         let registry = GhosttyRegistry::with_roots(runtime.clone(), state.clone());
 
@@ -1320,7 +1492,10 @@ mod tests {
 
         assert_eq!(
             paths.socket_path,
-            runtime.join("sockets").join("dev%2Fmain.sock")
+            runtime.join("sockets").join(format!(
+                "dev%2Fmain-{:016x}.sock",
+                stable_session_hash("dev/main")
+            ))
         );
         assert_eq!(
             paths.metadata_path,

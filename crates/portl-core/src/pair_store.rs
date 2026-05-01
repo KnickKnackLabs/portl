@@ -17,8 +17,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::pair_code::InitiatorMode;
 
-const DEFAULT_FILE_NAME: &str = "pending_invites.json";
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingInvite {
     /// 32-char lowercase hex for readability. Matches the shape of
@@ -66,16 +64,10 @@ pub struct PairStore {
 }
 
 impl PairStore {
-    /// Resolve the default store path: `<home>/pending_invites.json`
-    /// using the same home-dir convention as the peer store.
+    /// Resolve the default store path: `$PORTL_HOME/state/pending_invites.json`.
     #[must_use]
     pub fn default_path() -> PathBuf {
-        crate::peer_store::PeerStore::default_path()
-            .parent()
-            .map_or_else(
-                || PathBuf::from(DEFAULT_FILE_NAME),
-                |parent| parent.join(DEFAULT_FILE_NAME),
-            )
+        crate::paths::pending_invites_path()
     }
 
     /// Load the store from disk. Missing file → empty store; this

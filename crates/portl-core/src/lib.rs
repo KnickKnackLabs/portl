@@ -15,6 +15,7 @@ pub mod labels;
 pub mod net;
 pub mod pair_code;
 pub mod pair_store;
+pub mod paths;
 pub mod peer_store;
 pub mod rendezvous;
 pub mod runtime;

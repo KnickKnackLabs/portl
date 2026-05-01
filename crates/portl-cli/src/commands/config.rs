@@ -6,10 +6,10 @@
 //!   env overrides are surfaced in `portl status agent` instead).
 //! - `portl config path` — print the absolute path to `portl.toml`.
 //! - `portl config template` — print a commented template; pipe into
-//!   `> ~/.local/share/portl/portl.toml` (or the `PORTL_HOME`
+//!   `> ~/.portl/config/portl.toml` (or the `PORTL_HOME`
 //!   equivalent) to scaffold.
 //! - `portl config validate [--path PATH|--stdin]` — parse + type-check
-//!   TOML. Defaults to `$PORTL_HOME/portl.toml`.
+//!   TOML. Defaults to `$PORTL_HOME/config/portl.toml`.
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -126,9 +126,7 @@ fn run_validate(path: Option<PathBuf>, stdin: bool, human_ok: bool) -> Result<()
 /// Resolve the effective `portl.toml` path. Honors `PORTL_HOME`;
 /// falls back to the platform default home dir.
 fn effective_path() -> PathBuf {
-    let home = std::env::var_os("PORTL_HOME")
-        .map_or_else(portl_agent::config::default_home_dir, PathBuf::from);
-    PortlConfig::default_path(&home)
+    portl_core::paths::config_path()
 }
 
 #[cfg(test)]

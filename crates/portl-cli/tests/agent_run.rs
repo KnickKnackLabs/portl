@@ -29,11 +29,13 @@ const AGENT_ENV_VARS: &[&str] = &[
 #[ignore = "slow e2e smoke; run before release tagging with `mise run release:verify -- VERSION --full`"]
 async fn agent_run_loads_env_config_and_accepts_configured_root() -> Result<()> {
     let home = tempdir()?;
-    let identity_path = home.path().join("identity.bin");
-    let revocations_path = home.path().join("revocations.jsonl");
+    let legacy_identity_path = home.path().join("identity.bin");
+    let paths = portl_core::paths::for_home(home.path());
+    let identity_path = paths.identity_path();
+    let revocations_path = paths.revocations_path();
     let operator = Identity::new();
     let agent_identity = Identity::new();
-    store::save(&agent_identity, &identity_path)?;
+    store::save(&agent_identity, &legacy_identity_path)?;
 
     let (client, server) = pair().await?;
     let mut cfg = with_env(
@@ -82,8 +84,12 @@ async fn agent_run_loads_env_config_and_accepts_configured_root() -> Result<()> 
 
 #[test]
 fn agent_run_rejects_invalid_trust_root_hex() {
+    let home = tempdir().expect("tempdir");
     let err = with_env(
-        &[("PORTL_TRUST_ROOTS", Some(OsString::from("xyz")))],
+        &[
+            ("PORTL_HOME", Some(home.path().as_os_str().to_os_string())),
+            ("PORTL_TRUST_ROOTS", Some(OsString::from("xyz"))),
+        ],
         portl_cli::load_agent_config,
     )
     .expect_err("invalid trust root hex should fail");
@@ -96,8 +102,12 @@ fn agent_run_rejects_invalid_trust_root_hex() {
 
 #[test]
 fn agent_run_rejects_gateway_mode_env_with_portl_gateway_hint() {
+    let home = tempdir().expect("tempdir");
     let err = with_env(
-        &[("PORTL_MODE", Some(OsString::from("gateway")))],
+        &[
+            ("PORTL_HOME", Some(home.path().as_os_str().to_os_string())),
+            ("PORTL_MODE", Some(OsString::from("gateway"))),
+        ],
         portl_cli::load_agent_config,
     )
     .expect_err("PORTL_MODE=gateway should be rejected");

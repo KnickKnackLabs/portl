@@ -8,34 +8,24 @@ use age::armor::{ArmoredReader, ArmoredWriter, Format};
 use age::scrypt;
 use age::secrecy::SecretString;
 use age::{Decryptor, Encryptor};
-use directories::ProjectDirs;
 use ed25519_dalek::SigningKey;
 use zeroize::Zeroizing;
 
 use crate::error::{PortlError, Result};
 use crate::id::keypair::Identity;
 
-const IDENTITY_FILE: &str = "identity.bin";
-
 /// Resolve the default identity path.
 #[must_use]
 pub fn default_path() -> PathBuf {
-    if let Ok(home) = std::env::var("PORTL_HOME") {
-        return default_path_with_home(Some(Path::new(&home)));
-    }
-    default_path_with_home(None)
+    crate::paths::identity_path()
 }
 
 /// Resolve the default identity path with an optional home override.
 #[must_use]
 pub fn default_path_with_home(home_override: Option<&Path>) -> PathBuf {
-    match home_override {
-        Some(home) => home.join(IDENTITY_FILE),
-        None => ProjectDirs::from("computer", "KnickKnackLabs", "portl").map_or_else(
-            || PathBuf::from(IDENTITY_FILE),
-            |dirs| dirs.data_dir().join(IDENTITY_FILE),
-        ),
-    }
+    home_override.map_or_else(default_path, |home| {
+        crate::paths::for_home(home).identity_path()
+    })
 }
 
 /// Save an identity as raw 32-byte signing-key material.

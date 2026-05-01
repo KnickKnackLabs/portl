@@ -98,5 +98,5 @@ fn default_path_honours_portl_home_env() {
     let home = PathBuf::from("/tmp/portl-home");
     let path = default_path_with_home(Some(home.as_path()));
 
-    assert_eq!(path, home.join("identity.bin"));
+    assert_eq!(path, home.join("data/identity.bin"));
 }

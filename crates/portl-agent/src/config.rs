@@ -3,7 +3,6 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
-use directories::ProjectDirs;
 use iroh_base::RelayUrl;
 use portl_core::endpoint::Endpoint;
 use portl_core::peer_store::PeerStore;
@@ -52,9 +51,8 @@ pub struct AgentConfig {
     /// source of truth. Leave as empty `Vec` in tests that don't
     /// care about trust policy.
     pub trust_roots: Vec<[u8; 32]>,
-    /// Path to the peer store. Defaults to `<home>/peers.json` (the
-    /// same dir that holds `identity.bin`), overridable via explicit
-    /// assignment in tests.
+    /// Path to the peer store. Defaults to `<home>/data/peers.json`,
+    /// overridable via explicit assignment in tests.
     pub peers_path: Option<PathBuf>,
     pub revocations_path: Option<PathBuf>,
     pub revocations_max_bytes: Option<u64>,
@@ -89,12 +87,14 @@ impl AgentConfig {
     /// Load effective config. Order of precedence (high to low):
     ///
     /// 1. Environment variables (`PORTL_*`)
-    /// 2. `portl.toml` at `$PORTL_HOME/portl.toml` (if present)
+    /// 2. `portl.toml` at `$PORTL_HOME/config/portl.toml` (if present)
     /// 3. Compiled defaults
     ///
     /// CLI flags sit above this layer and are merged by the
     /// caller after `from_env` returns.
     pub fn from_env() -> Result<Self> {
+        #[cfg(not(test))]
+        portl_core::paths::ensure_layout_migrated()?;
         // Resolve home up-front so we know where to look for the
         // file. We duplicate the logic from `build` here but it's
         // short and avoids a two-pass structure.
@@ -117,7 +117,8 @@ impl AgentConfig {
                 std::env::temp_dir().join(format!("portl-ephemeral-{}", std::process::id()))
             }
         });
-        let identity_path = home.join("identity.bin");
+        let paths = portl_core::paths::for_home(&home);
+        let identity_path = paths.identity_path();
 
         if identity_secret.is_some() && identity_path.exists() {
             bail!(
@@ -126,7 +127,7 @@ impl AgentConfig {
             );
         }
 
-        let peers_path = home.join("peers.json");
+        let peers_path = paths.peers_path();
         // Load trust_roots from the peer store. Missing file = empty
         // roots: an agent with no peers refuses every ticket, which
         // is the correct fail-closed default. Installers are expected
@@ -167,7 +168,7 @@ impl AgentConfig {
             DiscoveryConfig::default()
         };
         let revocations_path =
-            env_path("PORTL_REVOCATIONS_PATH").unwrap_or_else(|| home.join("revocations.jsonl"));
+            env_path("PORTL_REVOCATIONS_PATH").unwrap_or_else(|| paths.revocations_path());
         let rate_limit = if let Some(value) = env_string("PORTL_RATE_LIMIT")? {
             parse_rate_limit(&value)?
         } else if let Some(section) = file.and_then(|f| f.agent.rate_limit.as_ref()) {
@@ -227,7 +228,7 @@ impl AgentConfig {
             endpoint: None,
             udp_session_linger_secs: Some(udp_session_linger_secs),
             metrics_enabled: Some(metrics_enabled),
-            metrics_socket_path: Some(home.join("metrics.sock")),
+            metrics_socket_path: Some(paths.metrics_socket_path()),
             session_provider,
             session_provider_path,
             relay_server,
@@ -326,8 +327,7 @@ pub fn parse_gateway_mode(url: &str) -> Result<AgentMode> {
 }
 
 pub fn default_home_dir() -> PathBuf {
-    ProjectDirs::from("computer", "KnickKnackLabs", "portl")
-        .map_or_else(|| PathBuf::from("."), |dirs| dirs.data_dir().to_path_buf())
+    portl_core::paths::default_home_dir()
 }
 
 fn env_string(name: &str) -> Result<Option<String>> {
@@ -627,17 +627,15 @@ mod tests {
                 let config = AgentConfig::from_env().expect("parse empty env");
                 let home = tmp.path().to_path_buf();
 
-                assert_eq!(config.identity_path, Some(home.join("identity.bin")));
+                let paths = portl_core::paths::for_home(&home);
+                assert_eq!(config.identity_path, Some(paths.identity_path()));
                 assert_eq!(
                     config.bind_addr,
                     Some("[::]:0".parse().expect("default listen addr"))
                 );
                 assert_eq!(config.discovery, DiscoveryConfig::default());
                 assert!(config.trust_roots.is_empty());
-                assert_eq!(
-                    config.revocations_path,
-                    Some(home.join("revocations.jsonl"))
-                );
+                assert_eq!(config.revocations_path, Some(paths.revocations_path()));
                 assert_eq!(
                     config.revocations_max_bytes,
                     Some(crate::revocations::DEFAULT_REVOCATIONS_MAX_BYTES)
@@ -649,7 +647,10 @@ mod tests {
                     Some(DEFAULT_UDP_SESSION_LINGER_SECS)
                 );
                 assert_eq!(config.metrics_enabled, Some(true));
-                assert_eq!(config.metrics_socket_path, Some(home.join("metrics.sock")));
+                assert_eq!(
+                    config.metrics_socket_path,
+                    Some(paths.metrics_socket_path())
+                );
             },
         );
     }
@@ -657,7 +658,9 @@ mod tests {
     #[test]
     fn from_env_rejects_both_identity_and_home() {
         let home = tempdir().expect("tempdir");
-        std::fs::write(home.path().join("identity.bin"), [7_u8; 32]).expect("write identity");
+        let paths = portl_core::paths::for_home(home.path());
+        std::fs::create_dir_all(paths.data_dir()).expect("create data dir");
+        std::fs::write(paths.identity_path(), [7_u8; 32]).expect("write identity");
 
         with_env(
             &[
@@ -825,19 +828,18 @@ mod tests {
     #[test]
     fn from_env_populates_trust_roots_from_peer_store() {
         // With v0.3.0's filesystem-backed model: writing a peers.json
-        // into PORTL_HOME is the only path to populating trust_roots.
+        // into PORTL_HOME/data is the only path to populating trust_roots.
         // Empty store → empty roots; no warnings, no crashes.
         let home = tempdir().expect("tempdir");
         let peers = portl_core::peer_store::PeerStore::new();
-        peers
-            .save(&home.path().join("peers.json"))
-            .expect("seed peer store");
+        let paths = portl_core::paths::for_home(home.path());
+        peers.save(&paths.peers_path()).expect("seed peer store");
         with_env(
             &[("PORTL_HOME", Some(home.path().as_os_str().to_os_string()))],
             || {
                 let config = AgentConfig::from_env().expect("parse env with empty peer store");
                 assert!(config.trust_roots.is_empty());
-                assert_eq!(config.peers_path, Some(home.path().join("peers.json")));
+                assert_eq!(config.peers_path, Some(paths.peers_path()));
             },
         );
     }

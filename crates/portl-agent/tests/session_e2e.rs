@@ -478,13 +478,16 @@ async fn start_agent(
     operator: &Identity,
     zmx_path: Option<std::path::PathBuf>,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
-    let revocations_path = std::env::temp_dir().join(format!(
-        "portl-agent-session-revocations-{}.json",
+    let home = std::env::temp_dir().join(format!(
+        "portl-agent-session-home-{}",
         rand::random::<u64>()
     ));
+    let paths = portl_core::paths::for_home(&home);
+    let revocations_path = paths.revocations_path();
     run_task(AgentConfig {
         discovery: DiscoveryConfig::in_process(),
         trust_roots: vec![operator.verifying_key()],
+        peers_path: Some(paths.peers_path()),
         revocations_path: Some(revocations_path),
         endpoint: Some(server),
         session_provider_path: zmx_path,

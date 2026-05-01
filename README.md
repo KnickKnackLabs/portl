@@ -52,7 +52,9 @@ The installer is idempotent. Re-run it to upgrade; by default it preserves
 whether this machine was already configured as a client or agent. Set
 `PORTL_VERSION=0.8.0` to pin a release. Use `--agent=off` to disable the
 service, or `--uninstall` to remove binaries and service while keeping
-`$PORTL_HOME`. Release artifacts cover macOS and Linux on arm64 / x86_64.
+`$PORTL_HOME`. By default, Portl stores local state under `~/.portl` on
+all operating systems (`config/`, `data/`, `state/`, and `run/` subdirs).
+Release artifacts cover macOS and Linux on arm64 / x86_64.
 
 Daemon lifecycle commands live on `portl-agent`:
 
@@ -284,11 +286,11 @@ portl status <TARGET>
 portl session providers <TARGET>
 ```
 
-The agent exposes OpenMetrics on `$PORTL_HOME/metrics.sock` when the
+The agent exposes OpenMetrics on `$PORTL_HOME/run/metrics.sock` when the
 local service is running:
 
 ```bash
-curl --unix-socket "$PORTL_HOME/metrics.sock" http://metrics/
+curl --unix-socket "${PORTL_HOME:-$HOME/.portl}/run/metrics.sock" http://metrics/
 ```
 
 ## Design docs

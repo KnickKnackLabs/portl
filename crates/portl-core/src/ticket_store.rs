@@ -3,7 +3,7 @@
 //! peer/ticket split: peers store standing authority, tickets store
 //! bounded credentials.
 //!
-//! On-disk format is JSON at `<config_dir>/tickets.json`. Writes are
+//! On-disk format is JSON at `$PORTL_HOME/data/tickets.json`. Writes are
 //! atomic. No live-reload is needed because `portl ticket ls` and
 //! the resolve cascade read from disk on demand — mutations are rare
 //! and latency-insensitive.
@@ -15,8 +15,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-
-use crate::peer_store::home_dir_pub as home_dir;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionShareMetadata {
@@ -68,7 +66,7 @@ impl TicketStore {
     }
 
     pub fn default_path() -> PathBuf {
-        home_dir().join("tickets.json")
+        crate::paths::tickets_path()
     }
 
     pub fn load(path: &Path) -> Result<Self> {

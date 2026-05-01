@@ -520,7 +520,7 @@ fn slicer_home() -> PathBuf {
 }
 
 fn local_revocations_path() -> PathBuf {
-    slicer_home().join("revocations.jsonl")
+    portl_core::paths::revocations_path()
 }
 
 fn ticket_not_after(created_at: i64, ttl_secs: u64) -> Option<u64> {

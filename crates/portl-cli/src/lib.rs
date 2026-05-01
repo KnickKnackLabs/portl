@@ -380,6 +380,27 @@ fn clap_exit_code(err: &clap::Error) -> ExitCode {
     }
 }
 
+fn dispatch_command(command: Command) -> ExitCode {
+    match dispatch(command) {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("{err:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn dispatch_parse_result(parsed: Result<Command, clap::Error>) -> ExitCode {
+    match parsed {
+        Ok(command) => dispatch_command(command),
+        Err(err) => {
+            let code = clap_exit_code(&err);
+            let _ = err.print();
+            code
+        }
+    }
+}
+
 fn validate_bool_env(name: &str) -> Result<(), String> {
     let Ok(value) = std::env::var(name) else {
         return Ok(());
@@ -396,23 +417,14 @@ fn validate_bool_env(name: &str) -> Result<(), String> {
 pub fn run(argv: Vec<OsString>) -> ExitCode {
     portl_core::tls::install_default_crypto_provider();
     match is_hidden_ghostty_command_invocation(&argv) {
-        Ok(true) => {}
+        Ok(true) => {
+            return dispatch_parse_result(Cli::try_parse_from(argv).map(Cli::into_command));
+        }
         Ok(false) => match is_portl_agent_invocation(&argv) {
             Ok(true) => {
-                return match AgentCli::try_parse_from(argv).map(|cli| agent_cli_to_command(&cli)) {
-                    Ok(command) => match dispatch(command) {
-                        Ok(code) => code,
-                        Err(err) => {
-                            eprintln!("{err:#}");
-                            ExitCode::FAILURE
-                        }
-                    },
-                    Err(err) => {
-                        let code = clap_exit_code(&err);
-                        let _ = err.print();
-                        code
-                    }
-                };
+                return dispatch_parse_result(
+                    AgentCli::try_parse_from(argv).map(|cli| agent_cli_to_command(&cli)),
+                );
             }
             Ok(false) => {}
             Err(ParseError::EmptyArgv) => {
@@ -472,13 +484,23 @@ pub fn run(argv: Vec<OsString>) -> ExitCode {
 
     logging::init(cli.log_verbose, cli.log.as_deref());
 
-    match dispatch(cli.into_command()) {
-        Ok(code) => code,
+    match portl_core::paths::ensure_layout_migrated() {
+        Ok(report) => {
+            if !report.is_empty() && !env_flag("PORTL_QUIET") {
+                eprintln!(
+                    "portl: migrated local state to {} ({} files)",
+                    report.root.display(),
+                    report.moved_count()
+                );
+            }
+        }
         Err(err) => {
-            eprintln!("{err:#}");
-            ExitCode::FAILURE
+            eprintln!("portl: migrate local state: {err:#}");
+            return ExitCode::FAILURE;
         }
     }
+
+    dispatch_command(cli.into_command())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -857,7 +879,7 @@ pub const TARGET_HELP: &str = "Target identifier. Accepts any of:\n\n  * peer la
 /// and raw ticket strings are intentionally excluded.
 pub const SESSION_SHARE_TARGET_HELP: &str = "Target identifier. Supported forms:\n\n  * peer label    — outbound-capable peer from `portl peer ls`\n  * adapter alias — alias backed by an `endpoint_id`\n  * endpoint_id   — 64-char hex endpoint id (or PPPP…SSSS elided form)\n\nSaved tickets and raw `portl…` ticket strings are NOT accepted here:\nthe share flow refuses to delegate a ticket credential to an unknown\nrecipient.";
 
-const PORTL_AFTER_HELP: &str = "Everyday sessions:\n  $ portl attach dotfiles\n  $ portl run dotfiles -- git status\n  $ PORTL_TARGET=other-machine portl attach dotfiles\n  $ portl session share dotfiles\n\nPair two machines:\n  $ portl init\n  $ portl invite                       # on the other machine\n  $ portl accept PORTLINV-…            # on this machine\n\nRun `portl <COMMAND> --help` for details on any subcommand.\n\nEnvironment variables:\n  PORTL_HOME       State directory override.\n  PORTL_CONFIG     Alt portl.toml path.\n  PORTL_TARGET     Default target for session commands.\n  PORTL_JSON       Force --json where supported (0/1).\n  PORTL_QUIET      Force --quiet where supported (0/1).\n  NO_COLOR         Disable color output.\n\nSee `docs/ENV.md` for the full list including relay and internal variables.";
+const PORTL_AFTER_HELP: &str = "Everyday sessions:\n  $ portl attach dotfiles\n  $ portl run dotfiles -- git status\n  $ PORTL_TARGET=other-machine portl attach dotfiles\n  $ portl session share dotfiles\n\nPair two machines:\n  $ portl init\n  $ portl invite                       # on the other machine\n  $ portl accept PORTLINV-…            # on this machine\n\nRun `portl <COMMAND> --help` for details on any subcommand.\n\nEnvironment variables:\n  PORTL_HOME       Portl home root override (default: ~/.portl).\n  PORTL_CONFIG     Alt portl.toml path.\n  PORTL_TARGET     Default target for session commands.\n  PORTL_JSON       Force --json where supported (0/1).\n  PORTL_QUIET      Force --quiet where supported (0/1).\n  NO_COLOR         Disable color output.\n\nSee `docs/ENV.md` for the full list including relay and internal variables.";
 
 const TOP_LEVEL_HELP: &str = "portl — peer-to-peer remote access and port forwarding.
 
@@ -926,7 +948,7 @@ Pair two machines:
 Run `portl <COMMAND> --help` for details on any subcommand.
 
 Environment variables:
-  PORTL_HOME       State directory override.
+  PORTL_HOME       Portl home root override (default: ~/.portl).
   PORTL_CONFIG     Alt portl.toml path.
   PORTL_TARGET     Default target for session commands.
   PORTL_JSON       Force --json where supported (0/1).
@@ -1611,9 +1633,9 @@ enum ConfigSub {
     Path,
     /// Print a commented default template to stdout.
     Template,
-    /// Parse + type-check a `portl.toml`. Defaults to `$PORTL_HOME/portl.toml`.
+    /// Parse + type-check a `portl.toml`. Defaults to `$PORTL_HOME/config/portl.toml`.
     Validate {
-        /// Path to validate. Defaults to `$PORTL_HOME/portl.toml`.
+        /// Path to validate. Defaults to `$PORTL_HOME/config/portl.toml`.
         #[arg(long = "path", conflicts_with = "stdin")]
         path: Option<PathBuf>,
         /// Read TOML from standard input.

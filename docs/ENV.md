@@ -8,7 +8,7 @@ surface.
 
 | Variable | Purpose |
 | --- | --- |
-| `PORTL_HOME` | State directory override for identity, peer store, tickets, and revocations. |
+| `PORTL_HOME` | Portl home root override. Defaults to `~/.portl` on every OS. Portl stores config under `config/`, durable data under `data/`, operational state under `state/`, and runtime sockets under `run/`. |
 | `PORTL_CONFIG` | Alternate `portl.toml` path. |
 | `PORTL_TARGET` | Default target for session commands. Accepts peer labels, saved ticket labels, endpoint IDs, aliases, and unique hostname shorthands such as `max` for `max-b265`. Explicit `--target` or `host/session` refs take precedence. |
 | `PORTL_JSON` | Force `--json` on commands that support structured output. Truthy values are `1`, `true`, `yes`, and `on`; falsey values are `0`, `false`, `no`, and `off`. |
@@ -48,8 +48,8 @@ shown in user-facing help, may change without notice, and should only
 be set by portl itself or by portl's test harness.
 
 - `PORTL_ZMX_BINARY` — local path used by `portl docker run --session-provider zmx` and `portl docker bake --session-provider zmx` to copy a zmx binary into managed Docker targets.
-- `PORTL_GHOSTTY_RUNTIME_DIR` — override the native Ghostty provider socket directory during tests and smoke validation.
-- `PORTL_GHOSTTY_STATE_DIR` — override the native Ghostty provider metadata/history directory during tests and smoke validation.
+- `PORTL_GHOSTTY_RUNTIME_DIR` — override the native Ghostty provider socket directory during tests and smoke validation. Defaults to `$PORTL_HOME/run/ghostty`.
+- `PORTL_GHOSTTY_STATE_DIR` — override the native Ghostty provider metadata/history directory during tests and smoke validation. Defaults to `$PORTL_HOME/state/ghostty`.
 - `PORTL_IDENTITY_KEY`
 - `PORTL_IDENTITY_SECRET_HEX`
 - `PORTL_AUDIT_SHELL_EXIT_PATH`

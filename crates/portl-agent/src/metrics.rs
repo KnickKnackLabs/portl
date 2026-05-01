@@ -1,7 +1,7 @@
 //! In-process metrics registry + unix socket server.
 //!
 //! Exposes `OpenMetrics` on a local unix socket at
-//! `$PORTL_HOME/metrics.sock` (mode 0600). The surface is small and
+//! `$PORTL_HOME/run/metrics.sock` (mode 0600). The surface is small and
 //! deliberately not configurable for v0.1: counters on the hot paths
 //! (tickets accepted, rejected-by-reason, shell/tcp/udp opened) plus
 //! a handful of gauges for active resource counts. Collectors live
@@ -141,18 +141,10 @@ impl Metrics {
     }
 }
 
-/// Resolve the unix socket path: `$PORTL_HOME/metrics.sock`.
+/// Resolve the unix socket path: `$PORTL_HOME/run/metrics.sock`.
 #[must_use]
 pub fn default_socket_path() -> PathBuf {
-    let home = if let Some(override_home) = std::env::var_os("PORTL_HOME") {
-        PathBuf::from(override_home)
-    } else if let Some(dirs) = directories::ProjectDirs::from("computer", "KnickKnackLabs", "portl")
-    {
-        dirs.data_dir().to_path_buf()
-    } else {
-        PathBuf::from(".")
-    };
-    home.join("metrics.sock")
+    portl_core::paths::metrics_socket_path()
 }
 
 /// Abstraction over "what the agent knows right now" for the

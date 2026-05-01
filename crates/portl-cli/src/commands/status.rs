@@ -518,8 +518,8 @@ mod tests {
                 pid: 42,
                 version: "0.6.7".to_owned(),
                 started_at_unix: 1_704_067_200,
-                home: "/Users/demo/.local/share/portl".to_owned(),
-                metrics_socket: "/Users/demo/.local/share/portl/metrics.sock".to_owned(),
+                home: "/Users/demo/.portl".to_owned(),
+                metrics_socket: "/Users/demo/.portl/run/metrics.sock".to_owned(),
             },
             Vec::new(),
             NetworkInfo {

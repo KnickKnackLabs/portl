@@ -5,9 +5,9 @@
 //! an invite code; server:
 //!
 //! 1. Reads one postcard-framed `PairRequest`.
-//! 2. Looks up `nonce` in `$PORTL_HOME/pending_invites.json`.
+//! 2. Looks up `nonce` in `$PORTL_HOME/state/pending_invites.json`.
 //! 3. If present + not expired: inserts/updates the caller in
-//!    `peers.json` and deletes the consumed invite.
+//!    `$PORTL_HOME/data/peers.json` and deletes the consumed invite.
 //! 4. Writes a `PairResponse` and closes the stream.
 //!
 //! The caller's identity is read from iroh's TLS peer cert, not
@@ -109,9 +109,7 @@ pub(crate) fn handle_pair(
         .peers_path
         .clone()
         .unwrap_or_else(PeerStore::default_path);
-    let pair_path = peers_path
-        .parent()
-        .map_or_else(PairStore::default_path, |p| p.join("pending_invites.json"));
+    let pair_path = portl_core::paths::for_home(&state.home).pending_invites_path();
 
     let mut pair_store = PairStore::load(&pair_path)
         .with_context(|| format!("load pair store at {}", pair_path.display()))?;
@@ -393,7 +391,8 @@ mod tests {
             connections: ConnectionRegistry::new(),
             peers_path: Some(peers_path.to_path_buf()),
             discovery: DiscoveryConfig::default(),
-            home: peers_path.parent().unwrap_or(peers_path).to_path_buf(),
+            home: crate::home_from_peers_path(peers_path)
+                .unwrap_or_else(|| peers_path.to_path_buf()),
             metrics_socket: std::env::temp_dir().join("portl-pair-test.sock"),
             session_provider_path: None,
             started_at_unix: 0,
@@ -434,7 +433,7 @@ mod tests {
 
         let tmp = tempdir().unwrap();
         let peers_path = tmp.path().join("peers.json");
-        let pair_path = tmp.path().join("pending_invites.json");
+        let pair_path = portl_core::paths::for_home(tmp.path()).pending_invites_path();
         seed_self(&peers_path);
         put_invite(&pair_path, &hex::encode([7u8; 16]), u64::MAX / 2);
         let state = Arc::new(make_state(&peers_path));
@@ -506,7 +505,7 @@ mod tests {
     fn handle_pair_happy_path() {
         let tmp = tempdir().unwrap();
         let peers_path = tmp.path().join("peers.json");
-        let pair_path = tmp.path().join("pending_invites.json");
+        let pair_path = portl_core::paths::for_home(tmp.path()).pending_invites_path();
         seed_self(&peers_path);
         put_invite(&pair_path, &hex::encode([7u8; 16]), u64::MAX / 2);
 
@@ -546,7 +545,7 @@ mod tests {
     fn handle_pair_uses_inviter_dictated_initiator_me() {
         let tmp = tempdir().unwrap();
         let peers_path = tmp.path().join("peers.json");
-        let pair_path = tmp.path().join("pending_invites.json");
+        let pair_path = portl_core::paths::for_home(tmp.path()).pending_invites_path();
         seed_self(&peers_path);
         put_invite_with_initiator(
             &pair_path,
@@ -578,7 +577,7 @@ mod tests {
     fn handle_pair_rejects_tampered_initiator() {
         let tmp = tempdir().unwrap();
         let peers_path = tmp.path().join("peers.json");
-        let pair_path = tmp.path().join("pending_invites.json");
+        let pair_path = portl_core::paths::for_home(tmp.path()).pending_invites_path();
         seed_self(&peers_path);
         put_invite_with_initiator(
             &pair_path,
@@ -604,7 +603,7 @@ mod tests {
     fn handle_pair_initiator_them_is_inbound_only() {
         let tmp = tempdir().unwrap();
         let peers_path = tmp.path().join("peers.json");
-        let pair_path = tmp.path().join("pending_invites.json");
+        let pair_path = portl_core::paths::for_home(tmp.path()).pending_invites_path();
         seed_self(&peers_path);
         put_invite_with_initiator(
             &pair_path,
@@ -653,7 +652,7 @@ mod tests {
     fn handle_pair_expired_nonce() {
         let tmp = tempdir().unwrap();
         let peers_path = tmp.path().join("peers.json");
-        let pair_path = tmp.path().join("pending_invites.json");
+        let pair_path = portl_core::paths::for_home(tmp.path()).pending_invites_path();
         seed_self(&peers_path);
         put_invite(&pair_path, &hex::encode([7u8; 16]), 100); // already past
         let state = make_state(&peers_path);
@@ -672,7 +671,7 @@ mod tests {
     fn handle_pair_already_paired_is_idempotent() {
         let tmp = tempdir().unwrap();
         let peers_path = tmp.path().join("peers.json");
-        let pair_path = tmp.path().join("pending_invites.json");
+        let pair_path = portl_core::paths::for_home(tmp.path()).pending_invites_path();
         seed_self(&peers_path);
         // Pre-seed the caller as an existing peer
         let mut peers = PeerStore::load(&peers_path).unwrap();
