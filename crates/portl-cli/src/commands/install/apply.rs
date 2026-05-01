@@ -14,6 +14,8 @@ pub(super) fn stop_install_target(target: InstallTarget, root: bool, path: &Path
         InstallTarget::Openrc => {
             let _ = ProcessCommand::new("rc-service")
                 .args(["portl-agent", "stop"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .status();
         }
     }

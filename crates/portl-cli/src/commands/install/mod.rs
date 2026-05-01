@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command as ProcessCommand, ExitCode};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -47,12 +47,12 @@ pub fn detect_host() -> DetectResult {
     detect_host_with(&DetectionContext::from_host())
 }
 
-pub fn stop_existing_agent_for_upgrade() -> Result<()> {
+pub fn stop_existing_agent_for_upgrade(target: Option<InstallTarget>) -> Result<()> {
     let detect_result = detect_host();
     if detect_result.inside_docker {
         return Ok(());
     }
-    let target = resolve_target(None, &detect_result)?;
+    let target = resolve_target(target, &detect_result)?;
     if matches!(target, InstallTarget::Dockerfile) {
         return Ok(());
     }
@@ -63,7 +63,59 @@ pub fn stop_existing_agent_for_upgrade() -> Result<()> {
         None,
     )?;
     stop_install_target(target, detect_result.root, &service_path);
+    if managed_agent_is_loaded() {
+        bail!(
+            "managed portl-agent service is still loaded after stop; stop it with the appropriate service manager or rerun the installer with sufficient privileges before migrating state"
+        );
+    }
     Ok(())
+}
+
+pub fn managed_agent_is_loaded() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let uid = nix::unistd::Uid::effective().as_raw();
+        launchctl_is_loaded(&format!("gui/{uid}/com.portl.agent"))
+            || launchctl_is_loaded("system/com.portl.agent")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        systemd_is_active(&["--user"]) || systemd_is_active(&[]) || openrc_is_active()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_is_loaded(target: &str) -> bool {
+    ProcessCommand::new("launchctl")
+        .args(["print", target])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_is_active(extra: &[&str]) -> bool {
+    let mut args = extra.to_vec();
+    args.extend_from_slice(&["is-active", "portl-agent.service"]);
+    ProcessCommand::new("systemctl")
+        .args(args)
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+#[cfg(target_os = "linux")]
+fn openrc_is_active() -> bool {
+    ProcessCommand::new("rc-service")
+        .args(["portl-agent", "status"])
+        .output()
+        .is_ok_and(|output| output.status.success())
+        || ProcessCommand::new("service")
+            .args(["portl-agent", "status"])
+            .output()
+            .is_ok_and(|output| output.status.success())
 }
 
 /// v0.3.1: expose self-row seeding so `portl init` can call it.
@@ -218,22 +270,61 @@ fn verify_agent_ready_after_apply(target: InstallTarget) -> Result<()> {
     let socket = crate::agent_ipc::default_socket_path();
     let runtime =
         tokio::runtime::Runtime::new().context("create runtime for agent readiness check")?;
+    let mut first_error = None;
     let mut last_error = None;
-    for _ in 0..20 {
+    for _ in 0..40 {
         match runtime.block_on(crate::agent_ipc::fetch_status(&socket)) {
             Ok(_) => {
                 println!("agent service is ready at {}", socket.display());
                 return Ok(());
             }
-            Err(err) => last_error = Some(err),
+            Err(err) => {
+                if first_error.is_none() {
+                    first_error = Some(err.to_string());
+                }
+                last_error = Some(err.to_string());
+            }
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    let detail = last_error.map_or_else(|| "status unavailable".to_owned(), |err| err.to_string());
+    print_service_diagnostics(target);
+    let detail = first_error
+        .or(last_error)
+        .unwrap_or_else(|| "status unavailable".to_owned());
     bail!(
         "portl-agent did not become ready at {} after install: {detail}",
         socket.display()
     )
+}
+
+fn print_service_diagnostics(target: InstallTarget) {
+    match target {
+        InstallTarget::Launchd => {
+            let domain = if nix::unistd::Uid::effective().is_root() {
+                "system".to_owned()
+            } else {
+                format!("gui/{}", nix::unistd::Uid::effective().as_raw())
+            };
+            let _ = ProcessCommand::new("launchctl")
+                .args(["print", &format!("{domain}/com.portl.agent")])
+                .status();
+        }
+        InstallTarget::Systemd => {
+            let detect = detect_host();
+            let args = if detect.root {
+                vec!["status", "--no-pager", "portl-agent.service"]
+            } else {
+                vec!["--user", "status", "--no-pager", "portl-agent.service"]
+            };
+            let _ = ProcessCommand::new("systemctl").args(args).status();
+        }
+        InstallTarget::Openrc => {
+            let _ = ProcessCommand::new("rc-service")
+                .args(["portl-agent", "status"])
+                .status();
+        }
+        InstallTarget::Dockerfile => {}
+    }
 }
 
 /// Write the local identity to `peers.json` as `label="self"`,

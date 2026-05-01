@@ -201,6 +201,18 @@ pub fn ensure_layout_migrated() -> Result<MigrationReport> {
     migrate_legacy_layouts(&paths)
 }
 
+pub fn layout_migration_needed() -> Result<bool> {
+    let paths = current();
+    for legacy_home in legacy_home_dirs(paths.root()) {
+        if legacy_home_needs_migration(&legacy_home, &paths)
+            .with_context(|| format!("inspect legacy Portl home {}", legacy_home.display()))?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn ensure_layout_dirs(paths: &PortlPaths) -> Result<()> {
     for dir in [
         paths.config_dir(),
@@ -231,6 +243,17 @@ fn legacy_home_dirs(new_root: &Path) -> Vec<PathBuf> {
     legacy_home_dirs_for(new_root, std::env::var_os(ENV_PORTL_HOME).is_none())
 }
 
+#[must_use]
+pub fn legacy_home_candidates() -> Vec<PathBuf> {
+    let paths = current();
+    legacy_home_dirs(paths.root())
+}
+
+#[must_use]
+pub fn home_is_explicit() -> bool {
+    std::env::var_os(ENV_PORTL_HOME).is_some()
+}
+
 fn legacy_home_dirs_for(new_root: &Path, include_platform_default: bool) -> Vec<PathBuf> {
     let mut seen = BTreeSet::new();
     let mut dirs = Vec::new();
@@ -259,6 +282,53 @@ pub fn previous_project_dirs_home() -> Option<PathBuf> {
 fn legacy_project_dirs_home() -> Option<PathBuf> {
     ProjectDirs::from("computer", "KnickKnackLabs", "portl")
         .map(|dirs| dirs.data_dir().to_path_buf())
+}
+
+fn legacy_home_needs_migration(legacy_home: &Path, paths: &PortlPaths) -> Result<bool> {
+    for (source, dest) in [
+        (legacy_home.join("portl.toml"), paths.config_path()),
+        (legacy_home.join("identity.bin"), paths.identity_path()),
+        (legacy_home.join("peers.json"), paths.peers_path()),
+        (legacy_home.join("tickets.json"), paths.tickets_path()),
+        (legacy_home.join("aliases.json"), paths.aliases_path()),
+        (
+            legacy_home.join("revocations.jsonl"),
+            paths.revocations_path(),
+        ),
+        (
+            legacy_home.join("pending_invites.json"),
+            paths.pending_invites_path(),
+        ),
+    ] {
+        if file_needs_migration(&source, &dest) {
+            return Ok(true);
+        }
+    }
+    dir_contents_need_migration(
+        &legacy_home.join("ghostty/sessions"),
+        &paths.ghostty_state_dir().join("sessions"),
+    )
+}
+
+fn file_needs_migration(source: &Path, dest: &Path) -> bool {
+    source != dest && source.exists() && !source.is_dir() && !dest.exists()
+}
+
+fn dir_contents_need_migration(source_dir: &Path, dest_dir: &Path) -> Result<bool> {
+    let entries = match fs::read_dir(source_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).with_context(|| format!("read {}", source_dir.display())),
+    };
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read entry in {}", source_dir.display()))?;
+        let source = entry.path();
+        let dest = dest_dir.join(entry.file_name());
+        if file_needs_migration(&source, &dest) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn migrate_legacy_home(
@@ -488,6 +558,33 @@ mod tests {
         if let Some(platform_default) = legacy_project_dirs_home() {
             assert!(candidates.contains(&platform_default));
         }
+    }
+
+    #[test]
+    fn layout_migration_needed_detects_flat_files_without_moving() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join(".portl");
+        fs::create_dir_all(&root)?;
+        fs::write(root.join("identity.bin"), b"id")?;
+        let paths = PortlPaths::new(&root);
+
+        assert!(legacy_home_needs_migration(&root, &paths)?);
+        assert!(root.join("identity.bin").exists());
+        assert!(!paths.identity_path().exists());
+        Ok(())
+    }
+
+    #[test]
+    fn layout_migration_needed_ignores_existing_destinations() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join(".portl");
+        let paths = PortlPaths::new(&root);
+        fs::create_dir_all(paths.data_dir())?;
+        fs::write(root.join("identity.bin"), b"old")?;
+        fs::write(paths.identity_path(), b"new")?;
+
+        assert!(!legacy_home_needs_migration(&root, &paths)?);
+        Ok(())
     }
 
     #[test]

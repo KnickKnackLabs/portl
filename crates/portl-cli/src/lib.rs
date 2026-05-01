@@ -390,56 +390,198 @@ fn dispatch_command(command: Command) -> ExitCode {
     }
 }
 
-fn command_needs_pre_migration_agent_stop(command: &Command) -> bool {
-    matches!(
-        command,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayoutMigrationAction {
+    Run,
+    Skip,
+    StopInstallServiceThenRun(Option<InstallTarget>),
+    Refuse(&'static str),
+}
+
+fn layout_migration_action(command: &Command) -> LayoutMigrationAction {
+    match command {
+        Command::Install {
+            target: Some(InstallTarget::Dockerfile),
+            ..
+        } => LayoutMigrationAction::Skip,
+        Command::Install {
+            apply: true,
+            yes: false,
+            detect: false,
+            dry_run: false,
+            ..
+        } => LayoutMigrationAction::Refuse("`portl install --apply` requires `--yes`"),
         Command::Install {
             apply: true,
             yes: true,
             detect: false,
             dry_run: false,
+            target,
             ..
-        }
-    )
+        } => LayoutMigrationAction::StopInstallServiceThenRun(*target),
+        Command::Install { .. } | Command::Doctor { .. } => LayoutMigrationAction::Skip,
+        _ => LayoutMigrationAction::Run,
+    }
 }
 
 #[cfg(test)]
 mod service_safe_upgrade_tests {
-    use super::{Command, command_needs_pre_migration_agent_stop};
+    use super::{Command, InstallTarget, LayoutMigrationAction, layout_migration_action};
 
     #[test]
-    fn pre_migration_stop_only_applies_to_confirmed_install_apply() {
-        assert!(command_needs_pre_migration_agent_stop(&Command::Install {
-            target: None,
-            apply: true,
-            yes: true,
-            detect: false,
-            dry_run: false,
-            output: None,
-        }));
-        assert!(!command_needs_pre_migration_agent_stop(&Command::Install {
-            target: None,
-            apply: true,
-            yes: false,
-            detect: false,
-            dry_run: false,
-            output: None,
-        }));
-        assert!(!command_needs_pre_migration_agent_stop(&Command::Install {
-            target: None,
-            apply: false,
-            yes: true,
-            detect: false,
-            dry_run: false,
-            output: None,
-        }));
-        assert!(!command_needs_pre_migration_agent_stop(&Command::Doctor {
-            fix: false,
-            yes: false,
-            verbose: false,
-            json: false,
-            quiet: false,
-        }));
+    fn install_apply_yes_stops_requested_target_before_migration() {
+        assert_eq!(
+            layout_migration_action(&Command::Install {
+                target: Some(InstallTarget::Openrc),
+                apply: true,
+                yes: true,
+                detect: false,
+                dry_run: false,
+                output: None,
+            }),
+            LayoutMigrationAction::StopInstallServiceThenRun(Some(InstallTarget::Openrc))
+        );
+    }
+
+    #[test]
+    fn install_inspection_paths_do_not_migrate() {
+        assert_eq!(
+            layout_migration_action(&Command::Install {
+                target: None,
+                apply: false,
+                yes: false,
+                detect: false,
+                dry_run: false,
+                output: None,
+            }),
+            LayoutMigrationAction::Skip
+        );
+        assert_eq!(
+            layout_migration_action(&Command::Install {
+                target: None,
+                apply: false,
+                yes: false,
+                detect: true,
+                dry_run: false,
+                output: None,
+            }),
+            LayoutMigrationAction::Skip
+        );
+        assert_eq!(
+            layout_migration_action(&Command::Install {
+                target: None,
+                apply: true,
+                yes: false,
+                detect: false,
+                dry_run: true,
+                output: None,
+            }),
+            LayoutMigrationAction::Skip
+        );
+    }
+
+    #[test]
+    fn dockerfile_install_does_not_migrate() {
+        assert_eq!(
+            layout_migration_action(&Command::Install {
+                target: Some(InstallTarget::Dockerfile),
+                apply: true,
+                yes: true,
+                detect: false,
+                dry_run: false,
+                output: None,
+            }),
+            LayoutMigrationAction::Skip
+        );
+    }
+
+    #[test]
+    fn install_apply_without_yes_fails_before_migration() {
+        assert_eq!(
+            layout_migration_action(&Command::Install {
+                target: None,
+                apply: true,
+                yes: false,
+                detect: false,
+                dry_run: false,
+                output: None,
+            }),
+            LayoutMigrationAction::Refuse("`portl install --apply` requires `--yes`")
+        );
+    }
+
+    #[test]
+    fn doctor_does_not_migrate_state() {
+        assert_eq!(
+            layout_migration_action(&Command::Doctor {
+                fix: false,
+                yes: false,
+                verbose: false,
+                json: false,
+                quiet: false,
+            }),
+            LayoutMigrationAction::Skip
+        );
+    }
+}
+
+fn prepare_layout_for_command(command: &Command) -> Result<bool, ExitCode> {
+    match layout_migration_action(command) {
+        LayoutMigrationAction::Skip => Ok(false),
+        LayoutMigrationAction::Refuse(message) => {
+            eprintln!("{message}");
+            Err(ExitCode::FAILURE)
+        }
+        LayoutMigrationAction::StopInstallServiceThenRun(target) => {
+            if let Err(err) = commands::install::stop_existing_agent_for_upgrade(target) {
+                eprintln!("portl: stop existing agent before install: {err:#}");
+                return Err(ExitCode::FAILURE);
+            }
+            Ok(true)
+        }
+        LayoutMigrationAction::Run => {
+            if !portl_core::paths::home_is_explicit()
+                && let Err(code) = reject_default_home_migration_with_loaded_agent()
+            {
+                return Err(code);
+            }
+            Ok(true)
+        }
+    }
+}
+
+fn reject_default_home_migration_with_loaded_agent() -> Result<(), ExitCode> {
+    match portl_core::paths::layout_migration_needed() {
+        Ok(true) if commands::install::managed_agent_is_loaded() => {
+            eprintln!(
+                "portl: local state needs migration, but a managed portl-agent service is still loaded. Run the current installer so it can stop the old agent, install the new binary, migrate state, and restart safely."
+            );
+            Err(ExitCode::FAILURE)
+        }
+        Ok(_) => Ok(()),
+        Err(err) => {
+            eprintln!("portl: inspect local state migration: {err:#}");
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+fn ensure_layout_migrated_or_exit() -> Result<(), ExitCode> {
+    match portl_core::paths::ensure_layout_migrated() {
+        Ok(report) => {
+            if !report.is_empty() && !env_flag("PORTL_QUIET") {
+                eprintln!(
+                    "portl: migrated local state to {} ({} files)",
+                    report.root.display(),
+                    report.moved_count()
+                );
+            }
+            Ok(())
+        }
+        Err(err) => {
+            eprintln!("portl: migrate local state: {err:#}");
+            Err(ExitCode::FAILURE)
+        }
     }
 }
 
@@ -537,27 +679,12 @@ pub fn run(argv: Vec<OsString>) -> ExitCode {
 
     logging::init(cli.log_verbose, cli.log.as_deref());
     let command = cli.into_command();
-    if command_needs_pre_migration_agent_stop(&command)
-        && let Err(err) = commands::install::stop_existing_agent_for_upgrade()
-    {
-        eprintln!("portl: stop existing agent before install: {err:#}");
-        return ExitCode::FAILURE;
-    }
-
-    match portl_core::paths::ensure_layout_migrated() {
-        Ok(report) => {
-            if !report.is_empty() && !env_flag("PORTL_QUIET") {
-                eprintln!(
-                    "portl: migrated local state to {} ({} files)",
-                    report.root.display(),
-                    report.moved_count()
-                );
-            }
-        }
-        Err(err) => {
-            eprintln!("portl: migrate local state: {err:#}");
-            return ExitCode::FAILURE;
-        }
+    let should_migrate = match prepare_layout_for_command(&command) {
+        Ok(should_migrate) => should_migrate,
+        Err(code) => return code,
+    };
+    if should_migrate && let Err(code) = ensure_layout_migrated_or_exit() {
+        return code;
     }
 
     dispatch_command(command)

@@ -252,7 +252,7 @@ fn check_listener_bind() -> CheckResult {
 /// fixed env-var schema. Doesn't actually probe DNS here; that's the
 /// relay check's job.
 fn check_discovery_config() -> CheckResult {
-    match portl_agent::AgentConfig::from_env() {
+    match portl_agent::AgentConfig::from_env_without_layout_migration() {
         Ok(cfg) => {
             let discovery = &cfg.discovery;
             let relay = if cfg.discovery.relays.is_empty() {
@@ -604,30 +604,14 @@ fn check_binary_drift() -> CheckResult {
 fn check_home_layout() -> CheckResult {
     let current = portl_core::paths::current();
     let current_identity = current.identity_path();
-    let Some(previous) = portl_core::paths::previous_project_dirs_home() else {
-        return CheckResult {
-            name: "home layout",
-            status: Status::Ok,
-            detail: format!("using {}", current.root().display()),
-        };
-    };
-    let stale = stale_legacy_durable_files(&previous)
-        .into_iter()
-        .map(|path| {
-            path.strip_prefix(&previous)
-                .unwrap_or(&path)
-                .display()
-                .to_string()
-        })
-        .collect::<Vec<_>>();
+    let stale = stale_legacy_durable_files_by_home();
     if current_identity.exists() && stale.is_empty() {
         return CheckResult {
             name: "home layout",
             status: Status::Ok,
             detail: format!(
-                "using {}; previous durable state migrated from {}",
-                current.root().display(),
-                previous.display()
+                "using {}; no unmigrated durable legacy files found",
+                current.root().display()
             ),
         };
     }
@@ -636,10 +620,9 @@ fn check_home_layout() -> CheckResult {
             name: "home layout",
             status: Status::Warn,
             detail: format!(
-                "using {}, but previous durable files remain in {}: {}. Back up, then move or remove these stale files before release validation.",
+                "using {}, but previous durable files remain: {}. Back up, then move or remove these stale files before release validation.",
                 current.root().display(),
-                previous.display(),
-                stale.join(", ")
+                format_stale_legacy_files(&stale)
             ),
         };
     }
@@ -648,9 +631,9 @@ fn check_home_layout() -> CheckResult {
             name: "home layout",
             status: Status::Fail,
             detail: format!(
-                "new home {} has no identity but previous durable state exists in {}. Run the current `portl config path` before starting the service, or restore from backup.",
+                "new home {} has no identity but previous durable state exists: {}. Run the current installer so it can stop any old agent, install the new binary, migrate state, and restart safely; or stop the agent first and run `portl config path` manually.",
                 current.root().display(),
-                previous.display()
+                format_stale_legacy_files(&stale)
             ),
         };
     }
@@ -659,6 +642,36 @@ fn check_home_layout() -> CheckResult {
         status: Status::Ok,
         detail: format!("using {}", current.root().display()),
     }
+}
+
+fn stale_legacy_durable_files_by_home() -> Vec<(PathBuf, Vec<PathBuf>)> {
+    portl_core::paths::legacy_home_candidates()
+        .into_iter()
+        .filter_map(|home| {
+            let stale = stale_legacy_durable_files(&home);
+            (!stale.is_empty()).then_some((home, stale))
+        })
+        .collect()
+}
+
+fn format_stale_legacy_files(stale: &[(PathBuf, Vec<PathBuf>)]) -> String {
+    stale
+        .iter()
+        .map(|(home, files)| {
+            let files = files
+                .iter()
+                .map(|path| {
+                    path.strip_prefix(home)
+                        .unwrap_or(path)
+                        .display()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{}: {files}", home.display())
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn stale_legacy_durable_files(previous: &Path) -> Vec<PathBuf> {
@@ -688,48 +701,45 @@ fn directory_has_entries(path: &Path) -> bool {
 
 fn check_agent_runtime_socket() -> CheckResult {
     let socket = portl_core::paths::metrics_socket_path();
-    if socket.exists() {
-        return CheckResult {
+    match fetch_agent_status_sync(&socket) {
+        Ok(status) => CheckResult {
             name: "agent runtime",
             status: Status::Ok,
-            detail: format!("metrics socket available at {}", socket.display()),
-        };
-    }
-    if service_is_loaded() {
-        return CheckResult {
+            detail: format!(
+                "agent IPC ok at {} (pid {}, v{})",
+                socket.display(),
+                status.agent.pid,
+                status.agent.version
+            ),
+        },
+        Err(err) if service_is_loaded() => CheckResult {
             name: "agent runtime",
             status: Status::Fail,
             detail: format!(
-                "managed portl-agent is loaded but current metrics socket is missing at {}. This usually means an old agent binary was restarted after state migrated; run the current installer or `portl-agent restart` after installing the new binary.",
+                "managed portl-agent is loaded but current agent IPC is unavailable at {}: {err}. This usually means an old agent binary was restarted after state migrated; run the current installer or `portl-agent restart` after installing the new binary.",
                 socket.display()
             ),
-        };
-    }
-    CheckResult {
-        name: "agent runtime",
-        status: Status::Warn,
-        detail: format!(
-            "agent service is not loaded; metrics socket absent at {}",
-            socket.display()
-        ),
+        },
+        Err(err) => CheckResult {
+            name: "agent runtime",
+            status: Status::Warn,
+            detail: format!(
+                "agent service is not loaded or not reachable at {}: {err}",
+                socket.display()
+            ),
+        },
     }
 }
 
+fn fetch_agent_status_sync(
+    socket: &Path,
+) -> anyhow::Result<portl_agent::status_schema::StatusResponse> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(crate::agent_ipc::fetch_status(socket))
+}
+
 fn service_is_loaded() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        let uid_str = format!("{}", nix::unistd::getuid());
-        launchctl_is_loaded(&format!("gui/{uid_str}/com.portl.agent"))
-            || launchctl_is_loaded("system/com.portl.agent")
-    }
-    #[cfg(target_os = "linux")]
-    {
-        systemctl_is_active(&["--user"]) || systemctl_is_active(&[])
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        false
-    }
+    crate::commands::install::managed_agent_is_loaded()
 }
 
 fn check_session_providers() -> CheckResult {
@@ -836,33 +846,37 @@ fn check_service_drift() -> CheckResult {
     }
     #[cfg(target_os = "linux")]
     {
-        let user = systemctl_is_active(&["--user"]);
-        let system = systemctl_is_active(&[]);
-        match (user, system) {
-            (true, true) => CheckResult {
-                name: "service",
-                status: Status::Warn,
-                detail: "both user and system portl-agent.service are active; \
-                 they'll fight over UDP binds. Pick one lane."
-                    .to_owned(),
-            },
-            (true, false) => CheckResult {
-                name: "service",
-                status: Status::Ok,
-                detail: "user systemd unit active".to_owned(),
-            },
-            (false, true) => CheckResult {
-                name: "service",
-                status: Status::Ok,
-                detail: "system systemd unit active".to_owned(),
-            },
-            (false, false) => CheckResult {
+        let mut active = Vec::new();
+        if systemctl_is_active(&["--user"]) {
+            active.push("user systemd unit");
+        }
+        if systemctl_is_active(&[]) {
+            active.push("system systemd unit");
+        }
+        if openrc_is_active() {
+            active.push("OpenRC service");
+        }
+        match active.as_slice() {
+            [] => CheckResult {
                 name: "service",
                 status: Status::Warn,
                 detail: "no portl-agent service active. Run \
                  `portl install --apply --yes` to install one, or \
                  `portl-agent &` to run ad-hoc."
                     .to_owned(),
+            },
+            [one] => CheckResult {
+                name: "service",
+                status: Status::Ok,
+                detail: format!("{one} active"),
+            },
+            many => CheckResult {
+                name: "service",
+                status: Status::Warn,
+                detail: format!(
+                    "multiple portl-agent services are active ({}); they'll fight over UDP binds. Pick one lane.",
+                    many.join(", ")
+                ),
             },
         }
     }
@@ -894,6 +908,18 @@ fn systemctl_is_active(extra: &[&str]) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn openrc_is_active() -> bool {
+    ProcessCommand::new("rc-service")
+        .args(["portl-agent", "status"])
+        .output()
+        .is_ok_and(|output| output.status.success())
+        || ProcessCommand::new("service")
+            .args(["portl-agent", "status"])
+            .output()
+            .is_ok_and(|output| output.status.success())
 }
 
 /// Auto-remediate the duplicate-service drift detected by
@@ -1042,6 +1068,19 @@ mod tests {
         assert!(stale.contains(&old.join("ghostty/sessions")));
         assert!(!stale.contains(&old.join("metrics.sock")));
         assert!(!stale.contains(&old.join("ghostty/runtime/sockets")));
+    }
+
+    #[test]
+    fn format_stale_legacy_files_groups_by_home() {
+        let first = PathBuf::from("/tmp/old-a");
+        let second = PathBuf::from("/tmp/old-b");
+        let formatted = format_stale_legacy_files(&[
+            (first.clone(), vec![first.join("identity.bin")]),
+            (second.clone(), vec![second.join("ghostty/sessions")]),
+        ]);
+
+        assert!(formatted.contains("/tmp/old-a: identity.bin"));
+        assert!(formatted.contains("/tmp/old-b: ghostty/sessions"));
     }
 
     #[test]

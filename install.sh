@@ -458,7 +458,7 @@ install_completions_best_effort() {
 # --- service management -----------------------------------------------
 
 service_configured() {
-    if "$INSTALL_DIR/portl-agent" status --service >/dev/null 2>&1; then
+    if [ "$DRY_RUN" -eq 0 ] && "$INSTALL_DIR/portl-agent" status --service >/dev/null 2>&1; then
         return 0
     fi
     # Transitional fallback for upgrading from releases before
@@ -475,8 +475,33 @@ service_configured() {
                 systemctl --user is-enabled portl-agent.service >/dev/null 2>&1 && return 0
                 systemctl is-enabled portl-agent.service >/dev/null 2>&1 && return 0
             fi
+            if has rc-service; then
+                rc-service portl-agent status >/dev/null 2>&1 && return 0
+            fi
             [ -f "${HOME:-/root}/.config/systemd/user/portl-agent.service" ] && return 0
             [ -f /etc/systemd/system/portl-agent.service ] && return 0
+            [ -f /etc/init.d/portl-agent ] && return 0
+            ;;
+    esac
+    return 1
+}
+
+service_loaded() {
+    case "$(uname -s)" in
+        Darwin)
+            launchctl print "gui/$(id -u)/com.portl.agent" >/dev/null 2>&1 && return 0
+            launchctl print system/com.portl.agent >/dev/null 2>&1 && return 0
+            ;;
+        Linux)
+            if has systemctl; then
+                systemctl --user is-active portl-agent.service >/dev/null 2>&1 && return 0
+                systemctl is-active portl-agent.service >/dev/null 2>&1 && return 0
+            fi
+            if has rc-service; then
+                rc-service portl-agent status >/dev/null 2>&1 && return 0
+            elif has service; then
+                service portl-agent status >/dev/null 2>&1 && return 0
+            fi
             ;;
     esac
     return 1
@@ -514,8 +539,16 @@ stop_existing_service_before_upgrade() {
                     run_quiet_best_effort systemctl stop portl-agent.service || true
                 fi
             fi
+            if has rc-service; then
+                run_quiet_best_effort rc-service portl-agent stop || true
+            elif has service; then
+                run_quiet_best_effort service portl-agent stop || true
+            fi
             ;;
     esac
+    if [ "$DRY_RUN" -eq 0 ] && service_loaded; then
+        err "portl-agent service is still running; stop it with your service manager or rerun this installer with sufficient privileges before migrating state"
+    fi
 }
 
 ensure_home_layout_with_new_binary() {

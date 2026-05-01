@@ -93,8 +93,24 @@ impl AgentConfig {
     /// CLI flags sit above this layer and are merged by the
     /// caller after `from_env` returns.
     pub fn from_env() -> Result<Self> {
+        Self::from_env_maybe_migrate(true)
+    }
+
+    /// Load effective config without migrating legacy layout. Intended
+    /// for diagnostic-only commands such as `portl doctor`, where merely
+    /// inspecting state must not move durable files out from under an old
+    /// still-running agent.
+    pub fn from_env_without_layout_migration() -> Result<Self> {
+        Self::from_env_maybe_migrate(false)
+    }
+
+    fn from_env_maybe_migrate(migrate_layout: bool) -> Result<Self> {
         #[cfg(not(test))]
-        portl_core::paths::ensure_layout_migrated()?;
+        if migrate_layout {
+            portl_core::paths::ensure_layout_migrated()?;
+        }
+        #[cfg(test)]
+        let _ = migrate_layout;
         // Resolve home up-front so we know where to look for the
         // file. We duplicate the logic from `build` here but it's
         // short and avoids a two-pass structure.
