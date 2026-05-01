@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::{Connection, SendStream};
+use portl_core::terminal::zmx_control;
 use portl_proto::session_v1::{
     ALPN_SESSION_V1, SessionAck, SessionEntry, SessionFirstFrame, SessionOp,
     SessionProviderSessions, SessionReason, SessionReq, SessionStreamKind, SessionSubTail,
@@ -26,11 +27,6 @@ pub(crate) mod provider;
 mod tmux_control;
 
 const MAX_CONTROL_BYTES: usize = 256 * 1024;
-const ZMX_CONTROL_HEADER_BYTES: usize = 5;
-const MAX_ZMX_CONTROL_FRAME_BYTES: usize = 16 * 1024 * 1024;
-const ZMX_TAG_OUTPUT: u8 = 1;
-const ZMX_TAG_VIEWPORT_SNAPSHOT: u8 = 14;
-const ZMX_TAG_LIVE_OUTPUT: u8 = 15;
 
 pub(crate) async fn serve_stream(
     connection: Connection,
@@ -821,8 +817,8 @@ fn spawn_zmx_control_process(
                 Some(message) = stdin_rx.recv() => {
                     let close = matches!(message, StdinMessage::Close);
                     let write = match message {
-                        StdinMessage::Data(data) => write_control_frame(&mut stdin, 0, &data).await,
-                        StdinMessage::Close => write_control_frame(&mut stdin, 3, &[]).await,
+                        StdinMessage::Data(data) => zmx_control::write_frame(&mut stdin, zmx_control::TAG_INPUT, &data).await,
+                        StdinMessage::Close => zmx_control::write_frame(&mut stdin, zmx_control::TAG_CLOSE, &[]).await,
                     };
                     if write.is_err() {
                         break;
@@ -835,15 +831,13 @@ fn spawn_zmx_control_process(
                 Some(command) = pty_rx.recv() => {
                     match command {
                         PtyCommand::Resize { rows, cols } => {
-                            let mut payload = [0_u8; 4];
-                            payload[..2].copy_from_slice(&rows.to_le_bytes());
-                            payload[2..].copy_from_slice(&cols.to_le_bytes());
-                            if write_control_frame(&mut stdin, 2, &payload).await.is_err() {
+                            let payload = zmx_control::resize_payload(rows, cols);
+                            if zmx_control::write_frame(&mut stdin, zmx_control::TAG_RESIZE, &payload).await.is_err() {
                                 break;
                             }
                         }
                         PtyCommand::Close { .. } => {
-                            let _ = write_control_frame(&mut stdin, 3, &[]).await;
+                            let _ = zmx_control::write_frame(&mut stdin, zmx_control::TAG_CLOSE, &[]).await;
                             let _ = stdin.shutdown().await;
                             break;
                         }
@@ -851,7 +845,7 @@ fn spawn_zmx_control_process(
                     }
                 }
                 else => {
-                    let _ = write_control_frame(&mut stdin, 3, &[]).await;
+                    let _ = zmx_control::write_frame(&mut stdin, zmx_control::TAG_CLOSE, &[]).await;
                     let _ = stdin.shutdown().await;
                     break;
                 }
@@ -860,10 +854,12 @@ fn spawn_zmx_control_process(
     });
 
     tokio::spawn(async move {
-        while let Ok(Some((tag, payload))) = read_control_frame(&mut stdout).await {
+        while let Ok(Some((tag, payload))) = zmx_control::read_frame(&mut stdout).await {
             if matches!(
                 tag,
-                ZMX_TAG_OUTPUT | ZMX_TAG_VIEWPORT_SNAPSHOT | ZMX_TAG_LIVE_OUTPUT
+                zmx_control::TAG_OUTPUT
+                    | zmx_control::TAG_VIEWPORT_SNAPSHOT
+                    | zmx_control::TAG_LIVE_OUTPUT
             ) && stdout_tx.send(payload).await.is_err()
             {
                 break;
@@ -917,43 +913,6 @@ fn spawn_zmx_control_process(
         pty_tx: Some(pty_tx),
         started_at,
     }))
-}
-
-async fn write_control_frame(
-    writer: &mut tokio::process::ChildStdin,
-    tag: u8,
-    payload: &[u8],
-) -> std::io::Result<()> {
-    let len = u32::try_from(payload.len()).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "zmx-control payload exceeds u32 frame length",
-        )
-    })?;
-    writer.write_all(&[tag]).await?;
-    writer.write_all(&len.to_le_bytes()).await?;
-    writer.write_all(payload).await
-}
-
-async fn read_control_frame(
-    reader: &mut tokio::process::ChildStdout,
-) -> std::io::Result<Option<(u8, Vec<u8>)>> {
-    let mut header = [0_u8; ZMX_CONTROL_HEADER_BYTES];
-    match reader.read_exact(&mut header).await {
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(err) => return Err(err),
-    }
-    let len = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
-    if len > MAX_ZMX_CONTROL_FRAME_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "zmx-control frame exceeds maximum payload size",
-        ));
-    }
-    let mut payload = vec![0_u8; len];
-    reader.read_exact(&mut payload).await?;
-    Ok(Some((header[0], payload)))
 }
 
 #[allow(clippy::too_many_arguments)]

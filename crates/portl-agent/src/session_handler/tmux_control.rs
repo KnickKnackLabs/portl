@@ -4,6 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
+use portl_core::attach_control::is_ctrl_backslash_sequence;
 use portl_core::terminal::tmux_cc::{
     self, Decoder as TmuxCcDecoder, TmuxControlEvent, parse_control_line,
 };
@@ -43,7 +44,7 @@ pub(crate) async fn pump_tmux_cc_pty(
             Some(message) = stdin_rx.recv(), if drain_deadline.is_none() => {
                 match message {
                     StdinMessage::Data(data) => {
-                        if is_ctrl_backslash(&data) {
+                        if is_ctrl_backslash_sequence(&data) {
                             write_pty_all(&master, b"detach-client\n").await.context("detach tmux -CC client")?;
                             drain_deadline = Some(tokio::time::Instant::now() + TMUX_CC_DRAIN_TIMEOUT);
                         } else {
@@ -123,78 +124,6 @@ async fn pump_control_bytes(
     Ok(())
 }
 
-fn is_ctrl_backslash(data: &[u8]) -> bool {
-    data.first().is_some_and(|byte| *byte == 0x1c) || is_key_pressed(data, 0x5c, 0b100)
-}
-
-fn is_key_pressed(data: &[u8], expected_key: u32, expected_mods: u32) -> bool {
-    data.windows(2).enumerate().any(|(index, window)| {
-        window == b"\x1b[" && keypress_with_mod(&data[index + 2..], expected_key, expected_mods)
-    })
-}
-
-fn keypress_with_mod(data: &[u8], expected_key: u32, expected_mods: u32) -> bool {
-    let mut pos = 0;
-    let Some(key_code) = parse_decimal(data, &mut pos) else {
-        return false;
-    };
-    if key_code != expected_key {
-        return false;
-    }
-
-    while data.get(pos).is_some_and(|byte| *byte == b':') {
-        pos += 1;
-        let _ = parse_decimal(data, &mut pos);
-    }
-
-    if data.get(pos).is_none_or(|byte| *byte != b';') {
-        return false;
-    }
-    pos += 1;
-
-    let Some(mod_encoded) = parse_decimal(data, &mut pos) else {
-        return false;
-    };
-    if mod_encoded < 1 {
-        return false;
-    }
-    let intentional_mods = (mod_encoded - 1) & 0b0011_1111;
-    if intentional_mods != expected_mods {
-        return false;
-    }
-
-    if data.get(pos).is_some_and(|byte| *byte == b':') {
-        pos += 1;
-        if parse_decimal(data, &mut pos) == Some(3) {
-            return false;
-        }
-    }
-
-    if data.get(pos).is_some_and(|byte| *byte == b';') {
-        pos += 1;
-        while data
-            .get(pos)
-            .is_some_and(|byte| byte.is_ascii_digit() || *byte == b':')
-        {
-            pos += 1;
-        }
-    }
-
-    data.get(pos).is_some_and(|byte| *byte == b'u')
-}
-
-fn parse_decimal(data: &[u8], pos: &mut usize) -> Option<u32> {
-    let start = *pos;
-    let mut value = 0_u32;
-    while let Some(byte) = data.get(*pos).filter(|byte| byte.is_ascii_digit()) {
-        value = value
-            .saturating_mul(10)
-            .saturating_add(u32::from(*byte - b'0'));
-        *pos += 1;
-    }
-    (*pos != start).then_some(value)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,18 +183,18 @@ mod tests {
 
     #[test]
     fn detects_raw_and_kitty_ctrl_backslash_detach() {
-        assert!(is_ctrl_backslash(b"\x1c"));
-        assert!(is_ctrl_backslash(b"\x1b[92;5u"));
-        assert!(is_ctrl_backslash(b"\x1b[92;5:1u"));
-        assert!(is_ctrl_backslash(b"\x1b[92;5:2u"));
-        assert!(is_ctrl_backslash(b"\x1b[92;69u"));
-        assert!(is_ctrl_backslash(b"\x1b[92:124;5u"));
+        assert!(is_ctrl_backslash_sequence(b"\x1c"));
+        assert!(is_ctrl_backslash_sequence(b"\x1b[92;5u"));
+        assert!(is_ctrl_backslash_sequence(b"\x1b[92;5:1u"));
+        assert!(is_ctrl_backslash_sequence(b"\x1b[92;5:2u"));
+        assert!(is_ctrl_backslash_sequence(b"\x1b[92;69u"));
+        assert!(is_ctrl_backslash_sequence(b"\x1b[92:124;5u"));
 
-        assert!(!is_ctrl_backslash(b"\x1b[92;5:3u"));
-        assert!(!is_ctrl_backslash(b"\x1b[92;6u"));
-        assert!(!is_ctrl_backslash(b"\x1b[92;7u"));
-        assert!(!is_ctrl_backslash(b"\x1b[91;5u"));
-        assert!(!is_ctrl_backslash(b"not-detach"));
+        assert!(!is_ctrl_backslash_sequence(b"\x1b[92;5:3u"));
+        assert!(!is_ctrl_backslash_sequence(b"\x1b[92;6u"));
+        assert!(!is_ctrl_backslash_sequence(b"\x1b[92;7u"));
+        assert!(!is_ctrl_backslash_sequence(b"\x1b[91;5u"));
+        assert!(!is_ctrl_backslash_sequence(b"not-detach"));
     }
 
     #[test]

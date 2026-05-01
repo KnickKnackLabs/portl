@@ -10,7 +10,9 @@ use anyhow::{Context, Result, anyhow};
 use clap::ValueEnum;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use iroh::endpoint::SendStream;
-use portl_core::attach_control::{RenderBarOptions, fit_visible, render_bar};
+use portl_core::attach_control::{
+    RenderBarOptions, fit_visible, is_ctrl_backslash_sequence, render_bar,
+};
 use portl_core::io::BufferedRecv;
 use portl_core::net::{
     SessionClient, open_session_attach, open_session_history, open_session_kill,
@@ -964,7 +966,7 @@ async fn local_session_attach(
         .as_str()
     {
         "zmx" => local_zmx_attach(target, session, cwd, argv).await,
-        "tmux" => local_tmux_attach(target, session, argv).await,
+        "tmux" => local_tmux_attach(target, session, cwd, argv).await,
         other => unreachable!("unsupported provider {other}"),
     }
 }
@@ -1043,6 +1045,7 @@ async fn local_zmx_control_attach(
     eprintln!("portl: using local session provider zmx");
     eprintln!("portl: attaching to local session \"{canonical_ref}\"");
     let mut command = Command::new(path);
+    command.kill_on_drop(true);
     command
         .args(["control", "--protocol", zmx_control::PROTOCOL])
         .arg("--rows")
@@ -1088,6 +1091,7 @@ async fn local_zmx_control_attach(
     });
     let (code, detached) = wait_local_attach_completion(&mut child, stdin_task).await?;
     if detached {
+        reap_local_child_after_detach(&mut child).await;
         stdout_task.abort();
         stderr_task.abort();
         let _ = stdout_task.await;
@@ -1107,24 +1111,34 @@ async fn local_zmx_control_attach(
     Ok(exit_code_from_i32(code))
 }
 
-async fn local_tmux_attach(target: &str, session: &str, argv: &[String]) -> Result<ExitCode> {
+async fn local_tmux_attach(
+    target: &str,
+    session: &str,
+    cwd: Option<&str>,
+    argv: &[String],
+) -> Result<ExitCode> {
     let path = local_tmux_path()?;
-    local_tmux_control_attach(path, target, session, argv).await
+    local_tmux_control_attach(path, target, session, cwd, argv).await
 }
 
 async fn local_tmux_control_attach(
     path: PathBuf,
     target: &str,
     session: &str,
+    cwd: Option<&str>,
     argv: &[String],
 ) -> Result<ExitCode> {
     let (cols, rows) = size().unwrap_or((80, 24));
+    let tmux_session = tmux_lookup_session(session);
+    validate_tmux_control_target(session)?;
     let canonical_ref = canonical_session_ref(target, "tmux", session);
     eprintln!("portl: using local session provider tmux");
     eprintln!("portl: attaching to local session \"{canonical_ref}\"");
+    let initial_viewport = local_tmux_viewport_snapshot(&path, session).await.ok();
     let mut command = Command::new(path);
+    command.kill_on_drop(true);
     command
-        .args(["-CC", "new-session", "-A", "-s", session])
+        .args(["-CC", "new-session", "-A", "-s", tmux_session])
         .arg("-x")
         .arg(cols.to_string())
         .arg("-y")
@@ -1133,8 +1147,17 @@ async fn local_tmux_control_attach(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
     let mut child = command.spawn().context("spawn tmux -CC attach")?;
-    let stdin = child.stdin.take().context("missing tmux -CC stdin")?;
+    let mut stdin = child.stdin.take().context("missing tmux -CC stdin")?;
+    if session != tmux_session {
+        stdin
+            .write_all(format!("switch-client -t {session}\n").as_bytes())
+            .await
+            .context("switch tmux -CC target")?;
+    }
     let mut stdout = child.stdout.take().context("missing tmux -CC stdout")?;
     let mut stderr = child.stderr.take().context("missing tmux -CC stderr")?;
 
@@ -1144,6 +1167,11 @@ async fn local_tmux_control_attach(
         None
     };
     let display = AttachDisplay::new(cols, rows);
+    if let Some(initial_viewport) = initial_viewport {
+        display
+            .write_output(AttachOutputStream::Stdout, &initial_viewport)
+            .await?;
+    }
     let stdin_task = maybe_spawn_stdin_task(
         AttachInputSink {
             kind: AttachInputSinkKind::Tmux { stdin },
@@ -1164,6 +1192,7 @@ async fn local_tmux_control_attach(
     });
     let (code, detached) = wait_local_attach_completion(&mut child, stdin_task).await?;
     if detached {
+        reap_local_child_after_detach(&mut child).await;
         stdout_task.abort();
         stderr_task.abort();
         let _ = stdout_task.await;
@@ -1243,6 +1272,67 @@ async fn run_local_tmux_capture(
 ) -> Result<portl_proto::session_v1::SessionRunResult> {
     let path = local_tmux_path()?;
     run_local_capture(&path, args).await
+}
+
+async fn local_tmux_viewport_snapshot(path: &PathBuf, target: &str) -> Result<Vec<u8>> {
+    let output = run_local_capture(
+        path,
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            target,
+            "PORTL_CURSOR #{cursor_x} #{cursor_y}",
+            ";",
+            "capture-pane",
+            "-p",
+            "-e",
+            "-N",
+            "-S",
+            "0",
+            "-E",
+            "-",
+            "-t",
+            target,
+        ],
+    )
+    .await?;
+    ensure_local_provider_success("tmux capture-pane", &output)?;
+    let mut lines = output.stdout.lines();
+    let (cursor_x, cursor_y) = lines
+        .next()
+        .and_then(parse_tmux_cursor_line)
+        .unwrap_or((0, 0));
+    let snapshot = lines.collect::<Vec<_>>().join("\n");
+    Ok(tmux_cc::render_viewport_snapshot(
+        snapshot.as_bytes(),
+        cursor_x,
+        cursor_y,
+    ))
+}
+
+fn parse_tmux_cursor_line(line: &str) -> Option<(u16, u16)> {
+    let rest = line.strip_prefix("PORTL_CURSOR ")?;
+    let mut parts = rest.split_whitespace();
+    let x = parts.next()?.parse().ok()?;
+    let y = parts.next()?.parse().ok()?;
+    Some((x, y))
+}
+
+fn tmux_lookup_session(input: &str) -> &str {
+    input.split_once(':').map_or(input, |(session, _)| session)
+}
+
+fn validate_tmux_control_target(target: &str) -> Result<()> {
+    if target.is_empty()
+        || !target.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b':' | b'.' | b'_' | b'-' | b'#' | b'@' | b'%' | b'$')
+        })
+    {
+        anyhow::bail!("unsafe tmux target {target:?}");
+    }
+    Ok(())
 }
 
 async fn run_local_capture(
@@ -1765,6 +1855,7 @@ async fn bridge_attach(
         AttachInputSink {
             kind: AttachInputSinkKind::Remote {
                 send: stdin,
+                resize,
                 control,
             },
         },
@@ -1793,30 +1884,7 @@ async fn bridge_attach(
         )
         .await
     });
-    let resize_task = tokio::spawn(async move {
-        let mut resize = resize;
-        let mut last = (cols, rows);
-        loop {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            if let Ok(now) = size()
-                && now != last
-            {
-                let frame = portl_proto::shell_v1::ResizeFrame {
-                    cols: now.0,
-                    rows: now.1,
-                };
-                resize
-                    .write_all(&postcard::to_stdvec(&frame).context("encode resize frame")?)
-                    .await
-                    .context("write resize frame")?;
-                last = now;
-            }
-        }
-        #[allow(unreachable_code)]
-        Ok::<_, anyhow::Error>(())
-    });
     let (code, detached) = wait_attach_completion(&mut exit, stdin_task).await?;
-    resize_task.abort();
     if detached {
         stdout_task.abort();
         stderr_task.abort();
@@ -1835,6 +1903,16 @@ async fn bridge_attach(
         drop(raw_guard);
     }
     Ok(code)
+}
+
+async fn reap_local_child_after_detach(child: &mut Child) {
+    if tokio::time::timeout(Duration::from_millis(500), child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
+    }
 }
 
 async fn wait_local_attach_completion(
@@ -2200,6 +2278,28 @@ impl AttachInputSink {
         }
     }
 
+    async fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+        match &mut self.kind {
+            AttachInputSinkKind::Remote { resize, .. } => {
+                let frame = portl_proto::shell_v1::ResizeFrame { cols, rows };
+                resize
+                    .write_all(&postcard::to_stdvec(&frame).context("encode resize frame")?)
+                    .await
+                    .context("write resize frame")
+            }
+            AttachInputSinkKind::Zmx { stdin } => {
+                let payload = zmx_control::resize_payload(rows, cols);
+                zmx_control::write_frame(stdin, zmx_control::TAG_RESIZE, &payload)
+                    .await
+                    .context("write zmx-control resize")
+            }
+            AttachInputSinkKind::Tmux { stdin } => stdin
+                .write_all(&tmux_cc::resize_commands(rows, cols))
+                .await
+                .context("write tmux -CC resize"),
+        }
+    }
+
     async fn kick_others(&mut self) -> Result<()> {
         match &mut self.kind {
             AttachInputSinkKind::Remote { control, .. } => {
@@ -2223,6 +2323,7 @@ impl AttachInputSink {
 enum AttachInputSinkKind {
     Remote {
         send: SendStream,
+        resize: SendStream,
         control: SendStream,
     },
     Zmx {
@@ -2297,24 +2398,40 @@ where
     R: AsyncRead + Unpin,
 {
     let mut buf = [0_u8; 8192];
+    let mut last_size = size().unwrap_or((80, 24));
     loop {
-        let read = stdin.read(&mut buf).await.context("read local stdin")?;
-        if read == 0 {
-            if let Err(err) = sink.close_stdin().await.context("finish local stdin") {
-                debug!(%err, "provider stdin already closed");
+        tokio::select! {
+            read = stdin.read(&mut buf) => {
+                let read = read.context("read local stdin")?;
+                if read == 0 {
+                    if let Err(err) = sink.close_stdin().await.context("finish local stdin") {
+                        debug!(%err, "provider stdin already closed");
+                    }
+                    return Ok(StdinTaskResult::Closed);
+                }
+                let chunk = &buf[..read];
+                if is_ctrl_backslash_sequence(chunk) {
+                    match run_attach_control_mode(sink, stdin, ui).await? {
+                        AttachControlOutcome::Continue => continue,
+                        AttachControlOutcome::Detached => return Ok(StdinTaskResult::Detached),
+                    }
+                }
+                if let Err(err) = sink.send_stdin(chunk).await.context("copy local stdin") {
+                    debug!(%err, "stdin loop ended after provider stdin closed");
+                    return Ok(StdinTaskResult::Closed);
+                }
             }
-            return Ok(StdinTaskResult::Closed);
-        }
-        let chunk = &buf[..read];
-        if is_attach_detach_sequence(chunk) {
-            match run_attach_control_mode(sink, stdin, ui, chunk).await? {
-                AttachControlOutcome::Continue => continue,
-                AttachControlOutcome::Detached => return Ok(StdinTaskResult::Detached),
+            () = tokio::time::sleep(Duration::from_millis(500)) => {
+                if let Ok(now) = size()
+                    && now != last_size
+                {
+                    if let Err(err) = sink.resize(now.0, now.1).await.context("resize attached session") {
+                        debug!(%err, "resize loop ended after provider stdin closed");
+                        return Ok(StdinTaskResult::Closed);
+                    }
+                    last_size = now;
+                }
             }
-        }
-        if let Err(err) = sink.send_stdin(chunk).await.context("copy local stdin") {
-            debug!(%err, "stdin loop ended after provider stdin closed");
-            return Ok(StdinTaskResult::Closed);
         }
     }
 }
@@ -2329,7 +2446,6 @@ async fn run_attach_control_mode<R>(
     sink: &mut AttachInputSink,
     stdin: &mut R,
     ui: &AttachControlUi,
-    _literal_sequence: &[u8],
 ) -> Result<AttachControlOutcome>
 where
     R: AsyncRead + Unpin,
@@ -2380,7 +2496,7 @@ where
             if command == b"\x1b" {
                 return Ok(AttachControlOutcome::Continue);
             }
-            if is_attach_detach_sequence(command) {
+            if is_ctrl_backslash_sequence(command) {
                 sink.send_stdin(command)
                     .await
                     .context("send literal attach detach sequence")?;
@@ -2455,78 +2571,6 @@ fn terminal_locale_supports_unicode() -> bool {
     })
 }
 
-fn is_attach_detach_sequence(data: &[u8]) -> bool {
-    data.first().is_some_and(|byte| *byte == 0x1c) || is_key_pressed(data, 0x5c, 0b100)
-}
-
-fn is_key_pressed(data: &[u8], expected_key: u32, expected_mods: u32) -> bool {
-    data.windows(2).enumerate().any(|(index, window)| {
-        window == b"\x1b[" && keypress_with_mod(&data[index + 2..], expected_key, expected_mods)
-    })
-}
-
-fn keypress_with_mod(data: &[u8], expected_key: u32, expected_mods: u32) -> bool {
-    let mut pos = 0;
-    let Some(key_code) = parse_decimal(data, &mut pos) else {
-        return false;
-    };
-    if key_code != expected_key {
-        return false;
-    }
-
-    while data.get(pos).is_some_and(|byte| *byte == b':') {
-        pos += 1;
-        let _ = parse_decimal(data, &mut pos);
-    }
-
-    if data.get(pos).is_none_or(|byte| *byte != b';') {
-        return false;
-    }
-    pos += 1;
-
-    let Some(mod_encoded) = parse_decimal(data, &mut pos) else {
-        return false;
-    };
-    if mod_encoded < 1 {
-        return false;
-    }
-    let intentional_mods = (mod_encoded - 1) & 0b0011_1111;
-    if intentional_mods != expected_mods {
-        return false;
-    }
-
-    if data.get(pos).is_some_and(|byte| *byte == b':') {
-        pos += 1;
-        if parse_decimal(data, &mut pos) == Some(3) {
-            return false;
-        }
-    }
-
-    if data.get(pos).is_some_and(|byte| *byte == b';') {
-        pos += 1;
-        while data
-            .get(pos)
-            .is_some_and(|byte| byte.is_ascii_digit() || *byte == b':')
-        {
-            pos += 1;
-        }
-    }
-
-    data.get(pos).is_some_and(|byte| *byte == b'u')
-}
-
-fn parse_decimal(data: &[u8], pos: &mut usize) -> Option<u32> {
-    let start = *pos;
-    let mut value = 0_u32;
-    while let Some(byte) = data.get(*pos).filter(|byte| byte.is_ascii_digit()) {
-        value = value
-            .saturating_mul(10)
-            .saturating_add(u32::from(*byte - b'0'));
-        *pos += 1;
-    }
-    (*pos != start).then_some(value)
-}
-
 async fn read_exit(recv: &mut BufferedRecv) -> Result<i32> {
     let frame = recv
         .read_frame::<portl_proto::shell_v1::ExitFrame>(128)
@@ -2561,15 +2605,15 @@ mod tests {
 
     #[test]
     fn detects_raw_and_kitty_ctrl_backslash_attach_detach() {
-        assert!(is_attach_detach_sequence(b"\x1c"));
-        assert!(is_attach_detach_sequence(b"\x1b[92;5u"));
-        assert!(is_attach_detach_sequence(b"prefix\x1b[92;5:1usuffix"));
-        assert!(is_attach_detach_sequence(b"\x1b[92:124;5u"));
+        assert!(is_ctrl_backslash_sequence(b"\x1c"));
+        assert!(is_ctrl_backslash_sequence(b"\x1b[92;5u"));
+        assert!(is_ctrl_backslash_sequence(b"prefix\x1b[92;5:1usuffix"));
+        assert!(is_ctrl_backslash_sequence(b"\x1b[92:124;5u"));
 
-        assert!(!is_attach_detach_sequence(b"\\"));
-        assert!(!is_attach_detach_sequence(b"\x1b[92;6u"));
-        assert!(!is_attach_detach_sequence(b"\x1b[92;5:3u"));
-        assert!(!is_attach_detach_sequence(b"not-detach"));
+        assert!(!is_ctrl_backslash_sequence(b"\\"));
+        assert!(!is_ctrl_backslash_sequence(b"\x1b[92;6u"));
+        assert!(!is_ctrl_backslash_sequence(b"\x1b[92;5:3u"));
+        assert!(!is_ctrl_backslash_sequence(b"not-detach"));
     }
 
     #[test]

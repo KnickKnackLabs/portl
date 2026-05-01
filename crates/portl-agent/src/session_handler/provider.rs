@@ -561,23 +561,6 @@ fn parse_tmux_cursor_line(line: &str) -> Option<(u16, u16)> {
     Some((x, y))
 }
 
-fn render_tmux_viewport_snapshot(snapshot: &[u8], cursor_x: u16, cursor_y: u16) -> Vec<u8> {
-    let mut out = Vec::with_capacity(snapshot.len() + 32);
-    out.extend_from_slice(b"\x1b[H\x1b[2J");
-
-    let mut lines = snapshot.split(|byte| *byte == b'\n').collect::<Vec<_>>();
-    if lines.last().is_some_and(|line| line.is_empty()) {
-        lines.pop();
-    }
-    for (index, line) in lines.into_iter().enumerate() {
-        out.extend_from_slice(format!("\x1b[{};1H", index + 1).as_bytes());
-        out.extend_from_slice(line.strip_suffix(b"\r").unwrap_or(line));
-        out.extend_from_slice(b"\x1b[K");
-    }
-    out.extend_from_slice(format!("\x1b[{};{}H", cursor_y + 1, cursor_x + 1).as_bytes());
-    out
-}
-
 impl TmuxProvider {
     pub(crate) fn new(path: Option<PathBuf>) -> Self {
         Self {
@@ -734,7 +717,7 @@ impl TmuxProvider {
             .and_then(parse_tmux_cursor_line)
             .unwrap_or((0, 0));
         let snapshot = lines.collect::<Vec<_>>().join("\n");
-        Ok(render_tmux_viewport_snapshot(
+        Ok(portl_core::terminal::tmux_cc::render_viewport_snapshot(
             snapshot.as_bytes(),
             cursor_x,
             cursor_y,
@@ -1569,7 +1552,8 @@ esac
 
     #[test]
     fn tmux_viewport_snapshot_restores_cursor_for_live_deltas() {
-        let rendered = render_tmux_viewport_snapshot(b"old spinner\nnext\n", 4, 0);
+        let rendered =
+            portl_core::terminal::tmux_cc::render_viewport_snapshot(b"old spinner\nnext\n", 4, 0);
 
         assert_eq!(
             rendered,
