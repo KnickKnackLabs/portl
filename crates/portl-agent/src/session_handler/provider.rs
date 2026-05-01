@@ -1021,14 +1021,18 @@ pub(crate) fn provider_discovery_info(
     };
     let zmx = discover_provider_path("zmx", zmx_config, target_home.as_deref());
     let tmux = discover_provider_path("tmux", tmux_config, target_home.as_deref());
-    let default_provider = if zmx.path.is_some() {
-        Some("zmx".to_owned())
-    } else if tmux.path.is_some() {
-        Some("tmux".to_owned())
-    } else {
-        None
-    };
-    let mut providers = vec![provider_info("zmx", &zmx), provider_info("tmux", &tmux)];
+    let ghostty = ghostty_discovery_info();
+    let default_provider = ghostty
+        .as_ref()
+        .filter(|info| info.detected)
+        .map(|info| info.name.clone())
+        .or_else(|| zmx.path.is_some().then(|| "zmx".to_owned()))
+        .or_else(|| tmux.path.is_some().then(|| "tmux".to_owned()));
+    let mut providers = Vec::new();
+    if let Some(info) = ghostty {
+        providers.push(info);
+    }
+    providers.extend([provider_info("zmx", &zmx), provider_info("tmux", &tmux)]);
     providers.push(crate::status_schema::SessionProviderInfo {
         name: "raw".to_owned(),
         detected: true,
@@ -1046,6 +1050,24 @@ pub(crate) fn provider_discovery_info(
         providers,
         search_paths,
     }
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[allow(clippy::unnecessary_wraps)]
+fn ghostty_discovery_info() -> Option<crate::status_schema::SessionProviderInfo> {
+    let status = crate::session_handler::ghostty::GhosttyProvider::new().status();
+    Some(crate::status_schema::SessionProviderInfo {
+        name: status.name,
+        detected: status.available,
+        path: status.path,
+        source: Some("builtin".to_owned()),
+        notes: status.notes,
+    })
+}
+
+#[cfg(not(feature = "ghostty-vt"))]
+fn ghostty_discovery_info() -> Option<crate::status_schema::SessionProviderInfo> {
+    None
 }
 
 fn provider_info(
@@ -1675,6 +1697,21 @@ esac
 
         assert!(TmuxProvider::with_path(fake).list().await?.is_empty());
         Ok(())
+    }
+
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn provider_discovery_info_prefers_builtin_ghostty_when_feature_enabled() {
+        let report = provider_discovery_info(None);
+
+        assert_eq!(report.default_provider.as_deref(), Some("ghostty"));
+        let ghostty = report
+            .providers
+            .iter()
+            .find(|provider| provider.name == "ghostty")
+            .expect("ghostty provider discovery entry");
+        assert!(ghostty.detected);
+        assert_eq!(ghostty.source.as_deref(), Some("builtin"));
     }
 
     #[cfg(feature = "ghostty-vt")]
