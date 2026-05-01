@@ -16,10 +16,11 @@ use portl_core::net::{
     SessionClient, open_session_attach, open_session_history, open_session_kill,
     open_session_list_detailed, open_session_providers, open_session_run,
 };
+use portl_core::terminal::{tmux_cc, zmx_control};
 use portl_core::ticket::schema::{Capabilities, EnvPolicy, ShellCaps};
 use portl_core::wire::session::{SessionControlAction, SessionControlFrame};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
+use tokio::process::{Child, ChildStdin, Command};
 use tracing::debug;
 
 use crate::commands::peer_resolve::{close_connected, connect_peer};
@@ -947,6 +948,7 @@ async fn local_session_kill(provider: Option<&str>, session: &str) -> Result<()>
 
 async fn local_session_attach(
     provider: Option<&str>,
+    target: &str,
     session: &str,
     user: Option<&str>,
     cwd: Option<&str>,
@@ -961,14 +963,59 @@ async fn local_session_attach(
         .await?
         .as_str()
     {
-        "zmx" => local_zmx_attach(session, cwd, argv).await,
-        "tmux" => local_tmux_attach(session, argv).await,
+        "zmx" => local_zmx_attach(target, session, cwd, argv).await,
+        "tmux" => local_tmux_attach(target, session, argv).await,
         other => unreachable!("unsupported provider {other}"),
     }
 }
 
-async fn local_zmx_attach(session: &str, cwd: Option<&str>, argv: &[String]) -> Result<ExitCode> {
+async fn local_zmx_attach(
+    target: &str,
+    session: &str,
+    cwd: Option<&str>,
+    argv: &[String],
+) -> Result<ExitCode> {
     let path = local_zmx_path()?;
+    if local_zmx_control_available(&path).await.unwrap_or(false) {
+        return local_zmx_control_attach(path, target, session, cwd, argv).await;
+    }
+    local_zmx_direct_attach(path, session, cwd, argv).await
+}
+
+async fn local_zmx_control_available(path: &std::path::Path) -> Result<bool> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(2),
+        Command::new(path)
+            .args(["control", "--protocol", zmx_control::PROTOCOL, "--probe"])
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await;
+    let Ok(Ok(output)) = output else {
+        return Ok(false);
+    };
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let protocol_ok = stdout.lines().any(|line| {
+        line.split_once('=').is_some_and(|(key, value)| {
+            key.trim() == "protocol" && value.trim() == zmx_control::PROTOCOL
+        })
+    });
+    let tier_ok = stdout.lines().any(|line| {
+        line.split_once('=')
+            .is_some_and(|(key, value)| key.trim() == "tier" && value.trim() == "control")
+    });
+    Ok(protocol_ok && tier_ok)
+}
+
+async fn local_zmx_direct_attach(
+    path: PathBuf,
+    session: &str,
+    cwd: Option<&str>,
+    argv: &[String],
+) -> Result<ExitCode> {
     eprintln!("portl: using local session provider zmx");
     eprintln!("portl: attaching to local session \"{session}\"");
     let mut command = Command::new(path);
@@ -984,24 +1031,156 @@ async fn local_zmx_attach(session: &str, cwd: Option<&str>, argv: &[String]) -> 
     Ok(exit_code_from_i32(status.code().unwrap_or(1)))
 }
 
-async fn local_tmux_attach(session: &str, argv: &[String]) -> Result<ExitCode> {
-    let path = local_tmux_path()?;
-    eprintln!("portl: using local session provider tmux");
-    eprintln!("portl: attaching to local session \"{session}\"");
+async fn local_zmx_control_attach(
+    path: PathBuf,
+    target: &str,
+    session: &str,
+    cwd: Option<&str>,
+    argv: &[String],
+) -> Result<ExitCode> {
+    let (cols, rows) = size().unwrap_or((80, 24));
+    let canonical_ref = canonical_session_ref(target, "zmx", session);
+    eprintln!("portl: using local session provider zmx");
+    eprintln!("portl: attaching to local session \"{canonical_ref}\"");
     let mut command = Command::new(path);
-    if argv.is_empty() {
-        command.args(["attach-session", "-t", session]);
-    } else {
-        command
-            .args(["new-session", "-A", "-s", session])
-            .args(argv);
-    }
     command
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    let status = command.status().await.context("run tmux attach")?;
-    Ok(exit_code_from_i32(status.code().unwrap_or(1)))
+        .args(["control", "--protocol", zmx_control::PROTOCOL])
+        .arg("--rows")
+        .arg(rows.to_string())
+        .arg("--cols")
+        .arg(cols.to_string())
+        .arg(session)
+        .args(argv)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let mut child = command.spawn().context("spawn zmx control attach")?;
+    let stdin = child.stdin.take().context("missing zmx-control stdin")?;
+    let mut stdout = child.stdout.take().context("missing zmx-control stdout")?;
+    let mut stderr = child.stderr.take().context("missing zmx-control stderr")?;
+
+    let raw_guard = if std::io::stdin().is_terminal() {
+        Some(RawModeGuard::new()?)
+    } else {
+        None
+    };
+    let display = AttachDisplay::new(cols, rows);
+    let stdin_task = maybe_spawn_stdin_task(
+        AttachInputSink {
+            kind: AttachInputSinkKind::Zmx { stdin },
+        },
+        AttachControlUi {
+            canonical_ref: canonical_ref.clone(),
+            supports_kick_others: false,
+            display: display.clone(),
+        },
+    )
+    .await?;
+    let stdout_display = display.clone();
+    let stdout_task =
+        tokio::spawn(async move { copy_zmx_control_output(&mut stdout, &stdout_display).await });
+    let stderr_display = display.clone();
+    let stderr_task = tokio::spawn(async move {
+        copy_remote_output(&mut stderr, &stderr_display, AttachOutputStream::Stderr).await
+    });
+    let (code, detached) = wait_local_attach_completion(&mut child, stdin_task).await?;
+    if detached {
+        stdout_task.abort();
+        stderr_task.abort();
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+    } else {
+        await_output_task(stdout_task, "stdout").await?;
+        await_output_task(stderr_task, "stderr").await?;
+    }
+    display.clear_bar().await?;
+    drop(raw_guard);
+    if detached {
+        eprintln!("portl: detached from session \"{canonical_ref}\"");
+        eprintln!();
+        eprintln!("The session is still running. To reconnect, run:");
+        eprintln!("  portl attach {canonical_ref}");
+    }
+    Ok(exit_code_from_i32(code))
+}
+
+async fn local_tmux_attach(target: &str, session: &str, argv: &[String]) -> Result<ExitCode> {
+    let path = local_tmux_path()?;
+    local_tmux_control_attach(path, target, session, argv).await
+}
+
+async fn local_tmux_control_attach(
+    path: PathBuf,
+    target: &str,
+    session: &str,
+    argv: &[String],
+) -> Result<ExitCode> {
+    let (cols, rows) = size().unwrap_or((80, 24));
+    let canonical_ref = canonical_session_ref(target, "tmux", session);
+    eprintln!("portl: using local session provider tmux");
+    eprintln!("portl: attaching to local session \"{canonical_ref}\"");
+    let mut command = Command::new(path);
+    command
+        .args(["-CC", "new-session", "-A", "-s", session])
+        .arg("-x")
+        .arg(cols.to_string())
+        .arg("-y")
+        .arg(rows.to_string())
+        .args(argv)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().context("spawn tmux -CC attach")?;
+    let stdin = child.stdin.take().context("missing tmux -CC stdin")?;
+    let mut stdout = child.stdout.take().context("missing tmux -CC stdout")?;
+    let mut stderr = child.stderr.take().context("missing tmux -CC stderr")?;
+
+    let raw_guard = if std::io::stdin().is_terminal() {
+        Some(RawModeGuard::new()?)
+    } else {
+        None
+    };
+    let display = AttachDisplay::new(cols, rows);
+    let stdin_task = maybe_spawn_stdin_task(
+        AttachInputSink {
+            kind: AttachInputSinkKind::Tmux { stdin },
+        },
+        AttachControlUi {
+            canonical_ref: canonical_ref.clone(),
+            supports_kick_others: true,
+            display: display.clone(),
+        },
+    )
+    .await?;
+    let stdout_display = display.clone();
+    let stdout_task =
+        tokio::spawn(async move { copy_tmux_control_output(&mut stdout, &stdout_display).await });
+    let stderr_display = display.clone();
+    let stderr_task = tokio::spawn(async move {
+        copy_remote_output(&mut stderr, &stderr_display, AttachOutputStream::Stderr).await
+    });
+    let (code, detached) = wait_local_attach_completion(&mut child, stdin_task).await?;
+    if detached {
+        stdout_task.abort();
+        stderr_task.abort();
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+    } else {
+        await_output_task(stdout_task, "stdout").await?;
+        await_output_task(stderr_task, "stderr").await?;
+    }
+    display.clear_bar().await?;
+    drop(raw_guard);
+    if detached {
+        eprintln!("portl: detached from session \"{canonical_ref}\"");
+        eprintln!();
+        eprintln!("The session is still running. To reconnect, run:");
+        eprintln!("  portl attach {canonical_ref}");
+    }
+    Ok(exit_code_from_i32(code))
 }
 
 async fn resolve_local_provider_for_session(
@@ -1215,8 +1394,15 @@ pub fn attach(
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
         if resolved_target_is_local(&resolved.target)? {
-            return local_session_attach(provider_name.as_deref(), &session_name, user, cwd, argv)
-                .await;
+            return local_session_attach(
+                provider_name.as_deref(),
+                &resolved.target,
+                &session_name,
+                user,
+                cwd,
+                argv,
+            )
+            .await;
         }
 
         let connected = connect_peer(&resolved.target, session_caps()).await?;
@@ -1576,14 +1762,19 @@ async fn bridge_attach(
     } = session;
     let display = AttachDisplay::new(cols, rows);
     let stdin_task = maybe_spawn_stdin_task(
-        stdin,
-        control,
+        AttachInputSink {
+            kind: AttachInputSinkKind::Remote {
+                send: stdin,
+                control,
+            },
+        },
         AttachControlUi {
             canonical_ref: canonical_ref.clone(),
             supports_kick_others: provider == "tmux",
             display: display.clone(),
         },
-    )?;
+    )
+    .await?;
     let stdout_display = display.clone();
     let stdout_task = tokio::spawn(async move {
         copy_remote_output(
@@ -1644,6 +1835,34 @@ async fn bridge_attach(
         drop(raw_guard);
     }
     Ok(code)
+}
+
+async fn wait_local_attach_completion(
+    child: &mut Child,
+    stdin_task: Option<tokio::task::JoinHandle<Result<StdinTaskResult>>>,
+) -> Result<(i32, bool)> {
+    let mut exit_fut = Box::pin(child.wait());
+    let Some(mut stdin_task) = stdin_task else {
+        let status = exit_fut.await.context("wait for local provider exit")?;
+        return Ok((status.code().unwrap_or(1), false));
+    };
+
+    tokio::select! {
+        status = &mut exit_fut => {
+            stdin_task.abort();
+            let _ = stdin_task.await;
+            Ok((status.context("wait for local provider exit")?.code().unwrap_or(1), false))
+        }
+        stdin_result = &mut stdin_task => {
+            match stdin_result.context("join stdin task")?? {
+                StdinTaskResult::Detached => Ok((0, true)),
+                StdinTaskResult::Closed => {
+                    let status = exit_fut.await.context("wait for local provider exit")?;
+                    Ok((status.code().unwrap_or(1), false))
+                }
+            }
+        }
+    }
 }
 
 async fn wait_attach_completion(
@@ -1731,11 +1950,14 @@ enum AttachOutputStream {
     Stderr,
 }
 
-async fn copy_remote_output(
-    recv: &mut BufferedRecv,
+async fn copy_remote_output<R>(
+    recv: &mut R,
     display: &AttachDisplay,
     stream: AttachOutputStream,
-) -> Result<()> {
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
     let mut buf = vec![0_u8; 16 * 1024];
     loop {
         let read = recv.read(&mut buf).await.context("read remote output")?;
@@ -1745,6 +1967,72 @@ async fn copy_remote_output(
         }
         display.write_output(stream, &buf[..read]).await?;
     }
+}
+
+async fn copy_tmux_control_output<R>(recv: &mut R, display: &AttachDisplay) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut decoder = tmux_cc::Decoder::default();
+    let mut read_buf = vec![0_u8; 16 * 1024];
+    let mut line_buf = Vec::new();
+    loop {
+        let read = recv
+            .read(&mut read_buf)
+            .await
+            .context("read tmux -CC output")?;
+        if read == 0 {
+            display.flush(AttachOutputStream::Stdout).await?;
+            return Ok(());
+        }
+        let control_bytes = decoder.decode(&read_buf[..read]);
+        for byte in control_bytes {
+            line_buf.push(byte);
+            if byte == b'\n' {
+                let line = String::from_utf8_lossy(&line_buf).into_owned();
+                line_buf.clear();
+                match tmux_cc::parse_control_line(&line) {
+                    tmux_cc::TmuxControlEvent::Output(bytes) => {
+                        display
+                            .write_output(AttachOutputStream::Stdout, &bytes)
+                            .await?;
+                    }
+                    tmux_cc::TmuxControlEvent::Error(error) => {
+                        display
+                            .write_output(
+                                AttachOutputStream::Stderr,
+                                format!("tmux: {error}\n").as_bytes(),
+                            )
+                            .await?;
+                    }
+                    tmux_cc::TmuxControlEvent::Exit => return Ok(()),
+                    tmux_cc::TmuxControlEvent::Ignore => {}
+                }
+            }
+        }
+    }
+}
+
+async fn copy_zmx_control_output<R>(recv: &mut R, display: &AttachDisplay) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    while let Some((tag, payload)) = zmx_control::read_frame(recv)
+        .await
+        .context("read zmx-control output")?
+    {
+        if matches!(
+            tag,
+            zmx_control::TAG_OUTPUT
+                | zmx_control::TAG_VIEWPORT_SNAPSHOT
+                | zmx_control::TAG_LIVE_OUTPUT
+        ) {
+            display
+                .write_output(AttachOutputStream::Stdout, &payload)
+                .await?;
+        }
+    }
+    display.flush(AttachOutputStream::Stdout).await
 }
 
 #[derive(Clone)]
@@ -1874,6 +2162,77 @@ enum StdinTaskResult {
     Detached,
 }
 
+struct AttachInputSink {
+    kind: AttachInputSinkKind,
+}
+
+impl AttachInputSink {
+    async fn send_stdin(&mut self, bytes: &[u8]) -> Result<()> {
+        match &mut self.kind {
+            AttachInputSinkKind::Remote { send, .. } => {
+                send.write_all(bytes).await.context("write remote stdin")
+            }
+            AttachInputSinkKind::Zmx { stdin } => {
+                zmx_control::write_frame(stdin, zmx_control::TAG_INPUT, bytes)
+                    .await
+                    .context("write zmx-control input")
+            }
+            AttachInputSinkKind::Tmux { stdin } => stdin
+                .write_all(&tmux_cc::send_keys_command(bytes))
+                .await
+                .context("write tmux -CC input"),
+        }
+    }
+
+    async fn close_stdin(&mut self) -> Result<()> {
+        match &mut self.kind {
+            AttachInputSinkKind::Remote { send, .. } => {
+                send.finish().context("finish remote stdin")
+            }
+            AttachInputSinkKind::Zmx { stdin } => {
+                let _ = zmx_control::write_frame(stdin, zmx_control::TAG_CLOSE, &[]).await;
+                stdin.shutdown().await.context("shutdown zmx-control stdin")
+            }
+            AttachInputSinkKind::Tmux { stdin } => {
+                let _ = stdin.write_all(b"detach-client\n").await;
+                stdin.shutdown().await.context("shutdown tmux -CC stdin")
+            }
+        }
+    }
+
+    async fn kick_others(&mut self) -> Result<()> {
+        match &mut self.kind {
+            AttachInputSinkKind::Remote { control, .. } => {
+                let frame = SessionControlFrame {
+                    action: SessionControlAction::KickOthers,
+                };
+                control
+                    .write_all(&postcard::to_stdvec(&frame).context("encode kick-others frame")?)
+                    .await
+                    .context("write session control frame")
+            }
+            AttachInputSinkKind::Zmx { .. } => Ok(()),
+            AttachInputSinkKind::Tmux { stdin } => stdin
+                .write_all(b"detach-client -a\n")
+                .await
+                .context("write tmux -CC kick-others"),
+        }
+    }
+}
+
+enum AttachInputSinkKind {
+    Remote {
+        send: SendStream,
+        control: SendStream,
+    },
+    Zmx {
+        stdin: ChildStdin,
+    },
+    Tmux {
+        stdin: ChildStdin,
+    },
+}
+
 #[derive(Clone)]
 struct AttachControlUi {
     canonical_ref: String,
@@ -1881,20 +2240,19 @@ struct AttachControlUi {
     display: AttachDisplay,
 }
 
-fn maybe_spawn_stdin_task(
-    mut send: SendStream,
-    mut control: SendStream,
+async fn maybe_spawn_stdin_task(
+    mut sink: AttachInputSink,
     ui: AttachControlUi,
 ) -> Result<Option<tokio::task::JoinHandle<Result<StdinTaskResult>>>> {
     if should_close_idle_stdin()? {
-        if let Err(err) = send.finish().context("finish remote stdin") {
-            debug!(%err, "remote stdin already closed");
+        if let Err(err) = sink.close_stdin().await.context("close idle stdin") {
+            debug!(%err, "provider stdin already closed");
         }
         return Ok(None);
     }
     Ok(Some(tokio::spawn(async move {
         let mut stdin_src = tokio::io::stdin();
-        Box::pin(stdin_loop(&mut send, &mut control, &mut stdin_src, &ui)).await
+        Box::pin(stdin_loop(&mut sink, &mut stdin_src, &ui)).await
     })))
 }
 
@@ -1931,8 +2289,7 @@ fn stdin_ready_within(timeout: Duration) -> Result<bool> {
 }
 
 async fn stdin_loop<R>(
-    send: &mut SendStream,
-    control: &mut SendStream,
+    sink: &mut AttachInputSink,
     stdin: &mut R,
     ui: &AttachControlUi,
 ) -> Result<StdinTaskResult>
@@ -1943,20 +2300,20 @@ where
     loop {
         let read = stdin.read(&mut buf).await.context("read local stdin")?;
         if read == 0 {
-            if let Err(err) = send.finish().context("finish remote stdin") {
-                debug!(%err, "remote stdin already closed");
+            if let Err(err) = sink.close_stdin().await.context("finish local stdin") {
+                debug!(%err, "provider stdin already closed");
             }
             return Ok(StdinTaskResult::Closed);
         }
         let chunk = &buf[..read];
         if is_attach_detach_sequence(chunk) {
-            match run_attach_control_mode(send, control, stdin, ui, chunk).await? {
+            match run_attach_control_mode(sink, stdin, ui, chunk).await? {
                 AttachControlOutcome::Continue => continue,
                 AttachControlOutcome::Detached => return Ok(StdinTaskResult::Detached),
             }
         }
-        if let Err(err) = send.write_all(chunk).await.context("copy local stdin") {
-            debug!(%err, "stdin loop ended after remote stdin closed");
+        if let Err(err) = sink.send_stdin(chunk).await.context("copy local stdin") {
+            debug!(%err, "stdin loop ended after provider stdin closed");
             return Ok(StdinTaskResult::Closed);
         }
     }
@@ -1969,8 +2326,7 @@ enum AttachControlOutcome {
 }
 
 async fn run_attach_control_mode<R>(
-    send: &mut SendStream,
-    control: &mut SendStream,
+    sink: &mut AttachInputSink,
     stdin: &mut R,
     ui: &AttachControlUi,
     _literal_sequence: &[u8],
@@ -1994,27 +2350,25 @@ where
             let read = read.context("read local stdin in attach control mode")?;
             if read == 0 {
                 clear_attach_control_bar(ui).await?;
-                if let Err(err) = send.finish().context("finish remote stdin") {
-                    debug!(%err, "remote stdin already closed");
+                if let Err(err) = sink.close_stdin().await.context("finish provider stdin") {
+                    debug!(%err, "provider stdin already closed");
                 }
                 return Ok(AttachControlOutcome::Continue);
             }
             let command = &buf[..read];
             clear_attach_control_bar(ui).await?;
             if command == b"d" {
-                if let Err(err) = send.finish().context("finish remote stdin for detach") {
-                    debug!(%err, "remote stdin already closed during detach");
+                if let Err(err) = sink
+                    .close_stdin()
+                    .await
+                    .context("finish provider stdin for detach")
+                {
+                    debug!(%err, "provider stdin already closed during detach");
                 }
                 return Ok(AttachControlOutcome::Detached);
             }
             if command == b"k" && ui.supports_kick_others {
-                let frame = SessionControlFrame {
-                    action: SessionControlAction::KickOthers,
-                };
-                control
-                    .write_all(&postcard::to_stdvec(&frame).context("encode kick-others frame")?)
-                    .await
-                    .context("send kick-others frame")?;
+                sink.kick_others().await.context("send kick-others frame")?;
                 ui.display
                     .print_message(&format!(
                         "portl: detached other clients from session \"{}\"",
@@ -2027,12 +2381,12 @@ where
                 return Ok(AttachControlOutcome::Continue);
             }
             if is_attach_detach_sequence(command) {
-                send.write_all(command)
+                sink.send_stdin(command)
                     .await
                     .context("send literal attach detach sequence")?;
                 return Ok(AttachControlOutcome::Continue);
             }
-            send.write_all(command)
+            sink.send_stdin(command)
                 .await
                 .context("forward attach control command as stdin")?;
             return Ok(AttachControlOutcome::Continue);
