@@ -24,8 +24,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::status_schema::{
-    AgentInfo, ConnectionsResponse, ErrorResponse, NetworkInfo, NetworkResponse, RelayResponse,
-    SessionProvidersInfo, StatusResponse,
+    AgentInfo, ConnectionsResponse, ErrorResponse, NetworkHealthInfo, NetworkInfo, NetworkResponse,
+    RelayResponse, SessionProvidersInfo, StatusResponse,
 };
 
 #[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
@@ -154,6 +154,7 @@ pub trait StatusSource: Send + Sync + 'static {
     fn agent_info(&self) -> AgentInfo;
     fn connections(&self) -> Vec<crate::conn_registry::ConnectionSnapshot>;
     fn network_info(&self) -> NetworkInfo;
+    fn network_health(&self) -> NetworkHealthInfo;
     fn session_providers_info(&self) -> SessionProvidersInfo;
     fn relay_status(&self) -> crate::relay::RelayStatus;
     /// Number of live QUIC connections. Drives the
@@ -304,6 +305,7 @@ async fn serve_one<S: StatusSource>(
                 s.agent_info(),
                 s.connections(),
                 s.network_info(),
+                s.network_health(),
                 s.session_providers_info(),
                 s.relay_status(),
             ))?,
@@ -423,6 +425,9 @@ impl StatusSource for NoStatus {
         unreachable!("NoStatus is never invoked")
     }
     fn network_info(&self) -> NetworkInfo {
+        unreachable!("NoStatus is never invoked")
+    }
+    fn network_health(&self) -> NetworkHealthInfo {
         unreachable!("NoStatus is never invoked")
     }
     fn session_providers_info(&self) -> SessionProvidersInfo {

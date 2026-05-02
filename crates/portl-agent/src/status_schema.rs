@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::conn_registry::ConnectionSnapshot;
+use crate::network_watchdog::{NetworkHealthSnapshot, WatchdogState};
 use crate::relay::RelayStatus;
 
 /// Current schema version. Emitted in every response envelope.
@@ -25,6 +26,8 @@ pub struct StatusResponse {
     pub agent: AgentInfo,
     pub connections: Vec<ConnectionSnapshot>,
     pub network: NetworkInfo,
+    #[serde(default = "NetworkHealthInfo::disabled")]
+    pub network_health: NetworkHealthInfo,
     #[serde(default)]
     pub session_providers: SessionProvidersInfo,
     /// Embedded-relay snapshot. Always present; `enabled=false` when
@@ -39,6 +42,7 @@ impl StatusResponse {
         agent: AgentInfo,
         connections: Vec<ConnectionSnapshot>,
         network: NetworkInfo,
+        network_health: NetworkHealthInfo,
         session_providers: SessionProvidersInfo,
         relay: RelayStatus,
     ) -> Self {
@@ -49,6 +53,7 @@ impl StatusResponse {
             agent,
             connections,
             network,
+            network_health,
             session_providers,
             relay,
         }
@@ -145,6 +150,61 @@ pub struct DiscoveryInfo {
     pub dns: bool,
     pub pkarr: bool,
     pub local: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkHealthInfo {
+    pub state: WatchdogState,
+    pub endpoint_generation: u64,
+    pub endpoint_started_at: u64,
+    pub last_inbound_handshake_at: Option<u64>,
+    pub last_self_probe_ok_at: Option<u64>,
+    pub last_self_probe_failed_at: Option<u64>,
+    pub consecutive_self_probe_failures: u32,
+    pub endpoint_refresh_count: u64,
+    pub last_endpoint_refresh_at: Option<u64>,
+    pub last_endpoint_refresh_error: Option<String>,
+}
+
+impl NetworkHealthInfo {
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            state: WatchdogState::Disabled,
+            endpoint_generation: 0,
+            endpoint_started_at: 0,
+            last_inbound_handshake_at: None,
+            last_self_probe_ok_at: None,
+            last_self_probe_failed_at: None,
+            consecutive_self_probe_failures: 0,
+            endpoint_refresh_count: 0,
+            last_endpoint_refresh_at: None,
+            last_endpoint_refresh_error: None,
+        }
+    }
+}
+
+impl From<NetworkHealthSnapshot> for NetworkHealthInfo {
+    fn from(value: NetworkHealthSnapshot) -> Self {
+        Self {
+            state: value.state,
+            endpoint_generation: value.endpoint_generation,
+            endpoint_started_at: value.endpoint_started_at,
+            last_inbound_handshake_at: value.last_inbound_handshake_at,
+            last_self_probe_ok_at: value.last_self_probe_ok_at,
+            last_self_probe_failed_at: value.last_self_probe_failed_at,
+            consecutive_self_probe_failures: value.consecutive_self_probe_failures,
+            endpoint_refresh_count: value.endpoint_refresh_count,
+            last_endpoint_refresh_at: value.last_endpoint_refresh_at,
+            last_endpoint_refresh_error: value.last_endpoint_refresh_error,
+        }
+    }
+}
+
+impl Default for NetworkHealthInfo {
+    fn default() -> Self {
+        Self::disabled()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -286,6 +346,7 @@ mod tests {
                     local: false,
                 },
             },
+            NetworkHealthInfo::disabled(),
             SessionProvidersInfo {
                 default_provider: Some("zmx".to_owned()),
                 default_user: Some(DefaultUserInfo {
@@ -315,6 +376,46 @@ mod tests {
         assert!(json.contains("\"version\":\"0.3.2\""));
         assert!(json.contains("\"default_provider\":\"zmx\""));
         assert!(json.contains("\"source\":\"mise_shim\""));
+    }
+
+    #[test]
+    fn status_response_includes_network_health() {
+        let r = StatusResponse::new(
+            AgentInfo {
+                pid: 42,
+                version: "0.0.0-test".to_owned(),
+                started_at_unix: 100,
+                home: "/tmp/portl".into(),
+                metrics_socket: "/tmp/portl/run/metrics.sock".into(),
+            },
+            Vec::new(),
+            NetworkInfo {
+                relays: Vec::new(),
+                discovery: DiscoveryInfo {
+                    dns: false,
+                    pkarr: false,
+                    local: true,
+                },
+            },
+            NetworkHealthInfo {
+                state: WatchdogState::Ok,
+                endpoint_generation: 1,
+                endpoint_started_at: 100,
+                last_inbound_handshake_at: Some(120),
+                last_self_probe_ok_at: Some(130),
+                last_self_probe_failed_at: None,
+                consecutive_self_probe_failures: 0,
+                endpoint_refresh_count: 0,
+                last_endpoint_refresh_at: None,
+                last_endpoint_refresh_error: None,
+            },
+            SessionProvidersInfo::default(),
+            RelayStatus::disabled(),
+        );
+
+        let json = serde_json::to_value(r).expect("serialize status response");
+        assert_eq!(json["network_health"]["state"], "ok");
+        assert_eq!(json["network_health"]["endpoint_generation"], 1);
     }
 
     #[test]

@@ -38,6 +38,10 @@ environment variable, then the built-in default.
 | `PORTL_RATE_LIMIT` | Per-peer rate limit. |
 | `PORTL_METRICS` | Metrics endpoint toggle. |
 | `PORTL_MODE` | Agent run mode. |
+| `PORTL_AGENT_WATCHDOG` | Agent endpoint watchdog mode. `auto` (default) enables the lightweight self-healing watchdog for listener agents; `off` disables it. |
+| `PORTL_AGENT_WATCHDOG_INTERVAL` | Watchdog self-probe interval. Defaults to `5m`. Recent inbound connections skip active probing. |
+| `PORTL_AGENT_WATCHDOG_TIMEOUT` | Watchdog self-probe timeout. Defaults to `5s`. |
+| `PORTL_AGENT_WATCHDOG_FAILURES` | Consecutive self-probe failures before refreshing the agent endpoint. Defaults to `3`; minimum `1`. |
 | `PORTL_SESSION_PROVIDER` | Preferred target-side persistent-session provider. v0.4.0 supports `zmx`. Used by managed targets and `portl.toml`; manual hosts must install providers explicitly. |
 | `PORTL_SESSION_PROVIDER_PATH` | Target-side persistent-session provider CLI path. The v0.4.0 slice treats this as a `zmx` path; otherwise the agent discovers `zmx` with `command -v zmx`. |
 

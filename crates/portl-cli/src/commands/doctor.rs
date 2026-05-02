@@ -63,6 +63,7 @@ pub fn run(opts: RunOpts) -> ExitCode {
         check_session_providers(),
         check_service_drift(),
         check_agent_runtime_socket(),
+        check_agent_network_endpoint(),
     ];
 
     let any_fail = results.iter().any(|r| r.status == Status::Fail);
@@ -752,6 +753,50 @@ fn check_agent_runtime_socket() -> CheckResult {
     }
 }
 
+fn check_agent_network_endpoint() -> CheckResult {
+    let socket = portl_core::paths::metrics_socket_path();
+    match fetch_agent_status_sync(&socket) {
+        Ok(status) => check_agent_network_endpoint_status(&status),
+        Err(err) => CheckResult {
+            name: "network endpoint",
+            status: Status::Warn,
+            detail: format!(
+                "agent status unavailable at {}; cannot inspect endpoint watchdog health: {err}",
+                socket.display()
+            ),
+        },
+    }
+}
+
+fn check_agent_network_endpoint_status(
+    status: &portl_agent::status_schema::StatusResponse,
+) -> CheckResult {
+    let health = &status.network_health;
+    let status = match health.state {
+        portl_agent::network_watchdog::WatchdogState::Ok => Status::Ok,
+        portl_agent::network_watchdog::WatchdogState::Degraded
+        | portl_agent::network_watchdog::WatchdogState::Refreshing => Status::Warn,
+        portl_agent::network_watchdog::WatchdogState::Failed => Status::Fail,
+        portl_agent::network_watchdog::WatchdogState::Disabled => Status::Warn,
+    };
+    let mut detail = format!(
+        "state={:?}, endpoint generation {}, failures={}, refresh_count={}",
+        health.state,
+        health.endpoint_generation,
+        health.consecutive_self_probe_failures,
+        health.endpoint_refresh_count
+    )
+    .to_lowercase();
+    if let Some(error) = &health.last_endpoint_refresh_error {
+        detail.push_str(&format!(", last_refresh_error={error}"));
+    }
+    CheckResult {
+        name: "network endpoint",
+        status,
+        detail,
+    }
+}
+
 fn fetch_agent_status_sync(
     socket: &Path,
 ) -> anyhow::Result<portl_agent::status_schema::StatusResponse> {
@@ -1116,6 +1161,42 @@ mod tests {
         let stale = stale_legacy_durable_files(&old);
 
         assert!(stale.is_empty(), "stale files were {stale:?}");
+    }
+
+    #[test]
+    fn network_endpoint_check_warns_when_degraded() {
+        let mut status = portl_agent::status_schema::StatusResponse::new(
+            portl_agent::status_schema::AgentInfo {
+                pid: 42,
+                version: "0.8.2".to_owned(),
+                started_at_unix: 100,
+                home: "/tmp/portl".to_owned(),
+                metrics_socket: "/tmp/portl/run/metrics.sock".to_owned(),
+            },
+            Vec::new(),
+            portl_agent::status_schema::NetworkInfo {
+                relays: Vec::new(),
+                discovery: portl_agent::status_schema::DiscoveryInfo {
+                    dns: false,
+                    pkarr: false,
+                    local: true,
+                },
+            },
+            portl_agent::status_schema::NetworkHealthInfo::disabled(),
+            portl_agent::status_schema::SessionProvidersInfo::default(),
+            portl_agent::relay::RelayStatus::disabled(),
+        );
+        status.network_health.state = portl_agent::network_watchdog::WatchdogState::Degraded;
+        status.network_health.endpoint_generation = 7;
+        status.network_health.consecutive_self_probe_failures = 2;
+        status.network_health.endpoint_refresh_count = 1;
+
+        let result = check_agent_network_endpoint_status(&status);
+
+        assert_eq!(result.name, "network endpoint");
+        assert_eq!(result.status, Status::Warn);
+        assert!(result.detail.contains("state=degraded"));
+        assert!(result.detail.contains("endpoint generation 7"));
     }
 
     #[test]

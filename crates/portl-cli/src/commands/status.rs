@@ -4,7 +4,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use iroh::endpoint::Connection;
-use iroh_base::{EndpointId, TransportAddr};
+use iroh_base::TransportAddr;
 use portl_core::endpoint::Endpoint;
 use portl_core::id::{Identity, store};
 use portl_core::net::{PeerSession, open_ticket_v1};
@@ -210,39 +210,16 @@ fn run_target_count(
 ) -> Result<ExitCode> {
     let mut any_success = false;
     for seq in 0..count {
-        let started = Instant::now();
-        let result = run_with_identity_path_mode_timeout(peer, None, relay, timeout);
+        let result = run_probe_with_identity_path_mode_timeout(peer, None, relay, timeout);
         match result {
-            Ok(code) if code == ExitCode::SUCCESS => {
+            Ok(mut report) => {
+                report.seq = seq;
                 any_success = true;
                 if json {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "schema": 1,
-                            "kind": "status.probe",
-                            "seq": seq,
-                            "target": peer,
-                            "path": if relay { "relay" } else { "unknown" },
-                            "rtt_ms": started.elapsed().as_secs_f64() * 1000.0,
-                            "ok": true,
-                        })
-                    );
+                    println!("{}", render_probe_json(&report));
+                } else {
+                    print_status(&report);
                 }
-            }
-            Ok(code) if json => {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "schema": 1,
-                        "kind": "status.probe",
-                        "seq": seq,
-                        "target": peer,
-                        "rtt_ms": null,
-                        "ok": false,
-                        "error": format!("probe exited with {code:?}"),
-                    })
-                );
             }
             Err(err) if json => {
                 println!(
@@ -259,7 +236,6 @@ fn run_target_count(
                 );
             }
             Err(err) => return Err(err),
-            Ok(code) => return Ok(code),
         }
         if seq + 1 < count {
             std::thread::sleep(Duration::from_secs(1));
@@ -286,6 +262,17 @@ fn run_with_identity_path_mode_timeout(
     relay: bool,
     timeout: Duration,
 ) -> Result<ExitCode> {
+    let report = run_probe_with_identity_path_mode_timeout(peer, identity_path, relay, timeout)?;
+    print_status(&report);
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_probe_with_identity_path_mode_timeout(
+    peer: &str,
+    identity_path: Option<&Path>,
+    relay: bool,
+    timeout: Duration,
+) -> Result<ProbeReport> {
     let runtime = tokio::runtime::Runtime::new()?;
     let identity_path = resolve_identity_path(identity_path);
     runtime.block_on(async move {
@@ -293,7 +280,7 @@ fn run_with_identity_path_mode_timeout(
         let raw_endpoint = crate::client_endpoint::bind_client_endpoint(&identity).await?;
         let outcome = tokio::time::timeout(
             timeout,
-            run_with_endpoint(peer, identity, raw_endpoint.clone(), relay),
+            probe_with_endpoint(peer, identity, raw_endpoint.clone(), relay),
         )
         .await;
         close_client_endpoint(raw_endpoint, "status command").await;
@@ -310,16 +297,18 @@ pub fn run_with_identity_path_and_endpoint(
     let identity_path = resolve_identity_path(identity_path);
     runtime.block_on(async move {
         let identity = store::load(&identity_path).context("load local identity")?;
-        run_with_endpoint(peer, identity, raw_endpoint, false).await
+        let report = probe_with_endpoint(peer, identity, raw_endpoint, false).await?;
+        print_status(&report);
+        Ok(ExitCode::SUCCESS)
     })
 }
 
-async fn run_with_endpoint(
+async fn probe_with_endpoint(
     peer: &str,
     identity: Identity,
     raw_endpoint: iroh::Endpoint,
     relay: bool,
-) -> Result<ExitCode> {
+) -> Result<ProbeReport> {
     let endpoint = Endpoint::from(raw_endpoint.clone());
     let resolved = resolve_peer(
         peer,
@@ -340,17 +329,24 @@ async fn run_with_endpoint(
     let path = path_label(&connection);
     let remote_id = connection.remote_id();
     let relationship = peer_relationship_label(peer, remote_id.as_bytes());
-    print_status(
-        remote_id,
-        &path,
-        rtt,
-        &resolved.discovery,
-        relationship.as_deref(),
-        &info,
-    );
-
     connection.close(0u32.into(), b"status complete");
-    Ok(ExitCode::SUCCESS)
+    Ok(ProbeReport {
+        schema: 1,
+        kind: "status.probe".to_owned(),
+        seq: 0,
+        target: peer.to_owned(),
+        ok: true,
+        rtt_ms: Some(rtt.as_secs_f64() * 1000.0),
+        path: Some(path),
+        endpoint_id: Some(hex::encode(remote_id.as_bytes())),
+        discovery: Some(resolved.discovery),
+        relationship,
+        agent_version: Some(info.agent_version),
+        uptime_s: Some(info.uptime_s),
+        hostname: Some(info.hostname),
+        os: Some(info.os),
+        error: None,
+    })
 }
 
 fn meta_caps() -> Capabilities {
@@ -441,29 +437,61 @@ fn path_label(connection: &Connection) -> String {
     }
 }
 
-fn print_status(
-    endpoint_id: EndpointId,
-    path: &str,
-    rtt: Duration,
-    discovery: &str,
-    relationship: Option<&str>,
-    info: &InfoView,
-) {
-    println!("{:<18}{}", "endpoint:", hex::encode(endpoint_id.as_bytes()));
-    println!("{:<18}{}", "path:", path);
-    println!("{:<18}{}ms", "rtt:", rtt.as_millis());
-    println!("{:<18}{}", "discovery:", discovery);
-    if let Some(relationship) = relationship {
+fn print_status(report: &ProbeReport) {
+    if let Some(endpoint_id) = &report.endpoint_id {
+        println!("{:<18}{}", "endpoint:", endpoint_id);
+    }
+    if let Some(path) = &report.path {
+        println!("{:<18}{}", "path:", path);
+    }
+    if let Some(rtt_ms) = report.rtt_ms {
+        println!("{:<18}{}ms", "rtt:", rtt_ms.round() as u64);
+    }
+    if let Some(discovery) = &report.discovery {
+        println!("{:<18}{}", "discovery:", discovery);
+    }
+    if let Some(relationship) = &report.relationship {
         println!("{:<18}{}", "relationship:", relationship);
     }
-    println!("{:<18}{}", "agent_version:", info.agent_version);
-    println!(
-        "{:<18}{}",
-        "uptime:",
-        humantime::format_duration(Duration::from_secs(info.uptime_s))
-    );
-    println!("{:<18}{}", "hostname:", info.hostname);
-    println!("{:<18}{}", "os:", info.os);
+    if let Some(agent_version) = &report.agent_version {
+        println!("{:<18}{}", "agent_version:", agent_version);
+    }
+    if let Some(uptime_s) = report.uptime_s {
+        println!(
+            "{:<18}{}",
+            "uptime:",
+            humantime::format_duration(Duration::from_secs(uptime_s))
+        );
+    }
+    if let Some(hostname) = &report.hostname {
+        println!("{:<18}{}", "hostname:", hostname);
+    }
+    if let Some(os) = &report.os {
+        println!("{:<18}{}", "os:", os);
+    }
+}
+
+fn render_probe_json(report: &ProbeReport) -> String {
+    serde_json::to_string(report).expect("serialize probe report")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProbeReport {
+    schema: u32,
+    kind: String,
+    seq: u32,
+    target: String,
+    ok: bool,
+    rtt_ms: Option<f64>,
+    path: Option<String>,
+    endpoint_id: Option<String>,
+    discovery: Option<String>,
+    relationship: Option<String>,
+    agent_version: Option<String>,
+    uptime_s: Option<u64>,
+    hostname: Option<String>,
+    os: Option<String>,
+    error: Option<String>,
 }
 
 fn peer_relationship_label(target: &str, endpoint_id: &[u8; 32]) -> Option<String> {
@@ -507,10 +535,40 @@ struct MetaEnvelope {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
+
     use portl_agent::status_schema::{
-        AgentInfo, DefaultUserInfo, DiscoveryInfo, NetworkInfo, SessionProviderInfo,
-        SessionProviderSearchPath, SessionProvidersInfo, StatusResponse,
+        AgentInfo, DefaultUserInfo, DiscoveryInfo, NetworkHealthInfo, NetworkInfo,
+        SessionProviderInfo, SessionProviderSearchPath, SessionProvidersInfo, StatusResponse,
     };
+
+    #[test]
+    fn target_status_json_emits_single_json_object_without_human_prefix() {
+        let report = super::ProbeReport {
+            schema: 1,
+            kind: "status.probe".to_owned(),
+            seq: 0,
+            target: "vn3".to_owned(),
+            ok: true,
+            rtt_ms: Some(12.5),
+            path: Some("direct".to_owned()),
+            endpoint_id: Some("abc".to_owned()),
+            discovery: Some("stored+configured-relay".to_owned()),
+            relationship: Some("mutual".to_owned()),
+            agent_version: Some("0.8.2".to_owned()),
+            uptime_s: Some(42),
+            hostname: Some("vn3".to_owned()),
+            os: Some("linux".to_owned()),
+            error: None,
+        };
+
+        let rendered = super::render_probe_json(&report);
+        let parsed: Value = serde_json::from_str(&rendered).expect("parse probe json");
+        assert_eq!(parsed["kind"], "status.probe");
+        assert_eq!(parsed["hostname"], "vn3");
+        assert_eq!(parsed["endpoint_id"], "abc");
+        assert!(!rendered.contains("endpoint:"));
+    }
 
     #[test]
     fn dashboard_renders_session_provider_discovery() {
@@ -531,6 +589,7 @@ mod tests {
                     local: true,
                 },
             },
+            NetworkHealthInfo::disabled(),
             SessionProvidersInfo {
                 default_provider: Some("zmx".to_owned()),
                 default_user: Some(DefaultUserInfo {

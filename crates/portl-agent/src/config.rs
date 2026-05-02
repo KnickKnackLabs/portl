@@ -30,6 +30,10 @@ const AGENT_ENV_VARS: &[&str] = &[
     "PORTL_SESSION_PROVIDER",
     "PORTL_SESSION_PROVIDER_PATH",
     "PORTL_MODE",
+    "PORTL_AGENT_WATCHDOG",
+    "PORTL_AGENT_WATCHDOG_INTERVAL",
+    "PORTL_AGENT_WATCHDOG_TIMEOUT",
+    "PORTL_AGENT_WATCHDOG_FAILURES",
     "PORTL_RELAY_ENABLE",
     "PORTL_RELAY_BIND",
     "PORTL_RELAY_HOSTNAME",
@@ -70,6 +74,8 @@ pub struct AgentConfig {
     /// Optional absolute path to the target-side persistent-session provider CLI.
     /// The first v0.4 slice treats this as a zmx path when set.
     pub session_provider_path: Option<PathBuf>,
+    /// Lightweight self-healing endpoint watchdog.
+    pub watchdog: crate::network_watchdog::WatchdogConfig,
     /// Optional in-process relay server. `None` = disabled
     /// (the default). See `PORTL_RELAY_ENABLE` + related vars.
     pub relay_server: Option<RelayServerConfig>,
@@ -227,6 +233,7 @@ impl AgentConfig {
             .map(|value| parse_listener_mode(&value))
             .transpose()?
             .unwrap_or(AgentMode::Listener);
+        let watchdog = parse_watchdog_config(&mode)?;
 
         let relay_server = parse_relay_server_config()?;
 
@@ -247,6 +254,7 @@ impl AgentConfig {
             metrics_socket_path: Some(paths.metrics_socket_path()),
             session_provider,
             session_provider_path,
+            watchdog,
             relay_server,
         })
     }
@@ -543,6 +551,38 @@ fn parse_bool_env(name: &str, value: &str) -> Result<bool> {
     }
 }
 
+fn parse_watchdog_config(mode: &AgentMode) -> Result<crate::network_watchdog::WatchdogConfig> {
+    let mut config = crate::network_watchdog::WatchdogConfig::default();
+    config.enabled = matches!(mode, AgentMode::Listener);
+    if let Some(value) = env_string("PORTL_AGENT_WATCHDOG")? {
+        config.enabled = match value.as_str() {
+            "auto" => matches!(mode, AgentMode::Listener),
+            "off" => false,
+            "on" | "1" | "true" | "yes" => true,
+            other => bail!(
+                "PORTL_AGENT_WATCHDOG must be auto, off, on, 0, 1, false, true, no, or yes (got {other})"
+            ),
+        };
+    }
+    if let Some(value) = env_string("PORTL_AGENT_WATCHDOG_INTERVAL")? {
+        config.interval = humantime::parse_duration(&value)
+            .with_context(|| format!("parse PORTL_AGENT_WATCHDOG_INTERVAL duration: {value}"))?;
+    }
+    if let Some(value) = env_string("PORTL_AGENT_WATCHDOG_TIMEOUT")? {
+        config.timeout = humantime::parse_duration(&value)
+            .with_context(|| format!("parse PORTL_AGENT_WATCHDOG_TIMEOUT duration: {value}"))?;
+    }
+    if let Some(value) = env_string("PORTL_AGENT_WATCHDOG_FAILURES")? {
+        config.failures_before_refresh = value.parse::<u32>().with_context(|| {
+            format!("parse PORTL_AGENT_WATCHDOG_FAILURES as a positive integer: {value}")
+        })?;
+        if config.failures_before_refresh == 0 {
+            bail!("PORTL_AGENT_WATCHDOG_FAILURES must be at least 1");
+        }
+    }
+    Ok(config)
+}
+
 fn parse_secret_hex(value: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(value)
         .with_context(|| format!("invalid PORTL_IDENTITY_SECRET_HEX hex: {value}"))?;
@@ -666,6 +706,53 @@ mod tests {
                 assert_eq!(
                     config.metrics_socket_path,
                     Some(paths.metrics_socket_path())
+                );
+                assert!(config.watchdog.enabled);
+                assert_eq!(
+                    config.watchdog.interval,
+                    std::time::Duration::from_secs(300)
+                );
+                assert_eq!(config.watchdog.timeout, std::time::Duration::from_secs(5));
+                assert_eq!(config.watchdog.failures_before_refresh, 3);
+            },
+        );
+    }
+
+    #[test]
+    fn watchdog_env_can_disable_and_tune() {
+        let home = tempdir().expect("tempdir");
+        with_env(
+            &[
+                ("PORTL_HOME", Some(home.path().as_os_str().to_os_string())),
+                ("PORTL_AGENT_WATCHDOG", Some(OsString::from("off"))),
+                ("PORTL_AGENT_WATCHDOG_INTERVAL", Some(OsString::from("30s"))),
+                ("PORTL_AGENT_WATCHDOG_TIMEOUT", Some(OsString::from("2s"))),
+                ("PORTL_AGENT_WATCHDOG_FAILURES", Some(OsString::from("2"))),
+            ],
+            || {
+                let config = AgentConfig::from_env().expect("parse watchdog env");
+                assert!(!config.watchdog.enabled);
+                assert_eq!(config.watchdog.interval, std::time::Duration::from_secs(30));
+                assert_eq!(config.watchdog.timeout, std::time::Duration::from_secs(2));
+                assert_eq!(config.watchdog.failures_before_refresh, 2);
+            },
+        );
+    }
+
+    #[test]
+    fn watchdog_env_rejects_zero_failures() {
+        let home = tempdir().expect("tempdir");
+        with_env(
+            &[
+                ("PORTL_HOME", Some(home.path().as_os_str().to_os_string())),
+                ("PORTL_AGENT_WATCHDOG_FAILURES", Some(OsString::from("0"))),
+            ],
+            || {
+                let err = AgentConfig::from_env().expect_err("zero failures must fail");
+                assert!(
+                    err.to_string()
+                        .contains("PORTL_AGENT_WATCHDOG_FAILURES must be at least 1"),
+                    "unexpected error: {err:#}"
                 );
             },
         );

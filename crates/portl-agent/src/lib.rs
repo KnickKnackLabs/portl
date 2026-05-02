@@ -2,13 +2,14 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 #[cfg(feature = "ghostty-vt")]
 use anyhow::Context as _;
 use anyhow::Result;
 use portl_core::id::{Identity, store};
 use portl_core::ticket::verify::TrustRoots;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, instrument, warn};
@@ -22,6 +23,7 @@ pub mod endpoint;
 pub mod gateway;
 pub mod meta_handler;
 pub mod metrics;
+pub mod network_watchdog;
 pub mod pair_handler;
 pub mod pipeline;
 pub mod rate_limit;
@@ -340,6 +342,8 @@ pub(crate) struct AgentState {
     pub session_provider_path: Option<PathBuf>,
     /// Agent process start time as unix seconds. For `up_since` fields.
     pub started_at_unix: u64,
+    /// Lightweight endpoint watchdog health surfaced via `/status`.
+    pub network_watchdog: network_watchdog::NetworkWatchdogHealth,
     /// Snapshot of the embedded-relay status for `/status/relay`.
     /// Set to `disabled` when the relay is off; swapped to the live
     /// config on startup when enabled. `RwLock` keeps it
@@ -376,6 +380,10 @@ impl metrics::StatusSource for AgentState {
                 local: self.discovery.local,
             },
         }
+    }
+
+    fn network_health(&self) -> status_schema::NetworkHealthInfo {
+        self.network_watchdog.snapshot(SystemTime::now()).into()
     }
 
     fn session_providers_info(&self) -> status_schema::SessionProvidersInfo {
@@ -423,6 +431,7 @@ fn maybe_test_panic() {}
 pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) -> Result<()> {
     audit::init();
 
+    let watchdog_enabled = cfg.watchdog.enabled && cfg.endpoint.is_none();
     let state = Arc::new(AgentState {
         trust_roots: std::sync::RwLock::new(TrustRoots(
             cfg.trust_roots.iter().copied().collect::<HashSet<_>>(),
@@ -465,21 +474,36 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
             .clone()
             .unwrap_or_else(metrics::default_socket_path),
         session_provider_path: cfg.session_provider_path.clone(),
-        started_at_unix: std::time::SystemTime::now()
+        network_watchdog: if watchdog_enabled {
+            network_watchdog::NetworkWatchdogHealth::new(SystemTime::now())
+        } else {
+            network_watchdog::NetworkWatchdogHealth::disabled(SystemTime::now())
+        },
+        started_at_unix: SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs()),
         relay_status: std::sync::RwLock::new(relay::RelayStatus::disabled()),
     });
 
-    let endpoint = if let Some(endpoint) = cfg.endpoint.clone() {
+    let identity = if cfg.endpoint.is_some() && !watchdog_enabled {
+        None
+    } else {
+        Some(load_identity(&cfg)?)
+    };
+    let mut endpoint = if let Some(endpoint) = cfg.endpoint.clone() {
         endpoint.inner().set_alpns(vec![
             portl_proto::ticket_v1::ALPN_TICKET_V1.to_vec(),
             portl_proto::pair_v1::ALPN_PAIR_V1.to_vec(),
         ]);
         endpoint.inner().clone()
     } else {
-        let identity = load_identity(&cfg)?;
-        endpoint::bind(&cfg, &identity).await?
+        endpoint::bind(
+            &cfg,
+            identity
+                .as_ref()
+                .expect("identity loaded for owned endpoint"),
+        )
+        .await?
     };
 
     tracing::info!("portl-agent listening");
@@ -492,12 +516,49 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
     let peer_reload = spawn_peer_store_reload_task(Arc::clone(&state), shutdown.clone());
     let metrics_task = spawn_metrics_server(&state, shutdown.clone(), &cfg);
     let relay_handle = spawn_relay_if_enabled(&state, shutdown.clone(), &cfg).await?;
+    let (endpoint_tx, endpoint_rx) = watch::channel(endpoint.clone());
+    let (watchdog_refresh_tx, mut watchdog_refresh_rx) = mpsc::unbounded_channel();
+    let watchdog_task = watchdog_enabled.then(|| {
+        network_watchdog::spawn_watchdog_task(
+            cfg.watchdog.clone(),
+            state.network_watchdog.clone(),
+            identity
+                .clone()
+                .expect("identity loaded for watchdog endpoint"),
+            endpoint_rx,
+            watchdog_refresh_tx,
+            shutdown.clone(),
+        )
+    });
 
     loop {
         tokio::select! {
             biased;
             () = shutdown.cancelled() => {
                 break;
+            }
+            refresh = watchdog_refresh_rx.recv() => {
+                let Some(network_watchdog::WatchdogCommand::RefreshEndpoint) = refresh else {
+                    break;
+                };
+                info!("watchdog requested endpoint refresh");
+                graceful_close_endpoint(&endpoint).await;
+                match endpoint::bind(&cfg, identity.as_ref().expect("identity loaded for endpoint refresh")).await {
+                    Ok(new_endpoint) => {
+                        endpoint = new_endpoint;
+                        let _ = endpoint_tx.send(endpoint.clone());
+                        state.network_watchdog.record_endpoint_refresh_success(SystemTime::now());
+                        info!("watchdog endpoint refresh complete");
+                    }
+                    Err(err) => {
+                        state.network_watchdog.record_endpoint_refresh_failure(
+                            SystemTime::now(),
+                            format!("{err:#}"),
+                        );
+                        warn!(?err, "watchdog endpoint refresh failed; exiting for service manager restart");
+                        anyhow::bail!("watchdog endpoint refresh failed: {err:#}");
+                    }
+                }
             }
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else {
@@ -510,6 +571,8 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
                         continue;
                     }
                 };
+
+                state.network_watchdog.record_inbound_handshake(SystemTime::now());
 
                 if connection.alpn() == portl_proto::ticket_v1::ALPN_TICKET_V1 {
                     let state = Arc::clone(&state);
@@ -559,6 +622,9 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
     revocation_gc.abort();
     revocation_reload.abort();
     peer_reload.abort();
+    if let Some(watchdog) = watchdog_task {
+        watchdog.abort();
+    }
     if let Some(metrics) = metrics_task {
         metrics.abort();
     }
@@ -610,7 +676,7 @@ fn spawn_revocation_gc_task(state: Arc<AgentState>, shutdown: CancellationToken)
             tokio::select! {
                 () = shutdown.cancelled() => break,
                 _ = interval.tick() => {
-                    let now = match std::time::SystemTime::now()
+                    let now = match SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                     {
                         Ok(d) => d.as_secs(),
