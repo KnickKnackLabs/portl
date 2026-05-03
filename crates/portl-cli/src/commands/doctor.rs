@@ -774,8 +774,7 @@ fn check_agent_network_endpoint_status(
     let health = &status.network_health;
     let missing_watchdog_health = health.state
         == portl_agent::network_watchdog::WatchdogState::Disabled
-        && health.endpoint_generation == 0
-        && !watchdog_explicitly_disabled();
+        && health.endpoint_generation == 0;
     let status = if missing_watchdog_health {
         Status::Warn
     } else {
@@ -814,12 +813,6 @@ fn fetch_agent_status_sync(
 ) -> anyhow::Result<portl_agent::status_schema::StatusResponse> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(crate::agent_ipc::fetch_status(socket))
-}
-
-fn watchdog_explicitly_disabled() -> bool {
-    std::env::var("PORTL_AGENT_WATCHDOG")
-        .map(|value| matches!(value.as_str(), "off" | "0" | "false" | "no"))
-        .unwrap_or(false)
 }
 
 fn service_is_loaded() -> bool {
@@ -1300,6 +1293,8 @@ mod tests {
     #[test]
     fn network_endpoint_check_accepts_intentionally_disabled_watchdog() {
         with_watchdog_env(Some("off"), || {
+            let mut health = portl_agent::status_schema::NetworkHealthInfo::disabled();
+            health.endpoint_generation = 1;
             let status = portl_agent::status_schema::StatusResponse::new(
                 portl_agent::status_schema::AgentInfo {
                     pid: 42,
@@ -1317,7 +1312,7 @@ mod tests {
                         local: true,
                     },
                 },
-                portl_agent::status_schema::NetworkHealthInfo::disabled(),
+                health,
                 portl_agent::status_schema::SessionProvidersInfo::default(),
                 portl_agent::relay::RelayStatus::disabled(),
             );
