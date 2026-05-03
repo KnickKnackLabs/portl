@@ -772,12 +772,20 @@ fn check_agent_network_endpoint_status(
     status: &portl_agent::status_schema::StatusResponse,
 ) -> CheckResult {
     let health = &status.network_health;
-    let status = match health.state {
-        portl_agent::network_watchdog::WatchdogState::Ok
-        | portl_agent::network_watchdog::WatchdogState::Disabled => Status::Ok,
-        portl_agent::network_watchdog::WatchdogState::Degraded
-        | portl_agent::network_watchdog::WatchdogState::Refreshing => Status::Warn,
-        portl_agent::network_watchdog::WatchdogState::Failed => Status::Fail,
+    let missing_watchdog_health = health.state
+        == portl_agent::network_watchdog::WatchdogState::Disabled
+        && health.endpoint_generation == 0
+        && !watchdog_explicitly_disabled();
+    let status = if missing_watchdog_health {
+        Status::Warn
+    } else {
+        match health.state {
+            portl_agent::network_watchdog::WatchdogState::Ok
+            | portl_agent::network_watchdog::WatchdogState::Disabled => Status::Ok,
+            portl_agent::network_watchdog::WatchdogState::Degraded
+            | portl_agent::network_watchdog::WatchdogState::Refreshing => Status::Warn,
+            portl_agent::network_watchdog::WatchdogState::Failed => Status::Fail,
+        }
     };
     let mut detail = format!(
         "state={:?}, endpoint generation {}, failures={}, refresh_count={}",
@@ -787,6 +795,9 @@ fn check_agent_network_endpoint_status(
         health.endpoint_refresh_count
     )
     .to_lowercase();
+    if missing_watchdog_health {
+        detail.push_str(", watchdog health missing from agent status");
+    }
     if let Some(error) = &health.last_endpoint_refresh_error {
         let _ =
             std::fmt::Write::write_fmt(&mut detail, format_args!(", last_refresh_error={error}"));
@@ -803,6 +814,12 @@ fn fetch_agent_status_sync(
 ) -> anyhow::Result<portl_agent::status_schema::StatusResponse> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(crate::agent_ipc::fetch_status(socket))
+}
+
+fn watchdog_explicitly_disabled() -> bool {
+    std::env::var("PORTL_AGENT_WATCHDOG")
+        .map(|value| matches!(value.as_str(), "off" | "0" | "false" | "no"))
+        .unwrap_or(false)
 }
 
 fn service_is_loaded() -> bool {
@@ -1217,6 +1234,40 @@ mod tests {
     #[test]
     fn network_endpoint_check_accepts_reported_disabled_watchdog() {
         with_watchdog_env(None, || {
+            let mut health = portl_agent::status_schema::NetworkHealthInfo::disabled();
+            health.endpoint_generation = 1;
+            let status = portl_agent::status_schema::StatusResponse::new(
+                portl_agent::status_schema::AgentInfo {
+                    pid: 42,
+                    version: "0.8.1".to_owned(),
+                    started_at_unix: 100,
+                    home: "/tmp/portl".to_owned(),
+                    metrics_socket: "/tmp/portl/run/metrics.sock".to_owned(),
+                },
+                Vec::new(),
+                portl_agent::status_schema::NetworkInfo {
+                    relays: Vec::new(),
+                    discovery: portl_agent::status_schema::DiscoveryInfo {
+                        dns: false,
+                        pkarr: false,
+                        local: true,
+                    },
+                },
+                health,
+                portl_agent::status_schema::SessionProvidersInfo::default(),
+                portl_agent::relay::RelayStatus::disabled(),
+            );
+
+            let result = check_agent_network_endpoint_status(&status);
+
+            assert_eq!(result.status, Status::Ok);
+            assert!(result.detail.contains("state=disabled"));
+        });
+    }
+
+    #[test]
+    fn network_endpoint_check_warns_when_watchdog_health_missing() {
+        with_watchdog_env(None, || {
             let status = portl_agent::status_schema::StatusResponse::new(
                 portl_agent::status_schema::AgentInfo {
                     pid: 42,
@@ -1241,8 +1292,8 @@ mod tests {
 
             let result = check_agent_network_endpoint_status(&status);
 
-            assert_eq!(result.status, Status::Ok);
-            assert!(result.detail.contains("state=disabled"));
+            assert_eq!(result.status, Status::Warn);
+            assert!(result.detail.contains("watchdog health missing"));
         });
     }
 

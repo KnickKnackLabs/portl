@@ -437,6 +437,12 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
     audit::init();
 
     let watchdog_enabled = cfg.watchdog.enabled && cfg.endpoint.is_none();
+    if cfg.watchdog.enabled
+        && cfg.endpoint.is_some()
+        && std::env::var_os("PORTL_AGENT_WATCHDOG").is_some()
+    {
+        warn!("watchdog requested but disabled for externally supplied endpoint");
+    }
     let identity = if cfg.endpoint.is_some() && !watchdog_enabled {
         None
     } else {
@@ -627,7 +633,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
     } else {
         Vec::new()
     };
-    if shutdown.is_cancelled() {
+    if shutdown.is_cancelled() || fatal_watchdog_error.is_some() {
         graceful_close_endpoint(&endpoint).await;
     }
     let all_sessions_reaped = if signal_shutdown_requested {

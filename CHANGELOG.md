@@ -5,6 +5,23 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Added
+
+- `portl-agent` now includes a lightweight network watchdog that tracks
+  authenticated reachability, performs low-frequency self-probes, refreshes
+  stale endpoints, and falls back to service-manager restarts for fixed-port
+  listeners. Operators can tune it with `PORTL_AGENT_WATCHDOG`,
+  `PORTL_AGENT_WATCHDOG_INTERVAL`, `PORTL_AGENT_WATCHDOG_TIMEOUT`, and
+  `PORTL_AGENT_WATCHDOG_FAILURES`.
+
+### Changed
+
+- Agent status now includes additive `network_health` fields, and
+  `portl doctor --verbose` reports the network endpoint watchdog state so stale
+  or degraded long-running agents are visible before remote probes time out.
+- `portl status TARGET --count N --json` now emits one JSON envelope containing
+  all probe results instead of multiple standalone JSON objects.
+
 ## 0.8.1 — 2026-05-02
 
 ### Changed

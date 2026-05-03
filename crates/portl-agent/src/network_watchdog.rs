@@ -135,6 +135,8 @@ impl NetworkWatchdogHealth {
         let mut inner = self.inner.write().expect("watchdog health lock");
         inner.last_inbound_handshake_at = Some(unix_secs(now));
         inner.consecutive_self_probe_failures = 0;
+        inner.consecutive_endpoint_refresh_failures = 0;
+        inner.next_endpoint_refresh_not_before = None;
         inner.last_endpoint_refresh_error = None;
         inner.state = WatchdogState::Ok;
     }
@@ -143,6 +145,8 @@ impl NetworkWatchdogHealth {
         let mut inner = self.inner.write().expect("watchdog health lock");
         inner.last_self_probe_ok_at = Some(unix_secs(now));
         inner.consecutive_self_probe_failures = 0;
+        inner.consecutive_endpoint_refresh_failures = 0;
+        inner.next_endpoint_refresh_not_before = None;
         inner.last_endpoint_refresh_error = None;
         inner.state = WatchdogState::Ok;
     }
@@ -152,7 +156,9 @@ impl NetworkWatchdogHealth {
         inner.last_self_probe_failed_at = Some(unix_secs(now));
         inner.consecutive_self_probe_failures =
             inner.consecutive_self_probe_failures.saturating_add(1);
-        inner.state = WatchdogState::Degraded;
+        if inner.state != WatchdogState::Failed {
+            inner.state = WatchdogState::Degraded;
+        }
         ProbeFailureAction {
             consecutive_failures: inner.consecutive_self_probe_failures,
         }
@@ -427,14 +433,11 @@ fn relay_only_probe_addr(addr: &EndpointAddr, discovery: &DiscoveryConfig) -> Op
     if discovery.relays.is_empty() {
         return None;
     }
-    let mut relays = addr
+    let relays = addr
         .relay_urls()
         .cloned()
         .map(TransportAddr::Relay)
         .collect::<Vec<_>>();
-    if relays.is_empty() {
-        relays.extend(discovery.relays.iter().cloned().map(TransportAddr::Relay));
-    }
     (!relays.is_empty()).then(|| EndpointAddr::from_parts(addr.id, relays))
 }
 
@@ -613,6 +616,54 @@ mod tests {
     }
 
     #[test]
+    fn probe_success_clears_refresh_failure_backoff() {
+        let health = NetworkWatchdogHealth::new(ts(100));
+        health.record_endpoint_refresh_failure(ts(100), "bind failed".to_owned());
+        assert!(!health.refresh_allowed(ts(399)));
+
+        health.record_probe_success(ts(120));
+
+        let snapshot = health.snapshot(ts(121));
+        assert_eq!(snapshot.state, WatchdogState::Ok);
+        assert_eq!(snapshot.consecutive_endpoint_refresh_failures, 0);
+        assert_eq!(snapshot.next_endpoint_refresh_not_before, None);
+        assert_eq!(snapshot.last_endpoint_refresh_error, None);
+        assert!(health.refresh_allowed(ts(121)));
+    }
+
+    #[test]
+    fn inbound_handshake_clears_refresh_failure_backoff() {
+        let health = NetworkWatchdogHealth::new(ts(100));
+        health.record_endpoint_refresh_failure(ts(100), "bind failed".to_owned());
+        assert!(!health.refresh_allowed(ts(399)));
+
+        health.record_inbound_handshake(ts(120));
+
+        let snapshot = health.snapshot(ts(121));
+        assert_eq!(snapshot.state, WatchdogState::Ok);
+        assert_eq!(snapshot.consecutive_endpoint_refresh_failures, 0);
+        assert_eq!(snapshot.next_endpoint_refresh_not_before, None);
+        assert_eq!(snapshot.last_endpoint_refresh_error, None);
+        assert!(health.refresh_allowed(ts(121)));
+    }
+
+    #[test]
+    fn probe_failure_preserves_refresh_failed_state() {
+        let health = NetworkWatchdogHealth::new(ts(100));
+        health.record_endpoint_refresh_failure(ts(100), "bind failed".to_owned());
+
+        let action = health.record_probe_failure(ts(120));
+
+        assert_eq!(action.consecutive_failures, 1);
+        let snapshot = health.snapshot(ts(121));
+        assert_eq!(snapshot.state, WatchdogState::Failed);
+        assert_eq!(
+            snapshot.last_endpoint_refresh_error.as_deref(),
+            Some("bind failed")
+        );
+    }
+
+    #[test]
     fn relay_probe_addr_uses_relay_only_when_relay_configured() {
         let relay: iroh_base::RelayUrl = "https://relay.example./".parse().expect("relay url");
         let discovery = DiscoveryConfig {
@@ -624,6 +675,19 @@ mod tests {
         let probe = relay_only_probe_addr(&addr, &discovery).expect("relay addr");
         assert_eq!(probe.relay_urls().count(), 1);
         assert_eq!(probe.ip_addrs().count(), 0);
+    }
+
+    #[test]
+    fn relay_probe_addr_waits_for_published_relay_url() {
+        let relay: iroh_base::RelayUrl = "https://relay.example./".parse().expect("relay url");
+        let discovery = DiscoveryConfig {
+            relays: vec![relay],
+            ..DiscoveryConfig::in_process()
+        };
+        let endpoint_id = SecretKey::from_bytes(&[1; 32]).public();
+        let addr = EndpointAddr::new(endpoint_id);
+
+        assert!(relay_only_probe_addr(&addr, &discovery).is_none());
     }
 
     #[test]
