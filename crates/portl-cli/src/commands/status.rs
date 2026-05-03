@@ -209,6 +209,7 @@ fn run_target_count(
     timeout: Duration,
 ) -> Result<ExitCode> {
     let mut any_success = false;
+    let mut reports = Vec::new();
     for seq in 0..count {
         let result = run_probe_with_identity_path_mode_timeout(peer, None, relay, timeout);
         match result {
@@ -216,30 +217,26 @@ fn run_target_count(
                 report.seq = seq;
                 any_success = true;
                 if json {
-                    println!("{}", render_probe_json(&report));
+                    reports.push(ProbeReportEnvelope::Single(report));
                 } else {
                     print_status(&report);
                 }
             }
             Err(err) if json => {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "schema": 1,
-                        "kind": "status.probe",
-                        "seq": seq,
-                        "target": peer,
-                        "rtt_ms": null,
-                        "ok": false,
-                        "error": format!("{err:#}"),
-                    })
-                );
+                reports.push(ProbeReportEnvelope::Single(ProbeReport::failure(
+                    seq,
+                    peer,
+                    format!("{err:#}"),
+                )));
             }
             Err(err) => return Err(err),
         }
         if seq + 1 < count {
             std::thread::sleep(Duration::from_secs(1));
         }
+    }
+    if json {
+        println!("{}", render_probe_json_envelope(reports, count));
     }
     Ok(if any_success {
         ExitCode::SUCCESS
@@ -475,6 +472,31 @@ fn render_probe_json(report: &ProbeReport) -> String {
     serde_json::to_string(report).expect("serialize probe report")
 }
 
+fn render_probe_json_envelope(reports: Vec<ProbeReportEnvelope>, count: u32) -> String {
+    if count == 1 && reports.len() == 1 {
+        let Some(ProbeReportEnvelope::Single(report)) = reports.into_iter().next() else {
+            unreachable!("single report vector contains a report")
+        };
+        return render_probe_json(&report);
+    }
+    let probes = reports
+        .into_iter()
+        .map(|report| match report {
+            ProbeReportEnvelope::Single(report) => report,
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&serde_json::json!({
+        "schema": 1,
+        "kind": "status.probes",
+        "probes": probes,
+    }))
+    .expect("serialize probe report envelope")
+}
+
+enum ProbeReportEnvelope {
+    Single(ProbeReport),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProbeReport {
     schema: u32,
@@ -517,6 +539,28 @@ fn unix_now_micros() -> Result<u64> {
         .as_micros()
         .try_into()
         .context("micros overflow u64")
+}
+
+impl ProbeReport {
+    fn failure(seq: u32, target: &str, error: String) -> Self {
+        Self {
+            schema: 1,
+            kind: "status.probe".to_owned(),
+            seq,
+            target: target.to_owned(),
+            ok: false,
+            rtt_ms: None,
+            path: None,
+            endpoint_id: None,
+            discovery: None,
+            relationship: None,
+            agent_version: None,
+            uptime_s: None,
+            hostname: None,
+            os: None,
+            error: Some(error),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -568,6 +612,28 @@ mod tests {
         assert_eq!(parsed["hostname"], "vn3");
         assert_eq!(parsed["endpoint_id"], "abc");
         assert!(!rendered.contains("endpoint:"));
+    }
+
+    #[test]
+    fn target_status_json_count_emits_single_envelope() {
+        let rendered = super::render_probe_json_envelope(
+            vec![
+                super::ProbeReportEnvelope::Single(super::ProbeReport::failure(
+                    0,
+                    "vn3",
+                    "one".to_owned(),
+                )),
+                super::ProbeReportEnvelope::Single(super::ProbeReport::failure(
+                    1,
+                    "vn3",
+                    "two".to_owned(),
+                )),
+            ],
+            2,
+        );
+        let parsed: Value = serde_json::from_str(&rendered).expect("parse probe json envelope");
+        assert_eq!(parsed["kind"], "status.probes");
+        assert_eq!(parsed["probes"].as_array().expect("probes array").len(), 2);
     }
 
     #[test]

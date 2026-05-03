@@ -164,7 +164,9 @@ pub struct NetworkHealthInfo {
     pub last_self_probe_failed_at: Option<u64>,
     pub consecutive_self_probe_failures: u32,
     pub endpoint_refresh_count: u64,
+    pub consecutive_endpoint_refresh_failures: u32,
     pub last_endpoint_refresh_at: Option<u64>,
+    pub next_endpoint_refresh_not_before: Option<u64>,
     pub last_endpoint_refresh_error: Option<String>,
 }
 
@@ -181,7 +183,9 @@ impl NetworkHealthInfo {
             last_self_probe_failed_at: None,
             consecutive_self_probe_failures: 0,
             endpoint_refresh_count: 0,
+            consecutive_endpoint_refresh_failures: 0,
             last_endpoint_refresh_at: None,
+            next_endpoint_refresh_not_before: None,
             last_endpoint_refresh_error: None,
         }
     }
@@ -199,7 +203,9 @@ impl From<NetworkHealthSnapshot> for NetworkHealthInfo {
             last_self_probe_failed_at: value.last_self_probe_failed_at,
             consecutive_self_probe_failures: value.consecutive_self_probe_failures,
             endpoint_refresh_count: value.endpoint_refresh_count,
+            consecutive_endpoint_refresh_failures: value.consecutive_endpoint_refresh_failures,
             last_endpoint_refresh_at: value.last_endpoint_refresh_at,
+            next_endpoint_refresh_not_before: value.next_endpoint_refresh_not_before,
             last_endpoint_refresh_error: value.last_endpoint_refresh_error,
         }
     }
@@ -411,7 +417,9 @@ mod tests {
                 last_self_probe_failed_at: None,
                 consecutive_self_probe_failures: 0,
                 endpoint_refresh_count: 0,
+                consecutive_endpoint_refresh_failures: 0,
                 last_endpoint_refresh_at: None,
+                next_endpoint_refresh_not_before: None,
                 last_endpoint_refresh_error: None,
             },
             SessionProvidersInfo::default(),

@@ -461,7 +461,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
     let watchdog_probe_identity = watchdog_enabled.then(Identity::new);
     let watchdog_probe_endpoint_id = watchdog_probe_identity
         .as_ref()
-        .map(|identity| identity.verifying_key());
+        .map(Identity::verifying_key);
     let mut startup_trust_roots = cfg.trust_roots.iter().copied().collect::<HashSet<_>>();
     if let Some(endpoint_id) = watchdog_probe_endpoint_id {
         startup_trust_roots.insert(endpoint_id);

@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::DiscoveryConfig;
 use anyhow::{Context, Result, bail};
 use iroh::endpoint::{RelayMode, presets};
-use iroh_base::SecretKey;
+use iroh_base::{EndpointAddr, SecretKey, TransportAddr};
 use portl_core::endpoint::Endpoint;
 use portl_core::id::Identity;
 use portl_core::net::open_ticket_v1;
@@ -59,7 +59,9 @@ pub struct NetworkHealthSnapshot {
     pub last_self_probe_failed_at: Option<u64>,
     pub consecutive_self_probe_failures: u32,
     pub endpoint_refresh_count: u64,
+    pub consecutive_endpoint_refresh_failures: u32,
     pub last_endpoint_refresh_at: Option<u64>,
+    pub next_endpoint_refresh_not_before: Option<u64>,
     pub last_endpoint_refresh_error: Option<String>,
 }
 
@@ -85,7 +87,9 @@ struct Inner {
     last_self_probe_failed_at: Option<u64>,
     consecutive_self_probe_failures: u32,
     endpoint_refresh_count: u64,
+    consecutive_endpoint_refresh_failures: u32,
     last_endpoint_refresh_at: Option<u64>,
+    next_endpoint_refresh_not_before: Option<u64>,
     last_endpoint_refresh_error: Option<String>,
 }
 
@@ -107,7 +111,9 @@ impl NetworkWatchdogHealth {
                 last_self_probe_failed_at: None,
                 consecutive_self_probe_failures: 0,
                 endpoint_refresh_count: 0,
+                consecutive_endpoint_refresh_failures: 0,
                 last_endpoint_refresh_at: None,
+                next_endpoint_refresh_not_before: None,
                 last_endpoint_refresh_error: None,
             })),
         }
@@ -167,14 +173,31 @@ impl NetworkWatchdogHealth {
         inner.last_inbound_handshake_at = None;
         inner.last_endpoint_refresh_error = None;
         inner.consecutive_self_probe_failures = 0;
+        inner.consecutive_endpoint_refresh_failures = 0;
+        inner.next_endpoint_refresh_not_before = None;
         inner.state = WatchdogState::Ok;
     }
 
     pub fn record_endpoint_refresh_failure(&self, now: SystemTime, error: String) {
         let mut inner = self.inner.write().expect("watchdog health lock");
-        inner.last_endpoint_refresh_at = Some(unix_secs(now));
+        let now_secs = unix_secs(now);
+        inner.last_endpoint_refresh_at = Some(now_secs);
+        inner.consecutive_endpoint_refresh_failures = inner
+            .consecutive_endpoint_refresh_failures
+            .saturating_add(1);
+        inner.next_endpoint_refresh_not_before = Some(now_secs.saturating_add(
+            refresh_backoff(inner.consecutive_endpoint_refresh_failures).as_secs(),
+        ));
         inner.last_endpoint_refresh_error = Some(error);
         inner.state = WatchdogState::Failed;
+    }
+
+    #[must_use]
+    pub fn refresh_allowed(&self, now: SystemTime) -> bool {
+        let inner = self.inner.read().expect("watchdog health lock");
+        inner
+            .next_endpoint_refresh_not_before
+            .is_none_or(|not_before| unix_secs(now) >= not_before)
     }
 
     #[must_use]
@@ -196,7 +219,9 @@ impl NetworkWatchdogHealth {
             last_self_probe_failed_at: inner.last_self_probe_failed_at,
             consecutive_self_probe_failures: inner.consecutive_self_probe_failures,
             endpoint_refresh_count: inner.endpoint_refresh_count,
+            consecutive_endpoint_refresh_failures: inner.consecutive_endpoint_refresh_failures,
             last_endpoint_refresh_at: inner.last_endpoint_refresh_at,
+            next_endpoint_refresh_not_before: inner.next_endpoint_refresh_not_before,
             last_endpoint_refresh_error: inner.last_endpoint_refresh_error.clone(),
         }
     }
@@ -275,6 +300,10 @@ pub fn spawn_watchdog_task(
                         ProbeOutcome::Success => debug!("watchdog self-probe succeeded"),
                         ProbeOutcome::Failure(error) => warn!(%error, "watchdog self-probe failed"),
                     }
+                    if should_refresh && !health.refresh_allowed(SystemTime::now()) {
+                        debug!("watchdog skipped endpoint refresh while refresh backoff is active");
+                        continue;
+                    }
                     if should_refresh {
                         health.record_endpoint_refresh_started();
                         if refresh_tx.send(WatchdogCommand::RefreshEndpoint).is_err() {
@@ -311,7 +340,7 @@ async fn self_probe(
     agent_endpoint: iroh::Endpoint,
 ) -> Result<()> {
     let agent_endpoint_wrapper = Endpoint::from(agent_endpoint.clone());
-    let addr = wait_for_non_empty_addr(&agent_endpoint_wrapper).await?;
+    let addr = wait_for_probe_addr(&agent_endpoint_wrapper, discovery).await?;
     let now = unix_secs(SystemTime::now());
     let ticket = mint_root(
         probe_identity.signing_key(),
@@ -377,15 +406,36 @@ async fn self_probe(
     }
 }
 
-async fn wait_for_non_empty_addr(endpoint: &Endpoint) -> Result<iroh_base::EndpointAddr> {
+async fn wait_for_probe_addr(
+    endpoint: &Endpoint,
+    discovery: &DiscoveryConfig,
+) -> Result<EndpointAddr> {
     for _ in 0..20 {
         let addr = endpoint.addr();
-        if !addr.is_empty() {
+        if let Some(relay_addr) = relay_only_probe_addr(&addr, discovery) {
+            return Ok(relay_addr);
+        }
+        if discovery.relays.is_empty() && !addr.is_empty() {
             return Ok(addr);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     bail!("agent endpoint did not publish a dialable address for watchdog self-probe")
+}
+
+fn relay_only_probe_addr(addr: &EndpointAddr, discovery: &DiscoveryConfig) -> Option<EndpointAddr> {
+    if discovery.relays.is_empty() {
+        return None;
+    }
+    let mut relays = addr
+        .relay_urls()
+        .cloned()
+        .map(TransportAddr::Relay)
+        .collect::<Vec<_>>();
+    if relays.is_empty() {
+        relays.extend(discovery.relays.iter().cloned().map(TransportAddr::Relay));
+    }
+    (!relays.is_empty()).then(|| EndpointAddr::from_parts(addr.id, relays))
 }
 
 async fn bind_probe_endpoint(
@@ -421,6 +471,15 @@ fn meta_caps() -> Capabilities {
 struct MetaEnvelope {
     preamble: StreamPreamble,
     req: MetaReq,
+}
+
+fn refresh_backoff(consecutive_failures: u32) -> Duration {
+    match consecutive_failures {
+        0 | 1 => Duration::from_mins(5),
+        2 => Duration::from_mins(10),
+        3 => Duration::from_mins(20),
+        _ => Duration::from_hours(1),
+    }
 }
 
 fn jittered_interval(interval: Duration) -> Duration {
@@ -530,10 +589,41 @@ mod tests {
 
         let snapshot = health.snapshot(ts(121));
         assert_eq!(snapshot.state, WatchdogState::Failed);
+        assert_eq!(snapshot.consecutive_endpoint_refresh_failures, 1);
+        assert_eq!(snapshot.next_endpoint_refresh_not_before, Some(420));
         assert_eq!(
             snapshot.last_endpoint_refresh_error.as_deref(),
             Some("bind failed")
         );
+    }
+
+    #[test]
+    fn refresh_failures_apply_exponential_backoff() {
+        let health = NetworkWatchdogHealth::new(ts(100));
+        health.record_endpoint_refresh_failure(ts(100), "one".to_owned());
+        assert!(!health.refresh_allowed(ts(399)));
+        assert!(health.refresh_allowed(ts(400)));
+
+        health.record_endpoint_refresh_failure(ts(400), "two".to_owned());
+        let snapshot = health.snapshot(ts(401));
+        assert_eq!(snapshot.consecutive_endpoint_refresh_failures, 2);
+        assert_eq!(snapshot.next_endpoint_refresh_not_before, Some(1_000));
+        assert!(!health.refresh_allowed(ts(999)));
+        assert!(health.refresh_allowed(ts(1_000)));
+    }
+
+    #[test]
+    fn relay_probe_addr_uses_relay_only_when_relay_configured() {
+        let relay: iroh_base::RelayUrl = "https://relay.example./".parse().expect("relay url");
+        let discovery = DiscoveryConfig {
+            relays: vec![relay.clone()],
+            ..DiscoveryConfig::in_process()
+        };
+        let endpoint_id = SecretKey::from_bytes(&[1; 32]).public();
+        let addr = EndpointAddr::new(endpoint_id).with_relay_url(relay.clone());
+        let probe = relay_only_probe_addr(&addr, &discovery).expect("relay addr");
+        assert_eq!(probe.relay_urls().count(), 1);
+        assert_eq!(probe.ip_addrs().count(), 0);
     }
 
     #[test]

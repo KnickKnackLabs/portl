@@ -44,6 +44,14 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
     debug!(initiator = ?request.initiator, nonce = %short_nonce(&request.nonce), "received pair request");
 
     let response = handle_pair(&state, caller_eid, &request)?;
+    if !matches!(response.result, PairResult::PolicyRejected(_))
+        && caller_eid != state.self_endpoint_id
+        && Some(caller_eid) != state.watchdog_probe_endpoint_id
+    {
+        state
+            .network_watchdog
+            .record_inbound_handshake(SystemTime::now());
+    }
     debug!(result = ?response.result, "sending pair response");
 
     let bytes = postcard::to_stdvec(&response).context("encode PairResponse")?;
