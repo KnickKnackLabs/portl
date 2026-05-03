@@ -50,15 +50,40 @@ pub(super) async fn pty_master_task(
                         if force {
                             return Ok(());
                         }
-                        drain_deadline
-                            .get_or_insert_with(|| tokio::time::Instant::now() + drain_timeout);
+                        if drain_deadline.is_none() {
+                            // Drain anything already in stdin_rx into pending_input
+                            // before we block the stdin arm.  This ensures bytes
+                            // enqueued before this Close are not silently dropped.
+                            while let Ok(msg) = stdin_rx.try_recv() {
+                                match msg {
+                                    StdinMessage::Data(bytes) => {
+                                        pending_input.push(bytes).context("queue pty stdin on close")?;
+                                    }
+                                    StdinMessage::Close => {
+                                        stdin_open = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            drain_deadline
+                                .get_or_insert_with(|| tokio::time::Instant::now() + drain_timeout);
+                        }
                     }
                     PtyCommand::KickOthers => {}
                 }
             }
+            // Only accept new stdin data while no graceful-close is pending.
+            // Already-queued bytes are drained by the writable arm below even
+            // after drain_deadline is set.
             Some(message) = stdin_rx.recv(), if stdin_open && drain_deadline.is_none() => {
                 match message {
-                    StdinMessage::Data(bytes) => pending_input.push(bytes).context("queue pty stdin")?,
+                    StdinMessage::Data(bytes) => {
+                        // Queue full → fail-closed: this is intentional
+                        // backpressure failure.  The session is torn down so
+                        // higher layers can surface the overflow rather than
+                        // silently dropping data.
+                        pending_input.push(bytes).context("queue pty stdin")?;
+                    }
                     StdinMessage::Close => stdin_open = false,
                 }
             }
@@ -75,16 +100,10 @@ pub(super) async fn pty_master_task(
                     None => return Ok(()),
                 }
             }
-            writable_guard = master.writable(), if !pending_input.is_empty() && drain_deadline.is_none() => {
-                let mut guard = writable_guard.context("wait pty writable")?;
-                if let Some(bytes) = pending_input.front_chunk() {
-                    match nix::unistd::write(master.get_ref(), bytes) {
-                        Ok(0) => return Err(anyhow::anyhow!("pty write returned zero bytes")),
-                        Ok(n) => { pending_input.consume(n); }
-                        Err(nix::errno::Errno::EAGAIN) => { guard.clear_ready(); }
-                        Err(e) => return Err(std::io::Error::from(e)).context("write pty stdin")?,
-                    }
-                }
+            // Drain already-queued bytes regardless of whether graceful close
+            // has started; new data is blocked by the stdin_rx arm's guard.
+            result = write_one_pending_pty_chunk(&master, &mut pending_input), if !pending_input.is_empty() => {
+                result.context("write pty stdin")?;
             }
             else => return Ok(()),
         }
@@ -136,17 +155,12 @@ pub(crate) async fn write_pty_all(
 }
 
 #[cfg(unix)]
-async fn wait_pty_writable(master: &AsyncFd<OwnedFd>) -> std::io::Result<()> {
-    let mut guard = master.writable().await?;
-    guard.clear_ready();
-    Ok(())
-}
-
-#[cfg(unix)]
 pub(crate) async fn write_one_pending_pty_chunk(
     master: &AsyncFd<OwnedFd>,
     pending: &mut PendingPtyWrite,
 ) -> std::io::Result<()> {
+    // Caller guards with !pending_input.is_empty(); this branch is unreachable
+    // in practice but we return early rather than panic to stay robust.
     let Some(bytes) = pending.front_chunk() else {
         return Ok(());
     };
@@ -247,6 +261,8 @@ impl PendingPtyWrite {
         }
     }
 
+    // Used by tests and future callers (Task 3); suppress the dead_code lint.
+    #[allow(dead_code)]
     pub(crate) fn clear(&mut self) -> usize {
         let dropped = self.pending_bytes;
         self.chunks.clear();
@@ -259,6 +275,7 @@ impl PendingPtyWrite {
         self.pending_bytes == 0
     }
 
+    #[allow(dead_code)]
     pub(crate) fn pending_bytes(&self) -> usize {
         self.pending_bytes
     }
@@ -375,13 +392,16 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pty_master_echoes_large_input_without_deadlock() {
-        // Use `stty raw; cat` so the PTY does not buffer lines and cat echoes
-        // every byte as it arrives without waiting for a newline.
+        // Use `stty raw -echo; cat` so the PTY passes bytes through without
+        // line-buffering or local echo, and cat reflects every byte back.
         let mut harness =
             spawn_pty_task_harness(&["-c", "stty raw -echo; cat"], Duration::from_secs(2));
-        // Give stty a moment to configure the terminal
+        // Give stty a moment to configure the terminal.
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let input = vec![b'x'; 256 * 1024];
+
+        // Build a non-uniform input so we can assert exact content rather than
+        // just length.  Pattern: repeating 0x00..0xFF.
+        let input: Vec<u8> = (0u8..=255).cycle().take(256 * 1024).collect();
 
         harness
             .stdin_tx
@@ -402,15 +422,93 @@ mod tests {
             observed.extend_from_slice(&chunk);
         }
 
-        assert!(observed.windows(4096).any(|window| window == &input[..4096]));
+        // Assert the first 4 KiB of echoed output exactly matches the input
+        // prefix, confirming correct data (not just correct byte count).
+        assert_eq!(
+            &observed[..4096],
+            &input[..4096],
+            "first 4096 echoed bytes must match input prefix exactly"
+        );
+
         harness
             .pty_tx
             .send(PtyCommand::Close { force: true })
             .expect("queue pty close");
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(harness.child_pid),
-            nix::sys::signal::Signal::SIGKILL,
+        let _ = kill(Pid::from_raw(harness.child_pid), Signal::SIGKILL);
+    }
+
+    /// H1: bytes queued in pending_input before a graceful Close must be
+    /// flushed to the PTY even after drain_deadline is set.  New stdin data
+    /// must NOT be accepted once the close has started.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pty_master_drains_queued_input_after_graceful_close() {
+        // `cat` echoes everything it receives.  stty raw -echo passes bytes
+        // without line-buffering.
+        let mut harness =
+            spawn_pty_task_harness(&["-c", "stty raw -echo; cat"], Duration::from_secs(2));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Queue some data before issuing the graceful close.  The newline
+        // ensures cat flushes its output even in line-buffered mode.
+        let payload = b"hello-drain-test\n";
+        harness
+            .stdin_tx
+            .send(crate::shell_registry::StdinMessage::Data(payload.to_vec()))
+            .await
+            .expect("send queued input");
+
+        // Now issue graceful close; the queued bytes must still be flushed.
+        harness
+            .pty_tx
+            .send(PtyCommand::Close { force: false })
+            .expect("queue graceful close");
+
+        // Collect all output.  The echoed payload must appear.
+        let output = tokio::time::timeout(
+            Duration::from_secs(3),
+            collect_output(&mut harness.stdout_rx),
+        )
+        .await
+        .expect("timed out collecting output after graceful close");
+
+        // Strip trailing newline/CR for comparison since PTY may add \r.
+        let payload_str = "hello-drain-test";
+        assert!(
+            output.contains(payload_str),
+            "queued payload {:?} must appear in output after graceful close; got {:?}",
+            payload_str,
+            &output[..output.len().min(128)],
         );
+
+        let _ = kill(
+            Pid::from_raw(harness.child_pid),
+            Signal::SIGKILL,
+        );
+        let _ = harness.task.await;
+        let _ = harness.child_wait.await;
+    }
+
+    /// M3: when PendingPtyWrite is full the task returns an error (fail-closed).
+    /// This is intentional backpressure: we kill the session rather than silently
+    /// drop data, so higher layers can detect and surface the overflow.
+    #[cfg(unix)]
+    #[test]
+    fn pending_pty_write_queue_full_is_error_not_silent_drop() {
+        let mut pending = super::PendingPtyWrite::new(4);
+        pending.push(b"abcd".to_vec()).expect("first push fits");
+        // One more byte exceeds capacity.
+        let err = pending
+            .push(b"e".to_vec())
+            .expect_err("must error on overflow");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "queue-full must surface as WouldBlock so callers can propagate it"
+        );
+        // Original data is untouched — nothing was silently dropped.
+        assert_eq!(pending.pending_bytes(), 4);
+        assert_eq!(pending.front_chunk(), Some(&b"abcd"[..]));
     }
 
     #[cfg(unix)]
