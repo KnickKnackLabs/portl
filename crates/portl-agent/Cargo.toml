@@ -21,8 +21,8 @@ ghostty-vt-static = ["ghostty-vt"]
 workspace = true
 
 [dependencies]
-portl-core  = { version = "0.8.1", path = "../portl-core" }
-portl-proto = { version = "0.8.1", path = "../portl-proto" }
+portl-core  = { version = "0.8.2", path = "../portl-core" }
+portl-proto = { version = "0.8.2", path = "../portl-proto" }
  anyhow      = { workspace = true }
  thiserror   = { workspace = true }
 serde       = { workspace = true }
@@ -58,7 +58,7 @@ libghostty-vt = { version = "0.1.1", git = "https://github.com/Uzaaft/libghostty
 tracing-journald = { workspace = true }
 
 [dev-dependencies]
-portl-core = { version = "0.8.1", path = "../portl-core", features = ["test-util"] }
+portl-core = { version = "0.8.2", path = "../portl-core", features = ["test-util"] }
 tempfile  = { workspace = true }
 iroh-base = { workspace = true }
 tokio      = { workspace = true }

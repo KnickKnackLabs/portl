@@ -5,6 +5,8 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.8.2 — 2026-05-03
+
 ### Added
 
 - `portl-agent` now includes a lightweight network watchdog that tracks
