@@ -58,11 +58,11 @@ pub enum GhosttyAttachControl {
 #[cfg(feature = "ghostty-vt")]
 pub struct GhosttyAttachChannels {
     pub pid: u32,
-    pub stdin_tx: tokio::sync::mpsc::Sender<GhosttyAttachInput>,
-    pub control_tx: tokio::sync::mpsc::UnboundedSender<GhosttyAttachControl>,
-    pub stdout_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    pub stderr_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    pub exit_rx: tokio::sync::watch::Receiver<Option<i32>>,
+    pub stdin_tx: mpsc::Sender<GhosttyAttachInput>,
+    pub control_tx: mpsc::UnboundedSender<GhosttyAttachControl>,
+    pub stdout_rx: mpsc::Receiver<Vec<u8>>,
+    pub stderr_rx: mpsc::Receiver<Vec<u8>>,
+    pub exit_rx: watch::Receiver<Option<i32>>,
 }
 
 #[cfg(feature = "ghostty-vt")]
@@ -139,7 +139,7 @@ pub async fn ghostty_session_attach(
         .take()
         .context("ghostty stderr already attached")?;
     let exit_rx = process.exit_rx();
-    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel(32);
+    let (stdin_tx, mut stdin_rx) = mpsc::channel(32);
     let process_stdin_tx = process.stdin_tx.clone();
     tokio::spawn(async move {
         while let Some(message) = stdin_rx.recv().await {
@@ -160,7 +160,7 @@ pub async fn ghostty_session_attach(
             }
         }
     });
-    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     if let Some(pty_tx) = process.pty_tx.clone() {
         tokio::spawn(async move {
             while let Some(command) = control_rx.recv().await {
