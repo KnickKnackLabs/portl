@@ -5,6 +5,27 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.8.3 — 2026-05-03
+
+### Added
+
+- Large interactive pastes during `portl attach` now show a progress/status bar
+  when input is large or backpressured, with `Esc` or `Ctrl+\` then `c` support
+  for dropping pending Portl input without interrupting, killing, or detaching
+  the remote session.
+
+### Fixed
+
+- Ghostty-backed session attaches now keep PTY reads and writes full-duplex,
+  bound helper input/output queues, cap attach snapshots below the IPC frame
+  limit, and avoid unbounded memory growth or deadlocks during large pastes.
+- PTY-backed `portl shell`, tmux control attaches, and Ghostty helper writes now
+  drain pending input opportunistically while continuing to read output, avoiding
+  freezes when pasted input causes heavy echo or redraw output.
+- Bracketed paste markers are now recognized as paste boundaries and preserved;
+  canceling a bracketed paste sends the closing marker when needed so remote
+  editors and shells are not left in paste mode.
+
 ## 0.8.2 — 2026-05-03
 
 ### Added
