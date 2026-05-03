@@ -1017,11 +1017,10 @@ fn append_bounded(history: &mut VecDeque<u8>, bytes: &[u8]) {
 fn broadcast(subscribers: &mut Vec<mpsc::Sender<Vec<u8>>>, bytes: &[u8]) {
     subscribers.retain(|subscriber| {
         match subscriber.try_send(bytes.to_vec()) {
-            Ok(()) => true,
             // Channel full: drop this output frame for the slow subscriber but keep them
             // subscribed. Bounded output may drop frames for slow subscribers to preserve
             // helper liveness rather than blocking the pty read loop.
-            Err(mpsc::error::TrySendError::Full(_)) => true,
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
             // Receiver dropped: evict the dead subscriber.
             Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
@@ -1067,6 +1066,7 @@ fn mirror_run_output(argv: &[String], run: &portl_proto::session_v1::SessionRunR
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_lines)]
 async fn handle_client(mut stream: UnixStream, tx: mpsc::Sender<HelperCommand>) -> Result<()> {
     let Some(first) = read_frame::<GhosttyRequest>(&mut stream).await? else {
         return Ok(());

@@ -437,8 +437,8 @@ mod tests {
         let _ = kill(Pid::from_raw(harness.child_pid), Signal::SIGKILL);
     }
 
-    /// H1: bytes queued in pending_input before a graceful Close must be
-    /// flushed to the PTY even after drain_deadline is set.  New stdin data
+    /// H1: bytes queued in `pending_input` before a graceful Close must be
+    /// flushed to the PTY even after `drain_deadline` is set.  New stdin data
     /// must NOT be accepted once the close has started.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -486,7 +486,7 @@ mod tests {
         let _ = harness.child_wait.await;
     }
 
-    /// M3: when PendingPtyWrite is full the task returns an error (fail-closed).
+    /// M3: when `PendingPtyWrite` is full the task returns an error (fail-closed).
     /// This is intentional backpressure: we kill the session rather than silently
     /// drop data, so higher layers can detect and surface the overflow.
     #[cfg(unix)]

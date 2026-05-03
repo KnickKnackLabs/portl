@@ -771,6 +771,8 @@ fn check_agent_network_endpoint() -> CheckResult {
 fn check_agent_network_endpoint_status(
     status: &portl_agent::status_schema::StatusResponse,
 ) -> CheckResult {
+    use std::fmt::Write as _;
+
     let health = &status.network_health;
     let missing_watchdog_health = health.state
         == portl_agent::network_watchdog::WatchdogState::Disabled
@@ -798,8 +800,7 @@ fn check_agent_network_endpoint_status(
         detail.push_str(", watchdog health missing from agent status");
     }
     if let Some(error) = &health.last_endpoint_refresh_error {
-        let _ =
-            std::fmt::Write::write_fmt(&mut detail, format_args!(", last_refresh_error={error}"));
+        let _ = write!(detail, ", last_refresh_error={error}");
     }
     CheckResult {
         name: "network endpoint",

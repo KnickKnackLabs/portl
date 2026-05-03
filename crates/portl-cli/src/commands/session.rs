@@ -3015,21 +3015,17 @@ impl BracketedPasteScanner {
             .windows(BEGIN.len())
             .enumerate()
             .filter_map(|(i, w)| (w == BEGIN).then_some(i))
-            .last();
+            .next_back();
         let last_end = combined
             .windows(END.len())
             .enumerate()
             .filter_map(|(i, w)| (w == END).then_some(i))
-            .last();
+            .next_back();
         let event = match (last_begin, last_end) {
             (None, None) => BracketedPasteEvent::None,
             (Some(_), None) => {
                 self.in_paste = true;
                 BracketedPasteEvent::Begin
-            }
-            (None, Some(_)) => {
-                self.in_paste = false;
-                BracketedPasteEvent::End
             }
             (Some(b), Some(e)) if b > e => {
                 self.in_paste = true;
@@ -3249,7 +3245,7 @@ where
                     BracketedPasteEvent::None => {}
                 }
                 if is_ctrl_backslash_sequence(chunk) {
-                    match run_attach_control_mode(sink, stdin, ui, &mut paste).await? {
+                    match run_attach_control_mode(sink, stdin, ui, &paste).await? {
                         AttachControlOutcome::Continue => continue,
                         AttachControlOutcome::Detached => return Ok(StdinTaskResult::Detached),
                         AttachControlOutcome::CancelPaste => {

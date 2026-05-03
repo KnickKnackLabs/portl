@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy)]
 pub struct RenderBarOptions<'a> {
     pub canonical_ref: &'a str,
