@@ -773,7 +773,14 @@ fn check_agent_network_endpoint_status(
 ) -> CheckResult {
     let health = &status.network_health;
     let status = match health.state {
-        portl_agent::network_watchdog::WatchdogState::Ok | portl_agent::network_watchdog::WatchdogState::Disabled => Status::Ok,
+        portl_agent::network_watchdog::WatchdogState::Ok => Status::Ok,
+        portl_agent::network_watchdog::WatchdogState::Disabled => {
+            if watchdog_explicitly_disabled() {
+                Status::Ok
+            } else {
+                Status::Warn
+            }
+        }
         portl_agent::network_watchdog::WatchdogState::Degraded
         | portl_agent::network_watchdog::WatchdogState::Refreshing => Status::Warn,
         portl_agent::network_watchdog::WatchdogState::Failed => Status::Fail,
@@ -787,13 +794,19 @@ fn check_agent_network_endpoint_status(
     )
     .to_lowercase();
     if let Some(error) = &health.last_endpoint_refresh_error {
-        let _ = std::fmt::Write::write_fmt(&mut detail, format_args!(", last_refresh_error={error}"));
+        let _ =
+            std::fmt::Write::write_fmt(&mut detail, format_args!(", last_refresh_error={error}"));
     }
     CheckResult {
         name: "network endpoint",
         status,
         detail,
     }
+}
+
+fn watchdog_explicitly_disabled() -> bool {
+    std::env::var("PORTL_AGENT_WATCHDOG")
+        .is_ok_and(|value| matches!(value.as_str(), "off" | "0" | "false" | "no"))
 }
 
 fn fetch_agent_status_sync(
@@ -1198,34 +1211,82 @@ mod tests {
         assert!(result.detail.contains("endpoint generation 7"));
     }
 
+    #[allow(unsafe_code)]
+    fn with_watchdog_env(value: Option<&str>, f: impl FnOnce()) {
+        let saved = std::env::var_os("PORTL_AGENT_WATCHDOG");
+        match value {
+            Some(value) => unsafe { std::env::set_var("PORTL_AGENT_WATCHDOG", value) },
+            None => unsafe { std::env::remove_var("PORTL_AGENT_WATCHDOG") },
+        }
+        f();
+        match saved {
+            Some(value) => unsafe { std::env::set_var("PORTL_AGENT_WATCHDOG", value) },
+            None => unsafe { std::env::remove_var("PORTL_AGENT_WATCHDOG") },
+        }
+    }
+
+    #[test]
+    fn network_endpoint_check_warns_when_watchdog_missing_or_unexpectedly_disabled() {
+        with_watchdog_env(None, || {
+            let status = portl_agent::status_schema::StatusResponse::new(
+                portl_agent::status_schema::AgentInfo {
+                    pid: 42,
+                    version: "0.8.1".to_owned(),
+                    started_at_unix: 100,
+                    home: "/tmp/portl".to_owned(),
+                    metrics_socket: "/tmp/portl/run/metrics.sock".to_owned(),
+                },
+                Vec::new(),
+                portl_agent::status_schema::NetworkInfo {
+                    relays: Vec::new(),
+                    discovery: portl_agent::status_schema::DiscoveryInfo {
+                        dns: false,
+                        pkarr: false,
+                        local: true,
+                    },
+                },
+                portl_agent::status_schema::NetworkHealthInfo::disabled(),
+                portl_agent::status_schema::SessionProvidersInfo::default(),
+                portl_agent::relay::RelayStatus::disabled(),
+            );
+
+            let result = check_agent_network_endpoint_status(&status);
+
+            assert_eq!(result.status, Status::Warn);
+            assert!(result.detail.contains("state=disabled"));
+        });
+    }
+
     #[test]
     fn network_endpoint_check_accepts_intentionally_disabled_watchdog() {
-        let status = portl_agent::status_schema::StatusResponse::new(
-            portl_agent::status_schema::AgentInfo {
-                pid: 42,
-                version: "0.8.2".to_owned(),
-                started_at_unix: 100,
-                home: "/tmp/portl".to_owned(),
-                metrics_socket: "/tmp/portl/run/metrics.sock".to_owned(),
-            },
-            Vec::new(),
-            portl_agent::status_schema::NetworkInfo {
-                relays: Vec::new(),
-                discovery: portl_agent::status_schema::DiscoveryInfo {
-                    dns: false,
-                    pkarr: false,
-                    local: true,
+        with_watchdog_env(Some("off"), || {
+            let status = portl_agent::status_schema::StatusResponse::new(
+                portl_agent::status_schema::AgentInfo {
+                    pid: 42,
+                    version: "0.8.2".to_owned(),
+                    started_at_unix: 100,
+                    home: "/tmp/portl".to_owned(),
+                    metrics_socket: "/tmp/portl/run/metrics.sock".to_owned(),
                 },
-            },
-            portl_agent::status_schema::NetworkHealthInfo::disabled(),
-            portl_agent::status_schema::SessionProvidersInfo::default(),
-            portl_agent::relay::RelayStatus::disabled(),
-        );
+                Vec::new(),
+                portl_agent::status_schema::NetworkInfo {
+                    relays: Vec::new(),
+                    discovery: portl_agent::status_schema::DiscoveryInfo {
+                        dns: false,
+                        pkarr: false,
+                        local: true,
+                    },
+                },
+                portl_agent::status_schema::NetworkHealthInfo::disabled(),
+                portl_agent::status_schema::SessionProvidersInfo::default(),
+                portl_agent::relay::RelayStatus::disabled(),
+            );
 
-        let result = check_agent_network_endpoint_status(&status);
+            let result = check_agent_network_endpoint_status(&status);
 
-        assert_eq!(result.status, Status::Ok);
-        assert!(result.detail.contains("state=disabled"));
+            assert_eq!(result.status, Status::Ok);
+            assert!(result.detail.contains("state=disabled"));
+        });
     }
 
     #[test]

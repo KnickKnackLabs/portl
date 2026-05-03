@@ -396,6 +396,7 @@ mod tests {
             metrics_socket: std::env::temp_dir().join("portl-pair-test.sock"),
             session_provider_path: None,
             self_endpoint_id: [0; 32],
+            watchdog_probe_endpoint_id: None,
             network_watchdog: crate::network_watchdog::NetworkWatchdogHealth::new(SystemTime::now()),
             started_at_unix: 0,
             relay_status: RwLock::new(crate::relay::RelayStatus::disabled()),

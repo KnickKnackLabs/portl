@@ -552,7 +552,10 @@ fn parse_bool_env(name: &str, value: &str) -> Result<bool> {
 }
 
 fn parse_watchdog_config(mode: &AgentMode) -> Result<crate::network_watchdog::WatchdogConfig> {
-    let mut config = crate::network_watchdog::WatchdogConfig { enabled: matches!(mode, AgentMode::Listener), ..Default::default() };
+    let mut config = crate::network_watchdog::WatchdogConfig {
+        enabled: matches!(mode, AgentMode::Listener),
+        ..Default::default()
+    };
     if let Some(value) = env_string("PORTL_AGENT_WATCHDOG")? {
         config.enabled = match value.as_str() {
             "auto" => matches!(mode, AgentMode::Listener),
@@ -566,10 +569,16 @@ fn parse_watchdog_config(mode: &AgentMode) -> Result<crate::network_watchdog::Wa
     if let Some(value) = env_string("PORTL_AGENT_WATCHDOG_INTERVAL")? {
         config.interval = humantime::parse_duration(&value)
             .with_context(|| format!("parse PORTL_AGENT_WATCHDOG_INTERVAL duration: {value}"))?;
+        if config.interval < std::time::Duration::from_secs(1) {
+            bail!("PORTL_AGENT_WATCHDOG_INTERVAL must be at least 1s");
+        }
     }
     if let Some(value) = env_string("PORTL_AGENT_WATCHDOG_TIMEOUT")? {
         config.timeout = humantime::parse_duration(&value)
             .with_context(|| format!("parse PORTL_AGENT_WATCHDOG_TIMEOUT duration: {value}"))?;
+        if config.timeout < std::time::Duration::from_millis(100) {
+            bail!("PORTL_AGENT_WATCHDOG_TIMEOUT must be at least 100ms");
+        }
     }
     if let Some(value) = env_string("PORTL_AGENT_WATCHDOG_FAILURES")? {
         config.failures_before_refresh = value.parse::<u32>().with_context(|| {
@@ -707,10 +716,7 @@ mod tests {
                     Some(paths.metrics_socket_path())
                 );
                 assert!(config.watchdog.enabled);
-                assert_eq!(
-                    config.watchdog.interval,
-                    std::time::Duration::from_mins(5)
-                );
+                assert_eq!(config.watchdog.interval, std::time::Duration::from_mins(5));
                 assert_eq!(config.watchdog.timeout, std::time::Duration::from_secs(5));
                 assert_eq!(config.watchdog.failures_before_refresh, 3);
             },
@@ -752,6 +758,37 @@ mod tests {
                     assert!(
                         !config.watchdog.enabled,
                         "value {value} should disable watchdog"
+                    );
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn watchdog_env_rejects_zero_interval_and_timeout() {
+        for (name, value, expected) in [
+            (
+                "PORTL_AGENT_WATCHDOG_INTERVAL",
+                "0s",
+                "PORTL_AGENT_WATCHDOG_INTERVAL must be at least 1s",
+            ),
+            (
+                "PORTL_AGENT_WATCHDOG_TIMEOUT",
+                "0ms",
+                "PORTL_AGENT_WATCHDOG_TIMEOUT must be at least 100ms",
+            ),
+        ] {
+            let home = tempdir().expect("tempdir");
+            with_env(
+                &[
+                    ("PORTL_HOME", Some(home.path().as_os_str().to_os_string())),
+                    (name, Some(OsString::from(value))),
+                ],
+                || {
+                    let err = AgentConfig::from_env().expect_err("invalid watchdog duration");
+                    assert!(
+                        err.to_string().contains(expected),
+                        "unexpected error: {err:#}"
                     );
                 },
             );

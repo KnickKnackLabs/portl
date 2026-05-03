@@ -345,6 +345,8 @@ pub(crate) struct AgentState {
     /// Local endpoint id, used to avoid counting self-probe traffic as
     /// external reachability evidence.
     pub self_endpoint_id: [u8; 32],
+    /// Watchdog probe endpoint id, excluded from external reachability evidence.
+    pub watchdog_probe_endpoint_id: Option<[u8; 32]>,
     /// Lightweight endpoint watchdog health surfaced via `/status`.
     pub network_watchdog: network_watchdog::NetworkWatchdogHealth,
     /// Snapshot of the embedded-relay status for `/status/relay`.
@@ -456,11 +458,17 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
         .await?
     };
     let self_endpoint_id = *endpoint.id().as_bytes();
+    let watchdog_probe_identity = watchdog_enabled.then(Identity::new);
+    let watchdog_probe_endpoint_id = watchdog_probe_identity
+        .as_ref()
+        .map(|identity| identity.verifying_key());
+    let mut startup_trust_roots = cfg.trust_roots.iter().copied().collect::<HashSet<_>>();
+    if let Some(endpoint_id) = watchdog_probe_endpoint_id {
+        startup_trust_roots.insert(endpoint_id);
+    }
 
     let state = Arc::new(AgentState {
-        trust_roots: std::sync::RwLock::new(TrustRoots(
-            cfg.trust_roots.iter().copied().collect::<HashSet<_>>(),
-        )),
+        trust_roots: std::sync::RwLock::new(TrustRoots(startup_trust_roots.clone())),
         // Snapshot the startup trust_roots as the "bootstrap" set.
         // `AgentConfig::from_env` populates `cfg.trust_roots` from
         // peer_store ∪ env_roots; we only need the env-root portion
@@ -471,7 +479,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
         // will still survive via bootstrap, but that's fine — the
         // startup snapshot is a subset of "what the operator
         // explicitly asked for" and we shouldn't silently unlink it.
-        bootstrap_roots: cfg.trust_roots.iter().copied().collect::<HashSet<_>>(),
+        bootstrap_roots: startup_trust_roots,
         revocations: std::sync::RwLock::new(RevocationSet::load_with_max_bytes(
             revocations_path(&cfg),
             cfg.revocations_max_bytes
@@ -500,6 +508,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
             .unwrap_or_else(metrics::default_socket_path),
         session_provider_path: cfg.session_provider_path.clone(),
         self_endpoint_id,
+        watchdog_probe_endpoint_id,
         network_watchdog: if watchdog_enabled {
             network_watchdog::NetworkWatchdogHealth::new(SystemTime::now())
         } else {
@@ -521,15 +530,17 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
     let peer_reload = spawn_peer_store_reload_task(Arc::clone(&state), shutdown.clone());
     let metrics_task = spawn_metrics_server(&state, shutdown.clone(), &cfg);
     let relay_handle = spawn_relay_if_enabled(&state, shutdown.clone(), &cfg).await?;
+    let mut fatal_watchdog_error: Option<anyhow::Error> = None;
     let (endpoint_tx, endpoint_rx) = watch::channel(endpoint.clone());
     let (watchdog_refresh_tx, mut watchdog_refresh_rx) = mpsc::unbounded_channel();
     let watchdog_task = watchdog_enabled.then(|| {
         network_watchdog::spawn_watchdog_task(
             cfg.watchdog.clone(),
             state.network_watchdog.clone(),
-            identity
+            watchdog_probe_identity
                 .clone()
-                .expect("identity loaded for watchdog endpoint"),
+                .expect("probe identity loaded for watchdog endpoint"),
+            cfg.discovery.clone(),
             endpoint_rx,
             watchdog_refresh_tx,
             shutdown.clone(),
@@ -542,11 +553,21 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
             () = shutdown.cancelled() => {
                 break;
             }
-            refresh = watchdog_refresh_rx.recv() => {
+            refresh = watchdog_refresh_rx.recv(), if watchdog_enabled => {
                 let Some(network_watchdog::WatchdogCommand::RefreshEndpoint) = refresh else {
                     break;
                 };
                 info!("watchdog requested endpoint refresh");
+                if cfg.bind_addr.is_some_and(|addr| addr.port() != 0) {
+                    state.network_watchdog.record_endpoint_refresh_failure(
+                        SystemTime::now(),
+                        "fixed listen address requires service-manager restart for endpoint refresh".to_owned(),
+                    );
+                    fatal_watchdog_error = Some(anyhow::anyhow!(
+                        "watchdog endpoint refresh requested for fixed listen address; exiting for service-manager restart"
+                    ));
+                    break;
+                }
                 match endpoint::bind(&cfg, identity.as_ref().expect("identity loaded for endpoint refresh")).await {
                     Ok(new_endpoint) => {
                         let old_endpoint = std::mem::replace(&mut endpoint, new_endpoint);
@@ -638,6 +659,9 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
 
     if signal_shutdown.load(Ordering::SeqCst) && !all_sessions_reaped {
         anyhow::bail!("graceful shutdown left live shell sessions unreaped");
+    }
+    if let Some(err) = fatal_watchdog_error {
+        return Err(err);
     }
 
     Ok(())
@@ -1010,7 +1034,13 @@ fn revocations_path(cfg: &AgentConfig) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use ed25519_dalek::SigningKey;
+    use portl_core::id::Identity;
     use portl_core::test_util;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
     use tokio_util::sync::CancellationToken;
 
     use super::{AgentConfig, DiscoveryConfig, run_task, run_with_shutdown};
@@ -1048,6 +1078,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_watchdog_does_not_stop_accept_loop() {
+        let endpoint = test_util::endpoint().await.expect("bind endpoint");
+        let shutdown = CancellationToken::new();
+        let home = tempfile::tempdir().expect("temp home");
+        let mut config = AgentConfig {
+            discovery: DiscoveryConfig::in_process(),
+            endpoint: Some(endpoint),
+            watchdog: crate::network_watchdog::WatchdogConfig {
+                enabled: false,
+                ..crate::network_watchdog::WatchdogConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        isolate_config_home(&mut config, home.path());
+        let task = tokio::spawn(run_with_shutdown(config, shutdown.clone()));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !task.is_finished(),
+            "agent exited when watchdog was disabled"
+        );
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("join timeout")
+            .expect("join handle")
+            .expect("run result");
+    }
+
+    #[tokio::test]
+    async fn watchdog_self_probe_succeeds_without_preseeded_self_peer() {
+        let shutdown = CancellationToken::new();
+        let home = tempfile::tempdir().expect("temp home");
+        let metrics_socket = home.path().join("run/status.sock");
+        let identity = Identity::from_signing_key(SigningKey::from_bytes(&[7_u8; 32]));
+        let mut config = AgentConfig {
+            identity_secret: Some(identity.signing_key().to_bytes()),
+            bind_addr: Some("127.0.0.1:0".parse().expect("bind addr")),
+            discovery: DiscoveryConfig::in_process(),
+            metrics_enabled: Some(true),
+            metrics_socket_path: Some(metrics_socket.clone()),
+            watchdog: crate::network_watchdog::WatchdogConfig {
+                enabled: true,
+                interval: Duration::from_secs(1),
+                timeout: Duration::from_secs(5),
+                failures_before_refresh: 2,
+            },
+            ..AgentConfig::default()
+        };
+        isolate_config_home(&mut config, home.path());
+        let task = tokio::spawn(run_with_shutdown(config, shutdown.clone()));
+
+        let mut saw_probe = false;
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Ok(status) = fetch_status_for_test(&metrics_socket).await
+                && status.network_health.last_self_probe_ok_at.is_some()
+            {
+                saw_probe = true;
+                assert_eq!(
+                    status.network_health.state,
+                    crate::network_watchdog::WatchdogState::Ok
+                );
+                break;
+            }
+        }
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("join timeout")
+            .expect("join handle")
+            .expect("run result");
+        assert!(saw_probe, "watchdog self-probe did not succeed");
+    }
+
+    async fn fetch_status_for_test(
+        socket: &std::path::Path,
+    ) -> anyhow::Result<crate::status_schema::StatusResponse> {
+        let mut stream = UnixStream::connect(socket).await?;
+        stream
+            .write_all(b"GET /status HTTP/1.1\r\nHost: portl\r\n\r\n")
+            .await?;
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).await?;
+        let response = String::from_utf8(bytes)?;
+        let (_, body) = response
+            .split_once("\r\n\r\n")
+            .ok_or_else(|| anyhow::anyhow!("missing HTTP body"))?;
+        Ok(serde_json::from_str(body)?)
+    }
+
+    #[tokio::test]
     async fn run_with_shutdown_stops_when_token_is_cancelled() {
         let endpoint = test_util::endpoint().await.expect("bind endpoint");
         let shutdown = CancellationToken::new();
@@ -1061,7 +1184,7 @@ mod tests {
         let task = tokio::spawn(run_with_shutdown(config, shutdown.clone()));
 
         shutdown.cancel();
-        tokio::time::timeout(std::time::Duration::from_secs(3), task)
+        tokio::time::timeout(Duration::from_secs(3), task)
             .await
             .expect("join timeout")
             .expect("join handle")

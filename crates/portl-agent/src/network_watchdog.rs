@@ -1,7 +1,10 @@
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::DiscoveryConfig;
 use anyhow::{Context, Result, bail};
+use iroh::endpoint::{RelayMode, presets};
+use iroh_base::SecretKey;
 use portl_core::endpoint::Endpoint;
 use portl_core::id::Identity;
 use portl_core::net::open_ticket_v1;
@@ -151,6 +154,7 @@ impl NetworkWatchdogHealth {
 
     pub fn record_endpoint_refresh_started(&self) {
         let mut inner = self.inner.write().expect("watchdog health lock");
+        inner.consecutive_self_probe_failures = 0;
         inner.state = WatchdogState::Refreshing;
     }
 
@@ -160,6 +164,7 @@ impl NetworkWatchdogHealth {
         inner.endpoint_started_at = unix_secs(now);
         inner.endpoint_refresh_count = inner.endpoint_refresh_count.saturating_add(1);
         inner.last_endpoint_refresh_at = Some(unix_secs(now));
+        inner.last_inbound_handshake_at = None;
         inner.last_endpoint_refresh_error = None;
         inner.consecutive_self_probe_failures = 0;
         inner.state = WatchdogState::Ok;
@@ -227,7 +232,8 @@ pub enum WatchdogCommand {
 pub fn spawn_watchdog_task(
     config: WatchdogConfig,
     health: NetworkWatchdogHealth,
-    identity: Identity,
+    probe_identity: Identity,
+    discovery: DiscoveryConfig,
     mut endpoint_rx: watch::Receiver<iroh::Endpoint>,
     refresh_tx: mpsc::UnboundedSender<WatchdogCommand>,
     shutdown: CancellationToken,
@@ -244,12 +250,19 @@ pub fn spawn_watchdog_task(
             tokio::select! {
                 () = shutdown.cancelled() => break,
                 _ = interval.tick() => {
+                    if health.snapshot(SystemTime::now()).state == WatchdogState::Refreshing {
+                        debug!("watchdog skipped self-probe while endpoint refresh is in flight");
+                        continue;
+                    }
                     if should_skip_probe_after_recent_inbound(&health, &config, SystemTime::now()) {
                         debug!("watchdog skipped self-probe after recent inbound connection");
                         continue;
                     }
                     let endpoint = endpoint_rx.borrow_and_update().clone();
-                    let outcome = match tokio::time::timeout(config.timeout, self_probe(&identity, endpoint)).await {
+                    let outcome = match tokio::time::timeout(
+                        config.timeout,
+                        self_probe(&probe_identity, &discovery, endpoint),
+                    ).await {
                         Ok(Ok(())) => ProbeOutcome::Success,
                         Ok(Err(err)) => ProbeOutcome::Failure(format!("{err:#}")),
                         Err(_) => ProbeOutcome::Failure(format!(
@@ -292,12 +305,16 @@ fn should_skip_probe_after_recent_inbound(
     unix_secs(now).saturating_sub(last) <= window.as_secs()
 }
 
-async fn self_probe(identity: &Identity, endpoint: iroh::Endpoint) -> Result<()> {
-    let endpoint_wrapper = Endpoint::from(endpoint.clone());
-    let addr = endpoint_wrapper.addr();
+async fn self_probe(
+    probe_identity: &Identity,
+    discovery: &DiscoveryConfig,
+    agent_endpoint: iroh::Endpoint,
+) -> Result<()> {
+    let agent_endpoint_wrapper = Endpoint::from(agent_endpoint.clone());
+    let addr = wait_for_non_empty_addr(&agent_endpoint_wrapper).await?;
     let now = unix_secs(SystemTime::now());
     let ticket = mint_root(
-        identity.signing_key(),
+        probe_identity.signing_key(),
         addr,
         meta_caps(),
         now,
@@ -305,9 +322,18 @@ async fn self_probe(identity: &Identity, endpoint: iroh::Endpoint) -> Result<()>
         None,
     )
     .context("mint watchdog self-probe ticket")?;
-    let (connection, session) = open_ticket_v1(&endpoint_wrapper, &ticket, &[], identity)
+    let client_endpoint = bind_probe_endpoint(probe_identity, discovery).await?;
+    let client_endpoint_wrapper = Endpoint::from(client_endpoint.clone());
+    let result = open_ticket_v1(&client_endpoint_wrapper, &ticket, &[], probe_identity)
         .await
-        .context("run watchdog self-probe ticket handshake")?;
+        .context("run watchdog self-probe ticket handshake");
+    let (connection, session) = match result {
+        Ok(value) => value,
+        Err(err) => {
+            client_endpoint.close().await;
+            return Err(err);
+        }
+    };
     let envelope = MetaEnvelope {
         preamble: StreamPreamble {
             peer_token: session.peer_token,
@@ -333,15 +359,47 @@ async fn self_probe(identity: &Identity, endpoint: iroh::Endpoint) -> Result<()>
     match postcard::from_bytes::<MetaResp>(&response_bytes).context("decode watchdog meta ping")? {
         MetaResp::Pong { .. } => {
             connection.close(0u32.into(), b"watchdog self-probe complete");
+            client_endpoint.close().await;
             Ok(())
         }
-        MetaResp::Error(error) => bail!(
-            "watchdog meta ping failed: {} ({:?})",
-            error.message,
-            error.kind
-        ),
-        other => bail!("unexpected watchdog meta response: {other:?}"),
+        MetaResp::Error(error) => {
+            client_endpoint.close().await;
+            bail!(
+                "watchdog meta ping failed: {} ({:?})",
+                error.message,
+                error.kind
+            )
+        }
+        other => {
+            client_endpoint.close().await;
+            bail!("unexpected watchdog meta response: {other:?}")
+        }
     }
+}
+
+async fn wait_for_non_empty_addr(endpoint: &Endpoint) -> Result<iroh_base::EndpointAddr> {
+    for _ in 0..20 {
+        let addr = endpoint.addr();
+        if !addr.is_empty() {
+            return Ok(addr);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    bail!("agent endpoint did not publish a dialable address for watchdog self-probe")
+}
+
+async fn bind_probe_endpoint(
+    identity: &Identity,
+    discovery: &DiscoveryConfig,
+) -> Result<iroh::Endpoint> {
+    let mut builder = iroh::Endpoint::builder(presets::Minimal)
+        .secret_key(SecretKey::from_bytes(&identity.signing_key().to_bytes()));
+    builder = if discovery.relays.is_empty() {
+        builder.relay_mode(RelayMode::Disabled)
+    } else {
+        builder.relay_mode(RelayMode::custom(discovery.relays.iter().cloned()))
+    };
+    builder.bind().await.map_err(Into::into)
 }
 
 fn meta_caps() -> Capabilities {
@@ -435,7 +493,33 @@ mod tests {
         assert_eq!(snapshot.endpoint_generation, 2);
         assert_eq!(snapshot.endpoint_refresh_count, 1);
         assert_eq!(snapshot.last_endpoint_refresh_at, Some(130));
+        assert_eq!(snapshot.last_inbound_handshake_at, None);
         assert_eq!(snapshot.consecutive_self_probe_failures, 0);
+    }
+
+    #[test]
+    fn refresh_started_resets_failures_to_prevent_duplicate_refresh_requests() {
+        let health = NetworkWatchdogHealth::new(ts(100));
+        health.record_probe_failure(ts(110));
+        health.record_probe_failure(ts(120));
+        health.record_probe_failure(ts(130));
+
+        health.record_endpoint_refresh_started();
+
+        let snapshot = health.snapshot(ts(131));
+        assert_eq!(snapshot.state, WatchdogState::Refreshing);
+        assert_eq!(snapshot.consecutive_self_probe_failures, 0);
+    }
+
+    #[test]
+    fn refresh_success_clears_stale_inbound_skip_window() {
+        let health = NetworkWatchdogHealth::new(ts(100));
+        health.record_inbound_handshake(ts(120));
+
+        health.record_endpoint_refresh_success(ts(130));
+
+        let snapshot = health.snapshot(ts(131));
+        assert_eq!(snapshot.last_inbound_handshake_at, None);
     }
 
     #[test]

@@ -87,7 +87,9 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
                 bearer: bearer.clone(),
             };
             audit::ticket_accepted(&session);
-            if source_id != state.self_endpoint_id {
+            if source_id != state.self_endpoint_id
+                && Some(source_id) != state.watchdog_probe_endpoint_id
+            {
                 state
                     .network_watchdog
                     .record_inbound_handshake(SystemTime::now());
