@@ -1133,7 +1133,10 @@ async fn handle_client(mut stream: UnixStream, tx: mpsc::Sender<HelperCommand>) 
             .await?;
             loop {
                 tokio::select! {
-                    Some(bytes) = output_rx.recv() => {
+                    response = output_rx.recv() => {
+                        let Some(bytes) = response else {
+                            return Ok(());
+                        };
                         if bytes.is_empty() {
                             write_frame(&mut stream, &GhosttyResponse::Exit { code: 0 }).await?;
                             return Ok(());
