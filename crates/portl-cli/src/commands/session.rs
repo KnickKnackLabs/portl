@@ -2867,7 +2867,7 @@ struct PasteConfig {
     detail_after: Duration,
 }
 
-impl PasteConfig {
+impl Default for PasteConfig {
     fn default() -> Self {
         Self {
             burst_threshold_bytes: 64 * 1024,
@@ -2875,7 +2875,9 @@ impl PasteConfig {
             detail_after: Duration::from_secs(2),
         }
     }
+}
 
+impl PasteConfig {
     #[cfg(test)]
     fn for_test(burst_threshold_bytes: usize, burst_window: Duration) -> Self {
         Self {
@@ -2952,6 +2954,9 @@ impl PasteState {
 
     fn observe_sent(&mut self, bytes: usize) {
         self.pending_bytes = self.pending_bytes.saturating_sub(bytes);
+        if self.pending_bytes == 0 {
+            self.deactivate_if_idle();
+        }
     }
 
     fn set_backpressured(&mut self, value: bool) {
@@ -2959,6 +2964,8 @@ impl PasteState {
         if value {
             self.active = true;
             self.active_since.get_or_insert_with(Instant::now);
+        } else {
+            self.deactivate_if_idle();
         }
     }
 
@@ -2991,7 +2998,6 @@ struct BracketedPasteScanner {
 }
 
 impl BracketedPasteScanner {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn in_bracketed_paste(&self) -> bool {
         self.in_paste
     }
@@ -4147,6 +4153,20 @@ mod tests {
         state.observe_read(32, Instant::now());
         assert!(state.is_active());
         state.cancel_pending();
+        assert!(!state.is_active());
+    }
+
+    #[test]
+    fn paste_state_deactivates_after_backpressured_drain() {
+        let mut state = PasteState::new(PasteConfig::for_test(16, Duration::from_secs(1)));
+        state.activate(Instant::now());
+        state.observe_queued(32);
+        state.set_backpressured(true);
+        assert!(state.is_active());
+
+        state.observe_sent(32);
+        assert!(state.is_active(), "still active while backpressured");
+        state.set_backpressured(false);
         assert!(!state.is_active());
     }
 
