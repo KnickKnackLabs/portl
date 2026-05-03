@@ -1193,11 +1193,26 @@ async fn handle_client(
                             Some(GhosttyRequest::Detach) | None => return Ok(()),
                             Some(GhosttyRequest::Kill) => {
                                 let (reply_tx, reply_rx) = oneshot::channel();
-                                tx.send(HelperCommand::Kill { reply: reply_tx })
-                                    .await
-                                    .map_err(|_| anyhow!("ghostty helper stopped"))?;
-                                let _ = reply_rx.await;
-                                return Ok(());
+                                match tx.try_send(HelperCommand::Kill { reply: reply_tx }) {
+                                    Ok(()) => {
+                                        let _ = reply_rx.await;
+                                        return Ok(());
+                                    }
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        write_frame(
+                                            &mut stream,
+                                            &GhosttyResponse::Error {
+                                                message: "ghostty helper input queue is full"
+                                                    .to_owned(),
+                                            },
+                                        )
+                                        .await?;
+                                        return Ok(());
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        return Err(anyhow!("ghostty helper stopped"));
+                                    }
+                                }
                             }
                             Some(other) => tracing::debug!(?other, "ignoring non-attach ghostty request on attach stream"),
                         }
