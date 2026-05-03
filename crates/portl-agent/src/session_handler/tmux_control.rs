@@ -10,12 +10,20 @@ use portl_core::terminal::tmux_cc::{
 };
 
 use crate::shell_handler::pty_master::{
-    DEFAULT_PTY_INPUT_QUEUE_BYTES, PendingPtyWrite, read_pty_chunk, set_nonblocking,
-    write_one_pending_pty_chunk, write_pty_all,
+    PendingPtyWrite, read_pty_chunk, set_nonblocking, write_one_pending_pty_chunk, write_pty_all,
 };
 use crate::shell_registry::{PtyCommand, StdinMessage};
 
 const TMUX_CC_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Queue capacity for encoded tmux send-keys commands.
+///
+/// `send_keys_command` encodes each raw byte as ` XX` (3 ASCII chars) plus a
+/// fixed `send-keys -H` prefix per 128-byte chunk — roughly a 3× expansion
+/// ratio at full chunk size, much worse for small payloads.  Size this buffer
+/// to absorb at least 1 MiB of raw paste input after hex encoding (≈ 4 MiB
+/// encoded at worst-case small-chunk ratio).
+const TMUX_PTY_INPUT_QUEUE_BYTES: usize = 4 * 1024 * 1024;
 
 pub(crate) async fn pump_tmux_cc_pty(
     master: OwnedFd,
@@ -32,7 +40,7 @@ pub(crate) async fn pump_tmux_cc_pty(
     let mut line_buf = Vec::new();
     let mut drain_deadline = None;
     let mut pending_initial_commands = Some(initial_commands);
-    let mut pending_input = PendingPtyWrite::new(DEFAULT_PTY_INPUT_QUEUE_BYTES);
+    let mut pending_input = PendingPtyWrite::new(TMUX_PTY_INPUT_QUEUE_BYTES);
 
     loop {
         let drain_sleep = async {
@@ -49,6 +57,10 @@ pub(crate) async fn pump_tmux_cc_pty(
                 match message {
                     StdinMessage::Data(data) => {
                         if is_ctrl_backslash_sequence(&data) {
+                            // Discard queued send-keys before issuing detach:
+                            // the client is leaving and the buffered input
+                            // would have no meaningful recipient.
+                            pending_input.clear();
                             write_pty_all(&master, b"detach-client\n").await.context("detach tmux -CC client")?;
                             drain_deadline = Some(tokio::time::Instant::now() + TMUX_CC_DRAIN_TIMEOUT);
                         } else {
@@ -58,6 +70,10 @@ pub(crate) async fn pump_tmux_cc_pty(
                         }
                     }
                     StdinMessage::Close => {
+                        // Discard queued send-keys: detaching means this
+                        // client is leaving; in-flight keystrokes have no
+                        // meaningful recipient.
+                        pending_input.clear();
                         write_pty_all(&master, b"detach-client\n").await.context("detach tmux -CC client")?;
                         drain_deadline = Some(tokio::time::Instant::now() + TMUX_CC_DRAIN_TIMEOUT);
                     }
@@ -66,14 +82,26 @@ pub(crate) async fn pump_tmux_cc_pty(
             Some(command) = pty_rx.recv(), if drain_deadline.is_none() => {
                 match command {
                     PtyCommand::Resize { rows, cols } => {
-                        write_pty_all(&master, &tmux_cc::resize_commands(rows, cols)).await.context("resize tmux -CC client")?;
+                        // Route resize through the same queue as send-keys so
+                        // it cannot overtake a partially-flushed input command.
+                        pending_input
+                            .push(tmux_cc::resize_commands(rows, cols))
+                            .context("queue tmux -CC resize")?;
                     }
                     PtyCommand::Close { .. } => {
+                        // Discard queued send-keys before issuing detach:
+                        // the client is leaving and buffered input would
+                        // have no meaningful recipient.
+                        pending_input.clear();
                         write_pty_all(&master, b"detach-client\n").await.context("detach tmux -CC client")?;
                         drain_deadline = Some(tokio::time::Instant::now() + TMUX_CC_DRAIN_TIMEOUT);
                     }
                     PtyCommand::KickOthers => {
-                        write_pty_all(&master, b"detach-client -a\n").await.context("detach other tmux -CC clients")?;
+                        // Queue behind any pending input so it does not
+                        // interleave with a partially-written send-keys command.
+                        pending_input
+                            .push(b"detach-client -a\n".to_vec())
+                            .context("queue tmux -CC kick-others")?;
                     }
                 }
             }
@@ -213,7 +241,62 @@ mod tests {
             .push(tmux_cc::send_keys_command(b"hello"))
             .expect("queue tmux command");
         let queued = pending.front_chunk().expect("queued command");
-        assert!(String::from_utf8_lossy(queued).contains("send-keys"));
+        let text = String::from_utf8_lossy(queued);
+        // Must use hex-literal send-keys form (-H flag).
+        assert!(text.contains("send-keys -H"), "expected 'send-keys -H' in {text:?}");
+        // 'h','e','l','l','o' → 68 65 6c 6c 6f
+        assert!(text.contains("68"), "expected hex byte for 'h' in {text:?}");
+        assert!(text.contains("65"), "expected hex byte for 'e' in {text:?}");
+        assert!(text.contains("6c"), "expected hex byte for 'l' in {text:?}");
+        assert!(text.contains("6f"), "expected hex byte for 'o' in {text:?}");
+    }
+
+    #[test]
+    fn resize_command_queued_not_written_directly() {
+        // Verifies that resize_commands output goes through PendingPtyWrite,
+        // not bypassed — i.e. the push result is correct and in-order with
+        // any preceding send-keys data.
+        let mut pending = PendingPtyWrite::new(TMUX_PTY_INPUT_QUEUE_BYTES);
+        pending
+            .push(tmux_cc::send_keys_command(b"abc"))
+            .expect("queue send-keys");
+        pending
+            .push(tmux_cc::resize_commands(24, 80))
+            .expect("queue resize");
+
+        // First chunk must be the send-keys command.
+        let first = String::from_utf8_lossy(pending.front_chunk().expect("first chunk"));
+        assert!(
+            first.contains("send-keys -H"),
+            "send-keys must precede resize; got {first:?}"
+        );
+
+        // After consuming the first chunk the resize command appears next.
+        let first_len = pending.front_chunk().unwrap().len();
+        pending.consume(first_len);
+        let second = String::from_utf8_lossy(pending.front_chunk().expect("second chunk"));
+        assert!(
+            second.contains("refresh-client") || second.contains("resize-window"),
+            "resize command must follow send-keys; got {second:?}"
+        );
+    }
+
+    #[test]
+    fn kick_others_queued_behind_pending_input() {
+        // KickOthers must be ordered after any queued send-keys.
+        let mut pending = PendingPtyWrite::new(TMUX_PTY_INPUT_QUEUE_BYTES);
+        pending
+            .push(tmux_cc::send_keys_command(b"x"))
+            .expect("queue send-keys");
+        pending
+            .push(b"detach-client -a\n".to_vec())
+            .expect("queue kick-others");
+
+        let first = String::from_utf8_lossy(pending.front_chunk().expect("first chunk"));
+        assert!(
+            first.contains("send-keys"),
+            "send-keys must precede kick-others; got {first:?}"
+        );
     }
 
     #[test]
