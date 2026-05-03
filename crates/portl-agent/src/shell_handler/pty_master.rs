@@ -26,6 +26,7 @@ pub(super) async fn pty_master_task(
     let mut stdin_open = true;
     let mut drain_deadline = None;
     let mut read_buf = vec![0_u8; IO_CHUNK];
+    let mut pending_input = PendingPtyWrite::new(DEFAULT_PTY_INPUT_QUEUE_BYTES);
 
     loop {
         let drain_sleep = async {
@@ -57,7 +58,7 @@ pub(super) async fn pty_master_task(
             }
             Some(message) = stdin_rx.recv(), if stdin_open && drain_deadline.is_none() => {
                 match message {
-                    StdinMessage::Data(bytes) => write_pty_all(&master, &bytes).await.context("write pty stdin")?,
+                    StdinMessage::Data(bytes) => pending_input.push(bytes).context("queue pty stdin")?,
                     StdinMessage::Close => stdin_open = false,
                 }
             }
@@ -72,6 +73,17 @@ pub(super) async fn pty_master_task(
                         }
                     }
                     None => return Ok(()),
+                }
+            }
+            writable_guard = master.writable(), if !pending_input.is_empty() && drain_deadline.is_none() => {
+                let mut guard = writable_guard.context("wait pty writable")?;
+                if let Some(bytes) = pending_input.front_chunk() {
+                    match nix::unistd::write(master.get_ref(), bytes) {
+                        Ok(0) => return Err(anyhow::anyhow!("pty write returned zero bytes")),
+                        Ok(n) => { pending_input.consume(n); }
+                        Err(nix::errno::Errno::EAGAIN) => { guard.clear_ready(); }
+                        Err(e) => return Err(std::io::Error::from(e)).context("write pty stdin")?,
+                    }
                 }
             }
             else => return Ok(()),
@@ -121,6 +133,39 @@ pub(crate) async fn write_pty_all(
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+async fn wait_pty_writable(master: &AsyncFd<OwnedFd>) -> std::io::Result<()> {
+    let mut guard = master.writable().await?;
+    guard.clear_ready();
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) async fn write_one_pending_pty_chunk(
+    master: &AsyncFd<OwnedFd>,
+    pending: &mut PendingPtyWrite,
+) -> std::io::Result<()> {
+    let Some(bytes) = pending.front_chunk() else {
+        return Ok(());
+    };
+    let mut guard = master.writable().await?;
+    match nix::unistd::write(master.get_ref(), bytes) {
+        Ok(0) => Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "pty write returned zero bytes",
+        )),
+        Ok(written) => {
+            pending.consume(written);
+            Ok(())
+        }
+        Err(nix::errno::Errno::EAGAIN) => {
+            guard.clear_ready();
+            Ok(())
+        }
+        Err(err) => Err(std::io::Error::from(err)),
+    }
 }
 
 #[cfg(unix)]
@@ -328,9 +373,51 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pty_master_echoes_large_input_without_deadlock() {
+        // Use `stty raw; cat` so the PTY does not buffer lines and cat echoes
+        // every byte as it arrives without waiting for a newline.
+        let mut harness =
+            spawn_pty_task_harness(&["-c", "stty raw -echo; cat"], Duration::from_secs(2));
+        // Give stty a moment to configure the terminal
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let input = vec![b'x'; 256 * 1024];
+
+        harness
+            .stdin_tx
+            .send(crate::shell_registry::StdinMessage::Data(input.clone()))
+            .await
+            .expect("send large input");
+
+        let mut observed = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while observed.len() < input.len() {
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .expect("timed out waiting for echoed input");
+            let chunk = tokio::time::timeout(remaining, harness.stdout_rx.recv())
+                .await
+                .expect("wait for pty output")
+                .expect("pty output channel open");
+            observed.extend_from_slice(&chunk);
+        }
+
+        assert!(observed.windows(4096).any(|window| window == &input[..4096]));
+        harness
+            .pty_tx
+            .send(PtyCommand::Close { force: true })
+            .expect("queue pty close");
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(harness.child_pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+
+    #[cfg(unix)]
     struct PtyTaskHarness {
         child_pid: i32,
         master_fd: i32,
+        stdin_tx: mpsc::Sender<crate::shell_registry::StdinMessage>,
         pty_tx: mpsc::UnboundedSender<PtyCommand>,
         stdout_rx: mpsc::Receiver<Vec<u8>>,
         task: tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -354,10 +441,10 @@ mod tests {
             drain_timeout,
         ));
         let child_wait = tokio::spawn(async move { child.wait().await });
-        let _ = stdin_tx;
         PtyTaskHarness {
             child_pid,
             master_fd,
+            stdin_tx,
             pty_tx,
             stdout_rx,
             task,
