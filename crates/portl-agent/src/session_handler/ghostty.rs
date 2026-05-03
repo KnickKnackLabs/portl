@@ -210,6 +210,12 @@ const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HISTORY_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(unix)]
 const IO_CHUNK: usize = 16 * 1024;
+#[cfg(unix)]
+const GHOSTTY_HELPER_COMMANDS: usize = 64;
+#[cfg(unix)]
+const GHOSTTY_SUBSCRIBER_BUFFER: usize = 64;
+#[cfg(unix)]
+const MAX_ATTACH_SNAPSHOT_BYTES: usize = MAX_FRAME_BYTES / 2;
 
 #[cfg(unix)]
 #[derive(Debug, Clone)]
@@ -777,7 +783,7 @@ enum HelperCommand {
         reply: oneshot::Sender<(
             GhosttySessionMetadata,
             Vec<u8>,
-            mpsc::UnboundedReceiver<Vec<u8>>,
+            mpsc::Receiver<Vec<u8>>,
         )>,
     },
     Input(Vec<u8>),
@@ -858,7 +864,7 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
     };
     write_metadata(&config.paths.metadata_path, &metadata).await?;
 
-    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+    let (cmd_tx, mut cmd_rx) = mpsc::channel(GHOSTTY_HELPER_COMMANDS);
     let accept_tx = cmd_tx.clone();
     let accept_task = tokio::spawn(async move {
         loop {
@@ -883,9 +889,12 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
     })?;
     let mut metadata = metadata;
     let mut history = VecDeque::new();
-    let mut subscribers: Vec<mpsc::UnboundedSender<Vec<u8>>> = Vec::new();
+    let mut subscribers: Vec<mpsc::Sender<Vec<u8>>> = Vec::new();
     let mut read_buf = vec![0_u8; IO_CHUNK];
     let mut child_wait = Box::pin(child.wait());
+    let mut pending_input = crate::shell_handler::pty_master::PendingPtyWrite::new(
+        crate::shell_handler::pty_master::DEFAULT_PTY_INPUT_QUEUE_BYTES,
+    );
 
     loop {
         tokio::select! {
@@ -905,6 +914,9 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
                     return Ok(());
                 }
             }
+            result = crate::shell_handler::pty_master::write_one_pending_pty_chunk(&master, &mut pending_input), if !pending_input.is_empty() => {
+                result.context("write queued ghostty pty input")?;
+            }
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
                     HelperCommand::Probe { reply } => {
@@ -914,13 +926,13 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
                     HelperCommand::Subscribe { cols, rows, reply } => {
                         let _ = resize_helper(&master, &mut terminal, &mut metadata, rows, cols);
                         metadata.last_seen_ms = now_ms();
-                        let (tx, rx) = mpsc::unbounded_channel();
+                        let (tx, rx) = mpsc::channel(GHOSTTY_SUBSCRIBER_BUFFER);
                         subscribers.push(tx);
-                        let snapshot = history.iter().copied().collect::<Vec<_>>();
+                        let snapshot = capped_attach_snapshot(&history);
                         let _ = reply.send((metadata.clone(), snapshot, rx));
                     }
                     HelperCommand::Input(bytes) => {
-                        crate::shell_handler::pty_master::write_pty_all(&master, &bytes).await.context("write ghostty pty input")?;
+                        pending_input.push(bytes).context("queue ghostty pty input")?;
                     }
                     HelperCommand::Resize { cols, rows } => {
                         let _ = resize_helper(&master, &mut terminal, &mut metadata, rows, cols);
@@ -975,12 +987,22 @@ fn resize_helper(
 fn process_output(
     terminal: &mut Terminal<'_, '_>,
     history: &mut VecDeque<u8>,
-    subscribers: &mut Vec<mpsc::UnboundedSender<Vec<u8>>>,
+    subscribers: &mut Vec<mpsc::Sender<Vec<u8>>>,
     bytes: &[u8],
 ) {
     terminal.vt_write(bytes);
     append_bounded(history, bytes);
     broadcast(subscribers, bytes);
+}
+
+#[cfg(unix)]
+fn capped_attach_snapshot(history: &VecDeque<u8>) -> Vec<u8> {
+    let len = history.len().min(MAX_ATTACH_SNAPSHOT_BYTES);
+    history
+        .iter()
+        .skip(history.len().saturating_sub(len))
+        .copied()
+        .collect()
 }
 
 #[cfg(unix)]
@@ -992,8 +1014,8 @@ fn append_bounded(history: &mut VecDeque<u8>, bytes: &[u8]) {
 }
 
 #[cfg(unix)]
-fn broadcast(subscribers: &mut Vec<mpsc::UnboundedSender<Vec<u8>>>, bytes: &[u8]) {
-    subscribers.retain(|subscriber| subscriber.send(bytes.to_vec()).is_ok());
+fn broadcast(subscribers: &mut Vec<mpsc::Sender<Vec<u8>>>, bytes: &[u8]) {
+    subscribers.retain(|subscriber| subscriber.try_send(bytes.to_vec()).is_ok());
 }
 
 #[cfg(unix)]
@@ -1037,7 +1059,7 @@ fn mirror_run_output(argv: &[String], run: &portl_proto::session_v1::SessionRunR
 #[cfg(unix)]
 async fn handle_client(
     mut stream: UnixStream,
-    tx: mpsc::UnboundedSender<HelperCommand>,
+    tx: mpsc::Sender<HelperCommand>,
 ) -> Result<()> {
     let Some(first) = read_frame::<GhosttyRequest>(&mut stream).await? else {
         return Ok(());
@@ -1046,6 +1068,7 @@ async fn handle_client(
         GhosttyRequest::Probe => {
             let (reply_tx, reply_rx) = oneshot::channel();
             tx.send(HelperCommand::Probe { reply: reply_tx })
+                .await
                 .map_err(|_| anyhow!("ghostty helper stopped"))?;
             let metadata = reply_rx.await.context("ghostty probe reply")?;
             write_frame(&mut stream, &GhosttyResponse::Ack { metadata }).await
@@ -1057,6 +1080,7 @@ async fn handle_client(
                 argv,
                 reply: reply_tx,
             })
+            .await
             .map_err(|_| anyhow!("ghostty helper stopped"))?;
             match reply_rx.await.context("ghostty run reply")? {
                 Ok(result) => {
@@ -1068,6 +1092,7 @@ async fn handle_client(
         GhosttyRequest::History => {
             let (reply_tx, reply_rx) = oneshot::channel();
             tx.send(HelperCommand::History { reply: reply_tx })
+                .await
                 .map_err(|_| anyhow!("ghostty helper stopped"))?;
             let output = reply_rx.await.context("ghostty history reply")?;
             write_frame(&mut stream, &GhosttyResponse::History { output }).await
@@ -1075,6 +1100,7 @@ async fn handle_client(
         GhosttyRequest::Kill => {
             let (reply_tx, reply_rx) = oneshot::channel();
             tx.send(HelperCommand::Kill { reply: reply_tx })
+                .await
                 .map_err(|_| anyhow!("ghostty helper stopped"))?;
             let _ = reply_rx.await;
             write_frame(&mut stream, &GhosttyResponse::Exit { code: 0 }).await
@@ -1086,6 +1112,7 @@ async fn handle_client(
                 rows,
                 reply: reply_tx,
             })
+            .await
             .map_err(|_| anyhow!("ghostty helper stopped"))?;
             let (metadata, snapshot, mut output_rx) =
                 reply_rx.await.context("ghostty attach reply")?;
@@ -1105,12 +1132,22 @@ async fn handle_client(
                     }
                     request = read_frame::<GhosttyRequest>(&mut stream) => {
                         match request? {
-                            Some(GhosttyRequest::Input { bytes }) => tx.send(HelperCommand::Input(bytes)).map_err(|_| anyhow!("ghostty helper stopped"))?,
-                            Some(GhosttyRequest::Resize { cols, rows }) => tx.send(HelperCommand::Resize { cols, rows }).map_err(|_| anyhow!("ghostty helper stopped"))?,
+                            Some(GhosttyRequest::Input { bytes }) => {
+                                tx.send(HelperCommand::Input(bytes))
+                                    .await
+                                    .map_err(|_| anyhow!("ghostty helper stopped"))?;
+                            }
+                            Some(GhosttyRequest::Resize { cols, rows }) => {
+                                tx.send(HelperCommand::Resize { cols, rows })
+                                    .await
+                                    .map_err(|_| anyhow!("ghostty helper stopped"))?;
+                            }
                             Some(GhosttyRequest::Detach) | None => return Ok(()),
                             Some(GhosttyRequest::Kill) => {
                                 let (reply_tx, reply_rx) = oneshot::channel();
-                                tx.send(HelperCommand::Kill { reply: reply_tx }).map_err(|_| anyhow!("ghostty helper stopped"))?;
+                                tx.send(HelperCommand::Kill { reply: reply_tx })
+                                    .await
+                                    .map_err(|_| anyhow!("ghostty helper stopped"))?;
                                 let _ = reply_rx.await;
                                 return Ok(());
                             }
@@ -1505,5 +1542,47 @@ mod tests {
             paths.history_path,
             state.join("sessions").join("dev%2Fmain.history")
         );
+    }
+
+    #[tokio::test]
+    async fn helper_attach_handles_large_echoing_input() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let registry =
+            GhosttyRegistry::with_roots(temp.path().join("run"), temp.path().join("state"));
+        let paths = registry.paths_for("large-cat");
+        let helper = GhosttyHelperConfig::for_test(
+            "large-cat",
+            paths.clone(),
+            vec!["/bin/cat".to_owned()],
+        );
+        let task = spawn_helper_thread(helper);
+        wait_for_socket(&paths.socket_path, Duration::from_secs(2)).await?;
+
+        let mut attach = GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .attach(80, 24)
+            .await?;
+        let input = vec![b'a'; 256 * 1024];
+        attach.input(input).await?;
+        let output = attach
+            .read_until_contains("aaaaaaaaaaaaaaaa", Duration::from_secs(5))
+            .await?;
+        assert!(output.contains("aaaaaaaaaaaaaaaa"));
+
+        GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .kill()
+            .await?;
+        task.join().expect("helper thread").context("helper result")?;
+        Ok(())
+    }
+
+    #[test]
+    fn capped_snapshot_stays_below_frame_limit() {
+        let mut history = VecDeque::new();
+        append_bounded(&mut history, &vec![b'x'; MAX_FRAME_BYTES + 1024]);
+        let snapshot = capped_attach_snapshot(&history);
+        assert!(snapshot.len() < MAX_FRAME_BYTES);
+        assert!(snapshot.iter().all(|byte| *byte == b'x'));
     }
 }
