@@ -445,7 +445,7 @@ fn print_status(report: &ProbeReport) {
         println!("{:<18}{}", "path:", path);
     }
     if let Some(rtt_ms) = report.rtt_ms {
-        println!("{:<18}{}ms", "rtt:", rtt_ms.round() as u64);
+        println!("{:<18}{}ms", "rtt:", rtt_ms.round());
     }
     if let Some(discovery) = &report.discovery {
         println!("{:<18}{}", "discovery:", discovery);

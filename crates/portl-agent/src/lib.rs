@@ -342,6 +342,9 @@ pub(crate) struct AgentState {
     pub session_provider_path: Option<PathBuf>,
     /// Agent process start time as unix seconds. For `up_since` fields.
     pub started_at_unix: u64,
+    /// Local endpoint id, used to avoid counting self-probe traffic as
+    /// external reachability evidence.
+    pub self_endpoint_id: [u8; 32],
     /// Lightweight endpoint watchdog health surfaced via `/status`.
     pub network_watchdog: network_watchdog::NetworkWatchdogHealth,
     /// Snapshot of the embedded-relay status for `/status/relay`.
@@ -432,6 +435,28 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
     audit::init();
 
     let watchdog_enabled = cfg.watchdog.enabled && cfg.endpoint.is_none();
+    let identity = if cfg.endpoint.is_some() && !watchdog_enabled {
+        None
+    } else {
+        Some(load_identity(&cfg)?)
+    };
+    let mut endpoint = if let Some(endpoint) = cfg.endpoint.clone() {
+        endpoint.inner().set_alpns(vec![
+            portl_proto::ticket_v1::ALPN_TICKET_V1.to_vec(),
+            portl_proto::pair_v1::ALPN_PAIR_V1.to_vec(),
+        ]);
+        endpoint.inner().clone()
+    } else {
+        endpoint::bind(
+            &cfg,
+            identity
+                .as_ref()
+                .expect("identity loaded for owned endpoint"),
+        )
+        .await?
+    };
+    let self_endpoint_id = *endpoint.id().as_bytes();
+
     let state = Arc::new(AgentState {
         trust_roots: std::sync::RwLock::new(TrustRoots(
             cfg.trust_roots.iter().copied().collect::<HashSet<_>>(),
@@ -474,6 +499,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
             .clone()
             .unwrap_or_else(metrics::default_socket_path),
         session_provider_path: cfg.session_provider_path.clone(),
+        self_endpoint_id,
         network_watchdog: if watchdog_enabled {
             network_watchdog::NetworkWatchdogHealth::new(SystemTime::now())
         } else {
@@ -484,27 +510,6 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
             .map_or(0, |d| d.as_secs()),
         relay_status: std::sync::RwLock::new(relay::RelayStatus::disabled()),
     });
-
-    let identity = if cfg.endpoint.is_some() && !watchdog_enabled {
-        None
-    } else {
-        Some(load_identity(&cfg)?)
-    };
-    let mut endpoint = if let Some(endpoint) = cfg.endpoint.clone() {
-        endpoint.inner().set_alpns(vec![
-            portl_proto::ticket_v1::ALPN_TICKET_V1.to_vec(),
-            portl_proto::pair_v1::ALPN_PAIR_V1.to_vec(),
-        ]);
-        endpoint.inner().clone()
-    } else {
-        endpoint::bind(
-            &cfg,
-            identity
-                .as_ref()
-                .expect("identity loaded for owned endpoint"),
-        )
-        .await?
-    };
 
     tracing::info!("portl-agent listening");
 
@@ -542,21 +547,20 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
                     break;
                 };
                 info!("watchdog requested endpoint refresh");
-                graceful_close_endpoint(&endpoint).await;
                 match endpoint::bind(&cfg, identity.as_ref().expect("identity loaded for endpoint refresh")).await {
                     Ok(new_endpoint) => {
-                        endpoint = new_endpoint;
+                        let old_endpoint = std::mem::replace(&mut endpoint, new_endpoint);
                         let _ = endpoint_tx.send(endpoint.clone());
                         state.network_watchdog.record_endpoint_refresh_success(SystemTime::now());
                         info!("watchdog endpoint refresh complete");
+                        graceful_close_endpoint(&old_endpoint).await;
                     }
                     Err(err) => {
                         state.network_watchdog.record_endpoint_refresh_failure(
                             SystemTime::now(),
                             format!("{err:#}"),
                         );
-                        warn!(?err, "watchdog endpoint refresh failed; exiting for service manager restart");
-                        anyhow::bail!("watchdog endpoint refresh failed: {err:#}");
+                        warn!(?err, "watchdog endpoint refresh failed; keeping existing endpoint and retrying later");
                     }
                 }
             }
@@ -571,8 +575,6 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
                         continue;
                     }
                 };
-
-                state.network_watchdog.record_inbound_handshake(SystemTime::now());
 
                 if connection.alpn() == portl_proto::ticket_v1::ALPN_TICKET_V1 {
                     let state = Arc::clone(&state);

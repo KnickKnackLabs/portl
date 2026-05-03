@@ -552,12 +552,11 @@ fn parse_bool_env(name: &str, value: &str) -> Result<bool> {
 }
 
 fn parse_watchdog_config(mode: &AgentMode) -> Result<crate::network_watchdog::WatchdogConfig> {
-    let mut config = crate::network_watchdog::WatchdogConfig::default();
-    config.enabled = matches!(mode, AgentMode::Listener);
+    let mut config = crate::network_watchdog::WatchdogConfig { enabled: matches!(mode, AgentMode::Listener), ..Default::default() };
     if let Some(value) = env_string("PORTL_AGENT_WATCHDOG")? {
         config.enabled = match value.as_str() {
             "auto" => matches!(mode, AgentMode::Listener),
-            "off" => false,
+            "off" | "0" | "false" | "no" => false,
             "on" | "1" | "true" | "yes" => true,
             other => bail!(
                 "PORTL_AGENT_WATCHDOG must be auto, off, on, 0, 1, false, true, no, or yes (got {other})"
@@ -710,7 +709,7 @@ mod tests {
                 assert!(config.watchdog.enabled);
                 assert_eq!(
                     config.watchdog.interval,
-                    std::time::Duration::from_secs(300)
+                    std::time::Duration::from_mins(5)
                 );
                 assert_eq!(config.watchdog.timeout, std::time::Duration::from_secs(5));
                 assert_eq!(config.watchdog.failures_before_refresh, 3);
@@ -737,6 +736,26 @@ mod tests {
                 assert_eq!(config.watchdog.failures_before_refresh, 2);
             },
         );
+    }
+
+    #[test]
+    fn watchdog_env_accepts_false_aliases() {
+        for value in ["0", "false", "no"] {
+            let home = tempdir().expect("tempdir");
+            with_env(
+                &[
+                    ("PORTL_HOME", Some(home.path().as_os_str().to_os_string())),
+                    ("PORTL_AGENT_WATCHDOG", Some(OsString::from(value))),
+                ],
+                || {
+                    let config = AgentConfig::from_env().expect("parse watchdog false alias");
+                    assert!(
+                        !config.watchdog.enabled,
+                        "value {value} should disable watchdog"
+                    );
+                },
+            );
+        }
     }
 
     #[test]

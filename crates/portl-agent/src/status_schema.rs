@@ -154,6 +154,8 @@ pub struct DiscoveryInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkHealthInfo {
+    /// Whether this agent expects the watchdog to be active for its endpoint.
+    pub enabled: bool,
     pub state: WatchdogState,
     pub endpoint_generation: u64,
     pub endpoint_started_at: u64,
@@ -170,6 +172,7 @@ impl NetworkHealthInfo {
     #[must_use]
     pub fn disabled() -> Self {
         Self {
+            enabled: false,
             state: WatchdogState::Disabled,
             endpoint_generation: 0,
             endpoint_started_at: 0,
@@ -187,6 +190,7 @@ impl NetworkHealthInfo {
 impl From<NetworkHealthSnapshot> for NetworkHealthInfo {
     fn from(value: NetworkHealthSnapshot) -> Self {
         Self {
+            enabled: value.state != WatchdogState::Disabled,
             state: value.state,
             endpoint_generation: value.endpoint_generation,
             endpoint_started_at: value.endpoint_started_at,
@@ -398,6 +402,7 @@ mod tests {
                 },
             },
             NetworkHealthInfo {
+                enabled: true,
                 state: WatchdogState::Ok,
                 endpoint_generation: 1,
                 endpoint_started_at: 100,

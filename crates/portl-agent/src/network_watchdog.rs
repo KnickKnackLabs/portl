@@ -39,7 +39,7 @@ impl Default for WatchdogConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            interval: Duration::from_secs(300),
+            interval: Duration::from_mins(5),
             timeout: Duration::from_secs(5),
             failures_before_refresh: 3,
         }
@@ -479,7 +479,7 @@ mod tests {
     #[test]
     fn watchdog_recent_inbound_skips_probe_window() {
         let config = WatchdogConfig {
-            interval: Duration::from_secs(60),
+            interval: Duration::from_mins(1),
             ..WatchdogConfig::default()
         };
         let health = NetworkWatchdogHealth::new(ts(100));

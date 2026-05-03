@@ -87,6 +87,11 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
                 bearer: bearer.clone(),
             };
             audit::ticket_accepted(&session);
+            if source_id != state.self_endpoint_id {
+                state
+                    .network_watchdog
+                    .record_inbound_handshake(SystemTime::now());
+            }
             state.metrics.tickets_accepted.inc();
             // Track this connection in the registry so
             // `/status/connections` (and the derived
