@@ -2955,6 +2955,7 @@ impl PasteState {
     fn observe_sent(&mut self, bytes: usize) {
         self.pending_bytes = self.pending_bytes.saturating_sub(bytes);
         if self.pending_bytes == 0 {
+            self.backpressured = false;
             self.deactivate_if_idle();
         }
     }
@@ -3296,7 +3297,7 @@ where
 
 async fn update_paste_bar(ui: &AttachControlUi, paste: &PasteState) -> Result<()> {
     if !paste.is_active() {
-        return Ok(());
+        return ui.display.clear_bar().await;
     }
     let now = Instant::now();
     let unicode = terminal_locale_supports_unicode();
@@ -4161,7 +4162,7 @@ mod tests {
         assert!(state.is_active());
 
         state.observe_sent(32);
-        assert!(state.is_active(), "still active while backpressured");
+        assert!(!state.is_active());
         state.set_backpressured(false);
         assert!(!state.is_active());
     }

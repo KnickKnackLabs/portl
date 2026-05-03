@@ -90,6 +90,11 @@ pub(super) async fn pty_master_task(
             () = drain_sleep => {
                 return Ok(());
             }
+            // Drain already-queued bytes regardless of whether graceful close
+            // has started; new data is blocked by the stdin_rx arm's guard.
+            result = write_one_pending_pty_chunk(&master, &mut pending_input), if !pending_input.is_empty() => {
+                result.context("write pty stdin")?;
+            }
             chunk = read_pty_chunk(&master, &mut read_buf) => {
                 match chunk.context("read pty output")? {
                     Some(chunk) => {
@@ -99,11 +104,6 @@ pub(super) async fn pty_master_task(
                     }
                     None => return Ok(()),
                 }
-            }
-            // Drain already-queued bytes regardless of whether graceful close
-            // has started; new data is blocked by the stdin_rx arm's guard.
-            result = write_one_pending_pty_chunk(&master, &mut pending_input), if !pending_input.is_empty() => {
-                result.context("write pty stdin")?;
             }
             else => return Ok(()),
         }

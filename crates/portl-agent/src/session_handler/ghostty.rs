@@ -932,7 +932,10 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
                         let _ = reply.send((metadata.clone(), snapshot, rx));
                     }
                     HelperCommand::Input(bytes) => {
-                        pending_input.push(bytes).context("queue ghostty pty input")?;
+                        if let Err(err) = pending_input.push(bytes) {
+                            tracing::warn!(%err, "ghostty pty input queue full; detaching subscribers");
+                            broadcast(&mut subscribers, &[]);
+                        }
                     }
                     HelperCommand::Resize { cols, rows } => {
                         let _ = resize_helper(&master, &mut terminal, &mut metadata, rows, cols);
@@ -1017,12 +1020,12 @@ fn append_bounded(history: &mut VecDeque<u8>, bytes: &[u8]) {
 fn broadcast(subscribers: &mut Vec<mpsc::Sender<Vec<u8>>>, bytes: &[u8]) {
     subscribers.retain(|subscriber| {
         match subscriber.try_send(bytes.to_vec()) {
-            // Channel full: drop this output frame for the slow subscriber but keep them
-            // subscribed. Bounded output may drop frames for slow subscribers to preserve
-            // helper liveness rather than blocking the pty read loop.
-            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
-            // Receiver dropped: evict the dead subscriber.
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
+            Ok(()) => true,
+            // Channel full: evict the slow subscriber so the client gets a closed
+            // stream and can reconnect for a fresh snapshot instead of silently
+            // diverging after missed output frames. Receiver dropped: evict the
+            // dead subscriber.
+            Err(mpsc::error::TrySendError::Full(_) | mpsc::error::TrySendError::Closed(_)) => false,
         }
     });
 }
@@ -1191,15 +1194,11 @@ async fn handle_client(mut stream: UnixStream, tx: mpsc::Sender<HelperCommand>) 
                                         let _ = reply_rx.await;
                                         return Ok(());
                                     }
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        write_frame(
-                                            &mut stream,
-                                            &GhosttyResponse::Error {
-                                                message: "ghostty helper input queue is full"
-                                                    .to_owned(),
-                                            },
-                                        )
-                                        .await?;
+                                    Err(mpsc::error::TrySendError::Full(command)) => {
+                                        tx.send(command)
+                                            .await
+                                            .map_err(|_| anyhow!("ghostty helper stopped"))?;
+                                        let _ = reply_rx.await;
                                         return Ok(());
                                     }
                                     Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -1642,15 +1641,14 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_full_retains_subscriber() {
-        // A subscriber whose channel is full should be retained (frame dropped, not evicted).
+    fn broadcast_full_evicts_subscriber() {
+        // A subscriber whose channel is full should be evicted so it can reconnect
+        // for a fresh snapshot rather than silently missing output frames.
         let (tx, _rx) = mpsc::channel::<Vec<u8>>(1);
-        // Fill the channel.
         tx.try_send(vec![1]).unwrap();
         let mut subscribers = vec![tx];
-        // broadcast when full: subscriber must remain.
         broadcast(&mut subscribers, b"overflow");
-        assert_eq!(subscribers.len(), 1, "full subscriber must be retained");
+        assert_eq!(subscribers.len(), 0, "full subscriber must be evicted");
     }
 
     #[test]
