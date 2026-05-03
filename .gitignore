@@ -12,9 +12,6 @@ Cargo.lock.bak
 # Pi agent local state (todos, session scratch)
 .pi/
 
-# Local worktrees
-.worktrees/
-
 # Local-only planning/scratch notes (kept out of the release repo)
 /scratch/
 
