@@ -2860,6 +2860,150 @@ async fn await_output_task(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PasteConfig {
+    burst_threshold_bytes: usize,
+    burst_window: Duration,
+    detail_after: Duration,
+}
+
+impl PasteConfig {
+    fn default() -> Self {
+        Self {
+            burst_threshold_bytes: 64 * 1024,
+            burst_window: Duration::from_millis(250),
+            detail_after: Duration::from_secs(2),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(burst_threshold_bytes: usize, burst_window: Duration) -> Self {
+        Self {
+            burst_threshold_bytes,
+            burst_window,
+            detail_after: Duration::from_millis(10),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PasteState {
+    config: PasteConfig,
+    active: bool,
+    burst_start: Option<Instant>,
+    burst_bytes: usize,
+    pending_bytes: usize,
+    backpressured: bool,
+    active_since: Option<Instant>,
+}
+
+impl PasteState {
+    fn new(config: PasteConfig) -> Self {
+        Self {
+            config,
+            active: false,
+            burst_start: None,
+            burst_bytes: 0,
+            pending_bytes: 0,
+            backpressured: false,
+            active_since: None,
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.active
+    }
+
+    fn pending_bytes(&self) -> usize {
+        self.pending_bytes
+    }
+
+    fn observe_read(&mut self, bytes: usize, now: Instant) {
+        match self.burst_start {
+            Some(start) if now.duration_since(start) < self.config.burst_window => {
+                self.burst_bytes += bytes;
+            }
+            _ => {
+                self.burst_start = Some(now);
+                self.burst_bytes = bytes;
+            }
+        }
+        if self.burst_bytes >= self.config.burst_threshold_bytes {
+            self.active = true;
+            self.active_since.get_or_insert(now);
+        }
+    }
+
+    fn observe_queued(&mut self, bytes: usize) {
+        self.pending_bytes += bytes;
+        self.active = true;
+        self.active_since.get_or_insert_with(Instant::now);
+    }
+
+    fn observe_sent(&mut self, bytes: usize) {
+        self.pending_bytes = self.pending_bytes.saturating_sub(bytes);
+    }
+
+    fn set_backpressured(&mut self, value: bool) {
+        self.backpressured = value;
+        if value {
+            self.active = true;
+            self.active_since.get_or_insert_with(Instant::now);
+        }
+    }
+
+    fn cancel_pending(&mut self) -> usize {
+        let dropped = self.pending_bytes;
+        self.pending_bytes = 0;
+        self.backpressured = false;
+        dropped
+    }
+
+    fn should_show_detail(&self, now: Instant) -> bool {
+        self.active_since
+            .is_some_and(|started| now.duration_since(started) >= self.config.detail_after)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BracketedPasteEvent {
+    None,
+    Begin,
+    End,
+}
+
+#[derive(Debug, Default)]
+struct BracketedPasteScanner {
+    tail: Vec<u8>,
+    in_paste: bool,
+}
+
+impl BracketedPasteScanner {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn in_bracketed_paste(&self) -> bool {
+        self.in_paste
+    }
+
+    fn scan(&mut self, bytes: &[u8]) -> BracketedPasteEvent {
+        const BEGIN: &[u8] = b"\x1b[200~";
+        const END: &[u8] = b"\x1b[201~";
+        let mut combined = self.tail.clone();
+        combined.extend_from_slice(bytes);
+        let event = if combined.windows(BEGIN.len()).any(|w| w == BEGIN) {
+            self.in_paste = true;
+            BracketedPasteEvent::Begin
+        } else if combined.windows(END.len()).any(|w| w == END) {
+            self.in_paste = false;
+            BracketedPasteEvent::End
+        } else {
+            BracketedPasteEvent::None
+        };
+        let keep = BEGIN.len().max(END.len()).saturating_sub(1);
+        self.tail = combined[combined.len().saturating_sub(keep)..].to_vec();
+        event
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StdinTaskResult {
     Closed,
@@ -3042,6 +3186,8 @@ where
 {
     let mut buf = [0_u8; 8192];
     let mut last_size = size().unwrap_or((80, 24));
+    let mut paste = PasteState::new(PasteConfig::default());
+    let mut bracketed = BracketedPasteScanner::default();
     loop {
         tokio::select! {
             read = stdin.read(&mut buf) => {
@@ -3053,16 +3199,38 @@ where
                     return Ok(StdinTaskResult::Closed);
                 }
                 let chunk = &buf[..read];
+                let now = Instant::now();
+                paste.observe_read(read, now);
+                match bracketed.scan(chunk) {
+                    BracketedPasteEvent::Begin => paste.set_backpressured(false),
+                    BracketedPasteEvent::End | BracketedPasteEvent::None => {}
+                }
                 if is_ctrl_backslash_sequence(chunk) {
-                    match run_attach_control_mode(sink, stdin, ui).await? {
+                    match run_attach_control_mode(sink, stdin, ui, &mut paste).await? {
                         AttachControlOutcome::Continue => continue,
                         AttachControlOutcome::Detached => return Ok(StdinTaskResult::Detached),
+                        AttachControlOutcome::CancelPaste => {
+                            paste.cancel_pending();
+                            update_paste_bar(ui, &paste).await?;
+                            continue;
+                        }
                     }
                 }
+                if paste.is_active() && chunk == b"\x1b" {
+                    paste.cancel_pending();
+                    update_paste_bar(ui, &paste).await?;
+                    continue;
+                }
+                paste.observe_queued(read);
+                update_paste_bar(ui, &paste).await?;
+                let send_started = Instant::now();
                 if let Err(err) = sink.send_stdin(chunk).await.context("copy local stdin") {
                     debug!(%err, "stdin loop ended after provider stdin closed");
                     return Ok(StdinTaskResult::Closed);
                 }
+                paste.set_backpressured(send_started.elapsed() >= Duration::from_millis(100));
+                paste.observe_sent(read);
+                update_paste_bar(ui, &paste).await?;
             }
             () = tokio::time::sleep(Duration::from_millis(500)) => {
                 if let Ok(now) = size()
@@ -3079,16 +3247,42 @@ where
     }
 }
 
+async fn update_paste_bar(ui: &AttachControlUi, paste: &PasteState) -> Result<()> {
+    if !paste.is_active() {
+        return Ok(());
+    }
+    let now = Instant::now();
+    if !paste.should_show_detail(now) {
+        return Ok(());
+    }
+    let pending = paste.pending_bytes();
+    let msg = if pending > 0 {
+        let unicode = terminal_locale_supports_unicode();
+        let sep = if unicode { "·" } else { "|" };
+        let lead = if unicode { "▌" } else { "|" };
+        let arrow = if unicode { "›" } else { ">" };
+        format!(
+            "{lead} Portl {arrow} {} {sep} pasting {} bytes {sep} Esc cancel",
+            ui.canonical_ref, pending
+        )
+    } else {
+        return ui.display.clear_bar().await;
+    };
+    ui.display.set_bar(msg).await
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttachControlOutcome {
     Continue,
     Detached,
+    CancelPaste,
 }
 
 async fn run_attach_control_mode<R>(
     sink: &mut AttachInputSink,
     stdin: &mut R,
     ui: &AttachControlUi,
+    paste: &PasteState,
 ) -> Result<AttachControlOutcome>
 where
     R: AsyncRead + Unpin,
@@ -3104,7 +3298,7 @@ where
             clear_attach_control_bar(ui).await?;
             return Ok(AttachControlOutcome::Continue);
         }
-        render_attach_control_bar(ui, CONTROL_TIMEOUT.saturating_sub(elapsed)).await?;
+        render_attach_control_bar(ui, CONTROL_TIMEOUT.saturating_sub(elapsed), paste).await?;
         if let Ok(read) = tokio::time::timeout(CONTROL_TICK, stdin.read(&mut buf)).await {
             let read = read.context("read local stdin in attach control mode")?;
             if read == 0 {
@@ -3136,6 +3330,9 @@ where
                     .await?;
                 return Ok(AttachControlOutcome::Continue);
             }
+            if command == b"c" && paste.is_active() {
+                return Ok(AttachControlOutcome::CancelPaste);
+            }
             if command == b"\x1b" {
                 return Ok(AttachControlOutcome::Continue);
             }
@@ -3153,11 +3350,16 @@ where
     }
 }
 
-async fn render_attach_control_bar(ui: &AttachControlUi, remaining: Duration) -> Result<()> {
+async fn render_attach_control_bar(
+    ui: &AttachControlUi,
+    remaining: Duration,
+    paste: &PasteState,
+) -> Result<()> {
     ui.display
         .set_bar(render_bar(RenderBarOptions {
             canonical_ref: &ui.canonical_ref,
             supports_kick_others: ui.supports_kick_others,
+            paste_cancellable: paste.is_active(),
             remaining,
             unicode: terminal_locale_supports_unicode(),
             color: terminal_color_enabled(),
@@ -3865,5 +4067,26 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("conflicting session targets"));
+    }
+
+    #[test]
+    fn paste_state_enters_on_large_burst_and_cancels_pending() {
+        let mut state = PasteState::new(PasteConfig::for_test(16, Duration::from_secs(1)));
+        state.observe_read(32, Instant::now());
+        assert!(state.is_active());
+        state.observe_queued(32);
+        assert_eq!(state.pending_bytes(), 32);
+        assert_eq!(state.cancel_pending(), 32);
+        assert_eq!(state.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn bracketed_paste_scanner_detects_begin_and_end_across_chunks() {
+        let mut scanner = BracketedPasteScanner::default();
+        assert_eq!(scanner.scan(b"abc\x1b[200"), BracketedPasteEvent::None);
+        assert_eq!(scanner.scan(b"~payload"), BracketedPasteEvent::Begin);
+        assert!(scanner.in_bracketed_paste());
+        assert_eq!(scanner.scan(b"more\x1b[201~"), BracketedPasteEvent::End);
+        assert!(!scanner.in_bracketed_paste());
     }
 }

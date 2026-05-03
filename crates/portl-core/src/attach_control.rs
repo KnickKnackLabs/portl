@@ -4,6 +4,7 @@ use std::time::Duration;
 pub struct RenderBarOptions<'a> {
     pub canonical_ref: &'a str,
     pub supports_kick_others: bool,
+    pub paste_cancellable: bool,
     pub remaining: Duration,
     pub unicode: bool,
     pub color: bool,
@@ -42,6 +43,9 @@ pub fn render_bar(options: RenderBarOptions<'_>) -> String {
         parts.push(format!("{} {} {}", sep, key("k"), label("kick")));
     }
     parts.push(format!("{} {} {}", sep, key(send_key), label("send")));
+    if options.paste_cancellable {
+        parts.push(format!("{} {} {}", sep, key("c"), label("cancel paste")));
+    }
     parts.push(format!("{} {} {}", sep, key("Esc"), label("cancel")));
     parts.push(format!("{sep} {timer}"));
     parts.join(" ")
@@ -191,6 +195,7 @@ mod tests {
         let bar = render_bar(RenderBarOptions {
             canonical_ref: "max-b265/tmux/dotfiles",
             supports_kick_others: true,
+            paste_cancellable: false,
             remaining: Duration::from_millis(1900),
             unicode: true,
             color: false,
@@ -207,6 +212,7 @@ mod tests {
         let bar = render_bar(RenderBarOptions {
             canonical_ref: "max-b265/zmx/dev",
             supports_kick_others: false,
+            paste_cancellable: false,
             remaining: Duration::from_secs(2),
             unicode: false,
             color: false,
@@ -215,6 +221,23 @@ mod tests {
         assert_eq!(
             bar,
             "| Portl > max-b265/zmx/dev  |  d detach | ^\\ send | Esc cancel | 2.0s"
+        );
+    }
+
+    #[test]
+    fn compact_bar_shows_cancel_paste_when_paste_active() {
+        let bar = render_bar(RenderBarOptions {
+            canonical_ref: "max-b265/zmx/dev",
+            supports_kick_others: false,
+            paste_cancellable: true,
+            remaining: Duration::from_secs(2),
+            unicode: false,
+            color: false,
+        });
+
+        assert_eq!(
+            bar,
+            "| Portl > max-b265/zmx/dev  |  d detach | ^\\ send | c cancel paste | Esc cancel | 2.0s"
         );
     }
 
