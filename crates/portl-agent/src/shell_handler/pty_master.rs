@@ -132,6 +132,93 @@ pub(crate) fn set_nonblocking(fd: &OwnedFd) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+pub(crate) const DEFAULT_PTY_INPUT_QUEUE_BYTES: usize = 1024 * 1024;
+
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct PendingPtyWrite {
+    chunks: std::collections::VecDeque<Vec<u8>>,
+    front_offset: usize,
+    pending_bytes: usize,
+    max_bytes: usize,
+}
+
+#[cfg(unix)]
+impl PendingPtyWrite {
+    pub(crate) fn new(max_bytes: usize) -> Self {
+        Self {
+            chunks: std::collections::VecDeque::new(),
+            front_offset: 0,
+            pending_bytes: 0,
+            max_bytes,
+        }
+    }
+
+    pub(crate) fn push(&mut self, bytes: Vec<u8>) -> std::io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if self.pending_bytes.saturating_add(bytes.len()) > self.max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "pty input queue is full",
+            ));
+        }
+        self.pending_bytes += bytes.len();
+        self.chunks.push_back(bytes);
+        Ok(())
+    }
+
+    pub(crate) fn front_chunk(&self) -> Option<&[u8]> {
+        self.chunks
+            .front()
+            .map(|chunk| &chunk[self.front_offset..])
+            .filter(|chunk| !chunk.is_empty())
+    }
+
+    pub(crate) fn consume(&mut self, written: usize) {
+        debug_assert!(
+            written <= self.pending_bytes,
+            "consume({written}) exceeds pending_bytes({})",
+            self.pending_bytes
+        );
+        let mut remaining = written.min(self.pending_bytes);
+        while remaining > 0 {
+            let Some(front) = self.chunks.front() else {
+                self.front_offset = 0;
+                break;
+            };
+            let available = front.len() - self.front_offset;
+            if remaining < available {
+                self.front_offset += remaining;
+                self.pending_bytes -= remaining;
+                return;
+            }
+            remaining -= available;
+            self.pending_bytes -= available;
+            self.chunks.pop_front();
+            self.front_offset = 0;
+        }
+    }
+
+    pub(crate) fn clear(&mut self) -> usize {
+        let dropped = self.pending_bytes;
+        self.chunks.clear();
+        self.front_offset = 0;
+        self.pending_bytes = 0;
+        dropped
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pending_bytes == 0
+    }
+
+    pub(crate) fn pending_bytes(&self) -> usize {
+        self.pending_bytes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
@@ -276,6 +363,101 @@ mod tests {
             task,
             child_wait,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_pty_write_tracks_bytes_and_partial_progress() {
+        let mut pending = super::PendingPtyWrite::new(16);
+
+        assert_eq!(pending.pending_bytes(), 0);
+        assert!(pending.push(b"abcdef".to_vec()).is_ok());
+        assert!(pending.push(b"gh".to_vec()).is_ok());
+        assert_eq!(pending.pending_bytes(), 8);
+        assert_eq!(pending.front_chunk(), Some(&b"abcdef"[..]));
+
+        pending.consume(2);
+        assert_eq!(pending.front_chunk(), Some(&b"cdef"[..]));
+        assert_eq!(pending.pending_bytes(), 6);
+
+        pending.consume(4);
+        assert_eq!(pending.front_chunk(), Some(&b"gh"[..]));
+        pending.consume(2);
+        assert!(pending.is_empty());
+        assert_eq!(pending.pending_bytes(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_pty_write_rejects_over_capacity_and_clears() {
+        let mut pending = super::PendingPtyWrite::new(8);
+
+        assert!(pending.push(b"12345678".to_vec()).is_ok());
+        let err = pending.push(b"9".to_vec()).expect_err("queue should be full");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(pending.clear(), 8);
+        assert!(pending.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_pty_write_consume_zero_is_noop() {
+        let mut pending = super::PendingPtyWrite::new(16);
+        pending.push(b"hello".to_vec()).unwrap();
+        pending.consume(0);
+        assert_eq!(pending.pending_bytes(), 5);
+        assert_eq!(pending.front_chunk(), Some(&b"hello"[..]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_pty_write_push_after_clear() {
+        let mut pending = super::PendingPtyWrite::new(8);
+        pending.push(b"12345678".to_vec()).unwrap();
+        pending.clear();
+        assert!(pending.push(b"abc".to_vec()).is_ok());
+        assert_eq!(pending.pending_bytes(), 3);
+        assert_eq!(pending.front_chunk(), Some(&b"abc"[..]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_pty_write_push_empty_is_noop() {
+        let mut pending = super::PendingPtyWrite::new(8);
+        pending.push(vec![]).unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(pending.pending_bytes(), 0);
+        assert_eq!(pending.front_chunk(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_pty_write_exact_boundary_fill() {
+        let mut pending = super::PendingPtyWrite::new(8);
+        assert!(pending.push(b"12345678".to_vec()).is_ok());
+        assert_eq!(pending.pending_bytes(), 8);
+        // One past the limit
+        assert!(pending.push(b"9".to_vec()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_pty_write_consume_cross_chunk_boundary() {
+        let mut pending = super::PendingPtyWrite::new(32);
+        pending.push(b"abc".to_vec()).unwrap();
+        pending.push(b"defg".to_vec()).unwrap();
+        pending.push(b"hi".to_vec()).unwrap();
+        // consume 1 byte into first chunk, then consume across chunk boundaries
+        pending.consume(1);
+        assert_eq!(pending.front_chunk(), Some(&b"bc"[..]));
+        assert_eq!(pending.pending_bytes(), 8);
+        // now consume 4: uses up "bc" (2) and "de" (2) from second chunk
+        pending.consume(4);
+        assert_eq!(pending.front_chunk(), Some(&b"fg"[..]));
+        assert_eq!(pending.pending_bytes(), 4);
+        // consume remainder
+        pending.consume(4);
+        assert!(pending.is_empty());
     }
 
     #[cfg(unix)]
