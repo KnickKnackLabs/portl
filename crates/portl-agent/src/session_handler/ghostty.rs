@@ -210,14 +210,14 @@ const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HISTORY_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(unix)]
 const IO_CHUNK: usize = 16 * 1024;
-// Shared command queue for all clients; bounded to apply backpressure and prevent
-// unbounded memory growth when clients submit commands faster than the helper processes them.
+// Shared command queue for all clients; bounded to propagate backpressure instead of
+// accumulating paste data. Clients that overflow the queue receive an explicit error.
 #[cfg(unix)]
 const GHOSTTY_HELPER_COMMANDS: usize = 64;
 #[cfg(unix)]
 const GHOSTTY_SUBSCRIBER_BUFFER: usize = 64;
-// Half of MAX_FRAME_BYTES to leave slack for framing overhead and avoid hitting the frame
-// size limit when the snapshot is serialized and length-prefixed.
+// MAX_FRAME_BYTES / 2 leaves postcard metadata/headroom under the frame cap so the
+// serialized, length-prefixed snapshot never exceeds the wire frame size limit.
 #[cfg(unix)]
 const MAX_ATTACH_SNAPSHOT_BYTES: usize = MAX_FRAME_BYTES / 2;
 
@@ -1156,7 +1156,8 @@ async fn handle_client(
                                         write_frame(
                                             &mut stream,
                                             &GhosttyResponse::Error {
-                                                message: "helper command queue full; close and reconnect".to_owned(),
+                                                message: "ghostty helper input queue is full"
+                                                    .to_owned(),
                                             },
                                         )
                                         .await?;
@@ -1168,10 +1169,22 @@ async fn handle_client(
                                 }
                             }
                             Some(GhosttyRequest::Resize { cols, rows }) => {
-                                // try_send: resize is best-effort; silently drop if the
-                                // queue is full to avoid starving output forwarding.
+                                // try_send: avoid blocking output forwarding. On Full,
+                                // report backpressure to the client and close the attach
+                                // stream; on Closed, propagate the error.
                                 match tx.try_send(HelperCommand::Resize { cols, rows }) {
-                                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        write_frame(
+                                            &mut stream,
+                                            &GhosttyResponse::Error {
+                                                message: "ghostty helper input queue is full"
+                                                    .to_owned(),
+                                            },
+                                        )
+                                        .await?;
+                                        return Ok(());
+                                    }
                                     Err(mpsc::error::TrySendError::Closed(_)) => {
                                         return Err(anyhow!("ghostty helper stopped"));
                                     }
