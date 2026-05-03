@@ -620,7 +620,7 @@ mod tests {
             ..DiscoveryConfig::in_process()
         };
         let endpoint_id = SecretKey::from_bytes(&[1; 32]).public();
-        let addr = EndpointAddr::new(endpoint_id).with_relay_url(relay.clone());
+        let addr = EndpointAddr::new(endpoint_id).with_relay_url(relay);
         let probe = relay_only_probe_addr(&addr, &discovery).expect("relay addr");
         assert_eq!(probe.relay_urls().count(), 1);
         assert_eq!(probe.ip_addrs().count(), 0);

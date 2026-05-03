@@ -773,8 +773,8 @@ fn check_agent_network_endpoint_status(
 ) -> CheckResult {
     let health = &status.network_health;
     let status = match health.state {
-        portl_agent::network_watchdog::WatchdogState::Ok => Status::Ok,
-        portl_agent::network_watchdog::WatchdogState::Disabled => Status::Ok,
+        portl_agent::network_watchdog::WatchdogState::Ok
+        | portl_agent::network_watchdog::WatchdogState::Disabled => Status::Ok,
         portl_agent::network_watchdog::WatchdogState::Degraded
         | portl_agent::network_watchdog::WatchdogState::Refreshing => Status::Warn,
         portl_agent::network_watchdog::WatchdogState::Failed => Status::Fail,
