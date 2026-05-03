@@ -784,11 +784,7 @@ enum HelperCommand {
     Subscribe {
         cols: u16,
         rows: u16,
-        reply: oneshot::Sender<(
-            GhosttySessionMetadata,
-            Vec<u8>,
-            mpsc::Receiver<Vec<u8>>,
-        )>,
+        reply: oneshot::Sender<(GhosttySessionMetadata, Vec<u8>, mpsc::Receiver<Vec<u8>>)>,
     },
     Input(Vec<u8>),
     Resize {
@@ -1071,10 +1067,7 @@ fn mirror_run_output(argv: &[String], run: &portl_proto::session_v1::SessionRunR
 }
 
 #[cfg(unix)]
-async fn handle_client(
-    mut stream: UnixStream,
-    tx: mpsc::Sender<HelperCommand>,
-) -> Result<()> {
+async fn handle_client(mut stream: UnixStream, tx: mpsc::Sender<HelperCommand>) -> Result<()> {
     let Some(first) = read_frame::<GhosttyRequest>(&mut stream).await? else {
         return Ok(());
     };
@@ -1613,11 +1606,8 @@ mod tests {
         let registry =
             GhosttyRegistry::with_roots(temp.path().join("run"), temp.path().join("state"));
         let paths = registry.paths_for("large-cat");
-        let helper = GhosttyHelperConfig::for_test(
-            "large-cat",
-            paths.clone(),
-            vec!["/bin/cat".to_owned()],
-        );
+        let helper =
+            GhosttyHelperConfig::for_test("large-cat", paths.clone(), vec!["/bin/cat".to_owned()]);
         let task = spawn_helper_thread(helper);
         wait_for_socket(&paths.socket_path, Duration::from_secs(2)).await?;
 
@@ -1636,7 +1626,9 @@ mod tests {
             .await?
             .kill()
             .await?;
-        task.join().expect("helper thread").context("helper result")?;
+        task.join()
+            .expect("helper thread")
+            .context("helper result")?;
         Ok(())
     }
 
@@ -1679,11 +1671,8 @@ mod tests {
         let registry =
             GhosttyRegistry::with_roots(temp.path().join("run"), temp.path().join("state"));
         let paths = registry.paths_for("queue-full");
-        let helper = GhosttyHelperConfig::for_test(
-            "queue-full",
-            paths.clone(),
-            vec!["/bin/cat".to_owned()],
-        );
+        let helper =
+            GhosttyHelperConfig::for_test("queue-full", paths.clone(), vec!["/bin/cat".to_owned()]);
         let task = spawn_helper_thread(helper);
         wait_for_socket(&paths.socket_path, Duration::from_secs(2)).await?;
 
@@ -1706,12 +1695,7 @@ mod tests {
         // If we only get Output/Exit, that's also acceptable (helper drained queue fast).
         let mut got_error_or_exit = false;
         for _ in 0..(GHOSTTY_HELPER_COMMANDS + 20) {
-            match tokio::time::timeout(
-                Duration::from_millis(200),
-                attach.next_response(),
-            )
-            .await
-            {
+            match tokio::time::timeout(Duration::from_millis(200), attach.next_response()).await {
                 Ok(Ok(Some(GhosttyResponse::Error { .. } | GhosttyResponse::Exit { .. }))) => {
                     got_error_or_exit = true;
                     break;
@@ -1728,7 +1712,9 @@ mod tests {
             .await?
             .kill()
             .await?;
-        task.join().expect("helper thread").context("helper result")?;
+        task.join()
+            .expect("helper thread")
+            .context("helper result")?;
         Ok(())
     }
 }

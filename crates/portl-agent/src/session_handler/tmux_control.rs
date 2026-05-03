@@ -243,7 +243,10 @@ mod tests {
         let queued = pending.front_chunk().expect("queued command");
         let text = String::from_utf8_lossy(queued);
         // Must use hex-literal send-keys form (-H flag).
-        assert!(text.contains("send-keys -H"), "expected 'send-keys -H' in {text:?}");
+        assert!(
+            text.contains("send-keys -H"),
+            "expected 'send-keys -H' in {text:?}"
+        );
         // 'h','e','l','l','o' → 68 65 6c 6c 6f
         assert!(text.contains("68"), "expected hex byte for 'h' in {text:?}");
         assert!(text.contains("65"), "expected hex byte for 'e' in {text:?}");

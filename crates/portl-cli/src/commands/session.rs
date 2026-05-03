@@ -2934,10 +2934,20 @@ impl PasteState {
         }
     }
 
+    fn activate(&mut self, now: Instant) {
+        self.active = true;
+        self.active_since.get_or_insert(now);
+    }
+
+    fn deactivate_if_idle(&mut self) {
+        if self.pending_bytes == 0 && !self.backpressured {
+            self.active = false;
+            self.active_since = None;
+        }
+    }
+
     fn observe_queued(&mut self, bytes: usize) {
         self.pending_bytes += bytes;
-        self.active = true;
-        self.active_since.get_or_insert_with(Instant::now);
     }
 
     fn observe_sent(&mut self, bytes: usize) {
@@ -2956,6 +2966,8 @@ impl PasteState {
         let dropped = self.pending_bytes;
         self.pending_bytes = 0;
         self.backpressured = false;
+        self.active = false;
+        self.active_since = None;
         dropped
     }
 
@@ -2984,19 +2996,43 @@ impl BracketedPasteScanner {
         self.in_paste
     }
 
+    fn force_end(&mut self) {
+        self.in_paste = false;
+    }
+
     fn scan(&mut self, bytes: &[u8]) -> BracketedPasteEvent {
         const BEGIN: &[u8] = b"\x1b[200~";
         const END: &[u8] = b"\x1b[201~";
         let mut combined = self.tail.clone();
         combined.extend_from_slice(bytes);
-        let event = if combined.windows(BEGIN.len()).any(|w| w == BEGIN) {
-            self.in_paste = true;
-            BracketedPasteEvent::Begin
-        } else if combined.windows(END.len()).any(|w| w == END) {
-            self.in_paste = false;
-            BracketedPasteEvent::End
-        } else {
-            BracketedPasteEvent::None
+        let last_begin = combined
+            .windows(BEGIN.len())
+            .enumerate()
+            .filter_map(|(i, w)| (w == BEGIN).then_some(i))
+            .last();
+        let last_end = combined
+            .windows(END.len())
+            .enumerate()
+            .filter_map(|(i, w)| (w == END).then_some(i))
+            .last();
+        let event = match (last_begin, last_end) {
+            (None, None) => BracketedPasteEvent::None,
+            (Some(_), None) => {
+                self.in_paste = true;
+                BracketedPasteEvent::Begin
+            }
+            (None, Some(_)) => {
+                self.in_paste = false;
+                BracketedPasteEvent::End
+            }
+            (Some(b), Some(e)) if b > e => {
+                self.in_paste = true;
+                BracketedPasteEvent::Begin
+            }
+            _ => {
+                self.in_paste = false;
+                BracketedPasteEvent::End
+            }
         };
         let keep = BEGIN.len().max(END.len()).saturating_sub(1);
         self.tail = combined[combined.len().saturating_sub(keep)..].to_vec();
@@ -3202,8 +3238,9 @@ where
                 let now = Instant::now();
                 paste.observe_read(read, now);
                 match bracketed.scan(chunk) {
-                    BracketedPasteEvent::Begin => paste.set_backpressured(false),
-                    BracketedPasteEvent::End | BracketedPasteEvent::None => {}
+                    BracketedPasteEvent::Begin => paste.activate(now),
+                    BracketedPasteEvent::End => paste.deactivate_if_idle(),
+                    BracketedPasteEvent::None => {}
                 }
                 if is_ctrl_backslash_sequence(chunk) {
                     match run_attach_control_mode(sink, stdin, ui, &mut paste).await? {
@@ -3211,14 +3248,22 @@ where
                         AttachControlOutcome::Detached => return Ok(StdinTaskResult::Detached),
                         AttachControlOutcome::CancelPaste => {
                             paste.cancel_pending();
-                            update_paste_bar(ui, &paste).await?;
+                            if bracketed.in_bracketed_paste() {
+                                bracketed.force_end();
+                                let _ = sink.send_stdin(b"\x1b[201~").await;
+                            }
+                            ui.display.clear_bar().await?;
                             continue;
                         }
                     }
                 }
                 if paste.is_active() && chunk == b"\x1b" {
                     paste.cancel_pending();
-                    update_paste_bar(ui, &paste).await?;
+                    if bracketed.in_bracketed_paste() {
+                        bracketed.force_end();
+                        let _ = sink.send_stdin(b"\x1b[201~").await;
+                    }
+                    ui.display.clear_bar().await?;
                     continue;
                 }
                 paste.observe_queued(read);
@@ -3252,23 +3297,30 @@ async fn update_paste_bar(ui: &AttachControlUi, paste: &PasteState) -> Result<()
         return Ok(());
     }
     let now = Instant::now();
+    let unicode = terminal_locale_supports_unicode();
+    let sep = if unicode { "·" } else { "|" };
+    let lead = if unicode { "▌" } else { "|" };
+    let arrow = if unicode { "›" } else { ">" };
     if !paste.should_show_detail(now) {
-        return Ok(());
+        return ui
+            .display
+            .set_bar(format!(
+                "{lead} Portl {arrow} {} {sep} Esc cancel paste",
+                ui.canonical_ref
+            ))
+            .await;
     }
     let pending = paste.pending_bytes();
-    let msg = if pending > 0 {
-        let unicode = terminal_locale_supports_unicode();
-        let sep = if unicode { "·" } else { "|" };
-        let lead = if unicode { "▌" } else { "|" };
-        let arrow = if unicode { "›" } else { ">" };
-        format!(
-            "{lead} Portl {arrow} {} {sep} pasting {} bytes {sep} Esc cancel",
-            ui.canonical_ref, pending
-        )
+    if pending > 0 {
+        ui.display
+            .set_bar(format!(
+                "{lead} Portl {arrow} {} {sep} pasting {pending} bytes {sep} Esc cancel",
+                ui.canonical_ref
+            ))
+            .await
     } else {
-        return ui.display.clear_bar().await;
-    };
-    ui.display.set_bar(msg).await
+        ui.display.clear_bar().await
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4078,6 +4130,24 @@ mod tests {
         assert_eq!(state.pending_bytes(), 32);
         assert_eq!(state.cancel_pending(), 32);
         assert_eq!(state.pending_bytes(), 0);
+        assert!(!state.is_active());
+    }
+
+    #[test]
+    fn paste_state_observe_queued_alone_does_not_activate() {
+        let mut state = PasteState::new(PasteConfig::for_test(16, Duration::from_secs(1)));
+        state.observe_queued(1024);
+        assert!(!state.is_active());
+        assert_eq!(state.pending_bytes(), 1024);
+    }
+
+    #[test]
+    fn paste_state_cancel_pending_deactivates() {
+        let mut state = PasteState::new(PasteConfig::for_test(16, Duration::from_secs(1)));
+        state.observe_read(32, Instant::now());
+        assert!(state.is_active());
+        state.cancel_pending();
+        assert!(!state.is_active());
     }
 
     #[test]
@@ -4087,6 +4157,24 @@ mod tests {
         assert_eq!(scanner.scan(b"~payload"), BracketedPasteEvent::Begin);
         assert!(scanner.in_bracketed_paste());
         assert_eq!(scanner.scan(b"more\x1b[201~"), BracketedPasteEvent::End);
+        assert!(!scanner.in_bracketed_paste());
+    }
+
+    #[test]
+    fn bracketed_paste_scanner_handles_begin_and_end_in_same_chunk() {
+        let mut scanner = BracketedPasteScanner::default();
+        // Both markers in one chunk — End comes after Begin, so net state is not-in-paste.
+        let event = scanner.scan(b"\x1b[200~content\x1b[201~");
+        assert_eq!(event, BracketedPasteEvent::End);
+        assert!(!scanner.in_bracketed_paste());
+    }
+
+    #[test]
+    fn bracketed_paste_scanner_force_end_clears_in_paste() {
+        let mut scanner = BracketedPasteScanner::default();
+        scanner.scan(b"\x1b[200~");
+        assert!(scanner.in_bracketed_paste());
+        scanner.force_end();
         assert!(!scanner.in_bracketed_paste());
     }
 }

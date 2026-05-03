@@ -481,10 +481,7 @@ mod tests {
             &output[..output.len().min(128)],
         );
 
-        let _ = kill(
-            Pid::from_raw(harness.child_pid),
-            Signal::SIGKILL,
-        );
+        let _ = kill(Pid::from_raw(harness.child_pid), Signal::SIGKILL);
         let _ = harness.task.await;
         let _ = harness.child_wait.await;
     }
@@ -578,7 +575,9 @@ mod tests {
         let mut pending = super::PendingPtyWrite::new(8);
 
         assert!(pending.push(b"12345678".to_vec()).is_ok());
-        let err = pending.push(b"9".to_vec()).expect_err("queue should be full");
+        let err = pending
+            .push(b"9".to_vec())
+            .expect_err("queue should be full");
         assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
         assert_eq!(pending.clear(), 8);
         assert!(pending.is_empty());
