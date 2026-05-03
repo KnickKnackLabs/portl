@@ -9,7 +9,10 @@ use portl_core::terminal::tmux_cc::{
     self, Decoder as TmuxCcDecoder, TmuxControlEvent, parse_control_line,
 };
 
-use crate::shell_handler::pty_master::{read_pty_chunk, set_nonblocking, write_pty_all};
+use crate::shell_handler::pty_master::{
+    DEFAULT_PTY_INPUT_QUEUE_BYTES, PendingPtyWrite, read_pty_chunk, set_nonblocking,
+    write_one_pending_pty_chunk, write_pty_all,
+};
 use crate::shell_registry::{PtyCommand, StdinMessage};
 
 const TMUX_CC_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -29,6 +32,7 @@ pub(crate) async fn pump_tmux_cc_pty(
     let mut line_buf = Vec::new();
     let mut drain_deadline = None;
     let mut pending_initial_commands = Some(initial_commands);
+    let mut pending_input = PendingPtyWrite::new(DEFAULT_PTY_INPUT_QUEUE_BYTES);
 
     loop {
         let drain_sleep = async {
@@ -48,7 +52,9 @@ pub(crate) async fn pump_tmux_cc_pty(
                             write_pty_all(&master, b"detach-client\n").await.context("detach tmux -CC client")?;
                             drain_deadline = Some(tokio::time::Instant::now() + TMUX_CC_DRAIN_TIMEOUT);
                         } else {
-                            write_pty_all(&master, &tmux_cc::send_keys_command(&data)).await.context("write tmux -CC input")?;
+                            pending_input
+                                .push(tmux_cc::send_keys_command(&data))
+                                .context("queue tmux -CC input")?;
                         }
                     }
                     StdinMessage::Close => {
@@ -70,6 +76,9 @@ pub(crate) async fn pump_tmux_cc_pty(
                         write_pty_all(&master, b"detach-client -a\n").await.context("detach other tmux -CC clients")?;
                     }
                 }
+            }
+            result = write_one_pending_pty_chunk(&master, &mut pending_input), if !pending_input.is_empty() && drain_deadline.is_none() => {
+                result.context("write queued tmux -CC input")?;
             }
             () = drain_sleep => return Ok(()),
             chunk = read_pty_chunk(&master, &mut read_buf) => {
@@ -195,6 +204,16 @@ mod tests {
         assert!(!is_ctrl_backslash_sequence(b"\x1b[92;7u"));
         assert!(!is_ctrl_backslash_sequence(b"\x1b[91;5u"));
         assert!(!is_ctrl_backslash_sequence(b"not-detach"));
+    }
+
+    #[test]
+    fn tmux_pending_input_queues_encoded_send_keys_command() {
+        let mut pending = PendingPtyWrite::new(1024);
+        pending
+            .push(tmux_cc::send_keys_command(b"hello"))
+            .expect("queue tmux command");
+        let queued = pending.front_chunk().expect("queued command");
+        assert!(String::from_utf8_lossy(queued).contains("send-keys"));
     }
 
     #[test]
