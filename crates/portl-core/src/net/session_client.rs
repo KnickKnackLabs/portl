@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 
 use crate::io::BufferedRecv;
@@ -13,6 +13,27 @@ use crate::wire::shell::{ExitFrame, PtyCfg, ResizeFrame, SignalFrame};
 
 const MAX_ACK_BYTES: usize = 256 * 1024;
 const MAX_EXIT_BYTES: usize = 1024;
+
+#[derive(Debug, thiserror::Error)]
+pub enum SessionOpenError {
+    #[error("{message}")]
+    Rejected {
+        reason: Option<SessionReason>,
+        message: String,
+    },
+    #[error(transparent)]
+    Transport(#[from] anyhow::Error),
+}
+
+impl SessionOpenError {
+    #[must_use]
+    pub fn reason(&self) -> Option<&SessionReason> {
+        match self {
+            Self::Rejected { reason, .. } => reason.as_ref(),
+            Self::Transport(_) => None,
+        }
+    }
+}
 
 pub struct SessionClient {
     pub provider: String,
@@ -131,7 +152,17 @@ pub async fn open_session_list_detailed(
     session: &PeerSession,
     provider: Option<String>,
 ) -> Result<Vec<SessionProviderSessions>> {
-    let ack = request_ack(
+    open_session_list_detailed_checked(connection, session, provider)
+        .await
+        .map_err(Into::into)
+}
+
+pub async fn open_session_list_detailed_checked(
+    connection: &Connection,
+    session: &PeerSession,
+    provider: Option<String>,
+) -> std::result::Result<Vec<SessionProviderSessions>, SessionOpenError> {
+    let ack = request_ack_checked(
         connection,
         session,
         req(SessionOp::List, provider, None, None),
@@ -139,6 +170,7 @@ pub async fn open_session_list_detailed(
     .await?;
     ack.session_groups
         .context("detailed session list response missing")
+        .map_err(Into::into)
 }
 
 pub async fn open_session_run(
@@ -198,6 +230,31 @@ pub async fn open_session_attach(
     cwd: Option<String>,
     pty: PtyCfg,
 ) -> Result<SessionClient> {
+    open_session_attach_checked(
+        connection,
+        session,
+        provider,
+        session_name,
+        argv,
+        user,
+        cwd,
+        pty,
+    )
+    .await
+    .map_err(Into::into)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn open_session_attach_checked(
+    connection: &Connection,
+    session: &PeerSession,
+    provider: Option<String>,
+    session_name: String,
+    argv: Option<Vec<String>>,
+    user: Option<String>,
+    cwd: Option<String>,
+    pty: PtyCfg,
+) -> std::result::Result<SessionClient, SessionOpenError> {
     let (mut control_send, control_recv) = connection
         .open_bi()
         .await
@@ -226,7 +283,7 @@ pub async fn open_session_attach(
         .read_frame(MAX_ACK_BYTES)
         .await?
         .context("missing session attach ack")?;
-    ensure_ok(&ack)?;
+    ensure_ok_open(&ack)?;
     let provider = ack.provider.clone().unwrap_or_else(|| "unknown".to_owned());
     let session_id = ack.session_id.context("session ack missing session id")?;
 
@@ -263,6 +320,16 @@ async fn request_ack(
     session: &PeerSession,
     body: SessionReqBody,
 ) -> Result<SessionAck> {
+    request_ack_checked(connection, session, body)
+        .await
+        .map_err(Into::into)
+}
+
+async fn request_ack_checked(
+    connection: &Connection,
+    session: &PeerSession,
+    body: SessionReqBody,
+) -> std::result::Result<SessionAck, SessionOpenError> {
     let (mut send, recv) = connection
         .open_bi()
         .await
@@ -282,7 +349,7 @@ async fn request_ack(
         .read_frame(MAX_ACK_BYTES)
         .await?
         .context("missing session ack")?;
-    ensure_ok(&ack)?;
+    ensure_ok_open(&ack)?;
     Ok(ack)
 }
 
@@ -303,11 +370,15 @@ fn req(
     }
 }
 
-fn ensure_ok(ack: &SessionAck) -> Result<()> {
+fn ensure_ok_open(ack: &SessionAck) -> std::result::Result<(), SessionOpenError> {
     if ack.ok {
         Ok(())
     } else {
-        bail!("{}", session_reason_message(ack.reason.as_ref()))
+        let reason = ack.reason.clone();
+        Err(SessionOpenError::Rejected {
+            message: session_reason_message(reason.as_ref()),
+            reason,
+        })
     }
 }
 
@@ -387,5 +458,36 @@ fn preamble(session: &PeerSession) -> StreamPreamble {
     StreamPreamble {
         peer_token: session.peer_token,
         alpn: String::from_utf8_lossy(ALPN_SESSION_V1).into_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attach_rejection_preserves_reason() {
+        let ack = SessionAck {
+            ok: false,
+            reason: Some(SessionReason::SessionNotFound("dev".to_owned())),
+            session_id: None,
+            provider: None,
+            providers: None,
+            sessions: None,
+            session_entries: None,
+            session_groups: None,
+            run: None,
+            output: None,
+        };
+
+        let err = ensure_ok_open(&ack).expect_err("expected typed rejection");
+        assert!(matches!(
+            err.reason(),
+            Some(SessionReason::SessionNotFound(name)) if name == "dev"
+        ));
+        assert_eq!(
+            err.to_string(),
+            "persistent session 'dev' was not found on the target"
+        );
     }
 }

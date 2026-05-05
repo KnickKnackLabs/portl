@@ -116,7 +116,15 @@ run_attach_once
 The first implementation should keep this CLI-owned. The target agent already
 keeps the persistent provider session alive independently of any single client
 connection, so the client can reattach by opening a new session attach with the
-same target, provider, session name, user, cwd, argv, and terminal size.
+same target, provider, session name, user, cwd, and terminal size.
+
+The initial attach may include `argv` to create/start a provider session. After
+the first successful attach, reconnect attempts must not silently recreate a
+killed provider session or rerun the initial `argv`. Until the protocol gains an
+attach-only flag, reconnect should preflight with existing list/detail APIs and
+stop if the provider/session is absent. Reconnect attempts should pass no `argv`
+unless a future provider-specific implementation proves that replaying `argv` is
+safe and idempotent.
 
 ## Attach lifecycle results
 
@@ -136,12 +144,20 @@ enum AttachEnd {
 `Disconnected` enters transparent resumption or visible reconnect depending on
 retry state.
 
+A decoded `ExitFrame` on the exit substream is the authoritative signal for a
+normal provider/session exit. stdout/stderr EOF by itself is not sufficient. If
+the exit substream closes, errors, or becomes unreadable before a clean
+`ExitFrame`, classify the attach attempt as `Disconnected` unless user detach is
+already known to be the cause. If a clean `ExitFrame` races with output stream
+errors during a bounded drain, the clean exit wins.
+
 Do not reconnect after:
 
 - user detach,
 - normal provider/session exit frame,
 - authorization or capability rejection,
 - provider not found/unavailable errors from `open_session_attach`,
+- provider/session absence detected on a reconnect preflight,
 - local non-interactive stdin EOF.
 
 Reconnect after:
@@ -189,12 +205,23 @@ Buffer only data the user produced while Portl was disconnected:
 
 Recommended stdin limit for the first slice: `256 KiB`.
 
+Input semantics are at-most-once for bytes written while a remote sink was
+connected. Bytes that were read locally and successfully handed to a QUIC
+`write_all` are not replayed after disconnect, because the client cannot know
+whether the agent or provider already consumed them. Buffer only bytes read after
+the attach runner has entered a disconnected state. This means the final
+in-flight keystroke or chunk at the exact drop boundary may be lost in the first
+slice; avoiding duplicates is safer than replaying possibly executed terminal
+input.
+
 When the buffer reaches the limit:
 
 - transition to visible reconnect state,
-- stop reading additional local stdin until reattached or detached,
-- show the buffered byte count in the bar,
-- do not silently drop bytes.
+- enter an input-paused/control-only mode rather than silently dropping more
+  bytes,
+- keep reading enough local input to recognize `Enter`, `d`, and `Ctrl-C`,
+- avoid consuming arbitrary large paste data solely to detect controls,
+- show the buffered byte count in the bar.
 
 Resize events should be coalesced. Only send the latest known dimensions after
 reattach.
@@ -202,6 +229,20 @@ reattach.
 Large paste remains bounded by the same buffer. A future enhancement may add a
 paste-specific larger limit or explicit paste-spooling policy, but the first
 slice should avoid unbounded memory growth.
+
+The reconnect runner should own one persistent input coordinator rather than
+spawning a fresh stdin task for each attach attempt. That coordinator owns local
+stdin reading, paste/bracketed-paste scanning, connected passthrough,
+disconnected buffering, reconnect controls, buffer-full behavior, and resize
+coalescing. Individual attach attempts register and unregister the current
+remote sink with this coordinator.
+
+Bracketed-paste and multi-byte escape state can straddle disconnect boundaries.
+The first slice should preserve local scanner state and avoid inventing delivery
+acknowledgements. If a disconnect occurs after some paste bytes were already
+written to the old sink, those bytes follow the at-most-once policy above. Bytes
+read after disconnected state are buffered and flushed on reattach in their
+original order.
 
 ## Backoff policy
 
@@ -212,7 +253,8 @@ Recommended defaults:
 - base delay: `500ms`,
 - maximum delay: `10s`,
 - maximum reconnect elapsed time: `2m`,
-- jitter: full jitter in `[0, capped_delay]`,
+- jitter: full jitter in `[0, capped_delay]` with a small post-transparent floor
+  such as `100ms`,
 - reset attempt count after a successful attach lasts at least `30s`.
 
 The visible backoff wait races:
@@ -241,7 +283,15 @@ Priority between bars:
 
 When disconnected, no bytes should be sent to the remote sink because there is no
 live sink. Local keys are either buffered input during transparent resumption or
-interpreted as reconnect controls once the visible bar is active.
+interpreted as reconnect controls once the visible bar is active. The state
+transition must be strict: bytes already accepted into the transparent buffer
+remain buffered terminal input, and bytes read after the visible reconnect state
+is active are reconnect controls only.
+
+Clear the reconnect bar before admitting large post-reattach output, or bound the
+amount of stdout/stderr that `AttachDisplay` may hold while a reconnect/success
+bar is visible. A cosmetic success state must not hold a large viewport snapshot
+or live-output burst behind the bar.
 
 ## Error handling
 
@@ -263,9 +313,16 @@ retrying and print the provider error. That means the persistent session may hav
 been killed or the provider state changed; retrying the same request is unlikely
 to help.
 
+`open_session_attach` must expose typed rejection reasons to reconnect policy.
+The CLI may keep user-facing string errors for display, but retry/no-retry
+classification should consume `SessionReason` or a typed client error enum rather
+than parsing formatted error text.
+
 ## Configuration surface
 
-Automatic reconnect is enabled by default for remote `portl session attach`.
+Automatic reconnect is enabled by default for interactive remote
+`portl session attach`. Non-interactive stdin EOF should retain fail-fast/current
+semantics unless a future batch-oriented reconnect mode is explicitly designed.
 
 The first implementation should prefer constants over a large CLI surface. If a
 small override is needed, add only these controls:
@@ -316,3 +373,21 @@ Manual smoke tests:
 5. Add integration tests and manual smoke coverage.
 
 This order keeps each step testable while preserving the approved final UX.
+
+## Review amendments accepted
+
+The implementation plan must include these roundtable-review constraints:
+
+1. Preserve typed attach rejection reasons for retry classification.
+2. Use clean `ExitFrame` receipt as the normal-exit discriminator.
+3. Avoid session recreation and `argv` replay on reconnect attempts.
+4. Use at-most-once semantics for in-flight connected stdin.
+5. Move stdin, paste scanning, reconnect controls, buffering, and resize
+   coalescing into one reconnect-owned input coordinator.
+6. Keep buffer-full mode control-capable without silently dropping arbitrary
+   input.
+7. Clear or bound status-bar output holding around reattach success.
+8. Prefer reusing the client endpoint across reconnect attempts where practical,
+   and avoid busy retry loops.
+9. Test exit/disconnect race precedence, detach precedence, retry-now controls,
+   and buffer/backpressure behavior.

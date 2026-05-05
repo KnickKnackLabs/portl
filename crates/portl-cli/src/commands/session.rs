@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::future::Future;
 use std::io::IsTerminal;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -18,8 +19,9 @@ use portl_core::attach_control::{
 };
 use portl_core::io::BufferedRecv;
 use portl_core::net::{
-    SessionClient, open_session_attach, open_session_history, open_session_kill,
-    open_session_list_detailed, open_session_providers, open_session_run,
+    SessionClient, SessionOpenError, open_session_attach, open_session_attach_checked,
+    open_session_history, open_session_kill, open_session_list_detailed,
+    open_session_list_detailed_checked, open_session_providers, open_session_run,
 };
 use portl_core::terminal::{tmux_cc, zmx_control};
 use portl_core::ticket::schema::{Capabilities, EnvPolicy, ShellCaps};
@@ -28,19 +30,24 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
 use tracing::debug;
 
-use crate::commands::peer_resolve::{close_connected, connect_peer, connect_peer_quiet};
+use crate::commands::peer_resolve::{
+    bind_client_endpoint, close_client_endpoint, close_connected, connect_peer, connect_peer_quiet,
+    connect_peer_with_endpoint, resolve_identity_path,
+};
 use crate::commands::session_share::{
     BuiltEnvelope, EnvelopeInputs, ResolveTargetError, ShareTargetForm,
     build_session_share_envelope, classify_share_target, fresh_workspace_handles, load_identity,
     resolve_rendezvous_url, run_offer_against_transport, unix_now,
 };
+use portl_core::id::store as identity_store;
 use portl_core::peer_store::PeerStore;
 use portl_core::rendezvous::ws::WsRendezvousBackend;
 use portl_core::ticket_store::TicketStore;
 use portl_proto::session_v1::{
     ProviderCapabilities, ProviderReport, ProviderStatus, SessionInfo, SessionProviderSessions,
 };
-use tokio::sync::mpsc;
+use rand::Rng;
+use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SessionHistoryFormat {
@@ -549,8 +556,7 @@ pub fn share(
                     .await
                 }
             };
-            crate::commands::peer_resolve::close_client_endpoint(client_endpoint, "share resolve")
-                .await;
+            close_client_endpoint(client_endpoint, "share resolve").await;
             let (target_addr, _provenance) = resolved_addr?;
             target_addr
         } else {
@@ -1695,36 +1701,23 @@ pub fn attach(
             .await;
         }
 
-        let connected = connect_peer(&resolved.target, session_caps()).await?;
         let (cols, rows) = size().unwrap_or((80, 24));
-        let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_owned());
-        if let Some(provider) = provider_name.as_deref() {
-            eprintln!(
-                "portl: attaching to session \"{}\"",
-                canonical_session_ref(&resolved.target, provider, &session_name)
-            );
+        let request = RemoteSessionAttachRequest {
+            target: resolved.target,
+            provider: provider_name,
+            session_name,
+            user: user.map(ToOwned::to_owned),
+            cwd: cwd.map(ToOwned::to_owned),
+            argv: argv.to_vec(),
+            term: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_owned()),
+            cols,
+            rows,
+        };
+        if session_reconnect_enabled() && std::io::stdin().is_terminal() {
+            remote_session_attach_with_reconnect(request).await
         } else {
-            eprintln!(
-                "portl: attaching to session \"{}\"",
-                target_session_ref(&resolved.target, &session_name)
-            );
+            remote_session_attach_once_without_reconnect(request).await
         }
-        let session = open_session_attach(
-            &connected.connection,
-            &connected.session,
-            provider_name,
-            session_name.clone(),
-            (!argv.is_empty()).then_some(argv.to_vec()),
-            user.map(ToOwned::to_owned),
-            cwd.map(ToOwned::to_owned),
-            portl_core::net::shell_client::PtyCfg { term, cols, rows },
-        )
-        .await?;
-        let provider = session.provider.clone();
-        let canonical_ref = canonical_session_ref(&resolved.target, &provider, &session_name);
-        let code = bridge_attach(session, cols, rows, canonical_ref).await?;
-        close_connected(connected, b"session complete").await;
-        Ok(exit_code_from_i32(code))
     });
     runtime.shutdown_background();
     result
@@ -2219,6 +2212,222 @@ fn canonical_target_label(target: &str) -> &str {
     target.split_once('/').map_or(target, |(host, _)| host)
 }
 
+#[derive(Debug, Clone)]
+struct RemoteSessionAttachRequest {
+    target: String,
+    provider: Option<String>,
+    session_name: String,
+    user: Option<String>,
+    cwd: Option<String>,
+    argv: Vec<String>,
+    term: String,
+    cols: u16,
+    rows: u16,
+}
+
+fn session_reconnect_enabled() -> bool {
+    std::env::var("PORTL_SESSION_RECONNECT").map_or(true, |value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        )
+    })
+}
+
+async fn remote_session_attach_once_without_reconnect(
+    request: RemoteSessionAttachRequest,
+) -> Result<ExitCode> {
+    let connected = connect_peer(&request.target, session_caps()).await?;
+    print_remote_attach_start(&request, request.provider.as_deref());
+    let session = open_session_attach(
+        &connected.connection,
+        &connected.session,
+        request.provider.clone(),
+        request.session_name.clone(),
+        (!request.argv.is_empty()).then_some(request.argv.clone()),
+        request.user.clone(),
+        request.cwd.clone(),
+        portl_core::net::shell_client::PtyCfg {
+            term: request.term.clone(),
+            cols: request.cols,
+            rows: request.rows,
+        },
+    )
+    .await?;
+    let provider = session.provider.clone();
+    let canonical_ref = canonical_session_ref(&request.target, &provider, &request.session_name);
+    let code = bridge_attach(session, request.cols, request.rows, canonical_ref).await?;
+    close_connected(connected, b"session complete").await;
+    Ok(exit_code_from_i32(code))
+}
+
+async fn remote_session_attach_with_reconnect(
+    request: RemoteSessionAttachRequest,
+) -> Result<ExitCode> {
+    let identity_path = resolve_identity_path(None);
+    let identity = identity_store::load(&identity_path).context("load local identity")?;
+    let endpoint = bind_client_endpoint(&identity).await?;
+    let result =
+        remote_session_attach_with_reconnect_on_endpoint(request, &identity, &endpoint).await;
+    close_client_endpoint(endpoint, "session reconnect").await;
+    result
+}
+
+#[allow(clippy::too_many_lines)]
+async fn remote_session_attach_with_reconnect_on_endpoint(
+    request: RemoteSessionAttachRequest,
+    identity: &portl_core::id::Identity,
+    endpoint: &iroh::Endpoint,
+) -> Result<ExitCode> {
+    print_remote_attach_start(&request, request.provider.as_deref());
+    let mut connected =
+        connect_peer_with_endpoint(&request.target, session_caps(), identity, endpoint, false)
+            .await?;
+    let mut session = open_session_attach_checked(
+        &connected.connection,
+        &connected.session,
+        request.provider.clone(),
+        request.session_name.clone(),
+        (!request.argv.is_empty()).then_some(request.argv.clone()),
+        request.user.clone(),
+        request.cwd.clone(),
+        portl_core::net::shell_client::PtyCfg {
+            term: request.term.clone(),
+            cols: request.cols,
+            rows: request.rows,
+        },
+    )
+    .await?;
+    let provider = session.provider.clone();
+    let canonical_ref = canonical_session_ref(&request.target, &provider, &request.session_name);
+    let raw_guard = RawModeGuard::new()?;
+    let display = AttachDisplay::new(request.cols, request.rows);
+    let mut coordinator = AttachInputCoordinator::spawn(
+        AttachControlUi {
+            canonical_ref: canonical_ref.clone(),
+            supports_kick_others: provider == "tmux",
+            display: display.clone(),
+        },
+        (request.cols, request.rows),
+    );
+
+    let mut reconnect_state = ReconnectAttemptState::new();
+    let mut attach_started = Instant::now();
+    loop {
+        match run_remote_attach_once(session, &display, &mut coordinator).await {
+            AttachEnd::Exited(code) => {
+                display.clear_bar().await?;
+                coordinator.stop().await;
+                drop(raw_guard);
+                connected.connection.close(0u32.into(), b"session complete");
+                return Ok(exit_code_from_i32(code));
+            }
+            AttachEnd::Detached => {
+                display.clear_bar().await?;
+                coordinator.stop().await;
+                drop(raw_guard);
+                connected.connection.close(0u32.into(), b"session detached");
+                print_detached_message(&canonical_ref);
+                return Ok(ExitCode::SUCCESS);
+            }
+            AttachEnd::QuitReconnect => {
+                display.clear_bar().await?;
+                coordinator.stop().await;
+                drop(raw_guard);
+                connected
+                    .connection
+                    .close(0u32.into(), b"session reconnect quit");
+                print_reconnect_quit_message(&canonical_ref);
+                return Ok(ExitCode::SUCCESS);
+            }
+            AttachEnd::Disconnected(err) => {
+                debug!(%err, "remote session attach disconnected");
+                connected
+                    .connection
+                    .close(0u32.into(), b"session disconnected");
+                if attach_started.elapsed() >= Duration::from_secs(30) {
+                    reconnect_state = ReconnectAttemptState::new();
+                }
+                let reattached = reconnect_remote_session(
+                    &request,
+                    &provider,
+                    identity,
+                    endpoint,
+                    &display,
+                    &canonical_ref,
+                    &mut coordinator,
+                    &mut reconnect_state,
+                )
+                .await?;
+                match reattached {
+                    ReconnectOutcome::Reattached {
+                        connected: next_connected,
+                        session: next_session,
+                    } => {
+                        connected = *next_connected;
+                        session = *next_session;
+                        attach_started = Instant::now();
+                    }
+                    ReconnectOutcome::Detached => {
+                        display.clear_bar().await?;
+                        coordinator.stop().await;
+                        drop(raw_guard);
+                        print_detached_message(&canonical_ref);
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    ReconnectOutcome::Quit => {
+                        display.clear_bar().await?;
+                        coordinator.stop().await;
+                        drop(raw_guard);
+                        print_reconnect_quit_message(&canonical_ref);
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    ReconnectOutcome::Expired => {
+                        display.clear_bar().await?;
+                        coordinator.stop().await;
+                        drop(raw_guard);
+                        eprintln!(
+                            "portl: could not reconnect to session \"{canonical_ref}\" after 2m"
+                        );
+                        eprintln!();
+                        eprintln!("The session may still be running. To reconnect, run:");
+                        eprintln!("  portl attach {canonical_ref}");
+                        return Ok(ExitCode::from(1));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn print_remote_attach_start(request: &RemoteSessionAttachRequest, provider: Option<&str>) {
+    if let Some(provider) = provider {
+        eprintln!(
+            "portl: attaching to session \"{}\"",
+            canonical_session_ref(&request.target, provider, &request.session_name)
+        );
+    } else {
+        eprintln!(
+            "portl: attaching to session \"{}\"",
+            target_session_ref(&request.target, &request.session_name)
+        );
+    }
+}
+
+fn print_detached_message(canonical_ref: &str) {
+    eprintln!("portl: detached from session \"{canonical_ref}\"");
+    eprintln!();
+    eprintln!("The session is still running. To reconnect, run:");
+    eprintln!("  portl attach {canonical_ref}");
+}
+
+fn print_reconnect_quit_message(canonical_ref: &str) {
+    eprintln!("portl: stopped reconnecting to session \"{canonical_ref}\"");
+    eprintln!();
+    eprintln!("The session is still running. To reconnect, run:");
+    eprintln!("  portl attach {canonical_ref}");
+}
+
 async fn bridge_attach(
     session: SessionClient,
     cols: u16,
@@ -2295,6 +2504,351 @@ async fn bridge_attach(
         drop(raw_guard);
     }
     Ok(code)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReconnectAttemptState {
+    started: Instant,
+    attempt: u32,
+}
+
+impl ReconnectAttemptState {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            attempt: 0,
+        }
+    }
+
+    fn next_attempt(&mut self) -> u32 {
+        self.attempt = self.attempt.saturating_add(1);
+        self.attempt
+    }
+}
+
+enum ReconnectOutcome {
+    Reattached {
+        connected: Box<crate::commands::peer_resolve::ConnectedPeer>,
+        session: Box<SessionClient>,
+    },
+    Detached,
+    Quit,
+    Expired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconnectDelayOutcome {
+    Retry,
+    Detached,
+    Quit,
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn reconnect_remote_session(
+    request: &RemoteSessionAttachRequest,
+    provider: &str,
+    identity: &portl_core::id::Identity,
+    endpoint: &iroh::Endpoint,
+    display: &AttachDisplay,
+    canonical_ref: &str,
+    coordinator: &mut AttachInputCoordinator,
+    state: &mut ReconnectAttemptState,
+) -> Result<ReconnectOutcome> {
+    const TRANSPARENT_GRACE: Duration = Duration::from_millis(1500);
+    let policy = ReconnectPolicy::default_interactive();
+    loop {
+        let attempt = state.next_attempt();
+        if !policy.retry_budget_remaining(state.started.elapsed()) {
+            return Ok(ReconnectOutcome::Expired);
+        }
+        let visible = state.started.elapsed() >= TRANSPARENT_GRACE;
+        let delay = reconnect_attempt_delay(attempt, &policy);
+        match wait_reconnect_delay(delay, visible, attempt, canonical_ref, display, coordinator)
+            .await?
+        {
+            ReconnectDelayOutcome::Retry => {}
+            ReconnectDelayOutcome::Detached => return Ok(ReconnectOutcome::Detached),
+            ReconnectDelayOutcome::Quit => return Ok(ReconnectOutcome::Quit),
+        }
+        if visible {
+            if !coordinator.set_reconnect_visible(true).await? {
+                return Ok(ReconnectOutcome::Quit);
+            }
+            display
+                .set_bar(format!(
+                    "▌ Portl › {canonical_ref} · reconnecting now · d detach · Ctrl-C quit"
+                ))
+                .await?;
+        }
+        let connected = match connect_peer_with_endpoint(
+            &request.target,
+            session_caps(),
+            identity,
+            endpoint,
+            true,
+        )
+        .await
+        {
+            Ok(connected) => connected,
+            Err(err) => {
+                debug!(%err, attempt, "session reconnect connect failed");
+                continue;
+            }
+        };
+        let groups = match open_session_list_detailed_checked(
+            &connected.connection,
+            &connected.session,
+            Some(provider.to_owned()),
+        )
+        .await
+        {
+            Ok(groups) => groups,
+            Err(err @ SessionOpenError::Rejected { .. }) => return Err(anyhow::Error::from(err)),
+            Err(SessionOpenError::Transport(err)) => {
+                debug!(%err, attempt, "session reconnect preflight failed");
+                connected
+                    .connection
+                    .close(0u32.into(), b"session reconnect preflight failed");
+                continue;
+            }
+        };
+        if !session_exists_for_reconnect(&groups, provider, &request.session_name) {
+            connected
+                .connection
+                .close(0u32.into(), b"session disappeared during reconnect");
+            anyhow::bail!(
+                "persistent session '{}' was not found on the target",
+                request.session_name
+            );
+        }
+        match open_session_attach_checked(
+            &connected.connection,
+            &connected.session,
+            Some(provider.to_owned()),
+            request.session_name.clone(),
+            None,
+            request.user.clone(),
+            request.cwd.clone(),
+            portl_core::net::shell_client::PtyCfg {
+                term: request.term.clone(),
+                cols: request.cols,
+                rows: request.rows,
+            },
+        )
+        .await
+        {
+            Ok(session) => {
+                if visible {
+                    display
+                        .set_bar(format!("▌ Portl › {canonical_ref} · reattached"))
+                        .await?;
+                }
+                return Ok(ReconnectOutcome::Reattached {
+                    connected: Box::new(connected),
+                    session: Box::new(session),
+                });
+            }
+            Err(err @ SessionOpenError::Rejected { .. }) => return Err(anyhow::Error::from(err)),
+            Err(SessionOpenError::Transport(err)) => {
+                debug!(%err, attempt, "session reconnect attach failed");
+                connected
+                    .connection
+                    .close(0u32.into(), b"session reconnect attach failed");
+            }
+        }
+    }
+}
+
+fn reconnect_attempt_delay(attempt: u32, policy: &ReconnectPolicy) -> Duration {
+    match attempt {
+        1 => Duration::ZERO,
+        2 => random_duration_between(Duration::from_millis(150), Duration::from_millis(300)),
+        _ => {
+            let capped = policy
+                .base_delay
+                .saturating_mul(1_u32 << attempt.saturating_sub(3).min(12))
+                .min(policy.max_delay);
+            // Apply jitter first, then reuse the visible-delay floor/cap logic so
+            // transparent retries stay fast while visible retries never spin.
+            policy.visible_delay(
+                attempt.saturating_sub(2),
+                random_duration_between(Duration::ZERO, capped),
+            )
+        }
+    }
+}
+
+fn random_duration_between(min: Duration, max: Duration) -> Duration {
+    if max <= min {
+        return min;
+    }
+    let min_ms = u64::try_from(min.as_millis()).unwrap_or(u64::MAX);
+    let max_ms = u64::try_from(max.as_millis()).unwrap_or(u64::MAX);
+    Duration::from_millis(rand::thread_rng().gen_range(min_ms..=max_ms))
+}
+
+async fn wait_reconnect_delay(
+    delay: Duration,
+    visible: bool,
+    attempt: u32,
+    canonical_ref: &str,
+    display: &AttachDisplay,
+    coordinator: &mut AttachInputCoordinator,
+) -> Result<ReconnectDelayOutcome> {
+    if delay.is_zero() {
+        return Ok(ReconnectDelayOutcome::Retry);
+    }
+    if visible {
+        if !coordinator.set_reconnect_visible(true).await? {
+            return Ok(ReconnectDelayOutcome::Quit);
+        }
+        display
+            .set_bar(format!(
+                "▌ Portl › {canonical_ref} · disconnected · retry {attempt} in {:.1}s · Enter retry now · d detach · Ctrl-C quit",
+                delay.as_secs_f32()
+            ))
+            .await?;
+    } else if !coordinator.set_reconnect_visible(false).await? {
+        return Ok(ReconnectDelayOutcome::Quit);
+    }
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            () = &mut sleep => return Ok(ReconnectDelayOutcome::Retry),
+            event = coordinator.next_event() => {
+                match event {
+                    Some(AttachInputEvent::RetryNow) => return Ok(ReconnectDelayOutcome::Retry),
+                    Some(AttachInputEvent::Detached) => return Ok(ReconnectDelayOutcome::Detached),
+                    Some(AttachInputEvent::QuitReconnect | AttachInputEvent::Closed) | None => return Ok(ReconnectDelayOutcome::Quit),
+                    Some(AttachInputEvent::BufferFull) => {
+                        if !coordinator.set_reconnect_visible(true).await? {
+                            return Ok(ReconnectDelayOutcome::Quit);
+                        }
+                        display
+                            .set_bar(format!(
+                                "▌ Portl › {canonical_ref} · disconnected · input buffer full · Enter retry now · d detach · Ctrl-C quit"
+                            ))
+                            .await?;
+                    }
+                    Some(AttachInputEvent::SinkFailed(err)) => {
+                        debug!(%err, "ignored stale sink failure during reconnect backoff");
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn run_remote_attach_once(
+    session: SessionClient,
+    display: &AttachDisplay,
+    coordinator: &mut AttachInputCoordinator,
+) -> AttachEnd {
+    if let Some(end) = coordinator.drain_before_attach() {
+        return end;
+    }
+    let SessionClient {
+        provider: _,
+        control_send: _control_send,
+        control_recv: _control_recv,
+        stdin,
+        stdout: mut stdout_recv,
+        stderr: mut stderr_recv,
+        mut exit,
+        signal: _signal,
+        resize,
+        control,
+    } = session;
+    if let Err(err) = coordinator
+        .set_sink(AttachInputSink {
+            kind: AttachInputSinkKind::Remote {
+                send: stdin,
+                resize,
+                control,
+            },
+        })
+        .await
+    {
+        return AttachEnd::Disconnected(err);
+    }
+    if let Err(err) = display.clear_bar().await {
+        return AttachEnd::Disconnected(err);
+    }
+    let stdout_display = display.clone();
+    let mut stdout_task = tokio::spawn(async move {
+        copy_remote_output(
+            &mut stdout_recv,
+            &stdout_display,
+            AttachOutputStream::Stdout,
+        )
+        .await
+    });
+    let stderr_display = display.clone();
+    let mut stderr_task = tokio::spawn(async move {
+        copy_remote_output(
+            &mut stderr_recv,
+            &stderr_display,
+            AttachOutputStream::Stderr,
+        )
+        .await
+    });
+    let mut exit_fut = Box::pin(read_exit(&mut exit));
+    let end = loop {
+        tokio::select! {
+            code = &mut exit_fut => {
+                break match code {
+                    Ok(code) => AttachEnd::Exited(code),
+                    Err(err) => AttachEnd::Disconnected(err),
+                };
+            }
+            event = coordinator.next_event() => {
+                break match event {
+                    Some(AttachInputEvent::Detached) => AttachEnd::Detached,
+                    Some(AttachInputEvent::QuitReconnect) => AttachEnd::QuitReconnect,
+                    Some(AttachInputEvent::Closed) => {
+                        match tokio::time::timeout(Duration::from_millis(500), &mut exit_fut).await {
+                            Ok(Ok(code)) => AttachEnd::Exited(code),
+                            Ok(Err(err)) => AttachEnd::Disconnected(err),
+                            Err(_) => AttachEnd::Disconnected(anyhow!("local stdin closed before exit frame")),
+                        }
+                    }
+                    Some(AttachInputEvent::SinkFailed(err)) => AttachEnd::Disconnected(err),
+                    Some(AttachInputEvent::RetryNow | AttachInputEvent::BufferFull) => continue,
+                    None => AttachEnd::Disconnected(anyhow!("attach input coordinator stopped")),
+                };
+            }
+            stdout = &mut stdout_task => {
+                let stdout = stdout.context("join stdout task").and_then(|result| result);
+                break output_task_end_to_attach_end(stdout, "stdout", &mut exit_fut).await;
+            }
+            stderr = &mut stderr_task => {
+                let stderr = stderr.context("join stderr task").and_then(|result| result);
+                break output_task_end_to_attach_end(stderr, "stderr", &mut exit_fut).await;
+            }
+        }
+    };
+    stdout_task.abort();
+    stderr_task.abort();
+    let _ = coordinator.clear_sink().await;
+    end
+}
+
+async fn output_task_end_to_attach_end(
+    output: Result<()>,
+    stream_name: &str,
+    exit_fut: &mut std::pin::Pin<Box<impl Future<Output = Result<i32>> + '_>>,
+) -> AttachEnd {
+    match tokio::time::timeout(Duration::from_secs(2), exit_fut).await {
+        Ok(Ok(code)) => AttachEnd::Exited(code),
+        Ok(Err(err)) => AttachEnd::Disconnected(err),
+        Err(_) => match output {
+            Ok(()) => {
+                AttachEnd::Disconnected(anyhow!("{stream_name} stream ended before exit frame"))
+            }
+            Err(err) => AttachEnd::Disconnected(err),
+        },
+    }
 }
 
 async fn reap_local_child_after_detach(child: &mut Child) {
@@ -2454,6 +3008,521 @@ impl Drop for RawModeGuard {
 enum AttachOutputStream {
     Stdout,
     Stderr,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReconnectPolicy {
+    base_delay: Duration,
+    max_delay: Duration,
+    max_elapsed: Duration,
+    delay_floor: Duration,
+}
+
+impl ReconnectPolicy {
+    fn default_interactive() -> Self {
+        Self {
+            base_delay: Duration::from_millis(500),
+            max_delay: Duration::from_secs(10),
+            max_elapsed: Duration::from_mins(2),
+            delay_floor: Duration::from_millis(100),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(
+        base_delay: Duration,
+        max_delay: Duration,
+        max_elapsed: Duration,
+        delay_floor: Duration,
+    ) -> Self {
+        Self {
+            base_delay,
+            max_delay,
+            max_elapsed,
+            delay_floor,
+        }
+    }
+
+    fn visible_delay(&self, attempt: u32, jitter: Duration) -> Duration {
+        let multiplier = 1_u32
+            .checked_shl(attempt.saturating_sub(1).min(16))
+            .unwrap_or(1);
+        let capped = self
+            .base_delay
+            .saturating_mul(multiplier)
+            .min(self.max_delay);
+        jitter.min(capped).max(self.delay_floor).min(self.max_delay)
+    }
+
+    fn retry_budget_remaining(&self, elapsed: Duration) -> bool {
+        elapsed < self.max_elapsed
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconnectControl {
+    RetryNow,
+    Detach,
+    Quit,
+}
+
+impl ReconnectControl {
+    fn from_visible_input(input: &[u8]) -> Option<Self> {
+        if input.contains(&0x03) {
+            return Some(Self::Quit);
+        }
+        if input.contains(&b'\r') || input.contains(&b'\n') {
+            return Some(Self::RetryNow);
+        }
+        (input == b"d").then_some(Self::Detach)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconnectBufferPush {
+    Accepted,
+    Full,
+}
+
+#[derive(Debug, Clone)]
+struct ReconnectInputBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl ReconnectInputBuffer {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> ReconnectBufferPush {
+        let remaining = self.limit.saturating_sub(self.bytes.len());
+        if bytes.len() > remaining {
+            self.bytes.extend_from_slice(&bytes[..remaining]);
+            return ReconnectBufferPush::Full;
+        }
+        self.bytes.extend_from_slice(bytes);
+        ReconnectBufferPush::Accepted
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn is_full(&self) -> bool {
+        self.bytes.len() >= self.limit
+    }
+
+    fn take(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.bytes)
+    }
+}
+
+fn session_exists_for_reconnect(
+    groups: &[SessionProviderSessions],
+    provider: &str,
+    session_name: &str,
+) -> bool {
+    let lookup = if provider == "tmux" {
+        session_name
+            .split_once(':')
+            .map_or(session_name, |(name, _)| name)
+    } else {
+        session_name
+    };
+    groups
+        .iter()
+        .filter(|group| group.available && group.provider == provider)
+        .any(|group| group.sessions.iter().any(|session| session.name == lookup))
+}
+
+#[derive(Debug)]
+enum AttachEnd {
+    Exited(i32),
+    Detached,
+    QuitReconnect,
+    Disconnected(anyhow::Error),
+}
+
+enum AttachInputCommand {
+    SetSink {
+        sink: AttachInputSink,
+        ack: oneshot::Sender<Result<()>>,
+    },
+    ClearSink {
+        ack: oneshot::Sender<Result<()>>,
+    },
+    SetReconnectVisible {
+        visible: bool,
+        ack: oneshot::Sender<Result<()>>,
+    },
+    Stop,
+}
+
+#[derive(Debug)]
+enum AttachInputEvent {
+    Closed,
+    Detached,
+    QuitReconnect,
+    RetryNow,
+    BufferFull,
+    SinkFailed(anyhow::Error),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AttachInputMode {
+    Connected,
+    Disconnected { visible: bool },
+}
+
+struct AttachInputCoordinator {
+    tx: mpsc::Sender<AttachInputCommand>,
+    rx: mpsc::Receiver<AttachInputEvent>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl AttachInputCoordinator {
+    fn spawn(ui: AttachControlUi, initial_size: (u16, u16)) -> Self {
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (event_tx, event_rx) = mpsc::channel(16);
+        let handle = tokio::spawn(async move {
+            if let Err(err) = Box::pin(attach_input_coordinator_loop(
+                cmd_rx,
+                event_tx,
+                ui,
+                initial_size,
+            ))
+            .await
+            {
+                debug!(%err, "attach input coordinator stopped");
+            }
+        });
+        Self {
+            tx: cmd_tx,
+            rx: event_rx,
+            handle,
+        }
+    }
+
+    async fn set_sink(&self, sink: AttachInputSink) -> Result<()> {
+        let (ack, done) = oneshot::channel();
+        self.tx
+            .send(AttachInputCommand::SetSink { sink, ack })
+            .await
+            .map_err(|_| anyhow!("attach input coordinator closed"))?;
+        done.await
+            .map_err(|_| anyhow!("attach input coordinator closed"))?
+    }
+
+    async fn clear_sink(&self) -> Result<()> {
+        let (ack, done) = oneshot::channel();
+        self.tx
+            .send(AttachInputCommand::ClearSink { ack })
+            .await
+            .map_err(|_| anyhow!("attach input coordinator closed"))?;
+        done.await
+            .map_err(|_| anyhow!("attach input coordinator closed"))?
+    }
+
+    async fn set_reconnect_visible(&self, visible: bool) -> Result<bool> {
+        let (ack, done) = oneshot::channel();
+        if self
+            .tx
+            .send(AttachInputCommand::SetReconnectVisible { visible, ack })
+            .await
+            .is_err()
+        {
+            return Ok(false);
+        }
+        match done.await {
+            Ok(Ok(())) => Ok(true),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Ok(false),
+        }
+    }
+
+    async fn next_event(&mut self) -> Option<AttachInputEvent> {
+        self.rx.recv().await
+    }
+
+    fn drain_before_attach(&mut self) -> Option<AttachEnd> {
+        loop {
+            match self.rx.try_recv() {
+                Ok(AttachInputEvent::SinkFailed(err)) => {
+                    debug!(%err, "drained stale sink failure before attach");
+                }
+                Ok(AttachInputEvent::RetryNow | AttachInputEvent::BufferFull) => {}
+                Ok(AttachInputEvent::Detached) => return Some(AttachEnd::Detached),
+                Ok(AttachInputEvent::QuitReconnect | AttachInputEvent::Closed) => {
+                    return Some(AttachEnd::QuitReconnect);
+                }
+                Err(mpsc::error::TryRecvError::Empty) => return None,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    return Some(AttachEnd::Disconnected(anyhow!(
+                        "attach input coordinator stopped"
+                    )));
+                }
+            }
+        }
+    }
+
+    async fn stop(self) {
+        let _ = self.tx.send(AttachInputCommand::Stop).await;
+        let _ = self.handle.await;
+    }
+}
+
+async fn attach_input_coordinator_loop(
+    mut cmd_rx: mpsc::Receiver<AttachInputCommand>,
+    event_tx: mpsc::Sender<AttachInputEvent>,
+    ui: AttachControlUi,
+    initial_size: (u16, u16),
+) -> Result<()> {
+    let mut stdin_src = tokio::io::stdin();
+    let mut sink: Option<AttachInputSink> = None;
+    let mut mode = AttachInputMode::Disconnected { visible: false };
+    let mut buffer = ReconnectInputBuffer::new(256 * 1024);
+    let mut last_size = initial_size;
+    let mut pending_size = Some(initial_size);
+    let mut paste = PasteState::new(PasteConfig::default());
+    let mut bracketed = BracketedPasteScanner::default();
+    let mut read_buf = [0_u8; 8192];
+
+    loop {
+        let read_limit = match mode {
+            AttachInputMode::Connected | AttachInputMode::Disconnected { visible: false } => {
+                read_buf.len()
+            }
+            AttachInputMode::Disconnected { visible: true } => 1,
+        };
+        tokio::select! {
+            command = cmd_rx.recv() => {
+                let Some(command) = command else { return Ok(()); };
+                if handle_attach_input_command(
+                    command,
+                    &mut sink,
+                    &mut mode,
+                    &mut buffer,
+                    &event_tx,
+                    pending_size,
+                ).await? {
+                    return Ok(());
+                }
+                if sink.is_some() {
+                    pending_size = None;
+                }
+            }
+            read = stdin_src.read(&mut read_buf[..read_limit]) => {
+                let read = read.context("read local stdin")?;
+                if read == 0 {
+                    if let Some(sink) = sink.as_mut()
+                        && let Err(err) = sink.close_stdin().await.context("finish local stdin")
+                    {
+                        debug!(%err, "provider stdin already closed");
+                    }
+                    let _ = event_tx.send(AttachInputEvent::Closed).await;
+                    return Ok(());
+                }
+                handle_attach_input_bytes(
+                    &read_buf[..read],
+                    &mut sink,
+                    &mut mode,
+                    &mut buffer,
+                    &event_tx,
+                    &ui,
+                    &mut stdin_src,
+                    &mut paste,
+                    &mut bracketed,
+                ).await?;
+            }
+            () = tokio::time::sleep(Duration::from_millis(500)) => {
+                if let Ok(now) = size()
+                    && now != last_size
+                {
+                    pending_size = Some(now);
+                    if let Some(active_sink) = sink.as_mut()
+                        && let Err(err) = active_sink.resize(now.0, now.1).await.context("resize attached session")
+                    {
+                        sink_failed(&event_tx, err).await;
+                        sink.take();
+                        mode = AttachInputMode::Disconnected { visible: false };
+                    } else if sink.is_some() {
+                        pending_size = None;
+                    }
+                    last_size = now;
+                }
+            }
+        }
+    }
+}
+
+async fn handle_attach_input_command(
+    command: AttachInputCommand,
+    sink: &mut Option<AttachInputSink>,
+    mode: &mut AttachInputMode,
+    buffer: &mut ReconnectInputBuffer,
+    event_tx: &mpsc::Sender<AttachInputEvent>,
+    pending_size: Option<(u16, u16)>,
+) -> Result<bool> {
+    match command {
+        AttachInputCommand::SetSink {
+            sink: mut next_sink,
+            ack,
+        } => {
+            *mode = AttachInputMode::Connected;
+            if let Some((cols, rows)) = pending_size
+                && let Err(err) = next_sink
+                    .resize(cols, rows)
+                    .await
+                    .context("flush pending resize")
+            {
+                let message = format!("{err:#}");
+                sink_failed(event_tx, err).await;
+                *mode = AttachInputMode::Disconnected { visible: false };
+                let _ = ack.send(Err(anyhow!(message)));
+                return Ok(false);
+            }
+            let buffered = buffer.take();
+            if !buffered.is_empty()
+                && let Err(err) = next_sink
+                    .send_stdin(&buffered)
+                    .await
+                    .context("flush reconnect input buffer")
+            {
+                let message = format!("{err:#}");
+                sink_failed(event_tx, err).await;
+                *mode = AttachInputMode::Disconnected { visible: false };
+                let _ = ack.send(Err(anyhow!(message)));
+                return Ok(false);
+            }
+            *sink = Some(next_sink);
+            let _ = ack.send(Ok(()));
+        }
+        AttachInputCommand::ClearSink { ack } => {
+            sink.take();
+            *mode = AttachInputMode::Disconnected { visible: false };
+            let _ = ack.send(Ok(()));
+        }
+        AttachInputCommand::SetReconnectVisible { visible, ack } => {
+            if sink.is_none() {
+                *mode = AttachInputMode::Disconnected { visible };
+            }
+            let _ = ack.send(Ok(()));
+        }
+        AttachInputCommand::Stop => return Ok(true),
+    }
+    Ok(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_attach_input_bytes(
+    chunk: &[u8],
+    sink: &mut Option<AttachInputSink>,
+    mode: &mut AttachInputMode,
+    buffer: &mut ReconnectInputBuffer,
+    event_tx: &mpsc::Sender<AttachInputEvent>,
+    ui: &AttachControlUi,
+    stdin_src: &mut tokio::io::Stdin,
+    paste: &mut PasteState,
+    bracketed: &mut BracketedPasteScanner,
+) -> Result<()> {
+    match *mode {
+        AttachInputMode::Connected => {
+            let Some(active_sink) = sink.as_mut() else {
+                *mode = AttachInputMode::Disconnected { visible: false };
+                return Ok(());
+            };
+            let now = Instant::now();
+            paste.observe_read(chunk.len(), now);
+            match bracketed.scan(chunk) {
+                BracketedPasteEvent::Begin => paste.activate(now),
+                BracketedPasteEvent::End => paste.deactivate_if_idle(),
+                BracketedPasteEvent::None => {}
+            }
+            if is_ctrl_backslash_sequence(chunk) {
+                match run_attach_control_mode(active_sink, stdin_src, ui, paste).await? {
+                    AttachControlOutcome::Continue => return Ok(()),
+                    AttachControlOutcome::Detached => {
+                        let _ = event_tx.send(AttachInputEvent::Detached).await;
+                        return Ok(());
+                    }
+                    AttachControlOutcome::CancelPaste => {
+                        paste.cancel_pending();
+                        if bracketed.in_bracketed_paste() {
+                            bracketed.force_end();
+                            let _ = active_sink.send_stdin(b"\x1b[201~").await;
+                        }
+                        ui.display.clear_bar().await?;
+                        return Ok(());
+                    }
+                }
+            }
+            if paste.is_active() && chunk == b"\x1b" {
+                paste.cancel_pending();
+                if bracketed.in_bracketed_paste() {
+                    bracketed.force_end();
+                    let _ = active_sink.send_stdin(b"\x1b[201~").await;
+                }
+                ui.display.clear_bar().await?;
+                return Ok(());
+            }
+            paste.observe_queued(chunk.len());
+            update_paste_bar(ui, paste).await?;
+            let send_started = Instant::now();
+            if let Err(err) = active_sink
+                .send_stdin(chunk)
+                .await
+                .context("copy local stdin")
+            {
+                debug!(%err, "stdin loop ended after provider stdin closed");
+                sink.take();
+                *mode = AttachInputMode::Disconnected { visible: false };
+                sink_failed(event_tx, err).await;
+                return Ok(());
+            }
+            paste.set_backpressured(send_started.elapsed() >= Duration::from_millis(100));
+            paste.observe_sent(chunk.len());
+            update_paste_bar(ui, paste).await?;
+        }
+        AttachInputMode::Disconnected { visible } => {
+            if visible {
+                match ReconnectControl::from_visible_input(chunk) {
+                    Some(ReconnectControl::RetryNow) => {
+                        let _ = event_tx.send(AttachInputEvent::RetryNow).await;
+                    }
+                    Some(ReconnectControl::Detach) => {
+                        let _ = event_tx.send(AttachInputEvent::Detached).await;
+                    }
+                    Some(ReconnectControl::Quit) => {
+                        let _ = event_tx.send(AttachInputEvent::QuitReconnect).await;
+                    }
+                    None => {}
+                }
+            } else {
+                match buffer.push(chunk) {
+                    ReconnectBufferPush::Accepted => {
+                        if buffer.is_full() {
+                            *mode = AttachInputMode::Disconnected { visible: true };
+                            let _ = event_tx.send(AttachInputEvent::BufferFull).await;
+                        }
+                    }
+                    ReconnectBufferPush::Full => {
+                        *mode = AttachInputMode::Disconnected { visible: true };
+                        let _ = event_tx.send(AttachInputEvent::BufferFull).await;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn sink_failed(event_tx: &mpsc::Sender<AttachInputEvent>, err: anyhow::Error) {
+    let _ = event_tx.send(AttachInputEvent::SinkFailed(err)).await;
 }
 
 #[cfg(feature = "ghostty-vt")]
@@ -2686,6 +3755,15 @@ struct AttachDisplayState {
     stderr: tokio::io::Stderr,
 }
 
+const ATTACH_OUTPUT_GATE_LIMIT: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachOutputGateDecision {
+    NotHolding,
+    Held,
+    Overflow,
+}
+
 #[derive(Debug, Default)]
 struct AttachOutputGate {
     holding: bool,
@@ -2698,15 +3776,23 @@ impl AttachOutputGate {
         self.holding = holding;
     }
 
-    fn hold(&mut self, stream: AttachOutputStream, bytes: &[u8]) -> Option<&[u8]> {
+    fn hold(&mut self, stream: AttachOutputStream, bytes: &[u8]) -> AttachOutputGateDecision {
         if !self.holding {
-            return None;
+            return AttachOutputGateDecision::NotHolding;
+        }
+        let target_len = match stream {
+            AttachOutputStream::Stdout => self.stdout.len(),
+            AttachOutputStream::Stderr => self.stderr.len(),
+        };
+        if target_len.saturating_add(bytes.len()) > ATTACH_OUTPUT_GATE_LIMIT {
+            self.holding = false;
+            return AttachOutputGateDecision::Overflow;
         }
         match stream {
             AttachOutputStream::Stdout => self.stdout.extend_from_slice(bytes),
             AttachOutputStream::Stderr => self.stderr.extend_from_slice(bytes),
         }
-        Some(&[])
+        AttachOutputGateDecision::Held
     }
 
     fn take_stdout(&mut self) -> Vec<u8> {
@@ -2734,9 +3820,16 @@ impl AttachDisplay {
 
     async fn write_output(&self, stream: AttachOutputStream, bytes: &[u8]) -> Result<()> {
         let mut state = self.inner.lock().await;
-        if state.gate.hold(stream, bytes).is_some() {
-            state.redraw_bar().await?;
-            return Ok(());
+        match state.gate.hold(stream, bytes) {
+            AttachOutputGateDecision::Held => {
+                state.redraw_bar().await?;
+                return Ok(());
+            }
+            AttachOutputGateDecision::Overflow => {
+                state.clear_bar().await?;
+                state.flush_held_output().await?;
+            }
+            AttachOutputGateDecision::NotHolding => {}
         }
         let had_bar = state.bar.is_some();
         if had_bar {
@@ -3525,17 +4618,47 @@ mod tests {
     fn attach_output_gate_buffers_while_control_bar_is_visible() {
         let mut gate = AttachOutputGate::default();
 
-        assert_eq!(gate.hold(AttachOutputStream::Stdout, b"frame1"), None);
+        assert_eq!(
+            gate.hold(AttachOutputStream::Stdout, b"frame1"),
+            AttachOutputGateDecision::NotHolding
+        );
         gate.set_holding(true);
         assert_eq!(
             gate.hold(AttachOutputStream::Stdout, b"frame2"),
-            Some(&[][..])
+            AttachOutputGateDecision::Held
         );
-        assert_eq!(gate.hold(AttachOutputStream::Stderr, b"err"), Some(&[][..]));
+        assert_eq!(
+            gate.hold(AttachOutputStream::Stderr, b"err"),
+            AttachOutputGateDecision::Held
+        );
         assert_eq!(gate.take_stdout(), b"frame2".to_vec());
         assert_eq!(gate.take_stderr(), b"err".to_vec());
         gate.set_holding(false);
-        assert_eq!(gate.hold(AttachOutputStream::Stdout, b"frame3"), None);
+        assert_eq!(
+            gate.hold(AttachOutputStream::Stdout, b"frame3"),
+            AttachOutputGateDecision::NotHolding
+        );
+    }
+
+    #[test]
+    fn attach_output_gate_overflows_to_unheld_mode() {
+        let mut gate = AttachOutputGate::default();
+        gate.set_holding(true);
+        assert_eq!(
+            gate.hold(
+                AttachOutputStream::Stdout,
+                &vec![b'x'; ATTACH_OUTPUT_GATE_LIMIT]
+            ),
+            AttachOutputGateDecision::Held
+        );
+        assert_eq!(
+            gate.hold(AttachOutputStream::Stdout, b"y"),
+            AttachOutputGateDecision::Overflow
+        );
+        assert_eq!(
+            gate.hold(AttachOutputStream::Stdout, b"z"),
+            AttachOutputGateDecision::NotHolding
+        );
     }
 
     #[cfg(unix)]
@@ -3727,6 +4850,77 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn reconnect_policy_applies_floor_after_transparent_phase() {
+        let policy = ReconnectPolicy::for_test(
+            Duration::from_millis(500),
+            Duration::from_secs(10),
+            Duration::from_mins(2),
+            Duration::from_millis(100),
+        );
+
+        assert_eq!(
+            policy.visible_delay(1, Duration::from_millis(0)),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            policy.visible_delay(8, Duration::from_secs(30)),
+            Duration::from_secs(10)
+        );
+        assert!(policy.retry_budget_remaining(Duration::from_secs(119)));
+        assert!(!policy.retry_budget_remaining(Duration::from_mins(2)));
+    }
+
+    #[test]
+    fn reconnect_control_from_visible_input_recognizes_retry_and_detach() {
+        assert_eq!(
+            ReconnectControl::from_visible_input(b"\r"),
+            Some(ReconnectControl::RetryNow)
+        );
+        assert_eq!(
+            ReconnectControl::from_visible_input(b"\n"),
+            Some(ReconnectControl::RetryNow)
+        );
+        assert_eq!(
+            ReconnectControl::from_visible_input(b"d"),
+            Some(ReconnectControl::Detach)
+        );
+        assert_eq!(
+            ReconnectControl::from_visible_input(&[0x03]),
+            Some(ReconnectControl::Quit)
+        );
+        assert_eq!(ReconnectControl::from_visible_input(b"x"), None);
+    }
+
+    #[test]
+    fn reconnect_buffer_caps_without_dropping_accepted_bytes() {
+        let mut buffer = ReconnectInputBuffer::new(4);
+
+        assert_eq!(buffer.push(b"ab"), ReconnectBufferPush::Accepted);
+        assert_eq!(buffer.push(b"cdef"), ReconnectBufferPush::Full);
+        assert_eq!(buffer.len(), 4);
+        assert_eq!(buffer.take(), b"abcd".to_vec());
+
+        assert_eq!(buffer.push(b"ab"), ReconnectBufferPush::Accepted);
+        assert_eq!(buffer.push(b"cd"), ReconnectBufferPush::Accepted);
+        assert_eq!(buffer.push(b"e"), ReconnectBufferPush::Full);
+        assert_eq!(buffer.len(), 4);
+        assert_eq!(buffer.take(), b"abcd".to_vec());
+    }
+
+    #[test]
+    fn reconnect_session_exists_matches_provider_and_tmux_base_session() {
+        let groups = vec![
+            test_session_group("zmx", &["dev"]),
+            test_session_group("tmux", &["work"]),
+        ];
+
+        assert!(session_exists_for_reconnect(&groups, "zmx", "dev"));
+        assert!(session_exists_for_reconnect(&groups, "tmux", "work:1.2"));
+        assert!(!session_exists_for_reconnect(&groups, "zmx", "missing"));
+        assert!(!session_exists_for_reconnect(&groups, "ghostty", "dev"));
     }
 
     #[test]
