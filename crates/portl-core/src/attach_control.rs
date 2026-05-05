@@ -108,7 +108,7 @@ pub fn visible_width(text: &str) -> usize {
 
 #[must_use]
 pub fn is_ctrl_backslash_sequence(data: &[u8]) -> bool {
-    data.first().is_some_and(|byte| *byte == 0x1c) || is_key_pressed(data, 0x5c, 0b100)
+    data.contains(&0x1c) || is_key_pressed(data, 0x5c, 0b100)
 }
 
 fn is_key_pressed(data: &[u8], expected_key: u32, expected_mods: u32) -> bool {
@@ -253,6 +253,7 @@ mod tests {
     #[test]
     fn detects_raw_and_kitty_ctrl_backslash() {
         assert!(is_ctrl_backslash_sequence(b"\x1c"));
+        assert!(is_ctrl_backslash_sequence(b"prefix\x1csuffix"));
         assert!(is_ctrl_backslash_sequence(b"\x1b[92;5u"));
         assert!(is_ctrl_backslash_sequence(b"prefix\x1b[92;5:1usuffix"));
         assert!(is_ctrl_backslash_sequence(b"\x1b[92;5:2u"));

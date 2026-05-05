@@ -2775,6 +2775,9 @@ impl AttachDisplay {
 
     async fn clear_bar(&self) -> Result<()> {
         let mut state = self.inner.lock().await;
+        if state.bar.is_none() {
+            return Ok(());
+        }
         state.bar = None;
         state.clear_bar().await?;
         state.gate.set_holding(false);
@@ -3533,6 +3536,90 @@ mod tests {
         assert_eq!(gate.take_stderr(), b"err".to_vec());
         gate.set_holding(false);
         assert_eq!(gate.hold(AttachOutputStream::Stdout, b"frame3"), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inactive_paste_bar_update_does_not_clear_application_row() {
+        let capture = StderrCapture::start();
+        let ui = AttachControlUi {
+            canonical_ref: "local/ghostty/dev".to_owned(),
+            supports_kick_others: false,
+            display: AttachDisplay::new(80, 24),
+        };
+        let paste = PasteState::new(PasteConfig::default());
+
+        update_paste_bar(&ui, &paste).await.unwrap();
+
+        let output = capture.finish();
+        assert_eq!(
+            output,
+            b"",
+            "inactive paste updates must not erase the application's last row; wrote {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    #[cfg(unix)]
+    struct StderrCapture {
+        saved: std::os::fd::RawFd,
+        read: std::os::fd::RawFd,
+    }
+
+    #[cfg(unix)]
+    impl StderrCapture {
+        #[allow(unsafe_code)]
+        fn start() -> Self {
+            let mut fds = [0; 2];
+            assert_eq!(
+                unsafe { nix::libc::pipe(fds.as_mut_ptr()) },
+                0,
+                "pipe stderr capture"
+            );
+            let saved = unsafe { nix::libc::dup(nix::libc::STDERR_FILENO) };
+            assert!(saved >= 0, "dup stderr");
+            assert_eq!(
+                unsafe { nix::libc::dup2(fds[1], nix::libc::STDERR_FILENO) },
+                nix::libc::STDERR_FILENO,
+                "redirect stderr"
+            );
+            assert_eq!(unsafe { nix::libc::close(fds[1]) }, 0, "close pipe writer");
+            Self {
+                saved,
+                read: fds[0],
+            }
+        }
+
+        #[allow(unsafe_code)]
+        fn finish(self) -> Vec<u8> {
+            assert_eq!(
+                unsafe { nix::libc::dup2(self.saved, nix::libc::STDERR_FILENO) },
+                nix::libc::STDERR_FILENO,
+                "restore stderr"
+            );
+            assert_eq!(
+                unsafe { nix::libc::close(self.saved) },
+                0,
+                "close saved stderr"
+            );
+            let mut output = Vec::new();
+            loop {
+                let mut buf = [0_u8; 1024];
+                let read =
+                    unsafe { nix::libc::read(self.read, buf.as_mut_ptr().cast(), buf.len()) };
+                if read == 0 {
+                    break;
+                }
+                assert!(read > 0, "read stderr capture");
+                output.extend_from_slice(&buf[..usize::try_from(read).unwrap()]);
+            }
+            assert_eq!(
+                unsafe { nix::libc::close(self.read) },
+                0,
+                "close pipe reader"
+            );
+            output
+        }
     }
 
     #[test]
