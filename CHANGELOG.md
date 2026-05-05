@@ -5,6 +5,26 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.8.4 — 2026-05-06
+
+### Added
+
+- Interactive remote `portl session attach` now automatically reconnects to
+  existing persistent sessions after transient network drops. Short interruptions
+  resume transparently; longer ones show a status bar with `Enter` retry, `d`
+  detach, and `Ctrl-C` stop-reconnecting controls. Input typed during a
+  transparent reconnect is buffered with a fixed cap and delivered once after
+  reattach.
+
+### Fixed
+
+- Remote session reconnects no longer replay the initial command argv after the
+  first attach, avoiding accidental command reruns or session recreation when a
+  network drop occurs.
+- Ghostty-backed attach control rendering no longer clears an application's last
+  row when no Portl status bar is visible, and raw `Ctrl+\\` is detected even
+  when terminal input coalesces it with neighboring bytes.
+
 ## 0.8.3 — 2026-05-03
 
 ### Added
