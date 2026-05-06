@@ -2348,16 +2348,18 @@ async fn remote_session_attach_with_reconnect_on_endpoint(
             }
             AttachEnd::Disconnected(err) => {
                 debug!(%err, "remote session attach disconnected");
+                let disconnected_path = attach_path_snapshot(&connected.connection);
+                if attach_started.elapsed() >= Duration::from_secs(30) {
+                    reconnect_state = ReconnectAttemptState::new();
+                }
+                reconnect_state.observe_path(disconnected_path.as_ref());
                 flight_recorder.record_with_path(
                     format!("attach stream disconnected: {err}"),
-                    attach_path_snapshot(&connected.connection),
+                    disconnected_path,
                 );
                 connected
                     .connection
                     .close(0u32.into(), b"session disconnected");
-                if attach_started.elapsed() >= Duration::from_secs(30) {
-                    reconnect_state = ReconnectAttemptState::new();
-                }
                 let reattached = reconnect_remote_session(
                     &request,
                     &provider,
@@ -2644,6 +2646,7 @@ fn format_compact_duration(duration: Duration) -> String {
 struct ReconnectAttemptState {
     started: Instant,
     attempt: u32,
+    last_rtt: Option<Duration>,
 }
 
 impl ReconnectAttemptState {
@@ -2651,12 +2654,19 @@ impl ReconnectAttemptState {
         Self {
             started: Instant::now(),
             attempt: 0,
+            last_rtt: None,
         }
     }
 
     fn next_attempt(&mut self) -> u32 {
         self.attempt = self.attempt.saturating_add(1);
         self.attempt
+    }
+
+    fn observe_path(&mut self, path: Option<&AttachPathSnapshot>) {
+        if let Some(rtt) = path.and_then(|path| path.rtt).filter(|rtt| !rtt.is_zero()) {
+            self.last_rtt = Some(rtt);
+        }
     }
 }
 
@@ -2689,9 +2699,8 @@ async fn reconnect_remote_session(
     state: &mut ReconnectAttemptState,
     flight_recorder: &mut AttachFlightRecorder,
 ) -> Result<ReconnectOutcome> {
-    const TRANSPARENT_GRACE: Duration = Duration::from_millis(1500);
-    let policy = ReconnectPolicy::default_interactive();
     loop {
+        let policy = ReconnectPolicy::default_interactive().with_observed_rtt(state.last_rtt);
         let attempt = state.next_attempt();
         if !policy.retry_budget_remaining(state.started.elapsed()) {
             flight_recorder.record(format!(
@@ -2700,7 +2709,7 @@ async fn reconnect_remote_session(
             ));
             return Ok(ReconnectOutcome::Expired);
         }
-        let visible = state.started.elapsed() >= TRANSPARENT_GRACE;
+        let visible = state.started.elapsed() >= policy.transparent_grace;
         let delay = reconnect_attempt_delay(attempt, &policy);
         flight_recorder.record(format!(
             "reconnect attempt {attempt} scheduled after {}{}",
@@ -2752,9 +2761,11 @@ async fn reconnect_remote_session(
             Err(err @ SessionOpenError::Rejected { .. }) => return Err(anyhow::Error::from(err)),
             Err(SessionOpenError::Transport(err)) => {
                 debug!(%err, attempt, "session reconnect preflight failed");
+                let path = attach_path_snapshot(&connected.connection);
+                state.observe_path(path.as_ref());
                 flight_recorder.record_with_path(
                     format!("reconnect attempt {attempt} preflight failed: {err}"),
-                    attach_path_snapshot(&connected.connection),
+                    path,
                 );
                 connected
                     .connection
@@ -2763,12 +2774,14 @@ async fn reconnect_remote_session(
             }
         };
         if !session_exists_for_reconnect(&groups, provider, &request.session_name) {
+            let path = attach_path_snapshot(&connected.connection);
+            state.observe_path(path.as_ref());
             flight_recorder.record_with_path(
                 format!(
                     "reconnect attempt {attempt} session '{}' disappeared",
                     request.session_name
                 ),
-                attach_path_snapshot(&connected.connection),
+                path,
             );
             connected
                 .connection
@@ -2795,10 +2808,10 @@ async fn reconnect_remote_session(
         .await
         {
             Ok(session) => {
-                flight_recorder.record_with_path(
-                    format!("reconnect attempt {attempt} reattached"),
-                    attach_path_snapshot(&connected.connection),
-                );
+                let path = attach_path_snapshot(&connected.connection);
+                state.observe_path(path.as_ref());
+                flight_recorder
+                    .record_with_path(format!("reconnect attempt {attempt} reattached"), path);
                 if visible {
                     display
                         .set_bar(format!("▌ Portl › {canonical_ref} · reattached"))
@@ -2812,9 +2825,11 @@ async fn reconnect_remote_session(
             Err(err @ SessionOpenError::Rejected { .. }) => return Err(anyhow::Error::from(err)),
             Err(SessionOpenError::Transport(err)) => {
                 debug!(%err, attempt, "session reconnect attach failed");
+                let path = attach_path_snapshot(&connected.connection);
+                state.observe_path(path.as_ref());
                 flight_recorder.record_with_path(
                     format!("reconnect attempt {attempt} attach failed: {err}"),
-                    attach_path_snapshot(&connected.connection),
+                    path,
                 );
                 connected
                     .connection
@@ -3181,6 +3196,7 @@ struct ReconnectPolicy {
     max_delay: Duration,
     max_elapsed: Duration,
     delay_floor: Duration,
+    transparent_grace: Duration,
 }
 
 impl ReconnectPolicy {
@@ -3190,6 +3206,7 @@ impl ReconnectPolicy {
             max_delay: Duration::from_secs(10),
             max_elapsed: Duration::from_mins(2),
             delay_floor: Duration::from_millis(100),
+            transparent_grace: Duration::from_millis(1500),
         }
     }
 
@@ -3205,7 +3222,20 @@ impl ReconnectPolicy {
             max_delay,
             max_elapsed,
             delay_floor,
+            transparent_grace: Duration::from_millis(1500),
         }
+    }
+
+    fn with_observed_rtt(mut self, rtt: Option<Duration>) -> Self {
+        let Some(rtt) = rtt.filter(|rtt| !rtt.is_zero()) else {
+            return self;
+        };
+        self.transparent_grace = self
+            .transparent_grace
+            .max(rtt.saturating_mul(8))
+            .min(Duration::from_secs(4));
+        self.delay_floor = self.delay_floor.max(rtt).min(Duration::from_secs(1));
+        self
     }
 
     fn visible_delay(&self, attempt: u32, jitter: Duration) -> Duration {
@@ -5057,6 +5087,42 @@ mod tests {
         let recorder = AttachFlightRecorder::new();
 
         assert_eq!(recorder.render_recent(), None);
+    }
+
+    #[test]
+    fn reconnect_policy_scales_ui_debounce_from_observed_rtt() {
+        let default = ReconnectPolicy::default_interactive();
+        assert_eq!(default.transparent_grace, Duration::from_millis(1500));
+        assert_eq!(default.delay_floor, Duration::from_millis(100));
+
+        let high_latency = default.with_observed_rtt(Some(Duration::from_millis(250)));
+        assert_eq!(high_latency.transparent_grace, Duration::from_secs(2));
+        assert_eq!(high_latency.delay_floor, Duration::from_millis(250));
+        assert_eq!(
+            high_latency.visible_delay(1, Duration::ZERO),
+            Duration::from_millis(250)
+        );
+
+        let capped = default.with_observed_rtt(Some(Duration::from_secs(2)));
+        assert_eq!(capped.transparent_grace, Duration::from_secs(4));
+        assert_eq!(capped.delay_floor, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn reconnect_attempt_state_tracks_last_observed_rtt() {
+        let mut state = ReconnectAttemptState::new();
+        state.observe_path(Some(&AttachPathSnapshot {
+            label: "direct".to_owned(),
+            rtt: Some(Duration::from_millis(220)),
+        }));
+
+        assert_eq!(state.last_rtt, Some(Duration::from_millis(220)));
+
+        state.observe_path(Some(&AttachPathSnapshot {
+            label: "direct".to_owned(),
+            rtt: None,
+        }));
+        assert_eq!(state.last_rtt, Some(Duration::from_millis(220)));
     }
 
     #[test]
