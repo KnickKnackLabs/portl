@@ -40,12 +40,12 @@ impl ShellOutput {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "ghostty-vt"))]
     pub(crate) fn is_empty_until_closed(&self) -> bool {
         matches!(self, Self::EmptyUntilClosed(_))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "ghostty-vt"))]
     pub(crate) fn empty_close_signal_for_test(&self) -> Option<watch::Receiver<bool>> {
         self.empty_close_signal()
     }
