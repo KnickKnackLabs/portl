@@ -1,16 +1,61 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use anyhow::{Context as _, Result};
 use dashmap::DashMap;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 
 pub(crate) type ShellRegistry = DashMap<[u8; 16], Arc<ShellProcess>>;
 
+pub(crate) enum ShellOutput {
+    Channel(AsyncMutex<Option<mpsc::Receiver<Vec<u8>>>>),
+    EmptyUntilClosed(watch::Receiver<bool>),
+}
+
+impl ShellOutput {
+    pub(crate) fn channel(rx: mpsc::Receiver<Vec<u8>>) -> Self {
+        Self::Channel(AsyncMutex::new(Some(rx)))
+    }
+
+    pub(crate) fn empty_until_closed(rx: watch::Receiver<bool>) -> Self {
+        Self::EmptyUntilClosed(rx)
+    }
+
+    pub(crate) async fn take_channel(&self) -> Result<Option<mpsc::Receiver<Vec<u8>>>> {
+        match self {
+            Self::Channel(rx) => rx
+                .lock()
+                .await
+                .take()
+                .context("stream already attached")
+                .map(Some),
+            Self::EmptyUntilClosed(_) => Ok(None),
+        }
+    }
+
+    pub(crate) fn empty_close_signal(&self) -> Option<watch::Receiver<bool>> {
+        match self {
+            Self::Channel(_) => None,
+            Self::EmptyUntilClosed(rx) => Some(rx.clone()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty_until_closed(&self) -> bool {
+        matches!(self, Self::EmptyUntilClosed(_))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn empty_close_signal_for_test(&self) -> Option<watch::Receiver<bool>> {
+        self.empty_close_signal()
+    }
+}
+
 pub(crate) struct ShellProcess {
     pub(crate) pid: u32,
     pub(crate) stdin_tx: mpsc::Sender<StdinMessage>,
-    pub(crate) stdout_rx: AsyncMutex<Option<mpsc::Receiver<Vec<u8>>>>,
-    pub(crate) stderr_rx: AsyncMutex<Option<mpsc::Receiver<Vec<u8>>>>,
+    pub(crate) stdout: ShellOutput,
+    pub(crate) stderr: ShellOutput,
     pub(crate) exit_code: Arc<Mutex<Option<i32>>>,
     pub(crate) exit_tx: watch::Sender<Option<i32>>,
     pub(crate) signal_target: Option<i32>,

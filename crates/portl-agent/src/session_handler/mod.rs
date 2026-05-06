@@ -17,10 +17,12 @@ use crate::caps_enforce::shell_permits;
 use crate::session::Session;
 #[cfg(feature = "ghostty-vt")]
 use crate::session_handler::ghostty::GhosttyProvider;
-use crate::shell_handler::pumps::{pump_exit, pump_output, pump_resizes, pump_signals, pump_stdin};
+use crate::shell_handler::pumps::{
+    ShellOutputKind, pump_exit, pump_output, pump_resizes, pump_signals, pump_stdin,
+};
 use crate::shell_handler::spawn::spawn_process;
 use crate::shell_handler::user::{RequestedUser, resolve_requested_user};
-use crate::shell_registry::{PtyCommand, ShellProcess, StdinMessage};
+use crate::shell_registry::{PtyCommand, ShellOutput, ShellProcess, StdinMessage};
 use crate::stream_io::BufferedRecv;
 use crate::target_context::TargetProcessContext;
 use crate::{AgentState, audit};
@@ -861,8 +863,8 @@ fn spawn_tmux_control_process(
     Ok(Arc::new(ShellProcess {
         pid,
         stdin_tx,
-        stdout_rx: tokio::sync::Mutex::new(Some(stdout_rx)),
-        stderr_rx: tokio::sync::Mutex::new(Some(stderr_rx)),
+        stdout: ShellOutput::channel(stdout_rx),
+        stderr: ShellOutput::channel(stderr_rx),
         exit_code,
         exit_tx,
         signal_target: None,
@@ -997,8 +999,8 @@ fn spawn_zmx_control_process(
     Ok(Arc::new(ShellProcess {
         pid,
         stdin_tx,
-        stdout_rx: tokio::sync::Mutex::new(Some(stdout_rx)),
-        stderr_rx: tokio::sync::Mutex::new(Some(stderr_rx)),
+        stdout: ShellOutput::channel(stdout_rx),
+        stderr: ShellOutput::channel(stderr_rx),
         exit_code,
         exit_tx,
         signal_target: None,
@@ -1063,8 +1065,8 @@ async fn serve_substream(
         .ok_or_else(|| anyhow!("session attach process not found"))?;
     match tail.kind {
         SessionStreamKind::Stdin => pump_stdin(recv, process).await,
-        SessionStreamKind::Stdout => pump_output(send, &process.stdout_rx).await,
-        SessionStreamKind::Stderr => pump_output(send, &process.stderr_rx).await,
+        SessionStreamKind::Stdout => pump_output(send, &process, ShellOutputKind::Stdout).await,
+        SessionStreamKind::Stderr => pump_output(send, &process, ShellOutputKind::Stderr).await,
         SessionStreamKind::Signal => pump_signals(recv, &process).await,
         SessionStreamKind::Resize => pump_resizes(recv, &process).await,
         SessionStreamKind::Exit => pump_exit(send, &process).await,

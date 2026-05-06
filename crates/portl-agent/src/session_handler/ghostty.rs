@@ -24,7 +24,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, watch};
 
 #[cfg(unix)]
-use crate::shell_registry::{PtyCommand, ShellProcess, StdinMessage};
+use crate::shell_registry::{PtyCommand, ShellOutput, ShellProcess, StdinMessage};
 
 pub(crate) const GHOSTTY_PROTOCOL_VERSION: u16 = 1;
 
@@ -548,13 +548,22 @@ fn ghostty_attach_process(pid: u32, mut attach: GhosttyAttach) -> Arc<ShellProce
     let (stdin_tx, mut stdin_rx) = mpsc::channel(32);
     let (pty_tx, mut pty_rx) = mpsc::unbounded_channel();
     let (stdout_tx, stdout_rx) = mpsc::channel(32);
-    let (_stderr_tx, stderr_rx) = mpsc::channel(1);
+    let (stderr_closed_tx, stderr_closed_rx) = watch::channel(false);
     let exit_code = Arc::new(Mutex::new(None));
     let (exit_tx, _) = watch::channel(None);
     let exit_code_task = Arc::clone(&exit_code);
     let exit_tx_task = exit_tx.clone();
 
     tokio::spawn(async move {
+        struct CloseOnDrop(watch::Sender<bool>);
+
+        impl Drop for CloseOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.send(true);
+            }
+        }
+
+        let _stderr_closed = CloseOnDrop(stderr_closed_tx);
         if !initial_snapshot.is_empty() && stdout_tx.send(initial_snapshot).await.is_err() {
             return;
         }
@@ -617,8 +626,8 @@ fn ghostty_attach_process(pid: u32, mut attach: GhosttyAttach) -> Arc<ShellProce
     Arc::new(ShellProcess {
         pid,
         stdin_tx,
-        stdout_rx: tokio::sync::Mutex::new(Some(stdout_rx)),
-        stderr_rx: tokio::sync::Mutex::new(Some(stderr_rx)),
+        stdout: ShellOutput::channel(stdout_rx),
+        stderr: ShellOutput::empty_until_closed(stderr_closed_rx),
         exit_code,
         exit_tx,
         signal_target,
@@ -1623,6 +1632,72 @@ mod tests {
             .read_until_contains("aaaaaaaaaaaaaaaa", Duration::from_secs(5))
             .await?;
         assert!(output.contains("aaaaaaaaaaaaaaaa"));
+
+        GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .kill()
+            .await?;
+        task.join()
+            .expect("helper thread")
+            .context("helper result")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ghostty_attach_models_stderr_as_empty_until_attach_closes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let registry =
+            GhosttyRegistry::with_roots(temp.path().join("run"), temp.path().join("state"));
+        let paths = registry.paths_for("stderr-lifecycle");
+        let helper = GhosttyHelperConfig::for_test(
+            "stderr-lifecycle",
+            paths.clone(),
+            vec!["/bin/cat".to_owned()],
+        );
+        let task = spawn_helper_thread(helper);
+        wait_for_socket(&paths.socket_path, Duration::from_secs(2)).await?;
+
+        let metadata = GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .probe()
+            .await?;
+        let attach = GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .attach(80, 24)
+            .await?;
+        let process = ghostty_attach_process(metadata.pid, attach);
+
+        assert!(
+            process.stderr.is_empty_until_closed(),
+            "ghostty stderr should be explicit empty output, not an already-closed live channel"
+        );
+        let mut closed = process
+            .stderr
+            .empty_close_signal_for_test()
+            .expect("ghostty stderr close signal");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), closed.changed())
+                .await
+                .is_err(),
+            "empty stderr must remain open while the attach is active"
+        );
+
+        process
+            .stdin_tx
+            .send(StdinMessage::Close)
+            .await
+            .context("detach ghostty attach")?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if *closed.borrow_and_update() {
+                    break;
+                }
+                closed.changed().await.context("wait for stderr close")?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("stderr close timeout")??;
 
         GhosttyClient::connect(paths.socket_path.clone())
             .await?

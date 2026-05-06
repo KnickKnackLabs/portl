@@ -127,17 +127,14 @@ pub async fn ghostty_session_attach(
         .await?;
     process.set_started_at(Instant::now());
     let stdout_rx = process
-        .stdout_rx
-        .lock()
-        .await
-        .take()
+        .stdout
+        .take_channel()
+        .await?
         .context("ghostty stdout already attached")?;
-    let stderr_rx = process
-        .stderr_rx
-        .lock()
-        .await
-        .take()
-        .context("ghostty stderr already attached")?;
+    let stderr_rx = process.stderr.take_channel().await?.unwrap_or_else(|| {
+        let (_tx, rx) = mpsc::channel(1);
+        rx
+    });
     let exit_rx = process.exit_rx();
     let (stdin_tx, mut stdin_rx) = mpsc::channel(32);
     let process_stdin_tx = process.stdin_tx.clone();

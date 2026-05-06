@@ -28,7 +28,7 @@ pub(crate) use shutdown::begin_session_shutdown;
 #[cfg(unix)]
 pub use spawn::spawn_pty_for_test;
 
-use pumps::{pump_exit, pump_output, pump_resizes, pump_signals, pump_stdin};
+use pumps::{ShellOutputKind, pump_exit, pump_output, pump_resizes, pump_signals, pump_stdin};
 use shutdown::{ShellSessionGuard, fresh_session_id};
 use spawn::spawn_process;
 use user::resolve_requested_user;
@@ -217,10 +217,10 @@ async fn serve_substream(
     match tail.kind {
         portl_proto::shell_v1::ShellStreamKind::Stdin => pump_stdin(recv, process).await,
         portl_proto::shell_v1::ShellStreamKind::Stdout => {
-            pump_output(send, &process.stdout_rx).await
+            pump_output(send, &process, ShellOutputKind::Stdout).await
         }
         portl_proto::shell_v1::ShellStreamKind::Stderr => {
-            pump_output(send, &process.stderr_rx).await
+            pump_output(send, &process, ShellOutputKind::Stderr).await
         }
         portl_proto::shell_v1::ShellStreamKind::Signal => pump_signals(recv, &process).await,
         portl_proto::shell_v1::ShellStreamKind::Resize => pump_resizes(recv, &process).await,

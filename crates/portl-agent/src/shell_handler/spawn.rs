@@ -13,7 +13,7 @@ use tracing::{debug, warn};
 use crate::audit;
 use crate::caps_enforce::shell_caps;
 use crate::session::Session;
-use crate::shell_registry::ShellProcess;
+use crate::shell_registry::{ShellOutput, ShellProcess};
 
 use super::PTY_DRAIN_TIMEOUT;
 use super::exec_capture::{exec_stdin_task, output_reader_task};
@@ -151,8 +151,8 @@ fn spawn_exec_process(
     Ok(Arc::new(ShellProcess {
         pid,
         stdin_tx,
-        stdout_rx: tokio::sync::Mutex::new(Some(stdout_rx)),
-        stderr_rx: tokio::sync::Mutex::new(Some(stderr_rx)),
+        stdout: ShellOutput::channel(stdout_rx),
+        stderr: ShellOutput::channel(stderr_rx),
         exit_code,
         exit_tx,
         signal_target: Some(process_group_signal_target_from_pid(pid)?),
@@ -219,7 +219,7 @@ fn spawn_pty_process(
     let (stdin_tx, stdin_rx) = mpsc::channel(32);
     let (pty_tx, pty_rx) = mpsc::unbounded_channel();
     let (stdout_tx, stdout_rx) = mpsc::channel(32);
-    let (_stderr_tx, stderr_rx) = mpsc::channel(1);
+    let (stderr_closed_tx, stderr_closed_rx) = watch::channel(false);
     let exit_code = Arc::new(Mutex::new(None));
     let (exit_tx, _) = watch::channel(None);
 
@@ -233,6 +233,7 @@ fn spawn_pty_process(
 
     let exit_code_wait = Arc::clone(&exit_code);
     let exit_tx_wait = exit_tx.clone();
+    let stderr_closed_tx_wait = stderr_closed_tx.clone();
     let ticket_id = session.ticket_id;
     let caller_endpoint_id = session.caller_endpoint_id;
     let audit_session_id = audit_session_id.to_owned();
@@ -264,6 +265,7 @@ fn spawn_pty_process(
             code,
             duration_ms,
         );
+        let _ = stderr_closed_tx_wait.send(true);
         let _ = exit_tx_wait.send(Some(code));
     });
 
@@ -279,8 +281,8 @@ fn spawn_pty_process(
     Ok(Arc::new(ShellProcess {
         pid,
         stdin_tx,
-        stdout_rx: tokio::sync::Mutex::new(Some(stdout_rx)),
-        stderr_rx: tokio::sync::Mutex::new(Some(stderr_rx)),
+        stdout: ShellOutput::channel(stdout_rx),
+        stderr: ShellOutput::empty_until_closed(stderr_closed_rx),
         exit_code,
         exit_tx,
         signal_target,

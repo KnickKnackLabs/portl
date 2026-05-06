@@ -4,9 +4,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use iroh::endpoint::SendStream;
 use tokio::io::AsyncReadExt;
-use tokio::sync::mpsc;
 
-use crate::shell_registry::{PtyCommand, ShellProcess, StdinMessage};
+use crate::shell_registry::{PtyCommand, ShellOutput, ShellProcess, StdinMessage};
 use crate::stream_io::BufferedRecv;
 
 use super::shutdown::send_signal;
@@ -28,15 +27,67 @@ pub(crate) async fn pump_stdin(mut recv: BufferedRecv, process: Arc<ShellProcess
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ShellOutputKind {
+    Stdout,
+    Stderr,
+}
+
+fn output_for(process: &ShellProcess, kind: ShellOutputKind) -> &ShellOutput {
+    match kind {
+        ShellOutputKind::Stdout => &process.stdout,
+        ShellOutputKind::Stderr => &process.stderr,
+    }
+}
+
+async fn wait_process_exit(process: &ShellProcess) -> Result<i32> {
+    let initial = *process
+        .exit_code
+        .lock()
+        .map_err(|_| anyhow!("exit code mutex poisoned"))?;
+    if let Some(code) = initial {
+        return Ok(code);
+    }
+
+    let mut rx = process.exit_rx();
+    if let Some(code) = *rx.borrow() {
+        return Ok(code);
+    }
+    loop {
+        rx.changed().await.context("wait for shell exit")?;
+        if let Some(code) = *rx.borrow() {
+            return Ok(code);
+        }
+    }
+}
+
 pub(crate) async fn pump_output(
     mut send: SendStream,
-    rx: &tokio::sync::Mutex<Option<mpsc::Receiver<Vec<u8>>>>,
+    process: &ShellProcess,
+    kind: ShellOutputKind,
 ) -> Result<()> {
-    let mut rx = rx.lock().await.take().context("stream already attached")?;
-    while let Some(chunk) = rx.recv().await {
-        send.write_all(&chunk).await.context("write shell output")?;
+    let output = output_for(process, kind);
+    if let Some(mut rx) = output.take_channel().await? {
+        while let Some(chunk) = rx.recv().await {
+            send.write_all(&chunk).await.context("write shell output")?;
+        }
+        send.finish().context("finish shell output")?;
+        return Ok(());
     }
-    send.finish().context("finish shell output")?;
+
+    let mut closed = output
+        .empty_close_signal()
+        .context("empty output stream missing close signal")?;
+    loop {
+        if *closed.borrow_and_update() {
+            break;
+        }
+        closed
+            .changed()
+            .await
+            .context("wait for empty output close")?;
+    }
+    send.finish().context("finish empty shell output")?;
     Ok(())
 }
 
@@ -99,27 +150,9 @@ pub(crate) fn resize_pty(master: &impl AsRawFd, rows: u16, cols: u16) -> std::io
 }
 
 pub(crate) async fn pump_exit(mut send: SendStream, process: &ShellProcess) -> Result<()> {
-    let initial = *process
-        .exit_code
-        .lock()
-        .map_err(|_| anyhow!("exit code mutex poisoned"))?;
-    let code = if let Some(code) = initial {
-        code
-    } else {
-        let mut rx = process.exit_rx();
-        let current = *rx.borrow();
-        match current {
-            Some(code) => code,
-            None => loop {
-                rx.changed().await.context("wait for shell exit")?;
-                if let Some(code) = *rx.borrow() {
-                    break code;
-                }
-            },
-        }
+    let frame = portl_proto::shell_v1::ExitFrame {
+        code: wait_process_exit(process).await?,
     };
-
-    let frame = portl_proto::shell_v1::ExitFrame { code };
     send.write_all(&postcard::to_stdvec(&frame)?).await?;
     send.finish().context("finish shell exit stream")?;
     Ok(())

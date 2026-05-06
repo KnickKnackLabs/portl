@@ -193,9 +193,9 @@ pub(super) mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
+    use tokio::sync::{mpsc, watch};
 
-    use crate::shell_registry::{ShellProcess, ShellRegistry};
+    use crate::shell_registry::{ShellOutput, ShellProcess, ShellRegistry};
 
     use super::{SessionReaper, ShellSessionGuard};
 
@@ -214,8 +214,8 @@ pub(super) mod tests {
             Arc::new(ShellProcess {
                 pid: 42,
                 stdin_tx,
-                stdout_rx: AsyncMutex::new(Some(stdout_rx)),
-                stderr_rx: AsyncMutex::new(Some(stderr_rx)),
+                stdout: ShellOutput::channel(stdout_rx),
+                stderr: ShellOutput::channel(stderr_rx),
                 exit_code,
                 exit_tx,
                 signal_target: None,
