@@ -233,7 +233,7 @@ fn spawn_pty_process(
 
     let exit_code_wait = Arc::clone(&exit_code);
     let exit_tx_wait = exit_tx.clone();
-    let stderr_closed_tx_wait = stderr_closed_tx.clone();
+    let stderr_closed_tx_wait = stderr_closed_tx;
     let ticket_id = session.ticket_id;
     let caller_endpoint_id = session.caller_endpoint_id;
     let audit_session_id = audit_session_id.to_owned();

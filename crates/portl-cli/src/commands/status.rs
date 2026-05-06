@@ -604,56 +604,61 @@ impl ProbeSummary {
             .iter()
             .filter_map(|report| report.rtt_ms)
             .collect::<Vec<_>>();
-        let (rtt_min_ms, rtt_avg_ms, rtt_max_ms, rtt_range_ms, rtt_jitter_ms) =
-            summarize_rtts(&rtts);
+        let rtt_summary = summarize_rtts(&rtts);
         let paths = summarize_paths(reports);
-        let quality = classify_probe_quality(successes, failures, rtt_avg_ms, rtt_range_ms);
+        let quality =
+            classify_probe_quality(successes, failures, rtt_summary.avg, rtt_summary.range);
         Self {
             total,
             successes,
             failures,
-            rtt_min_ms,
-            rtt_avg_ms,
-            rtt_max_ms,
-            rtt_range_ms,
-            rtt_jitter_ms,
+            rtt_min_ms: rtt_summary.min,
+            rtt_avg_ms: rtt_summary.avg,
+            rtt_max_ms: rtt_summary.max,
+            rtt_range_ms: rtt_summary.range,
+            rtt_jitter_ms: rtt_summary.jitter,
             paths,
             quality: quality.to_owned(),
         }
     }
 }
 
-fn summarize_rtts(
-    rtts: &[f64],
-) -> (
-    Option<f64>,
-    Option<f64>,
-    Option<f64>,
-    Option<f64>,
-    Option<f64>,
-) {
+#[derive(Debug, Clone, Copy, Default)]
+struct RttSummary {
+    min: Option<f64>,
+    avg: Option<f64>,
+    max: Option<f64>,
+    range: Option<f64>,
+    jitter: Option<f64>,
+}
+
+fn summarize_rtts(rtts: &[f64]) -> RttSummary {
     if rtts.is_empty() {
-        return (None, None, None, None, None);
+        return RttSummary::default();
     }
     let min = rtts.iter().copied().fold(f64::INFINITY, f64::min);
     let max = rtts.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let avg = rtts.iter().sum::<f64>() / rtts.len() as f64;
+    let avg = rtts.iter().sum::<f64>() / len_as_f64(rtts.len());
     let range = max - min;
     let jitter = if rtts.len() > 1 {
         rtts.windows(2)
             .map(|pair| (pair[1] - pair[0]).abs())
             .sum::<f64>()
-            / (rtts.len() - 1) as f64
+            / len_as_f64(rtts.len().saturating_sub(1))
     } else {
         0.0
     };
-    (
-        Some(round_ms(min)),
-        Some(round_ms(avg)),
-        Some(round_ms(max)),
-        Some(round_ms(range)),
-        Some(round_ms(jitter)),
-    )
+    RttSummary {
+        min: Some(round_ms(min)),
+        avg: Some(round_ms(avg)),
+        max: Some(round_ms(max)),
+        range: Some(round_ms(range)),
+        jitter: Some(round_ms(jitter)),
+    }
+}
+
+fn len_as_f64(len: usize) -> f64 {
+    f64::from(u32::try_from(len).unwrap_or(u32::MAX))
 }
 
 fn summarize_paths(reports: &[ProbeReport]) -> Vec<PathCount> {
