@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
 use std::future::Future;
 use std::io::IsTerminal;
@@ -13,7 +13,8 @@ use anyhow::{Context, Result, anyhow};
 use clap::ValueEnum;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use futures_util::stream::{FuturesUnordered, StreamExt};
-use iroh::endpoint::SendStream;
+use iroh::endpoint::{Connection, SendStream};
+use iroh_base::TransportAddr;
 use portl_core::attach_control::{
     RenderBarOptions, fit_visible, is_ctrl_backslash_sequence, render_bar,
 };
@@ -28,7 +29,7 @@ use portl_core::ticket::schema::{Capabilities, EnvPolicy, ShellCaps};
 use portl_core::wire::session::{SessionControlAction, SessionControlFrame};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
-use tracing::debug;
+use tracing::{debug, trace};
 
 use crate::commands::peer_resolve::{
     bind_client_endpoint, close_client_endpoint, close_connected, connect_peer, connect_peer_quiet,
@@ -2300,6 +2301,11 @@ async fn remote_session_attach_with_reconnect_on_endpoint(
     .await?;
     let provider = session.provider.clone();
     let canonical_ref = canonical_session_ref(&request.target, &provider, &request.session_name);
+    let mut flight_recorder = AttachFlightRecorder::new();
+    flight_recorder.record_with_path(
+        "initial attach opened",
+        attach_path_snapshot(&connected.connection),
+    );
     let raw_guard = RawModeGuard::new()?;
     let display = AttachDisplay::new(request.cols, request.rows);
     let mut coordinator = AttachInputCoordinator::spawn(
@@ -2342,6 +2348,10 @@ async fn remote_session_attach_with_reconnect_on_endpoint(
             }
             AttachEnd::Disconnected(err) => {
                 debug!(%err, "remote session attach disconnected");
+                flight_recorder.record_with_path(
+                    format!("attach stream disconnected: {err}"),
+                    attach_path_snapshot(&connected.connection),
+                );
                 connected
                     .connection
                     .close(0u32.into(), b"session disconnected");
@@ -2357,6 +2367,7 @@ async fn remote_session_attach_with_reconnect_on_endpoint(
                     &canonical_ref,
                     &mut coordinator,
                     &mut reconnect_state,
+                    &mut flight_recorder,
                 )
                 .await?;
                 match reattached {
@@ -2389,6 +2400,10 @@ async fn remote_session_attach_with_reconnect_on_endpoint(
                         eprintln!(
                             "portl: could not reconnect to session \"{canonical_ref}\" after 2m"
                         );
+                        if let Some(events) = flight_recorder.render_recent() {
+                            eprintln!();
+                            eprintln!("{events}");
+                        }
                         eprintln!();
                         eprintln!("The session may still be running. To reconnect, run:");
                         eprintln!("  portl attach {canonical_ref}");
@@ -2506,6 +2521,125 @@ async fn bridge_attach(
     Ok(code)
 }
 
+const ATTACH_FLIGHT_RECORDER_CAPACITY: usize = 12;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttachPathSnapshot {
+    label: String,
+    rtt: Option<Duration>,
+}
+
+impl AttachPathSnapshot {
+    fn from_connection(connection: &Connection) -> Option<Self> {
+        let paths: Vec<_> = connection
+            .paths()
+            .into_iter()
+            .filter(|path| !path.is_closed())
+            .collect();
+        let path = paths
+            .iter()
+            .find(|path| path.is_selected())
+            .or_else(|| paths.first())?;
+        let label = match path.remote_addr() {
+            TransportAddr::Relay(url) => format!("relay {url}"),
+            _ => "direct".to_owned(),
+        };
+        Some(Self {
+            label,
+            rtt: path.rtt(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttachFlightEvent {
+    elapsed: Duration,
+    message: String,
+    path: Option<AttachPathSnapshot>,
+}
+
+#[derive(Debug)]
+struct AttachFlightRecorder {
+    started: Instant,
+    events: VecDeque<AttachFlightEvent>,
+}
+
+impl AttachFlightRecorder {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            events: VecDeque::with_capacity(ATTACH_FLIGHT_RECORDER_CAPACITY),
+        }
+    }
+
+    fn record(&mut self, message: impl Into<String>) {
+        self.record_with_path(message, None);
+    }
+
+    fn record_with_path(&mut self, message: impl Into<String>, path: Option<AttachPathSnapshot>) {
+        self.record_at(self.started.elapsed(), message, path);
+    }
+
+    fn record_at(
+        &mut self,
+        elapsed: Duration,
+        message: impl Into<String>,
+        path: Option<AttachPathSnapshot>,
+    ) {
+        if self.events.len() == ATTACH_FLIGHT_RECORDER_CAPACITY {
+            self.events.pop_front();
+        }
+        let event = AttachFlightEvent {
+            elapsed,
+            message: message.into(),
+            path,
+        };
+        trace!(
+            elapsed_ms = event.elapsed.as_millis(),
+            message = %event.message,
+            path = ?event.path,
+            "session attach flight recorder event"
+        );
+        self.events.push_back(event);
+    }
+
+    fn render_recent(&self) -> Option<String> {
+        if self.events.is_empty() {
+            return None;
+        }
+        let mut out = String::from("Recent reconnect events:\n");
+        for event in &self.events {
+            let _ = write!(
+                out,
+                "  - +{} {}",
+                format_compact_duration(event.elapsed),
+                event.message
+            );
+            if let Some(path) = &event.path {
+                let _ = write!(out, " (path: {}", path.label);
+                if let Some(rtt) = path.rtt {
+                    let _ = write!(out, ", rtt: {}", format_compact_duration(rtt));
+                }
+                out.push(')');
+            }
+            out.push('\n');
+        }
+        Some(out.trim_end().to_owned())
+    }
+}
+
+fn attach_path_snapshot(connection: &Connection) -> Option<AttachPathSnapshot> {
+    AttachPathSnapshot::from_connection(connection)
+}
+
+fn format_compact_duration(duration: Duration) -> String {
+    if duration < Duration::from_secs(1) {
+        format!("{}ms", duration.as_millis())
+    } else {
+        format!("{:.1}s", duration.as_secs_f64())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ReconnectAttemptState {
     started: Instant,
@@ -2553,16 +2687,26 @@ async fn reconnect_remote_session(
     canonical_ref: &str,
     coordinator: &mut AttachInputCoordinator,
     state: &mut ReconnectAttemptState,
+    flight_recorder: &mut AttachFlightRecorder,
 ) -> Result<ReconnectOutcome> {
     const TRANSPARENT_GRACE: Duration = Duration::from_millis(1500);
     let policy = ReconnectPolicy::default_interactive();
     loop {
         let attempt = state.next_attempt();
         if !policy.retry_budget_remaining(state.started.elapsed()) {
+            flight_recorder.record(format!(
+                "reconnect budget expired after {} attempts",
+                attempt.saturating_sub(1)
+            ));
             return Ok(ReconnectOutcome::Expired);
         }
         let visible = state.started.elapsed() >= TRANSPARENT_GRACE;
         let delay = reconnect_attempt_delay(attempt, &policy);
+        flight_recorder.record(format!(
+            "reconnect attempt {attempt} scheduled after {}{}",
+            format_compact_duration(delay),
+            if visible { " (visible)" } else { "" }
+        ));
         match wait_reconnect_delay(delay, visible, attempt, canonical_ref, display, coordinator)
             .await?
         {
@@ -2592,6 +2736,8 @@ async fn reconnect_remote_session(
             Ok(connected) => connected,
             Err(err) => {
                 debug!(%err, attempt, "session reconnect connect failed");
+                flight_recorder
+                    .record(format!("reconnect attempt {attempt} connect failed: {err}"));
                 continue;
             }
         };
@@ -2606,6 +2752,10 @@ async fn reconnect_remote_session(
             Err(err @ SessionOpenError::Rejected { .. }) => return Err(anyhow::Error::from(err)),
             Err(SessionOpenError::Transport(err)) => {
                 debug!(%err, attempt, "session reconnect preflight failed");
+                flight_recorder.record_with_path(
+                    format!("reconnect attempt {attempt} preflight failed: {err}"),
+                    attach_path_snapshot(&connected.connection),
+                );
                 connected
                     .connection
                     .close(0u32.into(), b"session reconnect preflight failed");
@@ -2613,6 +2763,13 @@ async fn reconnect_remote_session(
             }
         };
         if !session_exists_for_reconnect(&groups, provider, &request.session_name) {
+            flight_recorder.record_with_path(
+                format!(
+                    "reconnect attempt {attempt} session '{}' disappeared",
+                    request.session_name
+                ),
+                attach_path_snapshot(&connected.connection),
+            );
             connected
                 .connection
                 .close(0u32.into(), b"session disappeared during reconnect");
@@ -2638,6 +2795,10 @@ async fn reconnect_remote_session(
         .await
         {
             Ok(session) => {
+                flight_recorder.record_with_path(
+                    format!("reconnect attempt {attempt} reattached"),
+                    attach_path_snapshot(&connected.connection),
+                );
                 if visible {
                     display
                         .set_bar(format!("▌ Portl › {canonical_ref} · reattached"))
@@ -2651,6 +2812,10 @@ async fn reconnect_remote_session(
             Err(err @ SessionOpenError::Rejected { .. }) => return Err(anyhow::Error::from(err)),
             Err(SessionOpenError::Transport(err)) => {
                 debug!(%err, attempt, "session reconnect attach failed");
+                flight_recorder.record_with_path(
+                    format!("reconnect attempt {attempt} attach failed: {err}"),
+                    attach_path_snapshot(&connected.connection),
+                );
                 connected
                     .connection
                     .close(0u32.into(), b"session reconnect attach failed");
@@ -4850,6 +5015,48 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn attach_flight_recorder_caps_and_renders_recent_path_context() {
+        let mut recorder = AttachFlightRecorder::new();
+        for idx in 0..ATTACH_FLIGHT_RECORDER_CAPACITY + 2 {
+            recorder.record_at(
+                Duration::from_millis((idx as u64) * 100),
+                format!("event {idx}"),
+                (idx == ATTACH_FLIGHT_RECORDER_CAPACITY + 1).then_some(AttachPathSnapshot {
+                    label: "direct".to_owned(),
+                    rtt: Some(Duration::from_millis(234)),
+                }),
+            );
+        }
+
+        let rendered = recorder.render_recent().expect("events render");
+
+        let lines = rendered.lines().collect::<Vec<_>>();
+        assert!(
+            !lines.iter().any(|line| line.ends_with("event 0")),
+            "{rendered}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.ends_with("event 1")),
+            "{rendered}"
+        );
+        assert!(
+            lines.iter().any(|line| line.ends_with("event 2")),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("event 13 (path: direct, rtt: 234ms)"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn attach_flight_recorder_omits_empty_render() {
+        let recorder = AttachFlightRecorder::new();
+
+        assert_eq!(recorder.render_recent(), None);
     }
 
     #[test]
