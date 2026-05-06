@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -216,18 +217,13 @@ fn run_target_count(
             Ok(mut report) => {
                 report.seq = seq;
                 any_success = true;
-                if json {
-                    reports.push(ProbeReportEnvelope::Single(report));
-                } else {
+                if !json {
                     print_status(&report);
                 }
+                reports.push(report);
             }
             Err(err) if json => {
-                reports.push(ProbeReportEnvelope::Single(ProbeReport::failure(
-                    seq,
-                    peer,
-                    format!("{err:#}"),
-                )));
+                reports.push(ProbeReport::failure(seq, peer, format!("{err:#}")));
             }
             Err(err) => return Err(err),
         }
@@ -237,6 +233,8 @@ fn run_target_count(
     }
     if json {
         println!("{}", render_probe_json_envelope(reports, count));
+    } else if count > 1 {
+        print_probe_summary(&ProbeSummary::from_reports(&reports));
     }
     Ok(if any_success {
         ExitCode::SUCCESS
@@ -478,29 +476,79 @@ fn render_probe_json(report: &ProbeReport) -> String {
     serde_json::to_string(report).expect("serialize probe report")
 }
 
-fn render_probe_json_envelope(reports: Vec<ProbeReportEnvelope>, count: u32) -> String {
+fn print_probe_summary(summary: &ProbeSummary) {
+    println!();
+    println!(
+        "{:<18}{}/{} ok · {} failed · quality={}",
+        "summary:", summary.successes, summary.total, summary.failures, summary.quality
+    );
+    if let (Some(min), Some(avg), Some(max), Some(range), Some(jitter)) = (
+        summary.rtt_min_ms,
+        summary.rtt_avg_ms,
+        summary.rtt_max_ms,
+        summary.rtt_range_ms,
+        summary.rtt_jitter_ms,
+    ) {
+        println!(
+            "{:<18}min={}ms avg={}ms max={}ms range={}ms jitter={}ms",
+            "rtt:",
+            format_ms(min),
+            format_ms(avg),
+            format_ms(max),
+            format_ms(range),
+            format_ms(jitter)
+        );
+    } else {
+        println!("{:<18}—", "rtt:");
+    }
+    if summary.paths.is_empty() {
+        println!("{:<18}—", "paths:");
+    } else {
+        let paths = summary
+            .paths
+            .iter()
+            .map(|path| format!("{} x{}", path.path, path.count))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("{:<18}{paths}", "paths:");
+    }
+}
+
+fn render_probe_json_envelope(reports: Vec<ProbeReport>, count: u32) -> String {
     if count == 1 && reports.len() == 1 {
-        let Some(ProbeReportEnvelope::Single(report)) = reports.into_iter().next() else {
+        let Some(report) = reports.into_iter().next() else {
             unreachable!("single report vector contains a report")
         };
         return render_probe_json(&report);
     }
-    let probes = reports
-        .into_iter()
-        .map(|report| match report {
-            ProbeReportEnvelope::Single(report) => report,
-        })
-        .collect::<Vec<_>>();
+    let summary = ProbeSummary::from_reports(&reports);
     serde_json::to_string(&serde_json::json!({
         "schema": 1,
         "kind": "status.probes",
-        "probes": probes,
+        "summary": summary,
+        "probes": reports,
     }))
     .expect("serialize probe report envelope")
 }
 
-enum ProbeReportEnvelope {
-    Single(ProbeReport),
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProbeSummary {
+    total: usize,
+    successes: usize,
+    failures: usize,
+    rtt_min_ms: Option<f64>,
+    rtt_avg_ms: Option<f64>,
+    rtt_max_ms: Option<f64>,
+    rtt_range_ms: Option<f64>,
+    rtt_jitter_ms: Option<f64>,
+    paths: Vec<PathCount>,
+    quality: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PathCount {
+    path: String,
+    count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -545,6 +593,115 @@ fn unix_now_micros() -> Result<u64> {
         .as_micros()
         .try_into()
         .context("micros overflow u64")
+}
+
+impl ProbeSummary {
+    fn from_reports(reports: &[ProbeReport]) -> Self {
+        let total = reports.len();
+        let successes = reports.iter().filter(|report| report.ok).count();
+        let failures = total.saturating_sub(successes);
+        let rtts = reports
+            .iter()
+            .filter_map(|report| report.rtt_ms)
+            .collect::<Vec<_>>();
+        let (rtt_min_ms, rtt_avg_ms, rtt_max_ms, rtt_range_ms, rtt_jitter_ms) =
+            summarize_rtts(&rtts);
+        let paths = summarize_paths(reports);
+        let quality = classify_probe_quality(successes, failures, rtt_avg_ms, rtt_range_ms);
+        Self {
+            total,
+            successes,
+            failures,
+            rtt_min_ms,
+            rtt_avg_ms,
+            rtt_max_ms,
+            rtt_range_ms,
+            rtt_jitter_ms,
+            paths,
+            quality: quality.to_owned(),
+        }
+    }
+}
+
+fn summarize_rtts(
+    rtts: &[f64],
+) -> (
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+) {
+    if rtts.is_empty() {
+        return (None, None, None, None, None);
+    }
+    let min = rtts.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = rtts.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let avg = rtts.iter().sum::<f64>() / rtts.len() as f64;
+    let range = max - min;
+    let jitter = if rtts.len() > 1 {
+        rtts.windows(2)
+            .map(|pair| (pair[1] - pair[0]).abs())
+            .sum::<f64>()
+            / (rtts.len() - 1) as f64
+    } else {
+        0.0
+    };
+    (
+        Some(round_ms(min)),
+        Some(round_ms(avg)),
+        Some(round_ms(max)),
+        Some(round_ms(range)),
+        Some(round_ms(jitter)),
+    )
+}
+
+fn summarize_paths(reports: &[ProbeReport]) -> Vec<PathCount> {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for path in reports.iter().filter_map(|report| report.path.as_ref()) {
+        *counts.entry(path.clone()).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(path, count)| PathCount { path, count })
+        .collect()
+}
+
+fn classify_probe_quality(
+    successes: usize,
+    failures: usize,
+    rtt_avg_ms: Option<f64>,
+    rtt_range_ms: Option<f64>,
+) -> &'static str {
+    if successes == 0 {
+        return "down";
+    }
+    if failures > 0 {
+        return "degraded";
+    }
+    let avg = rtt_avg_ms.unwrap_or(f64::INFINITY);
+    let range = rtt_range_ms.unwrap_or(f64::INFINITY);
+    if avg <= 50.0 && range <= 25.0 {
+        "excellent"
+    } else if avg <= 150.0 && range <= 75.0 {
+        "good"
+    } else if avg <= 300.0 && range <= 150.0 {
+        "fair"
+    } else {
+        "poor"
+    }
+}
+
+fn round_ms(value: f64) -> f64 {
+    (value * 1000.0).round() / 1000.0
+}
+
+fn format_ms(value: f64) -> String {
+    if value >= 100.0 {
+        format!("{}", value.round())
+    } else {
+        format!("{value:.1}")
+    }
 }
 
 impl ProbeReport {
@@ -624,22 +781,91 @@ mod tests {
     fn target_status_json_count_emits_single_envelope() {
         let rendered = super::render_probe_json_envelope(
             vec![
-                super::ProbeReportEnvelope::Single(super::ProbeReport::failure(
-                    0,
-                    "vn3",
-                    "one".to_owned(),
-                )),
-                super::ProbeReportEnvelope::Single(super::ProbeReport::failure(
-                    1,
-                    "vn3",
-                    "two".to_owned(),
-                )),
+                super::ProbeReport::failure(0, "vn3", "one".to_owned()),
+                super::ProbeReport::failure(1, "vn3", "two".to_owned()),
             ],
             2,
         );
         let parsed: Value = serde_json::from_str(&rendered).expect("parse probe json envelope");
         assert_eq!(parsed["kind"], "status.probes");
         assert_eq!(parsed["probes"].as_array().expect("probes array").len(), 2);
+        assert_eq!(parsed["summary"]["total"], 2);
+        assert_eq!(parsed["summary"]["successes"], 0);
+        assert_eq!(parsed["summary"]["failures"], 2);
+        assert_eq!(parsed["summary"]["quality"], "down");
+    }
+
+    #[test]
+    fn probe_summary_calculates_latency_paths_and_quality() {
+        let reports = vec![
+            super::ProbeReport {
+                schema: 1,
+                kind: "status.probe".to_owned(),
+                seq: 0,
+                target: "vn3".to_owned(),
+                ok: true,
+                rtt_ms: Some(40.0),
+                path: Some("direct".to_owned()),
+                endpoint_id: Some("abc".to_owned()),
+                discovery: None,
+                relationship: None,
+                agent_version: None,
+                uptime_s: None,
+                hostname: None,
+                os: None,
+                error: None,
+            },
+            super::ProbeReport {
+                schema: 1,
+                kind: "status.probe".to_owned(),
+                seq: 1,
+                target: "vn3".to_owned(),
+                ok: true,
+                rtt_ms: Some(55.0),
+                path: Some("direct".to_owned()),
+                endpoint_id: Some("abc".to_owned()),
+                discovery: None,
+                relationship: None,
+                agent_version: None,
+                uptime_s: None,
+                hostname: None,
+                os: None,
+                error: None,
+            },
+            super::ProbeReport {
+                schema: 1,
+                kind: "status.probe".to_owned(),
+                seq: 2,
+                target: "vn3".to_owned(),
+                ok: true,
+                rtt_ms: Some(70.0),
+                path: Some("relay https://example".to_owned()),
+                endpoint_id: Some("abc".to_owned()),
+                discovery: None,
+                relationship: None,
+                agent_version: None,
+                uptime_s: None,
+                hostname: None,
+                os: None,
+                error: None,
+            },
+        ];
+
+        let summary = super::ProbeSummary::from_reports(&reports);
+
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.successes, 3);
+        assert_eq!(summary.failures, 0);
+        assert_eq!(summary.rtt_min_ms, Some(40.0));
+        assert_eq!(summary.rtt_avg_ms, Some(55.0));
+        assert_eq!(summary.rtt_max_ms, Some(70.0));
+        assert_eq!(summary.rtt_range_ms, Some(30.0));
+        assert_eq!(summary.rtt_jitter_ms, Some(15.0));
+        assert_eq!(summary.quality, "good");
+        assert_eq!(summary.paths[0].path, "direct");
+        assert_eq!(summary.paths[0].count, 2);
+        assert_eq!(summary.paths[1].path, "relay https://example");
+        assert_eq!(summary.paths[1].count, 1);
     }
 
     #[test]
