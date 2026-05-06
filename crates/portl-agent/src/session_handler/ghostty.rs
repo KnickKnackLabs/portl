@@ -942,6 +942,7 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
                     }
                     HelperCommand::Input(bytes) => {
                         if let Err(err) = pending_input.push(bytes) {
+                            crate::metrics::record_ghostty_event("input_queue_full");
                             tracing::warn!(%err, "ghostty pty input queue full; detaching subscribers");
                             broadcast(&mut subscribers, &[]);
                         }
@@ -1027,14 +1028,19 @@ fn append_bounded(history: &mut VecDeque<u8>, bytes: &[u8]) {
 
 #[cfg(unix)]
 fn broadcast(subscribers: &mut Vec<mpsc::Sender<Vec<u8>>>, bytes: &[u8]) {
-    subscribers.retain(|subscriber| {
-        match subscriber.try_send(bytes.to_vec()) {
-            Ok(()) => true,
-            // Channel full: evict the slow subscriber so the client gets a closed
-            // stream and can reconnect for a fresh snapshot instead of silently
-            // diverging after missed output frames. Receiver dropped: evict the
-            // dead subscriber.
-            Err(mpsc::error::TrySendError::Full(_) | mpsc::error::TrySendError::Closed(_)) => false,
+    subscribers.retain(|subscriber| match subscriber.try_send(bytes.to_vec()) {
+        Ok(()) => true,
+        // Channel full: evict the slow subscriber so the client gets a closed
+        // stream and can reconnect for a fresh snapshot instead of silently
+        // diverging after missed output frames. Receiver dropped: evict the
+        // dead subscriber.
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            crate::metrics::record_ghostty_event("subscriber_evicted_full");
+            false
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            crate::metrics::record_ghostty_event("subscriber_evicted_closed");
+            false
         }
     });
 }

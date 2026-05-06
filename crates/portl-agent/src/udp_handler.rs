@@ -49,18 +49,36 @@ impl UdpConnectionContext {
             };
 
             let result = async {
-                let datagram: portl_proto::udp_v1::UdpDatagram =
-                    postcard::from_bytes(&bytes).context("decode udp datagram")?;
+                let datagram: portl_proto::udp_v1::UdpDatagram = match postcard::from_bytes(&bytes)
+                {
+                    Ok(datagram) => datagram,
+                    Err(err) => {
+                        portl_core::runtime::record_udp_datagram_drop(
+                            "agent_ingress",
+                            "decode_failed",
+                        );
+                        return Err(anyhow::Error::from(err).context("decode udp datagram"));
+                    }
+                };
                 let Some(session) = self.registry.get_live(datagram.session_id).await? else {
+                    portl_core::runtime::record_udp_datagram_drop(
+                        "agent_ingress",
+                        "unknown_session",
+                    );
                     return Ok::<_, anyhow::Error>(());
                 };
                 if bytes.len() > portl_proto::udp_v1::MAX_UDP_DATAGRAM_BYTES {
+                    portl_core::runtime::record_udp_datagram_drop(
+                        "agent_ingress",
+                        "payload_too_large",
+                    );
                     session
                         .send_error(datagram.target_port, datagram.src_tag, "payload too large")
                         .await?;
                     return Ok(());
                 }
                 if let Err(err) = session.route_to_target(&datagram).await {
+                    portl_core::runtime::record_udp_datagram_drop("agent_ingress", "route_failed");
                     session
                         .send_error(datagram.target_port, datagram.src_tag, &err.to_string())
                         .await?;

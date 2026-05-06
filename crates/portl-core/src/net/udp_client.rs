@@ -287,12 +287,10 @@ async fn upstream_loop(
             // `tokio::select!` below by returning here so select cancels
             // the sender future (and vice versa on sender error).
             match tx.try_send(Bytes::from(encoded)) {
-                // Silent drop on Full; observability counter is a future
-                // enhancement (see v0.2 operability plan). Match on both
-                // Ok and Full so clippy::match_same_arms is satisfied
-                // without folding the variants (we want the comment on
-                // Full to be explicit about why we drop).
-                Ok(()) | Err(TrySendError::Full(_)) => {}
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    crate::runtime::record_udp_datagram_drop("client_upstream", "queue_full");
+                }
                 Err(TrySendError::Closed(_)) => {
                     return Ok::<_, anyhow::Error>(());
                 }

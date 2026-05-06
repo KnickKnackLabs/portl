@@ -34,6 +34,7 @@ pub(crate) async fn serve_stream(
         .await?
         .context("missing meta request")?;
 
+    let op = meta_req_name(&req);
     let response = match req {
         portl_proto::meta_v1::MetaReq::Ping { .. } => {
             if meta_caps(&session).is_some_and(|caps| caps.ping) {
@@ -69,12 +70,32 @@ pub(crate) async fn serve_stream(
         }
     };
 
+    crate::metrics::record_meta_request(op, meta_resp_outcome(&response));
+
     let encoded = postcard::to_stdvec(&response).context("encode meta response")?;
     send.write_all(&encoded)
         .await
         .context("write meta response")?;
     send.finish().context("finish meta response")?;
     Ok(())
+}
+
+fn meta_req_name(req: &portl_proto::meta_v1::MetaReq) -> &'static str {
+    match req {
+        portl_proto::meta_v1::MetaReq::Ping { .. } => "ping",
+        portl_proto::meta_v1::MetaReq::Info => "info",
+        portl_proto::meta_v1::MetaReq::PublishRevocations { .. } => "publish_revocations",
+    }
+}
+
+fn meta_resp_outcome(resp: &portl_proto::meta_v1::MetaResp) -> &'static str {
+    match resp {
+        portl_proto::meta_v1::MetaResp::Error(error) => match error.kind {
+            portl_proto::error::ErrorKind::CapDenied => "cap_denied",
+            _ => "error",
+        },
+        _ => "success",
+    }
 }
 
 fn meta_caps(session: &Session) -> Option<&portl_core::ticket::schema::MetaCaps> {

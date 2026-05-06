@@ -368,7 +368,9 @@ async fn serve_attach(
     tmux: provider::TmuxProvider,
 ) -> Result<()> {
     let Some(name) = req.session_name.as_deref() else {
-        write_ack(&mut send, reject(SessionReason::MissingSessionName)).await?;
+        let reason = SessionReason::MissingSessionName;
+        record_session_attach_rejection(requested_provider_metric(&req), &reason);
+        write_ack(&mut send, reject(reason)).await?;
         let _ = send.finish();
         return Ok(());
     };
@@ -384,22 +386,19 @@ async fn serve_attach(
     {
         Ok(selected) => selected,
         Err(reason) => {
+            record_session_attach_rejection(requested_provider_metric(&req), &reason);
             write_ack(&mut send, reject(reason)).await?;
             let _ = send.finish();
             return Ok(());
         }
     };
+    crate::metrics::record_session_attach_attempt(selected.name());
     let requested_user = match resolve_requested_user(req.user.as_deref()) {
         Ok(user) => user,
         Err(reject_reason) => {
-            write_ack(
-                &mut send,
-                reject(SessionReason::SpawnFailed(format!(
-                    "{:?}",
-                    reject_reason.wire
-                ))),
-            )
-            .await?;
+            let reason = SessionReason::SpawnFailed(format!("{:?}", reject_reason.wire));
+            record_session_attach_rejection(selected.name(), &reason);
+            write_ack(&mut send, reject(reason)).await?;
             let _ = send.finish();
             return Ok(());
         }
@@ -423,14 +422,12 @@ async fn serve_attach(
     #[cfg(feature = "ghostty-vt")]
     if selected == SelectedProvider::Ghostty {
         if req.user.is_some() {
-            write_ack(
-                &mut send,
-                reject(SessionReason::CapabilityUnsupported {
-                    provider: "ghostty".to_owned(),
-                    capability: "user".to_owned(),
-                }),
-            )
-            .await?;
+            let reason = SessionReason::CapabilityUnsupported {
+                provider: "ghostty".to_owned(),
+                capability: "user".to_owned(),
+            };
+            record_session_attach_rejection("ghostty", &reason);
+            write_ack(&mut send, reject(reason)).await?;
             let _ = send.finish();
             return Ok(());
         }
@@ -441,14 +438,12 @@ async fn serve_attach(
 
     if selected == SelectedProvider::Tmux {
         if req.user.is_some() {
-            write_ack(
-                &mut send,
-                reject(SessionReason::CapabilityUnsupported {
-                    provider: "tmux".to_owned(),
-                    capability: "user".to_owned(),
-                }),
-            )
-            .await?;
+            let reason = SessionReason::CapabilityUnsupported {
+                provider: "tmux".to_owned(),
+                capability: "user".to_owned(),
+            };
+            record_session_attach_rejection("tmux", &reason);
+            write_ack(&mut send, reject(reason)).await?;
             let _ = send.finish();
             return Ok(());
         }
@@ -508,11 +503,9 @@ async fn serve_attach(
     ) {
         Ok(process) => process,
         Err(err) => {
-            write_ack(
-                &mut send,
-                reject(SessionReason::SpawnFailed(format!("{:?}", err.wire))),
-            )
-            .await?;
+            let reason = SessionReason::SpawnFailed(format!("{:?}", err.wire));
+            record_session_attach_rejection("zmx", &reason);
+            write_ack(&mut send, reject(reason)).await?;
             let _ = send.finish();
             return Ok(());
         }
@@ -577,11 +570,9 @@ async fn serve_ghostty_attach(
     {
         Ok(process) => process,
         Err(err) => {
-            write_ack(
-                &mut send,
-                reject(SessionReason::SpawnFailed(err.to_string())),
-            )
-            .await?;
+            let reason = SessionReason::SpawnFailed(err.to_string());
+            record_session_attach_rejection("ghostty", &reason);
+            write_ack(&mut send, reject(reason)).await?;
             let _ = send.finish();
             return Ok(());
         }
@@ -648,11 +639,9 @@ async fn serve_control_attach(
     ) {
         Ok(process) => process,
         Err(err) => {
-            write_ack(
-                &mut send,
-                reject(SessionReason::SpawnFailed(err.to_string())),
-            )
-            .await?;
+            let reason = SessionReason::SpawnFailed(err.to_string());
+            record_session_attach_rejection("zmx", &reason);
+            write_ack(&mut send, reject(reason)).await?;
             let _ = send.finish();
             return Ok(());
         }
@@ -725,11 +714,9 @@ async fn serve_tmux_control_attach(
     ) {
         Ok(process) => process,
         Err(err) => {
-            write_ack(
-                &mut send,
-                reject(SessionReason::SpawnFailed(err.to_string())),
-            )
-            .await?;
+            let reason = SessionReason::SpawnFailed(err.to_string());
+            record_session_attach_rejection("tmux", &reason);
+            write_ack(&mut send, reject(reason)).await?;
             let _ = send.finish();
             return Ok(());
         }
@@ -1091,6 +1078,29 @@ async fn pump_session_controls(mut recv: BufferedRecv, process: &ShellProcess) -
         }
     }
     Ok(())
+}
+
+fn requested_provider_metric(req: &SessionReq) -> &str {
+    req.provider.as_deref().unwrap_or("auto")
+}
+
+fn record_session_attach_rejection(provider: &str, reason: &SessionReason) {
+    crate::metrics::record_session_attach_rejection(provider, session_reason_metric(reason));
+}
+
+fn session_reason_metric(reason: &SessionReason) -> &'static str {
+    match reason {
+        SessionReason::CapDenied => "cap_denied",
+        SessionReason::ProviderNotFound(_) => "provider_not_found",
+        SessionReason::ProviderUnavailable(_) => "provider_unavailable",
+        SessionReason::CapabilityUnsupported { .. } => "capability_unsupported",
+        SessionReason::MissingSessionName => "missing_session_name",
+        SessionReason::MissingArgv => "missing_argv",
+        SessionReason::SessionNotFound(_) => "session_not_found",
+        SessionReason::SessionAmbiguous { .. } => "session_ambiguous",
+        SessionReason::SpawnFailed(_) => "spawn_failed",
+        SessionReason::InternalError(_) => "internal_error",
+    }
 }
 
 fn session_workload_context(

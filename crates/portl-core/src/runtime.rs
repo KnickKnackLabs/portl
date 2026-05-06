@@ -13,7 +13,22 @@ struct SlowTaskLabel {
     label: &'static str,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct UdpDropLabel {
+    direction: &'static str,
+    reason: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct StatusProbeLabel {
+    outcome: &'static str,
+}
+
 static SLOW_TASKS_TOTAL: LazyLock<Family<SlowTaskLabel, Counter>> = LazyLock::new(Family::default);
+static UDP_DATAGRAM_DROPS_TOTAL: LazyLock<Family<UdpDropLabel, Counter>> =
+    LazyLock::new(Family::default);
+static STATUS_PROBES_TOTAL: LazyLock<Family<StatusProbeLabel, Counter>> =
+    LazyLock::new(Family::default);
 
 pub fn register_metrics(registry: &mut Registry) {
     registry.register(
@@ -21,6 +36,28 @@ pub fn register_metrics(registry: &mut Registry) {
         "Number of completed slow_task-wrapped blocking tasks by label",
         SLOW_TASKS_TOTAL.clone(),
     );
+    registry.register(
+        "udp_datagram_drops",
+        "UDP datagrams dropped by Portl user-space queues before reaching iroh or the local target",
+        UDP_DATAGRAM_DROPS_TOTAL.clone(),
+    );
+    registry.register(
+        "status_probes",
+        "Status probes completed by the CLI, by final outcome",
+        STATUS_PROBES_TOTAL.clone(),
+    );
+}
+
+pub fn record_udp_datagram_drop(direction: &'static str, reason: &'static str) {
+    UDP_DATAGRAM_DROPS_TOTAL
+        .get_or_create(&UdpDropLabel { direction, reason })
+        .inc();
+}
+
+pub fn record_status_probe(outcome: &'static str) {
+    STATUS_PROBES_TOTAL
+        .get_or_create(&StatusProbeLabel { outcome })
+        .inc();
 }
 
 pub async fn slow_task<F, T>(label: &'static str, fut: F) -> T

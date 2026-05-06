@@ -9,7 +9,7 @@
 //! cheaply.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context, Result, bail};
 use prometheus_client::encoding::EncodeLabelSet;
@@ -31,6 +31,70 @@ use crate::status_schema::{
 #[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
 pub struct AckReasonLabel {
     pub reason: String,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
+pub struct SessionProviderLabel {
+    pub provider: String,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
+pub struct SessionRejectLabel {
+    pub provider: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
+pub struct GhosttyEventLabel {
+    pub event: String,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
+pub struct MetaRequestLabel {
+    pub op: String,
+    pub outcome: String,
+}
+
+static SESSION_ATTACH_ATTEMPTS: LazyLock<Family<SessionProviderLabel, Counter>> =
+    LazyLock::new(Family::default);
+static SESSION_ATTACH_REJECTIONS: LazyLock<Family<SessionRejectLabel, Counter>> =
+    LazyLock::new(Family::default);
+static GHOSTTY_EVENTS: LazyLock<Family<GhosttyEventLabel, Counter>> =
+    LazyLock::new(Family::default);
+static META_REQUESTS: LazyLock<Family<MetaRequestLabel, Counter>> = LazyLock::new(Family::default);
+
+pub fn record_session_attach_attempt(provider: &str) {
+    SESSION_ATTACH_ATTEMPTS
+        .get_or_create(&SessionProviderLabel {
+            provider: provider.to_owned(),
+        })
+        .inc();
+}
+
+pub fn record_session_attach_rejection(provider: &str, reason: &str) {
+    SESSION_ATTACH_REJECTIONS
+        .get_or_create(&SessionRejectLabel {
+            provider: provider.to_owned(),
+            reason: reason.to_owned(),
+        })
+        .inc();
+}
+
+pub fn record_ghostty_event(event: &str) {
+    GHOSTTY_EVENTS
+        .get_or_create(&GhosttyEventLabel {
+            event: event.to_owned(),
+        })
+        .inc();
+}
+
+pub fn record_meta_request(op: &str, outcome: &str) {
+    META_REQUESTS
+        .get_or_create(&MetaRequestLabel {
+            op: op.to_owned(),
+            outcome: outcome.to_owned(),
+        })
+        .inc();
 }
 
 pub struct Metrics {
@@ -114,6 +178,30 @@ impl Default for Metrics {
             "relay_rejects_total",
             "Relay endpoint authorization decisions that denied the connection, by reason",
             relay_rejects_total.clone(),
+        );
+
+        registry.register(
+            "session_attach_attempts",
+            "Persistent session attach attempts routed to a provider; reconnect attempts appear as additional attaches",
+            SESSION_ATTACH_ATTEMPTS.clone(),
+        );
+
+        registry.register(
+            "session_attach_rejections",
+            "Persistent session attach requests rejected before a session stream opened, by provider and reason",
+            SESSION_ATTACH_REJECTIONS.clone(),
+        );
+
+        registry.register(
+            "ghostty_events",
+            "Ghostty native provider lifecycle and backpressure events",
+            GHOSTTY_EVENTS.clone(),
+        );
+
+        registry.register(
+            "meta_requests",
+            "Meta protocol requests handled by the agent, by operation and outcome",
+            META_REQUESTS.clone(),
         );
 
         portl_core::runtime::register_metrics(&mut registry);
@@ -531,5 +619,48 @@ mod tests {
         let text = m.encode_text().unwrap();
         assert!(text.contains("portl_tickets_accepted"));
         assert!(text.contains("portl_udp_sessions_opened"));
+    }
+
+    #[test]
+    fn semantic_metrics_encode_with_stable_labels() {
+        let m = Metrics::default();
+
+        record_session_attach_attempt("test-zmx-semantic");
+        record_session_attach_rejection("test-zmx-semantic", "spawn_failed");
+        record_ghostty_event("test_input_queue_full");
+        record_meta_request("test_ping", "success");
+        portl_core::runtime::record_udp_datagram_drop("test_client_upstream", "queue_full");
+        portl_core::runtime::record_status_probe("test_success");
+
+        let text = m.encode_text().unwrap();
+
+        assert!(
+            text.contains("portl_session_attach_attempts_total{provider=\"test-zmx-semantic\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "portl_session_attach_rejections_total{provider=\"test-zmx-semantic\",reason=\"spawn_failed\"} 1"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("portl_ghostty_events_total{event=\"test_input_queue_full\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("portl_meta_requests_total{op=\"test_ping\",outcome=\"success\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "portl_udp_datagram_drops_total{direction=\"test_client_upstream\",reason=\"queue_full\"} 1"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("portl_status_probes_total{outcome=\"test_success\"} 1"),
+            "{text}"
+        );
     }
 }

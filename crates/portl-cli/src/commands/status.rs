@@ -272,7 +272,7 @@ fn run_probe_with_identity_path_mode_timeout(
 ) -> Result<ProbeReport> {
     let runtime = tokio::runtime::Runtime::new()?;
     let identity_path = resolve_identity_path(identity_path);
-    runtime.block_on(async move {
+    let result = runtime.block_on(async move {
         let identity = store::load(&identity_path).context("load local identity")?;
         let raw_endpoint = crate::client_endpoint::bind_client_endpoint(&identity).await?;
         let outcome = tokio::time::timeout(
@@ -282,7 +282,13 @@ fn run_probe_with_identity_path_mode_timeout(
         .await;
         close_client_endpoint(raw_endpoint, "status command").await;
         outcome.with_context(|| format!("timeout after {}", humantime::format_duration(timeout)))?
-    })
+    });
+    portl_core::runtime::record_status_probe(match &result {
+        Ok(_) => "success",
+        Err(err) if err.to_string().contains("timeout after") => "timeout",
+        Err(_) => "failure",
+    });
+    result
 }
 
 pub fn run_with_identity_path_and_endpoint(
