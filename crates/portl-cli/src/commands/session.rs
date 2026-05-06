@@ -2357,12 +2357,10 @@ async fn remote_session_attach_with_reconnect_on_endpoint(
                     format!("attach stream disconnected: {err}"),
                     disconnected_path,
                 );
-                connected
-                    .connection
-                    .close(0u32.into(), b"session disconnected");
                 let reattached = reconnect_remote_session(
                     &request,
                     &provider,
+                    connected,
                     identity,
                     endpoint,
                     &display,
@@ -2691,6 +2689,7 @@ enum ReconnectDelayOutcome {
 async fn reconnect_remote_session(
     request: &RemoteSessionAttachRequest,
     provider: &str,
+    current_connected: crate::commands::peer_resolve::ConnectedPeer,
     identity: &portl_core::id::Identity,
     endpoint: &iroh::Endpoint,
     display: &AttachDisplay,
@@ -2699,6 +2698,28 @@ async fn reconnect_remote_session(
     state: &mut ReconnectAttemptState,
     flight_recorder: &mut AttachFlightRecorder,
 ) -> Result<ReconnectOutcome> {
+    let policy = ReconnectPolicy::default_interactive().with_observed_rtt(state.last_rtt);
+    if !policy.retry_budget_remaining(state.started.elapsed()) {
+        flight_recorder.record(format!(
+            "reconnect expired after {}",
+            format_compact_duration(state.started.elapsed())
+        ));
+        return Ok(ReconnectOutcome::Expired);
+    }
+
+    if let Some(outcome) = try_same_connection_reattach(
+        request,
+        provider,
+        current_connected,
+        canonical_ref,
+        state,
+        flight_recorder,
+    )
+    .await?
+    {
+        return Ok(outcome);
+    }
+
     loop {
         let policy = ReconnectPolicy::default_interactive().with_observed_rtt(state.last_rtt);
         let attempt = state.next_attempt();
@@ -2835,6 +2856,111 @@ async fn reconnect_remote_session(
                     .connection
                     .close(0u32.into(), b"session reconnect attach failed");
             }
+        }
+    }
+}
+
+async fn try_same_connection_reattach(
+    request: &RemoteSessionAttachRequest,
+    provider: &str,
+    connected: crate::commands::peer_resolve::ConnectedPeer,
+    canonical_ref: &str,
+    state: &mut ReconnectAttemptState,
+    flight_recorder: &mut AttachFlightRecorder,
+) -> Result<Option<ReconnectOutcome>> {
+    let path = attach_path_snapshot(&connected.connection);
+    state.observe_path(path.as_ref());
+    flight_recorder.record_with_path("same-connection reattach preflight", path);
+
+    let groups = match open_session_list_detailed_checked(
+        &connected.connection,
+        &connected.session,
+        Some(provider.to_owned()),
+    )
+    .await
+    {
+        Ok(groups) => groups,
+        Err(err @ SessionOpenError::Rejected { .. }) => {
+            connected
+                .connection
+                .close(0u32.into(), b"same-connection preflight rejected");
+            return Err(anyhow::Error::from(err));
+        }
+        Err(SessionOpenError::Transport(err)) => {
+            let path = attach_path_snapshot(&connected.connection);
+            state.observe_path(path.as_ref());
+            flight_recorder.record_with_path(
+                format!("same-connection reattach preflight failed: {err}"),
+                path,
+            );
+            connected
+                .connection
+                .close(0u32.into(), b"same-connection preflight failed");
+            return Ok(None);
+        }
+    };
+
+    if !session_exists_for_reconnect(&groups, provider, &request.session_name) {
+        let path = attach_path_snapshot(&connected.connection);
+        state.observe_path(path.as_ref());
+        flight_recorder.record_with_path(
+            format!(
+                "same-connection reattach session '{}' disappeared",
+                request.session_name
+            ),
+            path,
+        );
+        connected.connection.close(
+            0u32.into(),
+            b"session disappeared during same-connection reconnect",
+        );
+        anyhow::bail!(
+            "persistent session '{}' was not found on the target",
+            request.session_name
+        );
+    }
+
+    match open_session_attach_checked(
+        &connected.connection,
+        &connected.session,
+        Some(provider.to_owned()),
+        request.session_name.clone(),
+        None,
+        request.user.clone(),
+        request.cwd.clone(),
+        portl_core::net::shell_client::PtyCfg {
+            term: request.term.clone(),
+            cols: request.cols,
+            rows: request.rows,
+        },
+    )
+    .await
+    {
+        Ok(session) => {
+            let path = attach_path_snapshot(&connected.connection);
+            state.observe_path(path.as_ref());
+            flight_recorder
+                .record_with_path(format!("same-connection reattached {canonical_ref}"), path);
+            Ok(Some(ReconnectOutcome::Reattached {
+                connected: Box::new(connected),
+                session: Box::new(session),
+            }))
+        }
+        Err(err @ SessionOpenError::Rejected { .. }) => {
+            connected
+                .connection
+                .close(0u32.into(), b"same-connection attach rejected");
+            Err(anyhow::Error::from(err))
+        }
+        Err(SessionOpenError::Transport(err)) => {
+            let path = attach_path_snapshot(&connected.connection);
+            state.observe_path(path.as_ref());
+            flight_recorder
+                .record_with_path(format!("same-connection reattach failed: {err}"), path);
+            connected
+                .connection
+                .close(0u32.into(), b"same-connection attach failed");
+            Ok(None)
         }
     }
 }
