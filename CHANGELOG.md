@@ -5,6 +5,35 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.8.5 — 2026-05-07
+
+### Added
+
+- Session reconnect diagnostics now keep a short in-memory flight recorder with
+  recent attach, disconnect, reconnect, path, and RTT events. If automatic
+  reconnects expire, Portl prints the recent event trail to make Ghostty and
+  high-latency failures easier to diagnose.
+- Portl now exports semantic OpenMetrics counters for session attach outcomes,
+  Ghostty provider events, status probe outcomes, metadata requests, and UDP
+  queue drops.
+
+### Changed
+
+- `portl status TARGET --count N` now summarizes counted probes with success and
+  failure totals, RTT min/average/max/range/jitter, path counts, and a quality
+  label. JSON output includes the same aggregate summary for multi-probe runs.
+- Interactive session reconnects now adapt their transparent grace period and
+  visible retry pacing to the latest observed peer RTT, reducing flicker and
+  unnecessary retry churn for high-latency links.
+- When an attach stream disconnects, Portl first tries to reopen attach streams
+  on the existing iroh connection before dialing a fresh connection.
+
+### Fixed
+
+- Ghostty-backed attaches no longer treat intentionally absent stderr output as
+  an immediate stream disconnect, avoiding reconnect loops and repeated session
+  snapshots.
+
 ## 0.8.4 — 2026-05-06
 
 ### Added
