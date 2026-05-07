@@ -23,10 +23,13 @@ schema = 1
 # rules.
 # listen_addr = "[::]:0"
 
-# Preferred persistent-session provider. v0.4 supports zmx via the
-# target-side `zmx` CLI; manual hosts must install it explicitly.
-# session_provider = "zmx"
-# session_provider_path = "/usr/local/bin/zmx"
+# Preferred persistent-session provider. Supported values:
+#   default  — ghostty (the compiled default)
+#   ghostty  — built-in Ghostty-backed sessions
+#   zmx      — target-side zmx CLI
+#   tmux     — target-side tmux control mode
+# session_provider = "default"
+# session_provider_path = "/usr/local/bin/zmx"  # zmx/tmux CLI override
 
 [agent.discovery]
 # How peers find us (publish) and how we find them (resolve).

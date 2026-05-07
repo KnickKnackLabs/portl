@@ -1595,7 +1595,7 @@ esac
 
         assert_eq!(
             rendered,
-            b"\x1b[H\x1b[2J\x1b[1;1Hold spinner\x1b[K\x1b[2;1Hnext\x1b[K\x1b[1;5H"
+            b"\x1b[0m\x1b[H\x1b[2J\x1b[1;1Hold spinner\x1b[K\x1b[2;1Hnext\x1b[K\x1b[1;5H"
         );
     }
 

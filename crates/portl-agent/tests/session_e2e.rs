@@ -246,7 +246,7 @@ async fn session_list_aggregates_available_providers_and_resolves_unique_attach(
     AsyncReadExt::read_to_end(&mut attach.stdout, &mut attached).await?;
     assert_eq!(
         String::from_utf8_lossy(&attached),
-        "\x1b[H\x1b[2J\x1b[1;1Hviewport:ops\x1b[K\x1b[1;1Htmux:ops\n"
+        "\x1b[0m\x1b[H\x1b[2J\x1b[1;1Hviewport:ops\x1b[K\x1b[1;1Htmux:ops\n"
     );
     assert_eq!(attach.wait_exit().await?, 0);
 
@@ -412,7 +412,7 @@ async fn session_tmux_provider_attaches_with_control_mode() -> Result<()> {
     AsyncReadExt::read_to_end(&mut attach.stdout, &mut attached).await?;
     assert_eq!(
         String::from_utf8_lossy(&attached),
-        "\x1b[H\x1b[2J\x1b[1;1Hviewport:dev\x1b[K\x1b[1;1Htmux:dev\n"
+        "\x1b[0m\x1b[H\x1b[2J\x1b[1;1Hviewport:dev\x1b[K\x1b[1;1Htmux:dev\n"
     );
     assert_eq!(attach.wait_exit().await?, 0);
 

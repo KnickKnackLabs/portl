@@ -796,7 +796,7 @@ async fn local_session_list_detailed(
         ]),
         Some(other) => {
             anyhow::bail!(
-                "unsupported local session provider '{other}' (supported: ghostty, zmx, tmux)"
+                "unsupported local session provider '{other}' (supported: default, ghostty, zmx, tmux)"
             )
         }
         None => {
@@ -1015,7 +1015,7 @@ async fn local_session_run(
         Some("tmux") => anyhow::bail!("persistent session provider 'tmux' does not support run"),
         Some(other) => {
             anyhow::bail!(
-                "unsupported local session provider '{other}' (supported: ghostty, zmx, tmux)"
+                "unsupported local session provider '{other}' (supported: default, ghostty, zmx, tmux)"
             )
         }
         None => unreachable!("handled above"),
@@ -1415,7 +1415,7 @@ async fn resolve_local_provider_for_session(
             "zmx" | "tmux" => return Ok(provider.to_owned()),
             other => {
                 anyhow::bail!(
-                    "unsupported local session provider '{other}' (supported: ghostty, zmx, tmux)"
+                    "unsupported local session provider '{other}' (supported: default, ghostty, zmx, tmux)"
                 )
             }
         }
@@ -2051,24 +2051,19 @@ fn split_session_ref(
 
 fn normalize_session_provider(provider: &str) -> Result<String> {
     let normalized = normalize_session_provider_alias(provider);
-    match normalized.as_str() {
-        #[cfg(feature = "ghostty-vt")]
-        "ghostty" => Ok(normalized),
-        "tmux" | "zmx" | "raw" => Ok(normalized),
-        other => {
-            #[cfg(feature = "ghostty-vt")]
-            anyhow::bail!(
-                "unsupported session provider '{other}' (supported: ghostty, zmx, tmux, raw)"
-            );
-            #[cfg(not(feature = "ghostty-vt"))]
-            anyhow::bail!("unsupported session provider '{other}' (supported: zmx, tmux, raw)");
-        }
+    if normalized == "raw" {
+        return Ok(normalized);
     }
+    if let Some(provider) = portl_agent::config::normalize_session_provider_override(&normalized) {
+        return Ok(provider.to_owned());
+    }
+    let supported = format!("{}, raw", portl_agent::config::SESSION_PROVIDER_HELP_VALUES);
+    anyhow::bail!("unsupported session provider '{normalized}' (supported: {supported})")
 }
 
 fn normalize_session_provider_alias(provider: &str) -> String {
     match provider.trim() {
-        "g" => "ghostty".to_owned(),
+        "default" | "g" => "ghostty".to_owned(),
         "t" => "tmux".to_owned(),
         "z" => "zmx".to_owned(),
         other => other.to_owned(),
@@ -3988,13 +3983,15 @@ impl RawModeGuard {
     }
 }
 
+fn raw_mode_cleanup_sequence() -> &'static [u8] {
+    b"\x1b[0m\x1b[<u\x1b[=0u\x1b[>4;0m\x1b[?25h\x1b[?1049l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"
+}
+
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let mut stdout = std::io::stdout();
-        let _ = stdout.write_all(
-            b"\x1b[0m\x1b[?25h\x1b[?1049l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l",
-        );
+        let _ = stdout.write_all(raw_mode_cleanup_sequence());
         let _ = stdout.flush();
     }
 }
@@ -6079,6 +6076,34 @@ mod tests {
             "Portl › abcdef".chars().count()
         );
         assert_eq!(fit_visible(text, 10), "\x1b[1;36mPortl ›\x1b[0m a…\x1b[0m");
+    }
+
+    #[test]
+    fn default_session_provider_alias_normalizes_to_ghostty() {
+        assert_eq!(normalize_session_provider("default").unwrap(), "ghostty");
+        assert_eq!(
+            effective_provider_from_env(None, Some("default")).as_deref(),
+            Some("ghostty")
+        );
+        assert_eq!(
+            effective_provider_from_env(Some("default"), Some("tmux")).as_deref(),
+            Some("ghostty")
+        );
+    }
+
+    #[test]
+    fn raw_mode_cleanup_resets_enhanced_keyboard_protocols() {
+        let cleanup = raw_mode_cleanup_sequence();
+        assert!(
+            cleanup.windows(b"\x1b[<u".len()).any(|w| w == b"\x1b[<u"),
+            "cleanup should pop kitty keyboard protocol state"
+        );
+        assert!(
+            cleanup
+                .windows(b"\x1b[>4;0m".len())
+                .any(|w| w == b"\x1b[>4;0m"),
+            "cleanup should disable xterm modifyOtherKeys"
+        );
     }
 
     #[test]

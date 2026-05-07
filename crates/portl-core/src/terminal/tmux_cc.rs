@@ -124,8 +124,8 @@ pub fn resize_commands(rows: u16, cols: u16) -> Vec<u8> {
 
 #[must_use]
 pub fn render_viewport_snapshot(snapshot: &[u8], cursor_x: u16, cursor_y: u16) -> Vec<u8> {
-    let mut out = Vec::with_capacity(snapshot.len() + 32);
-    out.extend_from_slice(b"\x1b[H\x1b[2J");
+    let mut out = Vec::with_capacity(snapshot.len() + 36);
+    out.extend_from_slice(b"\x1b[0m\x1b[H\x1b[2J");
 
     let mut lines = snapshot.split(|byte| *byte == b'\n').collect::<Vec<_>>();
     if lines.last().is_some_and(|line| line.is_empty()) {
@@ -165,7 +165,16 @@ mod tests {
     fn renders_tmux_viewport_snapshot() {
         assert_eq!(
             render_viewport_snapshot(b"old spinner\nnext\n", 4, 0),
-            b"\x1b[H\x1b[2J\x1b[1;1Hold spinner\x1b[K\x1b[2;1Hnext\x1b[K\x1b[1;5H"
+            b"\x1b[0m\x1b[H\x1b[2J\x1b[1;1Hold spinner\x1b[K\x1b[2;1Hnext\x1b[K\x1b[1;5H"
+        );
+    }
+
+    #[test]
+    fn tmux_viewport_snapshot_resets_leaked_sgr_before_replay() {
+        assert!(
+            render_viewport_snapshot(b"\x1b[1;32mprompt\x1b[0m\n", 0, 0)
+                .starts_with(b"\x1b[0m\x1b[H\x1b[2J"),
+            "initial viewport replay should not inherit dim or other SGR from the caller"
         );
     }
 }

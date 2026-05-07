@@ -81,7 +81,8 @@ pub struct AgentSection {
     /// Override `PORTL_LISTEN_ADDR` — socket to bind the QUIC
     /// listener on. Default: `"[::]:0"`.
     pub listen_addr: Option<String>,
-    /// Preferred persistent-session provider. v0.4 supports `zmx`.
+    /// Preferred persistent-session provider. Supports `default`,
+    /// `ghostty`, `zmx`, and `tmux`; `default` resolves to `ghostty`.
     pub session_provider: Option<String>,
     /// Absolute path to the provider CLI on the target host.
     pub session_provider_path: Option<PathBuf>,

@@ -1073,7 +1073,9 @@ pub const TARGET_HELP: &str = "Target identifier. Accepts any of:\n\n  * peer la
 /// and raw ticket strings are intentionally excluded.
 pub const SESSION_SHARE_TARGET_HELP: &str = "Target identifier. Supported forms:\n\n  * peer label    — outbound-capable peer from `portl peer ls`\n  * adapter alias — alias backed by an `endpoint_id`\n  * endpoint_id   — 64-char hex endpoint id (or PPPP…SSSS elided form)\n\nSaved tickets and raw `portl…` ticket strings are NOT accepted here:\nthe share flow refuses to delegate a ticket credential to an unknown\nrecipient.";
 
-const PORTL_AFTER_HELP: &str = "Everyday sessions:\n  $ portl attach dotfiles\n  $ portl run dotfiles -- git status\n  $ PORTL_TARGET=other-machine portl attach dotfiles\n  $ portl session share dotfiles\n\nPair two machines:\n  $ portl init\n  $ portl invite                       # on the other machine\n  $ portl accept PORTLINV-…            # on this machine\n\nRun `portl <COMMAND> --help` for details on any subcommand.\n\nEnvironment variables:\n  PORTL_HOME       Portl home root override (default: ~/.portl).\n  PORTL_CONFIG     Alt portl.toml path.\n  PORTL_TARGET     Default target for session commands.\n  PORTL_JSON       Force --json where supported (0/1).\n  PORTL_QUIET      Force --quiet where supported (0/1).\n  NO_COLOR         Disable color output.\n\nSee `docs/ENV.md` for the full list including relay and internal variables.";
+const SESSION_ENV_HELP: &str = "Session environment overrides:\n  PORTL_SESSION_PROVIDER       Preferred persistent-session provider (default, ghostty, zmx, tmux).\n                              `default` resolves to ghostty.\n  PORTL_SESSION_PROVIDER_PATH  Absolute path to a zmx or tmux provider binary.\n";
+
+const PORTL_AFTER_HELP: &str = "Everyday sessions:\n  $ portl attach dotfiles\n  $ portl run dotfiles -- git status\n  $ PORTL_TARGET=other-machine portl attach dotfiles\n  $ portl session share dotfiles\n\nPair two machines:\n  $ portl init\n  $ portl invite                       # on the other machine\n  $ portl accept PORTLINV-…            # on this machine\n\nRun `portl <COMMAND> --help` for details on any subcommand.\n\nEnvironment variables:\n  PORTL_HOME       Portl home root override (default: ~/.portl).\n  PORTL_CONFIG     Alt portl.toml path.\n  PORTL_TARGET     Default target for session commands.\n  PORTL_JSON       Force --json where supported (0/1).\n  PORTL_QUIET      Force --quiet where supported (0/1).\n  NO_COLOR         Disable color output.\n\nSession environment overrides:\n  PORTL_SESSION_PROVIDER       Preferred persistent-session provider (default, ghostty, zmx, tmux).\n                              `default` resolves to ghostty.\n  PORTL_SESSION_PROVIDER_PATH  Absolute path to a zmx or tmux provider binary.\n\nSee `docs/ENV.md` for the full list including relay and internal variables.";
 
 const TOP_LEVEL_HELP: &str = "portl — peer-to-peer remote access and port forwarding.
 
@@ -1148,6 +1150,11 @@ Environment variables:
   PORTL_JSON       Force --json where supported (0/1).
   PORTL_QUIET      Force --quiet where supported (0/1).
   NO_COLOR         Disable color output.
+
+Session environment overrides:
+  PORTL_SESSION_PROVIDER       Preferred persistent-session provider (default, ghostty, zmx, tmux).
+                              `default` resolves to ghostty.
+  PORTL_SESSION_PROVIDER_PATH  Absolute path to a zmx or tmux provider binary.
 
 See `docs/ENV.md` for the full list including relay and internal variables.";
 
@@ -1430,7 +1437,7 @@ enum SessionTopLevel {
         provider: Option<String>,
     },
     /// Manage persistent terminal sessions.
-    #[command(display_order = 120)]
+    #[command(display_order = 120, after_long_help = SESSION_ENV_HELP)]
     Session {
         #[command(subcommand)]
         action: SessionAction,

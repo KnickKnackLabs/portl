@@ -69,10 +69,11 @@ pub struct AgentConfig {
     pub metrics_enabled: Option<bool>,
     pub metrics_socket_path: Option<PathBuf>,
     /// Optional preferred target-side persistent-session provider.
-    /// The first v0.4 slice supports `zmx`.
+    /// `default` normalizes to `ghostty`; explicit overrides support
+    /// `ghostty`, `zmx`, and `tmux`.
     pub session_provider: Option<String>,
     /// Optional absolute path to the target-side persistent-session provider CLI.
-    /// The first v0.4 slice treats this as a zmx path when set.
+    /// Used for external CLI-backed providers (`zmx` or `tmux`).
     pub session_provider_path: Option<PathBuf>,
     /// Lightweight self-healing endpoint watchdog.
     pub watchdog: crate::network_watchdog::WatchdogConfig,
@@ -536,11 +537,38 @@ fn parse_rate_limit(value: &str) -> Result<RateLimitConfig> {
     })
 }
 
-fn parse_session_provider(value: &str) -> Result<String> {
+pub const SESSION_PROVIDER_DEFAULT_ALIAS: &str = "default";
+pub const SESSION_PROVIDER_DEFAULT: &str = "ghostty";
+pub const SESSION_PROVIDER_GHOSTTY: &str = "ghostty";
+pub const SESSION_PROVIDER_ZMX: &str = "zmx";
+pub const SESSION_PROVIDER_TMUX: &str = "tmux";
+pub const SESSION_PROVIDER_HELP_VALUES: &str = "default, ghostty, zmx, tmux";
+pub const SESSION_PROVIDER_CONFIG_VALUES: &[&str] = &[
+    SESSION_PROVIDER_DEFAULT_ALIAS,
+    SESSION_PROVIDER_GHOSTTY,
+    SESSION_PROVIDER_ZMX,
+    SESSION_PROVIDER_TMUX,
+];
+
+#[must_use]
+pub fn normalize_session_provider_override(value: &str) -> Option<&'static str> {
     match value.trim() {
-        "zmx" => Ok("zmx".to_owned()),
-        other => bail!("unsupported PORTL_SESSION_PROVIDER '{other}' (supported: zmx)"),
+        SESSION_PROVIDER_DEFAULT_ALIAS => Some(SESSION_PROVIDER_DEFAULT),
+        SESSION_PROVIDER_GHOSTTY => Some(SESSION_PROVIDER_GHOSTTY),
+        SESSION_PROVIDER_ZMX => Some(SESSION_PROVIDER_ZMX),
+        SESSION_PROVIDER_TMUX => Some(SESSION_PROVIDER_TMUX),
+        _ => None,
     }
+}
+
+fn parse_session_provider(value: &str) -> Result<String> {
+    if let Some(provider) = normalize_session_provider_override(value) {
+        return Ok(provider.to_owned());
+    }
+    let other = value.trim();
+    bail!(
+        "unsupported PORTL_SESSION_PROVIDER '{other}' (supported: {SESSION_PROVIDER_HELP_VALUES})"
+    )
 }
 
 fn parse_bool_env(name: &str, value: &str) -> Result<bool> {
@@ -848,6 +876,43 @@ mod tests {
             || {
                 let config = AgentConfig::from_env().expect("parse rate limit env");
                 assert_eq!(config.rate_limit, RateLimitConfig { rps: 7, burst: 13 });
+            },
+        );
+    }
+
+    #[test]
+    fn from_env_accepts_all_session_provider_overrides() {
+        for (input, expected) in [
+            ("default", "ghostty"),
+            ("ghostty", "ghostty"),
+            ("zmx", "zmx"),
+            ("tmux", "tmux"),
+        ] {
+            with_env(
+                &[("PORTL_SESSION_PROVIDER", Some(OsString::from(input)))],
+                || {
+                    let config = AgentConfig::from_env().expect("parse session provider env");
+                    assert_eq!(config.session_provider.as_deref(), Some(expected));
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn from_env_rejects_unknown_session_provider_with_shared_list() {
+        with_env(
+            &[("PORTL_SESSION_PROVIDER", Some(OsString::from("wezterm")))],
+            || {
+                let err = AgentConfig::from_env().expect_err("unknown provider must fail");
+                let text = err.to_string();
+                assert!(
+                    text.contains("unsupported PORTL_SESSION_PROVIDER 'wezterm'"),
+                    "unexpected error: {text}"
+                );
+                assert!(
+                    text.contains("supported: default, ghostty, zmx, tmux"),
+                    "error should use shared provider list: {text}"
+                );
             },
         );
     }

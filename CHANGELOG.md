@@ -5,6 +5,19 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Fixed
+
+- `PORTL_SESSION_PROVIDER` now accepts the same persistent-session provider
+  names Portl can actually use: `default`, `ghostty`, `zmx`, and `tmux`.
+  The `default` alias resolves to Ghostty, and `portl --help` plus
+  `portl session --help` now document the session-provider environment
+  overrides.
+- Interactive attaches now reset enhanced keyboard modes on exit so Ctrl-C from
+  TUIs cannot leave Ghostty or other CSI-u terminals printing raw key escape
+  sequences at the shell prompt.
+- Initial tmux attach snapshots now reset terminal styling before replay, so a
+  newly attached session no longer appears dim until the next prompt redraw.
+
 ## 0.8.8 — 2026-05-07
 
 ### Added

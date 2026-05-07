@@ -252,6 +252,23 @@ fn top_level_help_groups_daily_session_aliases() {
 }
 
 #[test]
+fn help_documents_session_environment_overrides() {
+    for args in [&["--help"][..], &["session", "--help"][..]] {
+        let help = help_output(args);
+        for needle in [
+            "PORTL_SESSION_PROVIDER",
+            "default, ghostty, zmx, tmux",
+            "PORTL_SESSION_PROVIDER_PATH",
+        ] {
+            assert!(
+                help.contains(needle),
+                "help for {args:?} should document {needle:?}:\n{help}"
+            );
+        }
+    }
+}
+
+#[test]
 fn top_level_help_snapshots_match() {
     let cases = [
         (
