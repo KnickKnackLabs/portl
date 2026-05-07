@@ -5,6 +5,17 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.8.7 — 2026-05-07
+
+### Fixed
+
+- Remote Ghostty attach control bars now stay visible over fullscreen TUI
+  redraws while `Ctrl+\\` control mode is active, and the bar now advertises
+  the available `r reload` shortcut.
+- Full Ghostty reloads no longer leave the local terminal in dim or faint color
+  state after retained scrollback replay; colors return to normal automatically
+  before the viewport and live output resume.
+
 ## 0.8.6 — 2026-05-07
 
 ### Changed
