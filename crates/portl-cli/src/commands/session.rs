@@ -4603,7 +4603,6 @@ impl AttachOutputGate {
             AttachOutputStream::Stderr => self.stderr.len(),
         };
         if target_len.saturating_add(bytes.len()) > ATTACH_OUTPUT_GATE_LIMIT {
-            self.holding = false;
             return AttachOutputGateDecision::Overflow;
         }
         match stream {
@@ -5400,7 +5399,13 @@ where
             clear_attach_control_bar(ui).await?;
             return Ok(AttachControlOutcome::Continue);
         }
-        render_attach_control_bar(ui, CONTROL_TIMEOUT.saturating_sub(elapsed), paste).await?;
+        render_attach_control_bar(
+            ui,
+            CONTROL_TIMEOUT.saturating_sub(elapsed),
+            paste,
+            sink.supports_reload(),
+        )
+        .await?;
         if let Ok(read) = tokio::time::timeout(CONTROL_TICK, stdin.read(&mut buf)).await {
             let read = read.context("read local stdin in attach control mode")?;
             if read == 0 {
@@ -5466,11 +5471,13 @@ async fn render_attach_control_bar(
     ui: &AttachControlUi,
     remaining: Duration,
     paste: &PasteState,
+    supports_reload: bool,
 ) -> Result<()> {
     ui.display
         .set_bar(render_bar(RenderBarOptions {
             canonical_ref: &ui.canonical_ref,
             supports_kick_others: ui.supports_kick_others,
+            supports_reload,
             paste_cancellable: paste.is_active(),
             remaining,
             unicode: terminal_locale_supports_unicode(),
@@ -5602,7 +5609,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_output_gate_overflows_to_unheld_mode() {
+    fn attach_output_gate_overflow_keeps_bar_holding() {
         let mut gate = AttachOutputGate::default();
         gate.set_holding(true);
         assert_eq!(
@@ -5618,7 +5625,12 @@ mod tests {
         );
         assert_eq!(
             gate.hold(AttachOutputStream::Stdout, b"z"),
-            AttachOutputGateDecision::NotHolding
+            AttachOutputGateDecision::Overflow
+        );
+        assert_eq!(gate.take_stdout(), vec![b'x'; ATTACH_OUTPUT_GATE_LIMIT]);
+        assert_eq!(
+            gate.hold(AttachOutputStream::Stdout, b"after-flush"),
+            AttachOutputGateDecision::Held
         );
     }
 

@@ -5,6 +5,7 @@ use std::time::Duration;
 pub struct RenderBarOptions<'a> {
     pub canonical_ref: &'a str,
     pub supports_kick_others: bool,
+    pub supports_reload: bool,
     pub paste_cancellable: bool,
     pub remaining: Duration,
     pub unicode: bool,
@@ -42,6 +43,9 @@ pub fn render_bar(options: RenderBarOptions<'_>) -> String {
     )];
     if options.supports_kick_others {
         parts.push(format!("{} {} {}", sep, key("k"), label("kick")));
+    }
+    if options.supports_reload {
+        parts.push(format!("{} {} {}", sep, key("r"), label("reload")));
     }
     parts.push(format!("{} {} {}", sep, key(send_key), label("send")));
     if options.paste_cancellable {
@@ -196,6 +200,7 @@ mod tests {
         let bar = render_bar(RenderBarOptions {
             canonical_ref: "max-b265/tmux/dotfiles",
             supports_kick_others: true,
+            supports_reload: false,
             paste_cancellable: false,
             remaining: Duration::from_millis(1900),
             unicode: true,
@@ -213,6 +218,7 @@ mod tests {
         let bar = render_bar(RenderBarOptions {
             canonical_ref: "max-b265/zmx/dev",
             supports_kick_others: false,
+            supports_reload: false,
             paste_cancellable: false,
             remaining: Duration::from_secs(2),
             unicode: false,
@@ -230,6 +236,7 @@ mod tests {
         let bar = render_bar(RenderBarOptions {
             canonical_ref: "max-b265/zmx/dev",
             supports_kick_others: false,
+            supports_reload: false,
             paste_cancellable: true,
             remaining: Duration::from_secs(2),
             unicode: false,
@@ -239,6 +246,24 @@ mod tests {
         assert_eq!(
             bar,
             "| Portl > max-b265/zmx/dev  |  d detach | ^\\ send | c cancel paste | Esc cancel | 2.0s"
+        );
+    }
+
+    #[test]
+    fn compact_bar_shows_reload_when_supported() {
+        let bar = render_bar(RenderBarOptions {
+            canonical_ref: "max-b265/ghostty/dev",
+            supports_kick_others: false,
+            supports_reload: true,
+            paste_cancellable: false,
+            remaining: Duration::from_secs(2),
+            unicode: false,
+            color: false,
+        });
+
+        assert_eq!(
+            bar,
+            "| Portl > max-b265/ghostty/dev  |  d detach | r reload | ^\\ send | Esc cancel | 2.0s"
         );
     }
 
