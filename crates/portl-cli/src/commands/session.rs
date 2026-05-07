@@ -3310,7 +3310,7 @@ async fn run_remote_attach_v2_once(
         mut live,
         mut history,
     } = session;
-    let reload_state = Arc::new(StdMutex::new(None));
+    let reload_state = Arc::new(StdMutex::new(AttachV2ReloadState::default()));
     let (initial_cols, initial_rows) = display.size().await;
     let resize_state = Arc::new(StdMutex::new(AttachV2ResizeState {
         resize_id: 0,
@@ -3339,6 +3339,8 @@ async fn run_remote_attach_v2_once(
     }
     let mut covered_live_seq = 0_u64;
     let mut last_viewport_generation = 0_u64;
+    let mut opening_state = AttachV2OpeningState::default();
+    let mut data_streams = AttachV2DataStreamStatus::default();
     let mut resync_pending = false;
     let end = loop {
         tokio::select! {
@@ -3359,13 +3361,14 @@ async fn run_remote_attach_v2_once(
                     Err(err) => break AttachEnd::Disconnected(err),
                 }
             }
-            frame = read_attach_v2_frame(&mut viewport) => {
+            frame = read_attach_v2_frame(&mut viewport), if data_streams.viewport_open() => {
                 match frame {
                     Ok(Some(AttachV2ServerFrame::ViewportSnapshot { attach_id: frame_attach_id, generation, covers_live_seq, cols, rows, resize_id, payload, .. })) if frame_attach_id == attach_id && generation > last_viewport_generation && attach_v2_viewport_matches_resize_state(resize_id, cols, rows, current_resize_state(&resize_state)) => {
                         last_viewport_generation = generation;
                         covered_live_seq = covered_live_seq.max(covers_live_seq);
                         resync_pending = false;
-                        clear_active_reload(&reload_state);
+                        opening_state.mark_viewport_seen();
+                        clear_reload_after_viewport(&reload_state);
                         match payload.decode(ATTACH_V2_MAX_DECODED_PAYLOAD) {
                             Ok(bytes) => {
                                 if let Err(err) = display.write_output(AttachOutputStream::Stdout, &bytes).await {
@@ -3387,24 +3390,31 @@ async fn run_remote_attach_v2_once(
                         );
                     }
                     Ok(Some(_)) => {}
-                    Ok(None) => break AttachEnd::Disconnected(anyhow!("attach v2 viewport stream ended before exit frame")),
+                    Ok(None) => {
+                        data_streams.close(AttachV2DataStream::Viewport);
+                        debug!("attach v2 viewport stream ended; waiting for control terminal frame");
+                    }
                     Err(err) => break AttachEnd::Disconnected(err),
                 }
             }
-            frame = read_attach_v2_frame(&mut history) => {
+            frame = read_attach_v2_frame(&mut history), if data_streams.history_open() => {
                 match frame {
                     Ok(Some(AttachV2ServerFrame::PreludeChunk { attach_id: frame_attach_id, payload, .. })) if frame_attach_id == attach_id => {
-                        match payload.decode(ATTACH_V2_MAX_DECODED_PAYLOAD) {
-                            Ok(bytes) => {
-                                if let Err(err) = display.write_output(AttachOutputStream::Stdout, &bytes).await {
-                                    break AttachEnd::Disconnected(err);
+                        if opening_state.should_render_prelude() {
+                            match payload.decode(ATTACH_V2_MAX_DECODED_PAYLOAD) {
+                                Ok(bytes) => {
+                                    if let Err(err) = display.write_output(AttachOutputStream::Stdout, &bytes).await {
+                                        break AttachEnd::Disconnected(err);
+                                    }
                                 }
+                                Err(err) => break AttachEnd::Disconnected(err),
                             }
-                            Err(err) => break AttachEnd::Disconnected(err),
+                        } else {
+                            debug!("ignored late attach v2 prelude after viewport snapshot");
                         }
                     }
                     Ok(Some(AttachV2ServerFrame::ReloadChunk { attach_id: frame_attach_id, reload_id, progress, payload, .. })) if frame_attach_id == attach_id => {
-                        if current_active_reload(&reload_state) == Some(reload_id) {
+                        if active_reload_accepts_chunk(&reload_state, reload_id) {
                             let text = if let Some(total) = progress.total_bytes {
                                 format!(
                                     "▌ Portl › reloading {} / {} bytes · Esc cancel",
@@ -3426,13 +3436,16 @@ async fn run_remote_attach_v2_once(
                         }
                     }
                     Ok(Some(_)) => {}
-                    Ok(None) => break AttachEnd::Disconnected(anyhow!("attach v2 history stream ended before exit frame")),
+                    Ok(None) => {
+                        data_streams.close(AttachV2DataStream::History);
+                        debug!("attach v2 history stream ended; waiting for control terminal frame");
+                    }
                     Err(err) => break AttachEnd::Disconnected(err),
                 }
             }
-            frame = read_attach_v2_frame(&mut live) => {
+            frame = read_attach_v2_frame(&mut live), if data_streams.live_open() => {
                 match frame {
-                    Ok(Some(AttachV2ServerFrame::LiveOutput { attach_id: frame_attach_id, start_seq, end_seq, payload, .. })) if frame_attach_id == attach_id && current_active_reload(&reload_state).is_none() && !resync_pending && end_seq > covered_live_seq => {
+                    Ok(Some(AttachV2ServerFrame::LiveOutput { attach_id: frame_attach_id, start_seq, end_seq, payload, .. })) if frame_attach_id == attach_id && active_reload_id(&reload_state).is_none() && !resync_pending && end_seq > covered_live_seq => {
                         if start_seq > covered_live_seq {
                             let _ = display
                                 .set_bar("▌ Portl › resyncing after live sequence gap".to_owned())
@@ -3457,7 +3470,10 @@ async fn run_remote_attach_v2_once(
                         }
                     }
                     Ok(Some(_)) => {}
-                    Ok(None) => break AttachEnd::Disconnected(anyhow!("attach v2 live stream ended before exit frame")),
+                    Ok(None) => {
+                        data_streams.close(AttachV2DataStream::Live);
+                        debug!("attach v2 live stream ended; waiting for control terminal frame");
+                    }
                     Err(err) => break AttachEnd::Disconnected(err),
                 }
             }
@@ -3481,18 +3497,189 @@ async fn read_attach_v2_frame(recv: &mut BufferedRecv) -> Result<Option<AttachV2
         .await
 }
 
-fn current_active_reload(reload_state: &Arc<StdMutex<Option<u64>>>) -> Option<u64> {
-    reload_state.lock().map_or(None, |state| *state)
+fn active_reload_id(reload_state: &Arc<StdMutex<AttachV2ReloadState>>) -> Option<u64> {
+    reload_state
+        .lock()
+        .map_or(None, |state| state.active_reload_id())
 }
 
-fn set_active_reload(reload_state: &Arc<StdMutex<Option<u64>>>, reload_id: Option<u64>) {
+fn cancellable_reload_id(reload_state: &Arc<StdMutex<AttachV2ReloadState>>) -> Option<u64> {
+    reload_state
+        .lock()
+        .map_or(None, |state| state.cancellable_reload_id())
+}
+
+fn active_reload_accepts_chunk(
+    reload_state: &Arc<StdMutex<AttachV2ReloadState>>,
+    reload_id: u64,
+) -> bool {
+    reload_state
+        .lock()
+        .is_ok_and(|state| state.accepts_chunk(reload_id))
+}
+
+fn start_active_reload(reload_state: &Arc<StdMutex<AttachV2ReloadState>>, reload_id: u64) {
     if let Ok(mut state) = reload_state.lock() {
-        *state = reload_id;
+        state.start(reload_id);
     }
 }
 
-fn clear_active_reload(reload_state: &Arc<StdMutex<Option<u64>>>) {
-    set_active_reload(reload_state, None);
+fn mark_reload_done(reload_state: &Arc<StdMutex<AttachV2ReloadState>>, reload_id: u64) -> bool {
+    reload_state
+        .lock()
+        .is_ok_and(|mut state| state.mark_done(reload_id))
+}
+
+fn mark_reload_cancelled(
+    reload_state: &Arc<StdMutex<AttachV2ReloadState>>,
+    reload_id: u64,
+) -> bool {
+    reload_state
+        .lock()
+        .is_ok_and(|mut state| state.mark_cancelled(reload_id))
+}
+
+fn clear_reload_after_viewport(reload_state: &Arc<StdMutex<AttachV2ReloadState>>) -> bool {
+    reload_state
+        .lock()
+        .is_ok_and(|mut state| state.clear_after_viewport())
+}
+
+#[derive(Debug, Default)]
+struct AttachV2OpeningState {
+    viewport_seen: bool,
+}
+
+impl AttachV2OpeningState {
+    fn should_render_prelude(&self) -> bool {
+        !self.viewport_seen
+    }
+
+    fn mark_viewport_seen(&mut self) {
+        self.viewport_seen = true;
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum AttachV2ReloadState {
+    #[default]
+    Idle,
+    Loading {
+        reload_id: u64,
+    },
+    AwaitingViewport {
+        reload_id: u64,
+    },
+}
+
+impl AttachV2ReloadState {
+    fn start(&mut self, reload_id: u64) {
+        *self = Self::Loading { reload_id };
+    }
+
+    fn active_reload_id(&self) -> Option<u64> {
+        match self {
+            Self::Idle => None,
+            Self::Loading { reload_id } | Self::AwaitingViewport { reload_id } => Some(*reload_id),
+        }
+    }
+
+    fn cancellable_reload_id(&self) -> Option<u64> {
+        match self {
+            Self::Loading { reload_id } => Some(*reload_id),
+            Self::Idle | Self::AwaitingViewport { .. } => None,
+        }
+    }
+
+    fn accepts_chunk(&self, reload_id: u64) -> bool {
+        matches!(self, Self::Loading { reload_id: active } if *active == reload_id)
+    }
+
+    fn mark_done(&mut self, reload_id: u64) -> bool {
+        match self {
+            Self::Loading { reload_id: active } if *active == reload_id => {
+                *self = Self::AwaitingViewport { reload_id };
+                true
+            }
+            Self::AwaitingViewport { reload_id: active } if *active == reload_id => true,
+            Self::Idle | Self::Loading { .. } | Self::AwaitingViewport { .. } => false,
+        }
+    }
+
+    fn mark_cancelled(&mut self, reload_id: u64) -> bool {
+        match self {
+            Self::Loading { reload_id: active } | Self::AwaitingViewport { reload_id: active }
+                if *active == reload_id =>
+            {
+                *self = Self::AwaitingViewport { reload_id };
+                true
+            }
+            Self::Idle | Self::Loading { .. } | Self::AwaitingViewport { .. } => false,
+        }
+    }
+
+    fn clear_after_viewport(&mut self) -> bool {
+        if matches!(self, Self::AwaitingViewport { .. }) {
+            *self = Self::Idle;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachV2DataStream {
+    Viewport,
+    History,
+    Live,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AttachV2DataStreamStatus {
+    viewport_open: bool,
+    history_open: bool,
+    live_open: bool,
+}
+
+impl Default for AttachV2DataStreamStatus {
+    fn default() -> Self {
+        Self {
+            viewport_open: true,
+            history_open: true,
+            live_open: true,
+        }
+    }
+}
+
+impl AttachV2DataStreamStatus {
+    fn close(&mut self, stream: AttachV2DataStream) {
+        match stream {
+            AttachV2DataStream::Viewport => self.viewport_open = false,
+            AttachV2DataStream::History => self.history_open = false,
+            AttachV2DataStream::Live => self.live_open = false,
+        }
+    }
+
+    fn viewport_open(self) -> bool {
+        self.viewport_open
+    }
+
+    fn history_open(self) -> bool {
+        self.history_open
+    }
+
+    fn live_open(self) -> bool {
+        self.live_open
+    }
+
+    #[cfg(test)]
+    fn data_eof_requires_disconnect(self) -> bool {
+        if !self.viewport_open && !self.history_open && !self.live_open {
+            return false;
+        }
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3582,7 +3769,7 @@ fn attach_v2_frame_matches(frame: &AttachV2ServerFrame, attach_id: [u8; 16]) -> 
 async fn handle_attach_v2_control_frame(
     frame: AttachV2ServerFrame,
     display: &AttachDisplay,
-    reload_state: &Arc<StdMutex<Option<u64>>>,
+    reload_state: &Arc<StdMutex<AttachV2ReloadState>>,
     resync_pending: &mut bool,
 ) -> Result<Option<AttachEnd>> {
     match frame {
@@ -3591,7 +3778,7 @@ async fn handle_attach_v2_control_frame(
             total_bytes,
             ..
         } => {
-            set_active_reload(reload_state, Some(reload_id));
+            start_active_reload(reload_state, reload_id);
             let text = total_bytes.map_or_else(
                 || "▌ Portl › reloading · Esc cancel".to_owned(),
                 |total| format!("▌ Portl › reloading 0 / {total} bytes · Esc cancel"),
@@ -3600,7 +3787,7 @@ async fn handle_attach_v2_control_frame(
             Ok(None)
         }
         AttachV2ServerFrame::ReloadDone { reload_id, .. } => {
-            if current_active_reload(reload_state) == Some(reload_id) {
+            if mark_reload_done(reload_state, reload_id) {
                 display
                     .set_bar("▌ Portl › reload complete · refreshing viewport".to_owned())
                     .await?;
@@ -3608,8 +3795,7 @@ async fn handle_attach_v2_control_frame(
             Ok(None)
         }
         AttachV2ServerFrame::ReloadCancelled { reload_id, .. } => {
-            if current_active_reload(reload_state) == Some(reload_id) {
-                clear_active_reload(reload_state);
+            if mark_reload_cancelled(reload_state, reload_id) {
                 *resync_pending = true;
                 display
                     .set_bar("▌ Portl › reload cancelled · refreshing viewport".to_owned())
@@ -5038,7 +5224,7 @@ impl AttachInputSink {
         matches!(
             &self.kind,
             AttachInputSinkKind::RemoteV2 { reload_state, .. }
-                if current_active_reload(reload_state).is_some()
+                if cancellable_reload_id(reload_state).is_some()
         )
     }
 
@@ -5055,7 +5241,7 @@ impl AttachInputSink {
                 ..
             } => {
                 if bytes == b"\x1b"
-                    && let Some(reload_id) = current_active_reload(reload_state)
+                    && let Some(reload_id) = cancellable_reload_id(reload_state)
                 {
                     return control
                         .write_all(
@@ -5192,7 +5378,7 @@ impl AttachInputSink {
                 ..
             } => {
                 *next_reload_id = next_reload_id.saturating_add(1);
-                set_active_reload(reload_state, Some(*next_reload_id));
+                start_active_reload(reload_state, *next_reload_id);
                 control
                     .write_all(
                         &postcard::to_stdvec(&AttachV2ClientFrame::Reload {
@@ -5270,7 +5456,7 @@ enum AttachInputSinkKind {
         next_resize_id: u64,
         next_reload_id: u64,
         resize_state: Arc<StdMutex<AttachV2ResizeState>>,
-        reload_state: Arc<StdMutex<Option<u64>>>,
+        reload_state: Arc<StdMutex<AttachV2ReloadState>>,
     },
     Zmx {
         stdin: ChildStdin,
@@ -5712,6 +5898,48 @@ mod tests {
             gate.hold(AttachOutputStream::Stdout, b"after-flush"),
             AttachOutputGateDecision::Held
         );
+    }
+
+    #[test]
+    fn attach_v2_opening_drops_late_prelude_after_viewport() {
+        let mut opening = AttachV2OpeningState::default();
+
+        assert!(opening.should_render_prelude());
+        opening.mark_viewport_seen();
+        assert!(!opening.should_render_prelude());
+    }
+
+    #[test]
+    fn attach_v2_reload_state_waits_for_final_viewport() {
+        let mut state = AttachV2ReloadState::default();
+
+        state.start(7);
+        assert_eq!(state.active_reload_id(), Some(7));
+        assert_eq!(state.cancellable_reload_id(), Some(7));
+        assert!(state.accepts_chunk(7));
+        assert!(!state.clear_after_viewport());
+        assert_eq!(state.active_reload_id(), Some(7));
+
+        assert!(state.mark_done(7));
+        assert_eq!(state.active_reload_id(), Some(7));
+        assert_eq!(state.cancellable_reload_id(), None);
+        assert!(!state.accepts_chunk(7));
+        assert!(state.clear_after_viewport());
+        assert_eq!(state.active_reload_id(), None);
+    }
+
+    #[test]
+    fn attach_v2_data_stream_eof_is_non_terminal() {
+        let mut streams = AttachV2DataStreamStatus::default();
+
+        streams.close(AttachV2DataStream::Viewport);
+        streams.close(AttachV2DataStream::History);
+        streams.close(AttachV2DataStream::Live);
+
+        assert!(!streams.viewport_open());
+        assert!(!streams.history_open());
+        assert!(!streams.live_open());
+        assert!(!streams.data_eof_requires_disconnect());
     }
 
     #[test]
