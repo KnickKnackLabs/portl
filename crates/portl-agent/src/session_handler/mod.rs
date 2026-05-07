@@ -57,6 +57,7 @@ pub(crate) async fn serve_stream(
                 cwd: req_body.cwd,
                 argv: req_body.argv,
                 pty: req_body.pty,
+                attach_v2: req_body.attach_v2,
             };
             serve_control_stream(connection, session, state, send, recv, req).await
         }
@@ -307,6 +308,21 @@ async fn serve_control_stream(
             Ok(())
         }
         SessionOp::Attach => serve_attach(session, state, send, recv, req, zmx, tmux).await,
+        #[cfg(feature = "ghostty-vt")]
+        SessionOp::AttachV2 => serve_attach_v2(session, state, send, recv, req, zmx, tmux).await,
+        #[cfg(not(feature = "ghostty-vt"))]
+        SessionOp::AttachV2 => {
+            write_ack(
+                &mut send,
+                reject(SessionReason::CapabilityUnsupported {
+                    provider: req.provider.unwrap_or_else(|| "ghostty".to_owned()),
+                    capability: "attach_v2".to_owned(),
+                }),
+            )
+            .await?;
+            let _ = send.finish();
+            Ok(())
+        }
     }
 }
 
@@ -611,6 +627,177 @@ async fn serve_ghostty_attach(
             let _ = send.finish();
             return Ok(());
         }
+    }
+}
+
+#[cfg(feature = "ghostty-vt")]
+async fn serve_attach_v2(
+    session: Session,
+    state: Arc<AgentState>,
+    mut send: SendStream,
+    mut recv: BufferedRecv,
+    req: SessionReq,
+    zmx: provider::ZmxProvider,
+    tmux: provider::TmuxProvider,
+) -> Result<()> {
+    let Some(name) = req.session_name.as_deref() else {
+        let reason = SessionReason::MissingSessionName;
+        record_session_attach_rejection(requested_provider_metric(&req), &reason);
+        write_ack(&mut send, reject(reason)).await?;
+        let _ = send.finish();
+        return Ok(());
+    };
+    let selected = match resolve_provider_for_session(
+        &zmx,
+        &tmux,
+        req.provider.as_deref(),
+        name,
+        SessionOp::AttachV2,
+        true,
+    )
+    .await
+    {
+        Ok(selected) => selected,
+        Err(reason) => {
+            record_session_attach_rejection(requested_provider_metric(&req), &reason);
+            write_ack(&mut send, reject(reason)).await?;
+            let _ = send.finish();
+            return Ok(());
+        }
+    };
+    if selected != SelectedProvider::Ghostty {
+        let reason = SessionReason::CapabilityUnsupported {
+            provider: selected.name().to_owned(),
+            capability: "attach_v2".to_owned(),
+        };
+        record_session_attach_rejection(selected.name(), &reason);
+        write_ack(&mut send, reject(reason)).await?;
+        let _ = send.finish();
+        return Ok(());
+    }
+    if req.user.is_some() {
+        let reason = SessionReason::CapabilityUnsupported {
+            provider: "ghostty".to_owned(),
+            capability: "user".to_owned(),
+        };
+        record_session_attach_rejection("ghostty", &reason);
+        write_ack(&mut send, reject(reason)).await?;
+        let _ = send.finish();
+        return Ok(());
+    }
+    let requested_user = match resolve_requested_user(req.user.as_deref()) {
+        Ok(user) => user,
+        Err(reject_reason) => {
+            let reason = SessionReason::SpawnFailed(format!("{:?}", reject_reason.wire));
+            record_session_attach_rejection("ghostty", &reason);
+            write_ack(&mut send, reject(reason)).await?;
+            let _ = send.finish();
+            return Ok(());
+        }
+    };
+    let workload_context = session_workload_context(&session, &req, requested_user.as_ref());
+    audit::session_event(
+        &session,
+        "audit.session_attach_v2",
+        Some("ghostty"),
+        Some(name),
+        "attach_v2",
+        req.user.as_deref(),
+        workload_context.cwd.as_deref(),
+        req.argv.as_ref(),
+    );
+    let config = req.attach_v2.unwrap_or_default();
+    let attach = match GhosttyProvider::new()
+        .attach_v2_session(
+            name,
+            workload_context.cwd.as_deref(),
+            req.pty.as_ref(),
+            req.argv.as_deref(),
+            Some(workload_context.env.clone()),
+            config,
+        )
+        .await
+    {
+        Ok(attach) => attach,
+        Err(err) => {
+            let reason = SessionReason::SpawnFailed(err.to_string());
+            record_session_attach_rejection("ghostty", &reason);
+            write_ack(&mut send, reject(reason)).await?;
+            let _ = send.finish();
+            return Ok(());
+        }
+    };
+    let session_id = rand::random::<[u8; 16]>();
+    state
+        .ghostty_attach_v2_registry
+        .insert(session_id, Arc::clone(&attach));
+    let _guard = GhosttyAttachV2RegistryGuard {
+        state: Arc::clone(&state),
+        session_id,
+    };
+    write_ack(
+        &mut send,
+        SessionAck {
+            ok: true,
+            reason: None,
+            session_id: Some(session_id),
+            provider: Some("ghostty".to_owned()),
+            providers: None,
+            sessions: None,
+            session_entries: None,
+            session_groups: None,
+            run: None,
+            output: None,
+        },
+    )
+    .await?;
+    let mut control_rx = attach.take_control_rx().await?;
+    loop {
+        tokio::select! {
+            frame = control_rx.recv() => {
+                let Some(frame) = frame else {
+                    let _ = send.finish();
+                    return Ok(());
+                };
+                let terminal = matches!(
+                    frame,
+                    portl_proto::session_v1::AttachV2ServerFrame::Exit { .. }
+                        | portl_proto::session_v1::AttachV2ServerFrame::Error { recoverable: false, .. }
+                );
+                write_attach_v2_frame(&mut send, &frame).await?;
+                if terminal {
+                    let _ = send.finish();
+                    return Ok(());
+                }
+            }
+            frame = recv.read_frame::<portl_proto::session_v1::AttachV2ClientFrame>(MAX_CONTROL_BYTES) => {
+                let Some(frame) = frame? else {
+                    let _ = attach
+                        .handle_client_frame(portl_proto::session_v1::AttachV2ClientFrame::Detach {
+                            attach_id: attach.attach_id,
+                        })
+                        .await;
+                    let _ = send.finish();
+                    return Ok(());
+                };
+                attach.handle_client_frame(frame).await?;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "ghostty-vt")]
+struct GhosttyAttachV2RegistryGuard {
+    state: Arc<AgentState>,
+    session_id: [u8; 16],
+}
+
+#[cfg(feature = "ghostty-vt")]
+impl Drop for GhosttyAttachV2RegistryGuard {
+    fn drop(&mut self) {
+        self.state
+            .ghostty_attach_v2_registry
+            .remove(&self.session_id);
     }
 }
 
@@ -1045,6 +1232,43 @@ async fn serve_substream(
     {
         bail!("invalid session sub-stream preamble")
     }
+    #[cfg(feature = "ghostty-vt")]
+    match tail.kind {
+        SessionStreamKind::AttachV2Input | SessionStreamKind::AttachV2Resize => {
+            let attach = state
+                .ghostty_attach_v2_registry
+                .get(&tail.session_id)
+                .map(|entry| Arc::clone(entry.value()))
+                .ok_or_else(|| anyhow!("ghostty attach v2 session not found"))?;
+            return pump_attach_v2_client_frames(recv, &attach).await;
+        }
+        SessionStreamKind::AttachV2Viewport => {
+            let attach = state
+                .ghostty_attach_v2_registry
+                .get(&tail.session_id)
+                .map(|entry| Arc::clone(entry.value()))
+                .ok_or_else(|| anyhow!("ghostty attach v2 session not found"))?;
+            return pump_attach_v2_latest_viewport_frames(send, attach.take_viewport_rx().await?)
+                .await;
+        }
+        SessionStreamKind::AttachV2Live => {
+            let attach = state
+                .ghostty_attach_v2_registry
+                .get(&tail.session_id)
+                .map(|entry| Arc::clone(entry.value()))
+                .ok_or_else(|| anyhow!("ghostty attach v2 session not found"))?;
+            return pump_attach_v2_server_frames(send, attach.take_live_rx().await?).await;
+        }
+        SessionStreamKind::AttachV2History => {
+            let attach = state
+                .ghostty_attach_v2_registry
+                .get(&tail.session_id)
+                .map(|entry| Arc::clone(entry.value()))
+                .ok_or_else(|| anyhow!("ghostty attach v2 session not found"))?;
+            return pump_attach_v2_server_frames(send, attach.take_history_rx().await?).await;
+        }
+        _ => {}
+    }
     let process = state
         .shell_registry
         .get(&tail.session_id)
@@ -1058,7 +1282,67 @@ async fn serve_substream(
         SessionStreamKind::Resize => pump_resizes(recv, &process).await,
         SessionStreamKind::Exit => pump_exit(send, &process).await,
         SessionStreamKind::Control => pump_session_controls(recv, &process).await,
+        SessionStreamKind::AttachV2Input
+        | SessionStreamKind::AttachV2Resize
+        | SessionStreamKind::AttachV2Viewport
+        | SessionStreamKind::AttachV2Live
+        | SessionStreamKind::AttachV2History => bail!("attach v2 stream not registered"),
     }
+}
+
+#[cfg(feature = "ghostty-vt")]
+async fn pump_attach_v2_client_frames(
+    mut recv: BufferedRecv,
+    attach: &ghostty::GhosttyAttachV2Session,
+) -> Result<()> {
+    while let Some(frame) = recv
+        .read_frame::<portl_proto::session_v1::AttachV2ClientFrame>(MAX_CONTROL_BYTES)
+        .await?
+    {
+        attach.handle_client_frame(frame).await?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "ghostty-vt")]
+async fn pump_attach_v2_server_frames(
+    mut send: SendStream,
+    mut rx: mpsc::Receiver<portl_proto::session_v1::AttachV2ServerFrame>,
+) -> Result<()> {
+    while let Some(frame) = rx.recv().await {
+        write_attach_v2_frame(&mut send, &frame).await?;
+    }
+    let _ = send.finish();
+    Ok(())
+}
+
+#[cfg(feature = "ghostty-vt")]
+async fn pump_attach_v2_latest_viewport_frames(
+    mut send: SendStream,
+    mut rx: watch::Receiver<Option<portl_proto::session_v1::AttachV2ServerFrame>>,
+) -> Result<()> {
+    let initial = { rx.borrow().clone() };
+    if let Some(frame) = initial {
+        write_attach_v2_frame(&mut send, &frame).await?;
+    }
+    while rx.changed().await.is_ok() {
+        let latest = { rx.borrow().clone() };
+        if let Some(frame) = latest {
+            write_attach_v2_frame(&mut send, &frame).await?;
+        }
+    }
+    let _ = send.finish();
+    Ok(())
+}
+
+#[cfg(feature = "ghostty-vt")]
+async fn write_attach_v2_frame(
+    send: &mut SendStream,
+    frame: &portl_proto::session_v1::AttachV2ServerFrame,
+) -> Result<()> {
+    send.write_all(&postcard::to_stdvec(frame).context("encode attach v2 frame")?)
+        .await
+        .context("write attach v2 frame")
 }
 
 async fn pump_session_controls(mut recv: BufferedRecv, process: &ShellProcess) -> Result<()> {
@@ -1469,6 +1753,7 @@ fn op_name(op: SessionOp) -> &'static str {
         SessionOp::Providers => "providers",
         SessionOp::List => "list",
         SessionOp::Attach => "attach",
+        SessionOp::AttachV2 => "attach_v2",
         SessionOp::Run => "run",
         SessionOp::History => "history",
         SessionOp::Kill => "kill",

@@ -12,7 +12,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 #[cfg(unix)]
-use libghostty_vt::{Terminal, TerminalOptions};
+use libghostty_vt::render::{CellIterator, RowIterator};
+#[cfg(unix)]
+use libghostty_vt::screen::Screen;
+#[cfg(unix)]
+use libghostty_vt::style::{RgbColor, Underline};
+#[cfg(unix)]
+use libghostty_vt::{RenderState, Terminal, TerminalOptions};
 #[cfg(unix)]
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -21,7 +27,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 #[cfg(unix)]
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
 
 #[cfg(unix)]
 use crate::shell_registry::{PtyCommand, ShellOutput, ShellProcess, StdinMessage};
@@ -216,6 +222,16 @@ const IO_CHUNK: usize = 16 * 1024;
 const GHOSTTY_HELPER_COMMANDS: usize = 64;
 #[cfg(unix)]
 const GHOSTTY_SUBSCRIBER_BUFFER: usize = 64;
+#[cfg(unix)]
+const GHOSTTY_ATTACH_V2_QUEUE: usize = 256;
+#[cfg(unix)]
+const GHOSTTY_ATTACH_V2_HISTORY_CHUNK: usize = 64 * 1024;
+#[cfg(unix)]
+const GHOSTTY_ATTACH_V2_RESIZE_SETTLE_MS: u64 = 200;
+#[cfg(unix)]
+const GHOSTTY_ATTACH_V2_MAX_RELOAD_JOBS: usize = 2;
+#[cfg(unix)]
+const GHOSTTY_FRAME_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 // MAX_FRAME_BYTES / 2 leaves postcard metadata/headroom under the frame cap so the
 // serialized, length-prefixed snapshot never exceeds the wire frame size limit.
 #[cfg(unix)]
@@ -371,6 +387,29 @@ impl GhosttyProvider {
             .attach(cols, rows)
             .await?;
         Ok(ghostty_attach_process(metadata.pid, attach))
+    }
+
+    pub(crate) async fn attach_v2_session(
+        &self,
+        session: &str,
+        cwd: Option<&str>,
+        pty: Option<&portl_proto::shell_v1::PtyCfg>,
+        argv: Option<&[String]>,
+        env: Option<Vec<(String, String)>>,
+        config: portl_proto::session_v1::AttachV2Config,
+    ) -> Result<Arc<GhosttyAttachV2Session>> {
+        let paths = self.ensure_helper(session, cwd, pty, argv, env).await?;
+        let cols = pty.map_or(80, |pty| pty.cols);
+        let rows = pty.map_or(24, |pty| pty.rows);
+        let metadata = GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .probe()
+            .await?;
+        let attach = GhosttyClient::connect(paths.socket_path)
+            .await?
+            .attach_v2(cols, rows, config)
+            .await?;
+        GhosttyAttachV2Session::new(metadata.pid, attach).await
     }
 
     async fn ensure_helper(
@@ -742,6 +781,11 @@ enum GhosttyRequest {
         cols: u16,
         rows: u16,
     },
+    AttachV2 {
+        cols: u16,
+        rows: u16,
+        config: portl_proto::session_v1::AttachV2Config,
+    },
     Input {
         bytes: Vec<u8>,
     },
@@ -756,6 +800,16 @@ enum GhosttyRequest {
     History,
     Kill,
     Detach,
+    ReloadV2 {
+        reload_id: u64,
+    },
+    CancelReloadV2 {
+        reload_id: u64,
+    },
+    RequestViewportV2 {
+        resize_id: u64,
+        reason: String,
+    },
 }
 
 #[cfg(unix)]
@@ -768,8 +822,52 @@ enum GhosttyResponse {
         metadata: GhosttySessionMetadata,
         snapshot: Vec<u8>,
     },
+    AttachedV2 {
+        metadata: GhosttySessionMetadata,
+        prelude: Vec<u8>,
+        viewport: Vec<u8>,
+        covers_live_seq: u64,
+        generation: u64,
+        cols: u16,
+        rows: u16,
+        resize_id: u64,
+    },
     Output {
         bytes: Vec<u8>,
+    },
+    OutputV2 {
+        start_seq: u64,
+        end_seq: u64,
+        bytes: Vec<u8>,
+    },
+    ViewportV2 {
+        generation: u64,
+        covers_live_seq: u64,
+        cols: u16,
+        rows: u16,
+        resize_id: u64,
+        bytes: Vec<u8>,
+    },
+    ReloadStartedV2 {
+        reload_id: u64,
+        total_bytes: Option<u64>,
+    },
+    ReloadChunkV2 {
+        reload_id: u64,
+        seq: u64,
+        progress: portl_proto::session_v1::AttachV2Progress,
+        bytes: Vec<u8>,
+    },
+    ReloadDoneV2 {
+        reload_id: u64,
+        final_generation: u64,
+    },
+    ReloadCancelledV2 {
+        reload_id: u64,
+    },
+    ResyncRequiredV2 {
+        reason: String,
+        from_seq: u64,
     },
     RunResult {
         result: portl_proto::session_v1::SessionRunResult,
@@ -795,10 +893,27 @@ enum HelperCommand {
         rows: u16,
         reply: oneshot::Sender<(GhosttySessionMetadata, Vec<u8>, mpsc::Receiver<Vec<u8>>)>,
     },
+    SubscribeV2 {
+        cols: u16,
+        rows: u16,
+        config: portl_proto::session_v1::AttachV2Config,
+        reply: oneshot::Sender<GhosttyAttachV2Initial>,
+    },
     Input(Vec<u8>),
     Resize {
         cols: u16,
         rows: u16,
+    },
+    ViewportV2 {
+        resize_id: u64,
+        reply: oneshot::Sender<GhosttyViewportV2>,
+    },
+    ReloadV2 {
+        reload_id: u64,
+        reply: mpsc::Sender<GhosttyResponse>,
+    },
+    CancelReloadV2 {
+        reload_id: u64,
     },
     Run {
         cwd: Option<String>,
@@ -811,6 +926,171 @@ enum HelperCommand {
     Kill {
         reply: oneshot::Sender<()>,
     },
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+struct GhosttyLiveOutputV2 {
+    start_seq: u64,
+    end_seq: u64,
+    bytes: Vec<u8>,
+}
+
+#[cfg(unix)]
+struct GhosttyAttachV2Initial {
+    metadata: GhosttySessionMetadata,
+    prelude: Vec<u8>,
+    viewport: Vec<u8>,
+    covers_live_seq: u64,
+    generation: u64,
+    cols: u16,
+    rows: u16,
+    resize_id: u64,
+    output_rx: mpsc::Receiver<GhosttyLiveOutputV2>,
+    event_rx: mpsc::UnboundedReceiver<GhosttyResponse>,
+}
+
+#[cfg(unix)]
+struct GhosttyViewportV2 {
+    generation: u64,
+    covers_live_seq: u64,
+    cols: u16,
+    rows: u16,
+    resize_id: u64,
+    bytes: Vec<u8>,
+}
+
+#[cfg(unix)]
+struct GhosttyV2Subscriber {
+    live: mpsc::Sender<GhosttyLiveOutputV2>,
+    events: mpsc::UnboundedSender<GhosttyResponse>,
+    resync_pending: bool,
+}
+
+#[cfg(unix)]
+struct GhosttyReloadJob {
+    reload_id: u64,
+    start_abs: u64,
+    end_abs: u64,
+    offset: u64,
+    seq: u64,
+    reply: mpsc::Sender<GhosttyResponse>,
+    started: bool,
+    final_generation: u64,
+    retained_history_truncated: bool,
+    pending_response: Option<GhosttyResponse>,
+}
+
+#[cfg(unix)]
+impl GhosttyReloadJob {
+    fn new(
+        reload_id: u64,
+        history_start_abs: u64,
+        retained_len: usize,
+        reply: mpsc::Sender<GhosttyResponse>,
+        final_generation: u64,
+        retained_history_truncated: bool,
+    ) -> Self {
+        Self {
+            reload_id,
+            start_abs: history_start_abs,
+            end_abs: history_start_abs.saturating_add(retained_len as u64),
+            offset: 0,
+            seq: 0,
+            reply,
+            started: false,
+            final_generation,
+            retained_history_truncated,
+            pending_response: None,
+        }
+    }
+
+    fn poll_send_next(&mut self, history: &VecDeque<u8>, history_start_abs: u64) -> bool {
+        if let Some(response) = self.pending_response.take() {
+            match self.reply.try_send(response) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(response)) => {
+                    self.pending_response = Some(response);
+                    return false;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return true,
+            }
+        }
+        if self.reply.capacity() == 0 {
+            return false;
+        }
+        let current_abs = self.start_abs.saturating_add(self.offset);
+        if history_start_abs > current_abs {
+            self.offset = history_start_abs.saturating_sub(self.start_abs);
+            self.retained_history_truncated = true;
+        }
+        if !self.started {
+            let total_bytes = Some(self.end_abs.saturating_sub(self.start_abs));
+            match self.reply.try_send(GhosttyResponse::ReloadStartedV2 {
+                reload_id: self.reload_id,
+                total_bytes,
+            }) {
+                Ok(()) => self.started = true,
+                Err(mpsc::error::TrySendError::Full(_)) => return false,
+                Err(mpsc::error::TrySendError::Closed(_)) => return true,
+            }
+        }
+        let current_abs = self.start_abs.saturating_add(self.offset);
+        if current_abs >= self.end_abs {
+            return match self.reply.try_send(GhosttyResponse::ReloadDoneV2 {
+                reload_id: self.reload_id,
+                final_generation: self.final_generation,
+            }) {
+                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => true,
+                Err(mpsc::error::TrySendError::Full(_)) => false,
+            };
+        }
+        let available_end = history_start_abs.saturating_add(history.len() as u64);
+        if current_abs >= available_end {
+            self.offset = self.end_abs.saturating_sub(self.start_abs);
+            self.retained_history_truncated = true;
+            return false;
+        }
+        let rel_start = usize::try_from(current_abs.saturating_sub(history_start_abs))
+            .unwrap_or(usize::MAX)
+            .min(history.len());
+        let chunk_len = self
+            .end_abs
+            .saturating_sub(current_abs)
+            .min(available_end.saturating_sub(current_abs))
+            .min(GHOSTTY_ATTACH_V2_HISTORY_CHUNK as u64) as usize;
+        if chunk_len == 0 {
+            return false;
+        }
+        let raw_bytes = vec_deque_chunk(history, rel_start, chunk_len);
+        let bytes = sanitize_terminal_replay(&raw_bytes);
+        let loaded = self.offset.saturating_add(raw_bytes.len() as u64);
+        let complete = self.start_abs.saturating_add(loaded) >= self.end_abs;
+        let progress = portl_proto::session_v1::AttachV2Progress {
+            loaded_bytes: loaded,
+            total_bytes: Some(self.end_abs.saturating_sub(self.start_abs)),
+            retained_history_truncated: self.retained_history_truncated,
+            complete,
+        };
+        let response = GhosttyResponse::ReloadChunkV2 {
+            reload_id: self.reload_id,
+            seq: self.seq,
+            progress,
+            bytes,
+        };
+        match self.reply.try_send(response) {
+            Ok(()) => {
+                self.offset = loaded;
+                self.seq = self.seq.saturating_add(1);
+                false
+            }
+            Err(mpsc::error::TrySendError::Full(response)) => {
+                self.pending_response = Some(response);
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => true,
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -899,6 +1179,11 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
     let mut metadata = metadata;
     let mut history = VecDeque::new();
     let mut subscribers: Vec<mpsc::Sender<Vec<u8>>> = Vec::new();
+    let mut v2_subscribers: Vec<GhosttyV2Subscriber> = Vec::new();
+    let mut history_start_abs = 0_u64;
+    let mut live_seq = 0_u64;
+    let mut viewport_generation = 0_u64;
+    let mut reload_jobs: VecDeque<GhosttyReloadJob> = VecDeque::new();
     let mut read_buf = vec![0_u8; IO_CHUNK];
     let mut child_wait = Box::pin(child.wait());
     let mut pending_input = crate::shell_handler::pty_master::PendingPtyWrite::new(
@@ -906,18 +1191,33 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
     );
 
     loop {
+        reload_jobs.retain_mut(|job| !job.poll_send_next(&history, history_start_abs));
         tokio::select! {
             status = &mut child_wait => {
-                let _ = status;
+                let code = status
+                    .context("wait for ghostty child")?
+                    .code()
+                    .unwrap_or(1);
                 broadcast(&mut subscribers, &[]);
+                broadcast_v2_event(&mut v2_subscribers, GhosttyResponse::Exit { code });
                 cleanup_helper_files(&config.paths).await;
                 accept_task.abort();
                 return Ok(());
             }
             chunk = crate::shell_handler::pty_master::read_pty_chunk(&master, &mut read_buf) => {
                 if let Some(bytes) = chunk.context("read ghostty pty")? {
-                    process_output(&mut terminal, &mut history, &mut subscribers, &bytes);
+                    process_output(
+                        &mut terminal,
+                        &mut history,
+                        &mut subscribers,
+                        &mut v2_subscribers,
+                        &mut history_start_abs,
+                        &mut live_seq,
+                        &bytes,
+                    );
                 } else {
+                    broadcast(&mut subscribers, &[]);
+                    broadcast_v2_event(&mut v2_subscribers, GhosttyResponse::Exit { code: 0 });
                     cleanup_helper_files(&config.paths).await;
                     accept_task.abort();
                     return Ok(());
@@ -926,6 +1226,7 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
             result = crate::shell_handler::pty_master::write_one_pending_pty_chunk(&master, &mut pending_input), if !pending_input.is_empty() => {
                 result.context("write queued ghostty pty input")?;
             }
+            () = tokio::time::sleep(Duration::from_millis(25)), if !reload_jobs.is_empty() => {}
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
                     HelperCommand::Probe { reply } => {
@@ -940,21 +1241,97 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
                         let snapshot = capped_attach_snapshot(&history);
                         let _ = reply.send((metadata.clone(), snapshot, rx));
                     }
+                    HelperCommand::SubscribeV2 { cols, rows, config, reply } => {
+                        let _ = resize_helper(&master, &mut terminal, &mut metadata, rows, cols);
+                        viewport_generation = viewport_generation.saturating_add(1);
+                        metadata.last_seen_ms = now_ms();
+                        let (tx, rx) = mpsc::channel(GHOSTTY_ATTACH_V2_QUEUE);
+                        let (event_tx, event_rx) = mpsc::unbounded_channel();
+                        v2_subscribers.push(GhosttyV2Subscriber {
+                            live: tx,
+                            events: event_tx,
+                            resync_pending: false,
+                        });
+                        let prelude = capped_prelude_snapshot(&history, config.prelude_max_bytes);
+                        let viewport = render_viewport_snapshot(&terminal).unwrap_or_default();
+                        let initial = GhosttyAttachV2Initial {
+                            metadata: metadata.clone(),
+                            prelude,
+                            viewport,
+                            covers_live_seq: live_seq,
+                            generation: viewport_generation,
+                            cols,
+                            rows,
+                            resize_id: 0,
+                            output_rx: rx,
+                            event_rx,
+                        };
+                        let _ = reply.send(initial);
+                    }
                     HelperCommand::Input(bytes) => {
                         if let Err(err) = pending_input.push(bytes) {
                             crate::metrics::record_ghostty_event("input_queue_full");
-                            tracing::warn!(%err, "ghostty pty input queue full; detaching subscribers");
+                            tracing::warn!(%err, "ghostty pty input queue full; requesting attach v2 resync");
                             broadcast(&mut subscribers, &[]);
+                            broadcast_v2_resync(
+                                &mut v2_subscribers,
+                                "input queue full".to_owned(),
+                                live_seq,
+                            );
                         }
                     }
                     HelperCommand::Resize { cols, rows } => {
-                        let _ = resize_helper(&master, &mut terminal, &mut metadata, rows, cols);
+                        if resize_helper(&master, &mut terminal, &mut metadata, rows, cols).is_ok() {
+                            viewport_generation = viewport_generation.saturating_add(1);
+                        }
+                    }
+                    HelperCommand::ViewportV2 { resize_id, reply } => {
+                        viewport_generation = viewport_generation.saturating_add(1);
+                        let bytes = render_viewport_snapshot(&terminal).unwrap_or_default();
+                        let _ = reply.send(GhosttyViewportV2 {
+                            generation: viewport_generation,
+                            covers_live_seq: live_seq,
+                            cols: metadata.cols,
+                            rows: metadata.rows,
+                            resize_id,
+                            bytes,
+                        });
+                    }
+                    HelperCommand::ReloadV2 { reload_id, reply } => {
+                        viewport_generation = viewport_generation.saturating_add(1);
+                        reload_jobs.retain(|job| job.reload_id != reload_id);
+                        while reload_jobs.len() >= GHOSTTY_ATTACH_V2_MAX_RELOAD_JOBS {
+                            if let Some(job) = reload_jobs.pop_front() {
+                                let _ = job.reply.try_send(GhosttyResponse::ReloadCancelledV2 {
+                                    reload_id: job.reload_id,
+                                });
+                            }
+                        }
+                        reload_jobs.push_back(GhosttyReloadJob::new(
+                            reload_id,
+                            history_start_abs,
+                            history.len(),
+                            reply,
+                            viewport_generation,
+                            history_start_abs > 0,
+                        ));
+                    }
+                    HelperCommand::CancelReloadV2 { reload_id } => {
+                        reload_jobs.retain(|job| job.reload_id != reload_id);
                     }
                     HelperCommand::Run { cwd, argv, reply } => {
                         let result = run_sidecar(cwd.as_deref().or(config.cwd.as_deref()), &argv).await;
                         if let Ok(run) = &result {
                             let mirrored = mirror_run_output(&argv, run);
-                            process_output(&mut terminal, &mut history, &mut subscribers, &mirrored);
+                            process_output(
+                                &mut terminal,
+                                &mut history,
+                                &mut subscribers,
+                                &mut v2_subscribers,
+                                &mut history_start_abs,
+                                &mut live_seq,
+                                &mirrored,
+                            );
                             metadata.last_seen_ms = now_ms();
                         }
                         let _ = reply.send(result.map_err(|err| err.to_string()));
@@ -1001,11 +1378,26 @@ fn process_output(
     terminal: &mut Terminal<'_, '_>,
     history: &mut VecDeque<u8>,
     subscribers: &mut Vec<mpsc::Sender<Vec<u8>>>,
+    v2_subscribers: &mut Vec<GhosttyV2Subscriber>,
+    history_start_abs: &mut u64,
+    live_seq: &mut u64,
     bytes: &[u8],
 ) {
+    let start_seq = *live_seq;
+    *live_seq = live_seq.saturating_add(bytes.len() as u64);
+    let end_seq = *live_seq;
     terminal.vt_write(bytes);
-    append_bounded(history, bytes);
+    let dropped = append_bounded(history, bytes);
+    *history_start_abs = history_start_abs.saturating_add(dropped as u64);
     broadcast(subscribers, bytes);
+    broadcast_v2(
+        v2_subscribers,
+        GhosttyLiveOutputV2 {
+            start_seq,
+            end_seq,
+            bytes: bytes.to_vec(),
+        },
+    );
 }
 
 #[cfg(unix)]
@@ -1019,11 +1411,235 @@ fn capped_attach_snapshot(history: &VecDeque<u8>) -> Vec<u8> {
 }
 
 #[cfg(unix)]
-fn append_bounded(history: &mut VecDeque<u8>, bytes: &[u8]) {
+fn capped_prelude_snapshot(history: &VecDeque<u8>, max_bytes: u64) -> Vec<u8> {
+    let cap = usize::try_from(max_bytes)
+        .unwrap_or(usize::MAX)
+        .min(MAX_ATTACH_SNAPSHOT_BYTES);
+    let len = history.len().min(cap);
+    let mut raw = history
+        .iter()
+        .skip(history.len().saturating_sub(len))
+        .copied()
+        .collect::<Vec<_>>();
+    if len < history.len() {
+        raw = trim_partial_replay_prefix(raw);
+    }
+    sanitize_terminal_replay(&raw)
+}
+
+#[cfg(unix)]
+fn trim_partial_replay_prefix(mut bytes: Vec<u8>) -> Vec<u8> {
+    if let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') {
+        bytes.drain(..=newline);
+    } else {
+        bytes.clear();
+    }
+    while bytes
+        .first()
+        .is_some_and(|byte| (*byte & 0b1100_0000) == 0b1000_0000)
+    {
+        bytes.remove(0);
+    }
+    bytes
+}
+
+#[cfg(unix)]
+fn vec_deque_chunk(history: &VecDeque<u8>, rel_start: usize, chunk_len: usize) -> Vec<u8> {
+    let (front, back) = history.as_slices();
+    let mut out = Vec::with_capacity(chunk_len);
+    if rel_start < front.len() {
+        let front_end = rel_start.saturating_add(chunk_len).min(front.len());
+        out.extend_from_slice(&front[rel_start..front_end]);
+        let remaining = chunk_len.saturating_sub(front_end.saturating_sub(rel_start));
+        if remaining > 0 {
+            out.extend_from_slice(&back[..remaining.min(back.len())]);
+        }
+    } else {
+        let back_start = rel_start.saturating_sub(front.len()).min(back.len());
+        let back_end = back_start.saturating_add(chunk_len).min(back.len());
+        out.extend_from_slice(&back[back_start..back_end]);
+    }
+    out
+}
+
+#[cfg(unix)]
+fn sanitize_terminal_replay(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0_usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == 0x1b && index + 1 < bytes.len() {
+            match bytes[index + 1] {
+                b']' | b'P' | b'^' | b'_' => {
+                    index += 2;
+                    while index < bytes.len() {
+                        if bytes[index] == 0x07 {
+                            index += 1;
+                            break;
+                        }
+                        if bytes[index] == 0x1b
+                            && index + 1 < bytes.len()
+                            && bytes[index + 1] == b'\\'
+                        {
+                            index += 2;
+                            break;
+                        }
+                        index += 1;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if matches!(byte, 0x90 | 0x9d | 0x9e | 0x9f) {
+            index += 1;
+            while index < bytes.len() {
+                if bytes[index] == 0x07 {
+                    index += 1;
+                    break;
+                }
+                if bytes[index] == 0x1b && index + 1 < bytes.len() && bytes[index + 1] == b'\\' {
+                    index += 2;
+                    break;
+                }
+                index += 1;
+            }
+            continue;
+        }
+        out.push(byte);
+        index += 1;
+    }
+    out
+}
+
+#[cfg(unix)]
+fn render_viewport_snapshot(terminal: &Terminal<'_, '_>) -> Result<Vec<u8>> {
+    let mut render_state = RenderState::new().context("create ghostty render state")?;
+    let snapshot = render_state
+        .update(terminal)
+        .context("update ghostty render state")?;
+    let rows = snapshot.rows().context("read ghostty viewport rows")?;
+    let mut row_iter = RowIterator::new().context("create ghostty row iterator")?;
+    let mut cell_iter = CellIterator::new().context("create ghostty cell iterator")?;
+    let mut out = Vec::new();
+    if matches!(terminal.active_screen()?, Screen::Alternate) {
+        out.extend_from_slice(b"\x1b[?1049h");
+    } else {
+        out.extend_from_slice(b"\x1b[?1049l");
+    }
+    out.extend_from_slice(b"\x1b[0m\x1b[2J\x1b[H");
+    let mut rows_iter = row_iter.update(&snapshot).context("iterate ghostty rows")?;
+    let mut row_index = 0_u16;
+    let mut styled_active = false;
+    while let Some(row) = rows_iter.next() {
+        if row_index > 0 {
+            out.extend_from_slice(b"\r\n");
+        }
+        let mut cells = cell_iter.update(row).context("iterate ghostty cells")?;
+        while let Some(cell) = cells.next() {
+            let style = cell.style().context("read ghostty cell style")?;
+            let fg = cell.fg_color().context("read ghostty cell foreground")?;
+            let bg = cell.bg_color().context("read ghostty cell background")?;
+            if !style.is_default() || fg.is_some() || bg.is_some() {
+                push_cell_sgr(&mut out, style, fg, bg);
+                styled_active = true;
+            } else if styled_active {
+                out.extend_from_slice(b"\x1b[0m");
+                styled_active = false;
+            }
+            let graphemes = cell.graphemes().context("read ghostty cell graphemes")?;
+            if graphemes.is_empty() || style.invisible {
+                out.push(b' ');
+            } else {
+                for grapheme in graphemes {
+                    let mut buf = [0_u8; 4];
+                    out.extend_from_slice(grapheme.encode_utf8(&mut buf).as_bytes());
+                }
+            }
+        }
+        row_index = row_index.saturating_add(1);
+        if row_index >= rows {
+            break;
+        }
+    }
+    out.extend_from_slice(b"\x1b[0m");
+    if let Some(cursor) = snapshot.cursor_viewport().context("read ghostty cursor")? {
+        out.extend_from_slice(
+            format!(
+                "\x1b[{};{}H",
+                cursor.y.saturating_add(1),
+                cursor.x.saturating_add(1)
+            )
+            .as_bytes(),
+        );
+    }
+    if snapshot
+        .cursor_visible()
+        .context("read ghostty cursor visibility")?
+    {
+        out.extend_from_slice(b"\x1b[?25h");
+    } else {
+        out.extend_from_slice(b"\x1b[?25l");
+    }
+    Ok(out)
+}
+
+#[cfg(unix)]
+fn push_cell_sgr(
+    out: &mut Vec<u8>,
+    style: libghostty_vt::style::Style,
+    fg: Option<RgbColor>,
+    bg: Option<RgbColor>,
+) {
+    let mut codes = vec!["0".to_owned()];
+    if style.bold {
+        codes.push("1".to_owned());
+    }
+    if style.faint {
+        codes.push("2".to_owned());
+    }
+    if style.italic {
+        codes.push("3".to_owned());
+    }
+    match style.underline {
+        Underline::None => {}
+        Underline::Single => codes.push("4".to_owned()),
+        Underline::Double => codes.push("21".to_owned()),
+        Underline::Curly => codes.push("4:3".to_owned()),
+        Underline::Dotted => codes.push("4:4".to_owned()),
+        Underline::Dashed => codes.push("4:5".to_owned()),
+        _ => {}
+    }
+    if style.blink {
+        codes.push("5".to_owned());
+    }
+    if style.inverse {
+        codes.push("7".to_owned());
+    }
+    if style.strikethrough {
+        codes.push("9".to_owned());
+    }
+    if style.overline {
+        codes.push("53".to_owned());
+    }
+    if let Some(RgbColor { r, g, b }) = fg {
+        codes.push(format!("38;2;{r};{g};{b}"));
+    }
+    if let Some(RgbColor { r, g, b }) = bg {
+        codes.push(format!("48;2;{r};{g};{b}"));
+    }
+    out.extend_from_slice(format!("\x1b[{}m", codes.join(";")).as_bytes());
+}
+
+#[cfg(unix)]
+fn append_bounded(history: &mut VecDeque<u8>, bytes: &[u8]) -> usize {
     history.extend(bytes.iter().copied());
+    let mut dropped = 0_usize;
     while history.len() > MAX_HISTORY_BYTES {
         let _ = history.pop_front();
+        dropped = dropped.saturating_add(1);
     }
+    dropped
 }
 
 #[cfg(unix)]
@@ -1042,6 +1658,55 @@ fn broadcast(subscribers: &mut Vec<mpsc::Sender<Vec<u8>>>, bytes: &[u8]) {
             crate::metrics::record_ghostty_event("subscriber_evicted_closed");
             false
         }
+    });
+}
+
+#[cfg(unix)]
+fn broadcast_v2(subscribers: &mut Vec<GhosttyV2Subscriber>, output: GhosttyLiveOutputV2) {
+    subscribers.retain_mut(
+        |subscriber| match subscriber.live.try_send(output.clone()) {
+            Ok(()) => {
+                subscriber.resync_pending = false;
+                true
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                crate::metrics::record_ghostty_event("attach_v2_live_queue_full");
+                if subscriber.resync_pending {
+                    return true;
+                }
+                subscriber.resync_pending = true;
+                subscriber
+                    .events
+                    .send(GhosttyResponse::ResyncRequiredV2 {
+                        reason: "live queue full".to_owned(),
+                        from_seq: output.start_seq,
+                    })
+                    .is_ok()
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        },
+    );
+}
+
+#[cfg(unix)]
+fn broadcast_v2_event(subscribers: &mut Vec<GhosttyV2Subscriber>, event: GhosttyResponse) {
+    subscribers.retain(|subscriber| subscriber.events.send(event.clone()).is_ok());
+}
+
+#[cfg(unix)]
+fn broadcast_v2_resync(subscribers: &mut Vec<GhosttyV2Subscriber>, reason: String, from_seq: u64) {
+    subscribers.retain_mut(|subscriber| {
+        if subscriber.resync_pending {
+            return true;
+        }
+        subscriber.resync_pending = true;
+        subscriber
+            .events
+            .send(GhosttyResponse::ResyncRequiredV2 {
+                reason: reason.clone(),
+                from_seq,
+            })
+            .is_ok()
     });
 }
 
@@ -1129,6 +1794,129 @@ async fn handle_client(mut stream: UnixStream, tx: mpsc::Sender<HelperCommand>) 
                 .map_err(|_| anyhow!("ghostty helper stopped"))?;
             let _ = reply_rx.await;
             write_frame(&mut stream, &GhosttyResponse::Exit { code: 0 }).await
+        }
+        GhosttyRequest::AttachV2 { cols, rows, config } => {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            tx.send(HelperCommand::SubscribeV2 {
+                cols,
+                rows,
+                config,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| anyhow!("ghostty helper stopped"))?;
+            let initial = reply_rx.await.context("ghostty attach v2 reply")?;
+            let mut output_rx = initial.output_rx;
+            let mut event_rx = initial.event_rx;
+            write_frame(
+                &mut stream,
+                &GhosttyResponse::AttachedV2 {
+                    metadata: initial.metadata,
+                    prelude: initial.prelude,
+                    viewport: initial.viewport,
+                    covers_live_seq: initial.covers_live_seq,
+                    generation: initial.generation,
+                    cols: initial.cols,
+                    rows: initial.rows,
+                    resize_id: initial.resize_id,
+                },
+            )
+            .await?;
+            let mut reload_rx: Option<mpsc::Receiver<GhosttyResponse>> = None;
+            loop {
+                tokio::select! {
+                    output = output_rx.recv() => {
+                        let Some(output) = output else {
+                            return Ok(());
+                        };
+                        write_frame(
+                            &mut stream,
+                            &GhosttyResponse::OutputV2 {
+                                start_seq: output.start_seq,
+                                end_seq: output.end_seq,
+                                bytes: output.bytes,
+                            },
+                        ).await?;
+                    }
+                    event = event_rx.recv() => {
+                        let Some(event) = event else {
+                            return Ok(());
+                        };
+                        write_frame(&mut stream, &event).await?;
+                        if matches!(event, GhosttyResponse::Exit { .. } | GhosttyResponse::Error { .. }) {
+                            return Ok(());
+                        }
+                    }
+                    Some(response) = async {
+                        match reload_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => None,
+                        }
+                    }, if reload_rx.is_some() => {
+                        let done = matches!(response, GhosttyResponse::ReloadDoneV2 { .. } | GhosttyResponse::ReloadCancelledV2 { .. });
+                        write_frame(&mut stream, &response).await?;
+                        if done {
+                            reload_rx = None;
+                        }
+                    }
+                    request = read_frame::<GhosttyRequest>(&mut stream) => {
+                        match request? {
+                            Some(GhosttyRequest::Input { bytes }) => {
+                                forward_helper_input(&tx, bytes, &mut stream).await?;
+                            }
+                            Some(GhosttyRequest::Resize { cols, rows }) => {
+                                forward_helper_resize(&tx, cols, rows, &mut stream).await?;
+                            }
+                            Some(GhosttyRequest::ReloadV2 { reload_id }) => {
+                                let (reload_tx, rx) = mpsc::channel(GHOSTTY_ATTACH_V2_QUEUE);
+                                tx.send(HelperCommand::ReloadV2 { reload_id, reply: reload_tx })
+                                    .await
+                                    .map_err(|_| anyhow!("ghostty helper stopped"))?;
+                                reload_rx = Some(rx);
+                            }
+                            Some(GhosttyRequest::CancelReloadV2 { reload_id }) => {
+                                reload_rx = None;
+                                tx.send(HelperCommand::CancelReloadV2 { reload_id })
+                                    .await
+                                    .map_err(|_| anyhow!("ghostty helper stopped"))?;
+                                write_frame(
+                                    &mut stream,
+                                    &GhosttyResponse::ReloadCancelledV2 { reload_id },
+                                ).await?;
+                            }
+                            Some(GhosttyRequest::RequestViewportV2 { resize_id, reason: _ }) => {
+                                let (reply_tx, reply_rx) = oneshot::channel();
+                                tx.send(HelperCommand::ViewportV2 { resize_id, reply: reply_tx })
+                                    .await
+                                    .map_err(|_| anyhow!("ghostty helper stopped"))?;
+                                let viewport = reply_rx.await.context("ghostty viewport v2 reply")?;
+                                write_frame(
+                                    &mut stream,
+                                    &GhosttyResponse::ViewportV2 {
+                                        generation: viewport.generation,
+                                        covers_live_seq: viewport.covers_live_seq,
+                                        cols: viewport.cols,
+                                        rows: viewport.rows,
+                                        resize_id: viewport.resize_id,
+                                        bytes: viewport.bytes,
+                                    },
+                                ).await?;
+                            }
+                            Some(GhosttyRequest::Detach) | None => return Ok(()),
+                            Some(GhosttyRequest::Kill) => {
+                                let (reply_tx, reply_rx) = oneshot::channel();
+                                tx.send(HelperCommand::Kill { reply: reply_tx })
+                                    .await
+                                    .map_err(|_| anyhow!("ghostty helper stopped"))?;
+                                let _ = reply_rx.await;
+                                return Ok(());
+                            }
+                            Some(other) => tracing::debug!(?other, "ignoring non-v2 ghostty request on attach v2 stream"),
+                        }
+                    }
+                    else => return Ok(()),
+                }
+            }
         }
         GhosttyRequest::Attach { cols, rows } => {
             let (reply_tx, reply_rx) = oneshot::channel();
@@ -1235,6 +2023,49 @@ async fn handle_client(mut stream: UnixStream, tx: mpsc::Sender<HelperCommand>) 
 }
 
 #[cfg(unix)]
+async fn forward_helper_input(
+    tx: &mpsc::Sender<HelperCommand>,
+    bytes: Vec<u8>,
+    stream: &mut UnixStream,
+) -> Result<()> {
+    match tx.try_send(HelperCommand::Input(bytes)) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            write_frame(
+                stream,
+                &GhosttyResponse::Error {
+                    message: "ghostty helper input queue is full".to_owned(),
+                },
+            )
+            .await
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(anyhow!("ghostty helper stopped")),
+    }
+}
+
+#[cfg(unix)]
+async fn forward_helper_resize(
+    tx: &mpsc::Sender<HelperCommand>,
+    cols: u16,
+    rows: u16,
+    stream: &mut UnixStream,
+) -> Result<()> {
+    match tx.try_send(HelperCommand::Resize { cols, rows }) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            write_frame(
+                stream,
+                &GhosttyResponse::Error {
+                    message: "ghostty helper input queue is full".to_owned(),
+                },
+            )
+            .await
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(anyhow!("ghostty helper stopped")),
+    }
+}
+
+#[cfg(unix)]
 pub(crate) struct GhosttyClient {
     stream: UnixStream,
 }
@@ -1302,6 +2133,43 @@ impl GhosttyClient {
             other => bail!("unexpected ghostty attach response: {other:?}"),
         }
     }
+
+    pub(crate) async fn attach_v2(
+        mut self,
+        cols: u16,
+        rows: u16,
+        config: portl_proto::session_v1::AttachV2Config,
+    ) -> Result<GhosttyAttachV2> {
+        write_frame(
+            &mut self.stream,
+            &GhosttyRequest::AttachV2 { cols, rows, config },
+        )
+        .await?;
+        match read_frame::<GhosttyResponse>(&mut self.stream).await? {
+            Some(GhosttyResponse::AttachedV2 {
+                prelude,
+                viewport,
+                covers_live_seq,
+                generation,
+                cols,
+                rows,
+                resize_id,
+                ..
+            }) => Ok(GhosttyAttachV2 {
+                stream: self.stream,
+                attach_id: [0; 16],
+                prelude,
+                viewport,
+                covers_live_seq,
+                generation,
+                cols,
+                rows,
+                resize_id,
+            }),
+            Some(GhosttyResponse::Error { message }) => bail!(message),
+            other => bail!("unexpected ghostty attach v2 response: {other:?}"),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1310,6 +2178,575 @@ pub(crate) struct GhosttyAttach {
     initial_snapshot: Vec<u8>,
     #[cfg(test)]
     buffered: String,
+}
+
+#[cfg(unix)]
+pub(crate) struct GhosttyAttachV2 {
+    stream: UnixStream,
+    pub(crate) attach_id: [u8; 16],
+    pub(crate) prelude: Vec<u8>,
+    pub(crate) viewport: Vec<u8>,
+    pub(crate) covers_live_seq: u64,
+    pub(crate) generation: u64,
+    pub(crate) cols: u16,
+    pub(crate) rows: u16,
+    pub(crate) resize_id: u64,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+enum GhosttyAttachV2Command {
+    Input(Vec<u8>),
+    Resize {
+        resize_id: u64,
+        cols: u16,
+        rows: u16,
+    },
+    Detach,
+    Reload {
+        reload_id: u64,
+    },
+    CancelReload {
+        reload_id: u64,
+    },
+    RequestViewport {
+        resize_id: u64,
+        reason: String,
+    },
+}
+
+#[cfg(unix)]
+pub(crate) struct GhosttyAttachV2Session {
+    pub(crate) attach_id: [u8; 16],
+    command_tx: mpsc::Sender<GhosttyAttachV2Command>,
+    control_rx:
+        AsyncMutex<Option<mpsc::UnboundedReceiver<portl_proto::session_v1::AttachV2ServerFrame>>>,
+    viewport_rx:
+        AsyncMutex<Option<watch::Receiver<Option<portl_proto::session_v1::AttachV2ServerFrame>>>>,
+    live_rx: AsyncMutex<Option<mpsc::Receiver<portl_proto::session_v1::AttachV2ServerFrame>>>,
+    history_rx: AsyncMutex<Option<mpsc::Receiver<portl_proto::session_v1::AttachV2ServerFrame>>>,
+}
+
+#[cfg(unix)]
+impl GhosttyAttachV2Session {
+    pub(crate) async fn new(_pid: u32, mut attach: GhosttyAttachV2) -> Result<Arc<Self>> {
+        let attach_id = rand::random::<[u8; 16]>();
+        attach.attach_id = attach_id;
+        let (command_tx, command_rx) = mpsc::channel(64);
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let (viewport_tx, viewport_rx) = watch::channel(None);
+        let (live_tx, live_rx) = mpsc::channel(128);
+        let (history_tx, history_rx) = mpsc::channel(16);
+        let session = Arc::new(Self {
+            attach_id,
+            command_tx,
+            control_rx: AsyncMutex::new(Some(control_rx)),
+            viewport_rx: AsyncMutex::new(Some(viewport_rx)),
+            live_rx: AsyncMutex::new(Some(live_rx)),
+            history_rx: AsyncMutex::new(Some(history_rx)),
+        });
+        enqueue_initial_attach_v2_frames(&attach, &control_tx, &viewport_tx, &history_tx).await?;
+        let error_tx = control_tx.clone();
+        let error_attach_id = attach_id;
+        tokio::spawn(async move {
+            if let Err(err) = attach_v2_dispatch_loop(
+                attach,
+                command_rx,
+                control_tx,
+                viewport_tx,
+                live_tx,
+                history_tx,
+            )
+            .await
+            {
+                let _ = error_tx.send(portl_proto::session_v1::AttachV2ServerFrame::Error {
+                    attach_id: error_attach_id,
+                    message: format!("ghostty attach v2 dispatcher stopped: {err:#}"),
+                    recoverable: false,
+                });
+                tracing::debug!(%err, "ghostty attach v2 dispatcher ended");
+            }
+        });
+        Ok(session)
+    }
+
+    pub(crate) async fn take_control_rx(
+        &self,
+    ) -> Result<mpsc::UnboundedReceiver<portl_proto::session_v1::AttachV2ServerFrame>> {
+        self.control_rx
+            .lock()
+            .await
+            .take()
+            .context("attach v2 control stream already attached")
+    }
+
+    pub(crate) async fn take_viewport_rx(
+        &self,
+    ) -> Result<watch::Receiver<Option<portl_proto::session_v1::AttachV2ServerFrame>>> {
+        self.viewport_rx
+            .lock()
+            .await
+            .take()
+            .context("attach v2 viewport stream already attached")
+    }
+
+    pub(crate) async fn take_live_rx(
+        &self,
+    ) -> Result<mpsc::Receiver<portl_proto::session_v1::AttachV2ServerFrame>> {
+        self.live_rx
+            .lock()
+            .await
+            .take()
+            .context("attach v2 live stream already attached")
+    }
+
+    pub(crate) async fn take_history_rx(
+        &self,
+    ) -> Result<mpsc::Receiver<portl_proto::session_v1::AttachV2ServerFrame>> {
+        self.history_rx
+            .lock()
+            .await
+            .take()
+            .context("attach v2 history stream already attached")
+    }
+
+    pub(crate) async fn handle_client_frame(
+        &self,
+        frame: portl_proto::session_v1::AttachV2ClientFrame,
+    ) -> Result<()> {
+        use portl_proto::session_v1::AttachV2ClientFrame as Frame;
+        match frame {
+            Frame::Input { attach_id, bytes } if attach_id == self.attach_id => self
+                .command_tx
+                .send(GhosttyAttachV2Command::Input(bytes))
+                .await
+                .context("send attach v2 input command"),
+            Frame::Resize {
+                attach_id,
+                resize_id,
+                cols,
+                rows,
+            } if attach_id == self.attach_id => self
+                .command_tx
+                .send(GhosttyAttachV2Command::Resize {
+                    resize_id,
+                    cols,
+                    rows,
+                })
+                .await
+                .context("send attach v2 resize command"),
+            Frame::Detach { attach_id } if attach_id == self.attach_id => self
+                .command_tx
+                .send(GhosttyAttachV2Command::Detach)
+                .await
+                .context("send attach v2 detach command"),
+            Frame::Reload {
+                attach_id,
+                reload_id,
+            } if attach_id == self.attach_id => self
+                .command_tx
+                .send(GhosttyAttachV2Command::Reload { reload_id })
+                .await
+                .context("send attach v2 reload command"),
+            Frame::CancelReload {
+                attach_id,
+                reload_id,
+            } if attach_id == self.attach_id => self
+                .command_tx
+                .send(GhosttyAttachV2Command::CancelReload { reload_id })
+                .await
+                .context("send attach v2 cancel reload command"),
+            Frame::RequestViewport {
+                attach_id,
+                resize_id,
+                reason,
+            } if attach_id == self.attach_id => self
+                .command_tx
+                .send(GhosttyAttachV2Command::RequestViewport { resize_id, reason })
+                .await
+                .context("send attach v2 viewport request command"),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn enqueue_initial_attach_v2_frames(
+    attach: &GhosttyAttachV2,
+    control_tx: &mpsc::UnboundedSender<portl_proto::session_v1::AttachV2ServerFrame>,
+    viewport_tx: &watch::Sender<Option<portl_proto::session_v1::AttachV2ServerFrame>>,
+    history_tx: &mpsc::Sender<portl_proto::session_v1::AttachV2ServerFrame>,
+) -> Result<()> {
+    use portl_proto::session_v1::{
+        AttachV2Payload, AttachV2Progress, AttachV2ServerFrame as Frame,
+    };
+    control_tx
+        .send(Frame::AttachReady {
+            attach_id: attach.attach_id,
+            provider: "ghostty".to_owned(),
+        })
+        .context("queue attach v2 ready frame")?;
+    if !attach.prelude.is_empty() {
+        history_tx
+            .send(Frame::PreludeChunk {
+                attach_id: attach.attach_id,
+                seq: 0,
+                progress: AttachV2Progress {
+                    loaded_bytes: attach.prelude.len() as u64,
+                    total_bytes: Some(attach.prelude.len() as u64),
+                    retained_history_truncated: false,
+                    complete: true,
+                },
+                payload: AttachV2Payload::encode_auto(&attach.prelude)?,
+            })
+            .await
+            .context("queue attach v2 prelude frame")?;
+    }
+    viewport_tx.send_replace(Some(Frame::ViewportSnapshot {
+        attach_id: attach.attach_id,
+        generation: attach.generation,
+        covers_live_seq: attach.covers_live_seq,
+        cols: attach.cols,
+        rows: attach.rows,
+        resize_id: attach.resize_id,
+        payload: AttachV2Payload::encode_auto(&attach.viewport)?,
+    }));
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn attach_v2_dispatch_loop(
+    mut attach: GhosttyAttachV2,
+    mut command_rx: mpsc::Receiver<GhosttyAttachV2Command>,
+    control_tx: mpsc::UnboundedSender<portl_proto::session_v1::AttachV2ServerFrame>,
+    viewport_tx: watch::Sender<Option<portl_proto::session_v1::AttachV2ServerFrame>>,
+    live_tx: mpsc::Sender<portl_proto::session_v1::AttachV2ServerFrame>,
+    history_tx: mpsc::Sender<portl_proto::session_v1::AttachV2ServerFrame>,
+) -> Result<()> {
+    let mut pending_resize_viewport: Option<(u64, tokio::time::Instant)> = None;
+    let mut resync_pending = false;
+    loop {
+        tokio::select! {
+            Some(command) = command_rx.recv() => {
+                match command {
+                    GhosttyAttachV2Command::Resize { resize_id, cols, rows } => {
+                        attach.resize(cols, rows).await?;
+                        pending_resize_viewport = Some((
+                            resize_id,
+                            tokio::time::Instant::now()
+                                + Duration::from_millis(GHOSTTY_ATTACH_V2_RESIZE_SETTLE_MS),
+                        ));
+                    }
+                    command => handle_attach_v2_command(&mut attach, command).await?,
+                }
+            }
+            () = async {
+                let Some((_, deadline)) = pending_resize_viewport else {
+                    std::future::pending::<()>().await;
+                    return;
+                };
+                tokio::time::sleep_until(deadline).await;
+            }, if pending_resize_viewport.is_some() => {
+                if let Some((resize_id, _)) = pending_resize_viewport.take() {
+                    attach
+                        .request_viewport(resize_id, "resize_settled".to_owned())
+                        .await?;
+                }
+            }
+            response = attach.next_response() => {
+                let Some(response) = response? else {
+                    let _ = control_tx.send(portl_proto::session_v1::AttachV2ServerFrame::Error {
+                        attach_id: attach.attach_id,
+                        message: "ghostty attach v2 helper stream closed".to_owned(),
+                        recoverable: false,
+                    });
+                    return Ok(());
+                };
+                let output_after_resize = matches!(response, GhosttyResponse::OutputV2 { .. })
+                    && pending_resize_viewport.is_some();
+                if handle_attach_v2_response(
+                    &mut attach,
+                    response,
+                    &control_tx,
+                    &viewport_tx,
+                    &live_tx,
+                    &history_tx,
+                    &mut resync_pending,
+                ).await? {
+                    return Ok(());
+                }
+                if output_after_resize {
+                    if let Some((resize_id, _)) = pending_resize_viewport.take() {
+                        attach
+                            .request_viewport(resize_id, "resize_output".to_owned())
+                            .await?;
+                    }
+                }
+            }
+            else => return Ok(()),
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn handle_attach_v2_command(
+    attach: &mut GhosttyAttachV2,
+    command: GhosttyAttachV2Command,
+) -> Result<()> {
+    match command {
+        GhosttyAttachV2Command::Input(bytes) => attach.input(bytes).await,
+        GhosttyAttachV2Command::Resize {
+            resize_id,
+            cols,
+            rows,
+        } => {
+            attach.resize(cols, rows).await?;
+            attach
+                .request_viewport(resize_id, "resize".to_owned())
+                .await
+        }
+        GhosttyAttachV2Command::Detach => attach.detach().await,
+        GhosttyAttachV2Command::Reload { reload_id } => attach.reload(reload_id).await,
+        GhosttyAttachV2Command::CancelReload { reload_id } => attach.cancel_reload(reload_id).await,
+        GhosttyAttachV2Command::RequestViewport { resize_id, reason } => {
+            attach.request_viewport(resize_id, reason).await
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn handle_attach_v2_response(
+    attach: &mut GhosttyAttachV2,
+    response: GhosttyResponse,
+    control_tx: &mpsc::UnboundedSender<portl_proto::session_v1::AttachV2ServerFrame>,
+    viewport_tx: &watch::Sender<Option<portl_proto::session_v1::AttachV2ServerFrame>>,
+    live_tx: &mpsc::Sender<portl_proto::session_v1::AttachV2ServerFrame>,
+    history_tx: &mpsc::Sender<portl_proto::session_v1::AttachV2ServerFrame>,
+    resync_pending: &mut bool,
+) -> Result<bool> {
+    use portl_proto::session_v1::{AttachV2Payload, AttachV2ServerFrame as Frame};
+    match response {
+        GhosttyResponse::OutputV2 {
+            start_seq,
+            end_seq,
+            bytes,
+        } => {
+            let frame = Frame::LiveOutput {
+                attach_id: attach.attach_id,
+                start_seq,
+                end_seq,
+                payload: AttachV2Payload::encode_auto(&bytes)?,
+            };
+            match live_tx.try_send(frame) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    crate::metrics::record_ghostty_event("attach_v2_live_queue_full");
+                    if !*resync_pending {
+                        *resync_pending = true;
+                        control_tx
+                            .send(Frame::ResyncRequired {
+                                attach_id: attach.attach_id,
+                                reason: "live queue full".to_owned(),
+                                from_seq: start_seq,
+                            })
+                            .context("queue attach v2 live resync")?;
+                        let _ = attach
+                            .request_viewport(0, "live_queue_full".to_owned())
+                            .await;
+                    }
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return Ok(true),
+            }
+        }
+        GhosttyResponse::ViewportV2 {
+            generation,
+            covers_live_seq,
+            cols,
+            rows,
+            resize_id,
+            bytes,
+        } => {
+            *resync_pending = false;
+            viewport_tx.send_replace(Some(Frame::ViewportSnapshot {
+                attach_id: attach.attach_id,
+                generation,
+                covers_live_seq,
+                cols,
+                rows,
+                resize_id,
+                payload: AttachV2Payload::encode_auto(&bytes)?,
+            }));
+        }
+        GhosttyResponse::ReloadStartedV2 {
+            reload_id,
+            total_bytes,
+        } => {
+            control_tx
+                .send(Frame::ReloadStarted {
+                    attach_id: attach.attach_id,
+                    reload_id,
+                    total_bytes,
+                })
+                .context("queue attach v2 reload started")?;
+        }
+        GhosttyResponse::ReloadChunkV2 {
+            reload_id,
+            seq,
+            progress,
+            bytes,
+        } => {
+            match history_tx.try_send(Frame::ReloadChunk {
+                attach_id: attach.attach_id,
+                reload_id,
+                seq,
+                progress,
+                payload: AttachV2Payload::encode_auto(&bytes)?,
+            }) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    crate::metrics::record_ghostty_event("attach_v2_history_queue_full");
+                    let _ = control_tx.send(Frame::ReloadCancelled {
+                        attach_id: attach.attach_id,
+                        reload_id,
+                    });
+                    let _ = attach.cancel_reload(reload_id).await;
+                    let _ = attach
+                        .request_viewport(0, "history_queue_full".to_owned())
+                        .await;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return Ok(true),
+            }
+        }
+        GhosttyResponse::ReloadDoneV2 {
+            reload_id,
+            final_generation,
+        } => {
+            control_tx
+                .send(Frame::ReloadDone {
+                    attach_id: attach.attach_id,
+                    reload_id,
+                    final_generation,
+                })
+                .context("queue attach v2 reload done")?;
+            let _ = attach.request_viewport(0, "reload_done".to_owned()).await;
+        }
+        GhosttyResponse::ReloadCancelledV2 { reload_id } => {
+            control_tx
+                .send(Frame::ReloadCancelled {
+                    attach_id: attach.attach_id,
+                    reload_id,
+                })
+                .context("queue attach v2 reload cancelled")?;
+            let _ = attach
+                .request_viewport(0, "reload_cancelled".to_owned())
+                .await;
+        }
+        GhosttyResponse::ResyncRequiredV2 { reason, from_seq } => {
+            control_tx
+                .send(Frame::ResyncRequired {
+                    attach_id: attach.attach_id,
+                    reason: reason.clone(),
+                    from_seq,
+                })
+                .context("queue attach v2 resync required")?;
+            let _ = attach.request_viewport(0, reason).await;
+        }
+        GhosttyResponse::Exit { code } => {
+            let _ = control_tx.send(Frame::Exit {
+                attach_id: attach.attach_id,
+                code,
+            });
+            return Ok(true);
+        }
+        GhosttyResponse::Error { message } => {
+            let _ = control_tx.send(Frame::Error {
+                attach_id: attach.attach_id,
+                message,
+                recoverable: false,
+            });
+            return Ok(true);
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+#[cfg(unix)]
+impl GhosttyAttachV2 {
+    pub(crate) async fn input(&mut self, bytes: Vec<u8>) -> Result<()> {
+        write_frame(&mut self.stream, &GhosttyRequest::Input { bytes }).await
+    }
+
+    pub(crate) async fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+        write_frame(&mut self.stream, &GhosttyRequest::Resize { cols, rows }).await
+    }
+
+    pub(crate) async fn reload(&mut self, reload_id: u64) -> Result<()> {
+        write_frame(&mut self.stream, &GhosttyRequest::ReloadV2 { reload_id }).await
+    }
+
+    pub(crate) async fn cancel_reload(&mut self, reload_id: u64) -> Result<()> {
+        write_frame(
+            &mut self.stream,
+            &GhosttyRequest::CancelReloadV2 { reload_id },
+        )
+        .await
+    }
+
+    pub(crate) async fn request_viewport(&mut self, resize_id: u64, reason: String) -> Result<()> {
+        write_frame(
+            &mut self.stream,
+            &GhosttyRequest::RequestViewportV2 { resize_id, reason },
+        )
+        .await
+    }
+
+    pub(crate) async fn detach(&mut self) -> Result<()> {
+        write_frame(&mut self.stream, &GhosttyRequest::Detach).await
+    }
+
+    async fn next_response(&mut self) -> Result<Option<GhosttyResponse>> {
+        read_frame::<GhosttyResponse>(&mut self.stream).await
+    }
+
+    #[cfg(test)]
+    async fn read_reload_until_done(
+        &mut self,
+        reload_id: u64,
+        timeout: Duration,
+    ) -> Result<String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut out = Vec::new();
+        loop {
+            let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
+            else {
+                bail!("timed out waiting for ghostty attach v2 reload {reload_id}");
+            };
+            let response = tokio::time::timeout(remaining, self.next_response())
+                .await
+                .context("wait for ghostty attach v2 reload")??;
+            match response {
+                Some(GhosttyResponse::ReloadStartedV2 { reload_id: id, .. }) if id == reload_id => {
+                }
+                Some(GhosttyResponse::ReloadChunkV2 {
+                    reload_id: id,
+                    bytes,
+                    ..
+                }) if id == reload_id => {
+                    out.extend_from_slice(&bytes);
+                }
+                Some(GhosttyResponse::ReloadDoneV2 { reload_id: id, .. }) if id == reload_id => {
+                    return Ok(String::from_utf8_lossy(&out).into_owned());
+                }
+                Some(GhosttyResponse::ReloadCancelledV2 { reload_id: id }) if id == reload_id => {
+                    bail!("ghostty attach v2 reload {reload_id} cancelled");
+                }
+                Some(GhosttyResponse::Error { message }) => bail!(message),
+                Some(_) => {}
+                None => bail!("ghostty attach v2 stream closed"),
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1365,8 +2802,15 @@ async fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result
         bail!("ghostty frame too large: {} bytes", bytes.len());
     }
     let len = u32::try_from(bytes.len()).context("ghostty frame length overflow")?;
-    stream.write_all(&len.to_be_bytes()).await?;
-    stream.write_all(&bytes).await?;
+    tokio::time::timeout(
+        GHOSTTY_FRAME_WRITE_TIMEOUT,
+        stream.write_all(&len.to_be_bytes()),
+    )
+    .await
+    .context("write ghostty frame length timed out")??;
+    tokio::time::timeout(GHOSTTY_FRAME_WRITE_TIMEOUT, stream.write_all(&bytes))
+        .await
+        .context("write ghostty frame timed out")??;
     Ok(())
 }
 
@@ -1514,6 +2958,202 @@ mod tests {
             .expect("helper thread")
             .context("helper result")?;
         assert!(!paths.metadata_path.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn helper_attach_v2_sends_bounded_prelude_then_viewport() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let registry =
+            GhosttyRegistry::with_roots(temp.path().join("run"), temp.path().join("state"));
+        let paths = registry.paths_for("v2-prelude");
+        let helper = GhosttyHelperConfig::for_test(
+            "v2-prelude",
+            paths.clone(),
+            vec!["/bin/sh".to_owned(), "-l".to_owned()],
+        );
+        let task = spawn_helper_thread(helper);
+        wait_for_socket(&paths.socket_path, Duration::from_secs(2)).await?;
+
+        let run = GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .run(
+                None,
+                vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "printf '0123456789abcdef\\nviewport-ok\\n'".to_owned(),
+                ],
+            )
+            .await?;
+        assert_eq!(run.code, 0);
+
+        let config = portl_proto::session_v1::AttachV2Config {
+            prelude_max_wait_ms: 200,
+            prelude_max_bytes: 8,
+        };
+        let attach = GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .attach_v2(80, 24, config)
+            .await?;
+
+        assert_eq!(attach.attach_id, [0; 16]);
+        assert!(attach.prelude.len() <= 8, "prelude was too large");
+        assert!(
+            String::from_utf8_lossy(&attach.viewport).contains("viewport-ok"),
+            "viewport was {:?}",
+            String::from_utf8_lossy(&attach.viewport)
+        );
+        assert!(attach.covers_live_seq > 0);
+
+        GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .kill()
+            .await?;
+        task.join()
+            .expect("helper thread")
+            .context("helper result")?;
+        Ok(())
+    }
+
+    #[test]
+    fn attach_v2_terminal_replay_strips_unsafe_control_strings() {
+        assert_eq!(
+            sanitize_terminal_replay(b"before\x1b]52;c;secret\x07after"),
+            b"beforeafter"
+        );
+        assert_eq!(
+            sanitize_terminal_replay(b"before\x1bPprivate\x1b\\after"),
+            b"beforeafter"
+        );
+    }
+
+    #[tokio::test]
+    async fn helper_attach_v2_reload_cancel_reports_cancelled() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let registry =
+            GhosttyRegistry::with_roots(temp.path().join("run"), temp.path().join("state"));
+        let paths = registry.paths_for("v2-reload-cancel");
+        let helper = GhosttyHelperConfig::for_test(
+            "v2-reload-cancel",
+            paths.clone(),
+            vec!["/bin/sh".to_owned(), "-l".to_owned()],
+        );
+        let task = spawn_helper_thread(helper);
+        wait_for_socket(&paths.socket_path, Duration::from_secs(2)).await?;
+
+        let run = GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .run(
+                None,
+                vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "for i in $(seq 1 2000); do printf 'cancel-line-%04d\\n' \"$i\"; done"
+                        .to_owned(),
+                ],
+            )
+            .await?;
+        assert_eq!(run.code, 0);
+
+        let mut attach = GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .attach_v2(
+                80,
+                24,
+                portl_proto::session_v1::AttachV2Config {
+                    prelude_max_wait_ms: 200,
+                    prelude_max_bytes: 16,
+                },
+            )
+            .await?;
+        attach.reload(9).await?;
+        attach.cancel_reload(9).await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .context("timed out waiting for reload cancellation")?;
+            match tokio::time::timeout(remaining, attach.next_response())
+                .await
+                .context("wait for reload cancellation")??
+            {
+                Some(GhosttyResponse::ReloadCancelledV2 { reload_id: 9 }) => break,
+                Some(_) => {}
+                None => bail!("ghostty attach v2 stream closed"),
+            }
+        }
+
+        GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .kill()
+            .await?;
+        task.join()
+            .expect("helper thread")
+            .context("helper result")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn helper_attach_v2_reload_streams_full_retained_history_in_chunks() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let registry =
+            GhosttyRegistry::with_roots(temp.path().join("run"), temp.path().join("state"));
+        let paths = registry.paths_for("v2-reload");
+        let helper = GhosttyHelperConfig::for_test(
+            "v2-reload",
+            paths.clone(),
+            vec!["/bin/sh".to_owned(), "-l".to_owned()],
+        );
+        let task = spawn_helper_thread(helper);
+        wait_for_socket(&paths.socket_path, Duration::from_secs(2)).await?;
+
+        let run = GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .run(
+                None,
+                vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "python3 - <<'PY'\nfor i in range(256): print(f'history-line-{i:03d}')\nPY"
+                        .to_owned(),
+                ],
+            )
+            .await?;
+        assert_eq!(run.code, 0);
+
+        let mut attach = GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .attach_v2(
+                80,
+                24,
+                portl_proto::session_v1::AttachV2Config {
+                    prelude_max_wait_ms: 200,
+                    prelude_max_bytes: 16,
+                },
+            )
+            .await?;
+        attach.reload(7).await?;
+        let history = attach
+            .read_reload_until_done(7, Duration::from_secs(2))
+            .await?;
+
+        assert!(
+            history.contains("history-line-000"),
+            "history was {history:?}"
+        );
+        assert!(
+            history.contains("history-line-255"),
+            "history was {history:?}"
+        );
+
+        GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .kill()
+            .await?;
+        task.join()
+            .expect("helper thread")
+            .context("helper result")?;
         Ok(())
     }
 

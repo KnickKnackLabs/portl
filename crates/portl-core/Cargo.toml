@@ -61,6 +61,7 @@ hkdf             = { workspace = true }
 url              = { workspace = true }
 futures-util     = { workspace = true }
 http             = { workspace = true }
+zstd             = { workspace = true }
 
 [dev-dependencies]
 portl-core = { version = "0.8.5", path = ".", features = ["test-util"] }

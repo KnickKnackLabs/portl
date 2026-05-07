@@ -3846,6 +3846,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "zeroize",
+ "zstd",
 ]
 
 [[package]]

@@ -49,6 +49,58 @@ pub struct SessionClient {
     pub control: SendStream,
 }
 
+pub struct SessionClientV2 {
+    pub provider: String,
+    pub attach_id: [u8; 16],
+    pub control_send: SendStream,
+    pub control_recv: BufferedRecv,
+    pub input: SendStream,
+    pub resize: SendStream,
+    pub viewport: BufferedRecv,
+    pub live: BufferedRecv,
+    pub history: BufferedRecv,
+}
+
+impl SessionClientV2 {
+    pub async fn send_control(
+        &mut self,
+        frame: crate::wire::session::AttachV2ClientFrame,
+    ) -> Result<()> {
+        self.control_send
+            .write_all(&postcard::to_stdvec(&frame).context("encode attach v2 control frame")?)
+            .await
+            .context("write attach v2 control frame")
+    }
+
+    pub async fn send_input(&mut self, bytes: Vec<u8>) -> Result<()> {
+        self.input
+            .write_all(
+                &postcard::to_stdvec(&crate::wire::session::AttachV2ClientFrame::Input {
+                    attach_id: self.attach_id,
+                    bytes,
+                })
+                .context("encode attach v2 input frame")?,
+            )
+            .await
+            .context("write attach v2 input frame")
+    }
+
+    pub async fn resize(&mut self, resize_id: u64, cols: u16, rows: u16) -> Result<()> {
+        self.resize
+            .write_all(
+                &postcard::to_stdvec(&crate::wire::session::AttachV2ClientFrame::Resize {
+                    attach_id: self.attach_id,
+                    resize_id,
+                    cols,
+                    rows,
+                })
+                .context("encode attach v2 resize frame")?,
+            )
+            .await
+            .context("write attach v2 resize frame")
+    }
+}
+
 impl SessionClient {
     pub async fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
         let frame = ResizeFrame { cols, rows };
@@ -220,6 +272,139 @@ pub async fn open_session_kill(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub async fn open_session_attach_v2(
+    connection: &Connection,
+    session: &PeerSession,
+    provider: Option<String>,
+    session_name: String,
+    argv: Option<Vec<String>>,
+    user: Option<String>,
+    cwd: Option<String>,
+    pty: PtyCfg,
+    config: crate::wire::session::AttachV2Config,
+) -> Result<SessionClientV2> {
+    open_session_attach_v2_checked(
+        connection,
+        session,
+        provider,
+        session_name,
+        argv,
+        user,
+        cwd,
+        pty,
+        config,
+    )
+    .await
+    .map_err(Into::into)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn open_session_attach_v2_checked(
+    connection: &Connection,
+    session: &PeerSession,
+    provider: Option<String>,
+    session_name: String,
+    argv: Option<Vec<String>>,
+    user: Option<String>,
+    cwd: Option<String>,
+    pty: PtyCfg,
+    config: crate::wire::session::AttachV2Config,
+) -> std::result::Result<SessionClientV2, SessionOpenError> {
+    let (mut control_send, control_recv) = connection
+        .open_bi()
+        .await
+        .context("open session attach v2 control stream")?;
+    control_send
+        .write_all(&postcard::to_stdvec(&preamble(session)).context("encode session preamble")?)
+        .await
+        .context("write session preamble")?;
+    control_send
+        .write_all(
+            &postcard::to_stdvec(&SessionFirstFrame::Control(SessionReqBody {
+                op: SessionOp::AttachV2,
+                provider,
+                session_name: Some(session_name),
+                user,
+                cwd,
+                argv,
+                pty: Some(pty),
+                attach_v2: Some(config),
+            }))
+            .context("encode session attach v2 request")?,
+        )
+        .await
+        .context("write session attach v2 request")?;
+    let mut control_recv = BufferedRecv::new(control_recv, Vec::new());
+    let ack: SessionAck = control_recv
+        .read_frame(MAX_ACK_BYTES)
+        .await?
+        .context("missing session attach v2 ack")?;
+    ensure_ok_open(&ack)?;
+    let provider = ack.provider.clone().unwrap_or_else(|| "unknown".to_owned());
+    let session_id = ack.session_id.context("session ack missing session id")?;
+    let ready: crate::wire::session::AttachV2ServerFrame = control_recv
+        .read_frame(crate::wire::session::ATTACH_V2_MAX_DECODED_PAYLOAD)
+        .await?
+        .context("missing attach v2 ready frame")?;
+    let attach_id = match ready {
+        crate::wire::session::AttachV2ServerFrame::AttachReady { attach_id, .. } => attach_id,
+        other => {
+            return Err(SessionOpenError::Transport(anyhow::anyhow!(
+                "unexpected attach v2 first control frame: {other:?}"
+            )));
+        }
+    };
+
+    let viewport = open_recv_stream(
+        connection,
+        session,
+        session_id,
+        SessionStreamKind::AttachV2Viewport,
+    )
+    .await?;
+    let live = open_recv_stream(
+        connection,
+        session,
+        session_id,
+        SessionStreamKind::AttachV2Live,
+    )
+    .await?;
+    let history = open_recv_stream(
+        connection,
+        session,
+        session_id,
+        SessionStreamKind::AttachV2History,
+    )
+    .await?;
+    let (input, _) = open_send_stream(
+        connection,
+        session,
+        session_id,
+        SessionStreamKind::AttachV2Input,
+    )
+    .await?;
+    let (resize, _) = open_send_stream(
+        connection,
+        session,
+        session_id,
+        SessionStreamKind::AttachV2Resize,
+    )
+    .await?;
+
+    Ok(SessionClientV2 {
+        provider,
+        attach_id,
+        control_send,
+        control_recv,
+        input,
+        resize,
+        viewport,
+        live,
+        history,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn open_session_attach(
     connection: &Connection,
     session: &PeerSession,
@@ -273,6 +458,7 @@ pub async fn open_session_attach_checked(
                 cwd,
                 argv,
                 pty: Some(pty),
+                attach_v2: None,
             }))
             .context("encode session attach request")?,
         )
@@ -367,6 +553,7 @@ fn req(
         cwd: None,
         argv,
         pty: None,
+        attach_v2: None,
     }
 }
 

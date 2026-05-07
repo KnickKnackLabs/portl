@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
 use std::future::Future;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write as IoWrite};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::{ExitCode, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -20,13 +20,17 @@ use portl_core::attach_control::{
 };
 use portl_core::io::BufferedRecv;
 use portl_core::net::{
-    SessionClient, SessionOpenError, open_session_attach, open_session_attach_checked,
-    open_session_history, open_session_kill, open_session_list_detailed,
-    open_session_list_detailed_checked, open_session_providers, open_session_run,
+    SessionClient, SessionClientV2, SessionOpenError, open_session_attach_checked,
+    open_session_attach_v2_checked, open_session_history, open_session_kill,
+    open_session_list_detailed, open_session_list_detailed_checked, open_session_providers,
+    open_session_run,
 };
 use portl_core::terminal::{tmux_cc, zmx_control};
 use portl_core::ticket::schema::{Capabilities, EnvPolicy, ShellCaps};
-use portl_core::wire::session::{SessionControlAction, SessionControlFrame};
+use portl_core::wire::session::{
+    ATTACH_V2_MAX_DECODED_PAYLOAD, AttachV2ClientFrame, AttachV2Config, AttachV2ServerFrame,
+    SessionControlAction, SessionControlFrame,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
 use tracing::{debug, trace};
@@ -2226,6 +2230,97 @@ struct RemoteSessionAttachRequest {
     rows: u16,
 }
 
+enum RemoteAttachSession {
+    V1(SessionClient),
+    V2(SessionClientV2),
+}
+
+impl RemoteAttachSession {
+    fn provider(&self) -> &str {
+        match self {
+            Self::V1(session) => &session.provider,
+            Self::V2(session) => &session.provider,
+        }
+    }
+}
+
+fn attach_v2_config_from_env() -> AttachV2Config {
+    let mut config = AttachV2Config::default();
+    if let Some(value) = parse_env_u64("PORTL_ATTACH_PRELUDE_MAX_WAIT_MS") {
+        config.prelude_max_wait_ms = value;
+    }
+    if let Some(value) = parse_env_u64("PORTL_ATTACH_PRELUDE_MAX_BYTES") {
+        config.prelude_max_bytes = value;
+    }
+    config
+}
+
+fn parse_env_u64(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+fn should_try_attach_v2(provider: Option<&str>) -> bool {
+    !matches!(provider, Some("zmx" | "tmux" | "raw"))
+}
+
+fn should_fallback_to_attach_v1(provider: Option<&str>, err: &SessionOpenError) -> bool {
+    provider.is_none()
+        && matches!(
+            err.reason(),
+            Some(
+                portl_core::wire::session::SessionReason::CapabilityUnsupported { .. }
+                    | portl_core::wire::session::SessionReason::ProviderUnavailable(_)
+                    | portl_core::wire::session::SessionReason::ProviderNotFound(_)
+            )
+        )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_remote_attach_session_checked(
+    connection: &Connection,
+    session: &portl_core::net::PeerSession,
+    provider: Option<String>,
+    session_name: String,
+    argv: Option<Vec<String>>,
+    user: Option<String>,
+    cwd: Option<String>,
+    pty: portl_core::net::shell_client::PtyCfg,
+) -> std::result::Result<RemoteAttachSession, SessionOpenError> {
+    if should_try_attach_v2(provider.as_deref()) {
+        match open_session_attach_v2_checked(
+            connection,
+            session,
+            provider.clone(),
+            session_name.clone(),
+            argv.clone(),
+            user.clone(),
+            cwd.clone(),
+            pty.clone(),
+            attach_v2_config_from_env(),
+        )
+        .await
+        {
+            Ok(session) => return Ok(RemoteAttachSession::V2(session)),
+            Err(err) if should_fallback_to_attach_v1(provider.as_deref(), &err) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    open_session_attach_checked(
+        connection,
+        session,
+        provider,
+        session_name,
+        argv,
+        user,
+        cwd,
+        pty,
+    )
+    .await
+    .map(RemoteAttachSession::V1)
+}
+
 fn session_reconnect_enabled() -> bool {
     std::env::var("PORTL_SESSION_RECONNECT").map_or(true, |value| {
         !matches!(
@@ -2240,7 +2335,7 @@ async fn remote_session_attach_once_without_reconnect(
 ) -> Result<ExitCode> {
     let connected = connect_peer(&request.target, session_caps()).await?;
     print_remote_attach_start(&request, request.provider.as_deref());
-    let session = open_session_attach(
+    let session = open_remote_attach_session_checked(
         &connected.connection,
         &connected.session,
         request.provider.clone(),
@@ -2255,7 +2350,7 @@ async fn remote_session_attach_once_without_reconnect(
         },
     )
     .await?;
-    let provider = session.provider.clone();
+    let provider = session.provider().to_owned();
     let canonical_ref = canonical_session_ref(&request.target, &provider, &request.session_name);
     let code = bridge_attach(session, request.cols, request.rows, canonical_ref).await?;
     close_connected(connected, b"session complete").await;
@@ -2284,7 +2379,7 @@ async fn remote_session_attach_with_reconnect_on_endpoint(
     let mut connected =
         connect_peer_with_endpoint(&request.target, session_caps(), identity, endpoint, false)
             .await?;
-    let mut session = open_session_attach_checked(
+    let mut session = open_remote_attach_session_checked(
         &connected.connection,
         &connected.session,
         request.provider.clone(),
@@ -2299,7 +2394,7 @@ async fn remote_session_attach_with_reconnect_on_endpoint(
         },
     )
     .await?;
-    let provider = session.provider.clone();
+    let provider = session.provider().to_owned();
     let canonical_ref = canonical_session_ref(&request.target, &provider, &request.session_name);
     let mut flight_recorder = AttachFlightRecorder::new();
     flight_recorder.record_with_path(
@@ -2444,11 +2539,17 @@ fn print_reconnect_quit_message(canonical_ref: &str) {
 }
 
 async fn bridge_attach(
-    session: SessionClient,
+    session: RemoteAttachSession,
     cols: u16,
     rows: u16,
     canonical_ref: String,
 ) -> Result<i32> {
+    let session = match session {
+        RemoteAttachSession::V1(session) => session,
+        RemoteAttachSession::V2(session) => {
+            return bridge_attach_v2(session, cols, rows, canonical_ref).await;
+        }
+    };
     let raw_guard = if std::io::stdin().is_terminal() {
         Some(RawModeGuard::new()?)
     } else {
@@ -2519,6 +2620,40 @@ async fn bridge_attach(
         drop(raw_guard);
     }
     Ok(code)
+}
+
+async fn bridge_attach_v2(
+    session: SessionClientV2,
+    cols: u16,
+    rows: u16,
+    canonical_ref: String,
+) -> Result<i32> {
+    let raw_guard = if std::io::stdin().is_terminal() {
+        Some(RawModeGuard::new()?)
+    } else {
+        None
+    };
+    let display = AttachDisplay::new(cols, rows);
+    let mut coordinator = AttachInputCoordinator::spawn(
+        AttachControlUi {
+            canonical_ref: canonical_ref.clone(),
+            supports_kick_others: false,
+            display: display.clone(),
+        },
+        (cols, rows),
+    );
+    let end = run_remote_attach_v2_once(session, &display, &mut coordinator).await;
+    display.clear_bar().await?;
+    coordinator.stop().await;
+    drop(raw_guard);
+    match end {
+        AttachEnd::Exited(code) => Ok(code),
+        AttachEnd::Detached | AttachEnd::QuitReconnect => {
+            print_detached_message(&canonical_ref);
+            Ok(0)
+        }
+        AttachEnd::Disconnected(err) => Err(err),
+    }
 }
 
 const ATTACH_FLIGHT_RECORDER_CAPACITY: usize = 12;
@@ -2671,7 +2806,7 @@ impl ReconnectAttemptState {
 enum ReconnectOutcome {
     Reattached {
         connected: Box<crate::commands::peer_resolve::ConnectedPeer>,
-        session: Box<SessionClient>,
+        session: Box<RemoteAttachSession>,
     },
     Detached,
     Quit,
@@ -2812,7 +2947,7 @@ async fn reconnect_remote_session(
                 request.session_name
             );
         }
-        match open_session_attach_checked(
+        match open_remote_attach_session_checked(
             &connected.connection,
             &connected.session,
             Some(provider.to_owned()),
@@ -2920,7 +3055,7 @@ async fn try_same_connection_reattach(
         );
     }
 
-    match open_session_attach_checked(
+    match open_remote_attach_session_checked(
         &connected.connection,
         &connected.session,
         Some(provider.to_owned()),
@@ -3047,6 +3182,21 @@ async fn wait_reconnect_delay(
 }
 
 async fn run_remote_attach_once(
+    session: RemoteAttachSession,
+    display: &AttachDisplay,
+    coordinator: &mut AttachInputCoordinator,
+) -> AttachEnd {
+    match session {
+        RemoteAttachSession::V1(session) => {
+            run_remote_attach_v1_once(session, display, coordinator).await
+        }
+        RemoteAttachSession::V2(session) => {
+            run_remote_attach_v2_once(session, display, coordinator).await
+        }
+    }
+}
+
+async fn run_remote_attach_v1_once(
     session: SessionClient,
     display: &AttachDisplay,
     coordinator: &mut AttachInputCoordinator,
@@ -3138,6 +3288,308 @@ async fn run_remote_attach_once(
     stderr_task.abort();
     let _ = coordinator.clear_sink().await;
     end
+}
+
+async fn run_remote_attach_v2_once(
+    session: SessionClientV2,
+    display: &AttachDisplay,
+    coordinator: &mut AttachInputCoordinator,
+) -> AttachEnd {
+    if let Some(end) = coordinator.drain_before_attach() {
+        return end;
+    }
+    let SessionClientV2 {
+        provider: _,
+        attach_id,
+        control_send,
+        mut control_recv,
+        input,
+        resize,
+        mut viewport,
+        mut live,
+        mut history,
+    } = session;
+    let reload_state = Arc::new(StdMutex::new(None));
+    if let Err(err) = coordinator
+        .set_sink(AttachInputSink {
+            kind: AttachInputSinkKind::RemoteV2 {
+                input,
+                resize,
+                control: control_send,
+                attach_id,
+                next_resize_id: 0,
+                next_reload_id: 0,
+                reload_state: Arc::clone(&reload_state),
+            },
+        })
+        .await
+    {
+        return AttachEnd::Disconnected(err);
+    }
+    if let Err(err) = display.clear_bar().await {
+        return AttachEnd::Disconnected(err);
+    }
+    let mut covered_live_seq = 0_u64;
+    let mut last_viewport_generation = 0_u64;
+    let mut resync_pending = false;
+    let end = loop {
+        tokio::select! {
+            frame = read_attach_v2_frame(&mut control_recv) => {
+                match frame {
+                    Ok(Some(frame)) if attach_v2_frame_matches(&frame, attach_id) => match handle_attach_v2_control_frame(
+                        frame,
+                        display,
+                        &reload_state,
+                        &mut resync_pending,
+                    ).await {
+                        Ok(Some(end)) => break end,
+                        Ok(None) => {}
+                        Err(err) => break AttachEnd::Disconnected(err),
+                    },
+                    Ok(Some(_)) => {}
+                    Ok(None) => break AttachEnd::Disconnected(anyhow!("attach v2 control stream ended before exit frame")),
+                    Err(err) => break AttachEnd::Disconnected(err),
+                }
+            }
+            frame = read_attach_v2_frame(&mut viewport) => {
+                match frame {
+                    Ok(Some(AttachV2ServerFrame::ViewportSnapshot { attach_id: frame_attach_id, generation, covers_live_seq, payload, .. })) if frame_attach_id == attach_id && generation > last_viewport_generation => {
+                        last_viewport_generation = generation;
+                        covered_live_seq = covered_live_seq.max(covers_live_seq);
+                        resync_pending = false;
+                        clear_active_reload(&reload_state);
+                        match payload.decode(ATTACH_V2_MAX_DECODED_PAYLOAD) {
+                            Ok(bytes) => {
+                                if let Err(err) = display.write_output(AttachOutputStream::Stdout, &bytes).await {
+                                    break AttachEnd::Disconnected(err);
+                                }
+                                let _ = display.clear_bar().await;
+                            }
+                            Err(err) => break AttachEnd::Disconnected(err),
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break AttachEnd::Disconnected(anyhow!("attach v2 viewport stream ended before exit frame")),
+                    Err(err) => break AttachEnd::Disconnected(err),
+                }
+            }
+            frame = read_attach_v2_frame(&mut history) => {
+                match frame {
+                    Ok(Some(AttachV2ServerFrame::PreludeChunk { attach_id: frame_attach_id, payload, .. })) if frame_attach_id == attach_id => {
+                        match payload.decode(ATTACH_V2_MAX_DECODED_PAYLOAD) {
+                            Ok(bytes) => {
+                                if let Err(err) = display.write_output(AttachOutputStream::Stdout, &bytes).await {
+                                    break AttachEnd::Disconnected(err);
+                                }
+                            }
+                            Err(err) => break AttachEnd::Disconnected(err),
+                        }
+                    }
+                    Ok(Some(AttachV2ServerFrame::ReloadChunk { attach_id: frame_attach_id, reload_id, progress, payload, .. })) if frame_attach_id == attach_id => {
+                        if current_active_reload(&reload_state) == Some(reload_id) {
+                            let text = if let Some(total) = progress.total_bytes {
+                                format!(
+                                    "▌ Portl › reloading {} / {} bytes · Esc cancel",
+                                    progress.loaded_bytes,
+                                    total
+                                )
+                            } else {
+                                format!("▌ Portl › reloading {} bytes · Esc cancel", progress.loaded_bytes)
+                            };
+                            let _ = display.set_bar(text).await;
+                            match payload.decode(ATTACH_V2_MAX_DECODED_PAYLOAD) {
+                                Ok(bytes) => {
+                                    if let Err(err) = display.write_output(AttachOutputStream::Stdout, &bytes).await {
+                                        break AttachEnd::Disconnected(err);
+                                    }
+                                }
+                                Err(err) => break AttachEnd::Disconnected(err),
+                            }
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break AttachEnd::Disconnected(anyhow!("attach v2 history stream ended before exit frame")),
+                    Err(err) => break AttachEnd::Disconnected(err),
+                }
+            }
+            frame = read_attach_v2_frame(&mut live) => {
+                match frame {
+                    Ok(Some(AttachV2ServerFrame::LiveOutput { attach_id: frame_attach_id, start_seq, end_seq, payload, .. })) if frame_attach_id == attach_id && current_active_reload(&reload_state).is_none() && !resync_pending && end_seq > covered_live_seq => {
+                        if start_seq > covered_live_seq {
+                            let _ = display
+                                .set_bar("▌ Portl › resyncing after live sequence gap".to_owned())
+                                .await;
+                            resync_pending = true;
+                            if let Err(err) = coordinator.request_viewport("live_seq_gap").await {
+                                break AttachEnd::Disconnected(err);
+                            }
+                            continue;
+                        }
+                        match payload.decode(ATTACH_V2_MAX_DECODED_PAYLOAD) {
+                            Ok(bytes) => {
+                                let skip = covered_live_seq.saturating_sub(start_seq) as usize;
+                                let bytes = &bytes[skip.min(bytes.len())..];
+                                covered_live_seq = end_seq;
+                                if let Err(err) = display.write_output(AttachOutputStream::Stdout, bytes).await {
+                                    break AttachEnd::Disconnected(err);
+                                }
+                            }
+                            Err(err) => break AttachEnd::Disconnected(err),
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break AttachEnd::Disconnected(anyhow!("attach v2 live stream ended before exit frame")),
+                    Err(err) => break AttachEnd::Disconnected(err),
+                }
+            }
+            event = coordinator.next_event() => {
+                break match event {
+                    Some(AttachInputEvent::Detached) => AttachEnd::Detached,
+                    Some(AttachInputEvent::QuitReconnect) => AttachEnd::QuitReconnect,
+                    Some(AttachInputEvent::Closed) => AttachEnd::Detached,
+                    Some(AttachInputEvent::SinkFailed(err)) => AttachEnd::Disconnected(err),
+                    Some(AttachInputEvent::RetryNow | AttachInputEvent::BufferFull) => continue,
+                    None => AttachEnd::Disconnected(anyhow!("attach input coordinator stopped")),
+                };
+            }
+        }
+    };
+    let _ = coordinator.clear_sink().await;
+    end
+}
+
+async fn read_attach_v2_frame(recv: &mut BufferedRecv) -> Result<Option<AttachV2ServerFrame>> {
+    recv.read_frame::<AttachV2ServerFrame>(ATTACH_V2_MAX_DECODED_PAYLOAD)
+        .await
+}
+
+fn current_active_reload(reload_state: &Arc<StdMutex<Option<u64>>>) -> Option<u64> {
+    reload_state.lock().map(|state| *state).unwrap_or(None)
+}
+
+fn set_active_reload(reload_state: &Arc<StdMutex<Option<u64>>>, reload_id: Option<u64>) {
+    if let Ok(mut state) = reload_state.lock() {
+        *state = reload_id;
+    }
+}
+
+fn clear_active_reload(reload_state: &Arc<StdMutex<Option<u64>>>) {
+    set_active_reload(reload_state, None);
+}
+
+fn attach_v2_frame_matches(frame: &AttachV2ServerFrame, attach_id: [u8; 16]) -> bool {
+    match frame {
+        AttachV2ServerFrame::AttachReady {
+            attach_id: frame_attach_id,
+            ..
+        }
+        | AttachV2ServerFrame::PreludeChunk {
+            attach_id: frame_attach_id,
+            ..
+        }
+        | AttachV2ServerFrame::ViewportSnapshot {
+            attach_id: frame_attach_id,
+            ..
+        }
+        | AttachV2ServerFrame::LiveOutput {
+            attach_id: frame_attach_id,
+            ..
+        }
+        | AttachV2ServerFrame::ReloadStarted {
+            attach_id: frame_attach_id,
+            ..
+        }
+        | AttachV2ServerFrame::ReloadChunk {
+            attach_id: frame_attach_id,
+            ..
+        }
+        | AttachV2ServerFrame::ReloadDone {
+            attach_id: frame_attach_id,
+            ..
+        }
+        | AttachV2ServerFrame::ReloadCancelled {
+            attach_id: frame_attach_id,
+            ..
+        }
+        | AttachV2ServerFrame::BackpressureNotice {
+            attach_id: frame_attach_id,
+            ..
+        }
+        | AttachV2ServerFrame::ResyncRequired {
+            attach_id: frame_attach_id,
+            ..
+        }
+        | AttachV2ServerFrame::Heartbeat {
+            attach_id: frame_attach_id,
+            ..
+        }
+        | AttachV2ServerFrame::Exit {
+            attach_id: frame_attach_id,
+            ..
+        }
+        | AttachV2ServerFrame::Error {
+            attach_id: frame_attach_id,
+            ..
+        } => *frame_attach_id == attach_id,
+    }
+}
+
+async fn handle_attach_v2_control_frame(
+    frame: AttachV2ServerFrame,
+    display: &AttachDisplay,
+    reload_state: &Arc<StdMutex<Option<u64>>>,
+    resync_pending: &mut bool,
+) -> Result<Option<AttachEnd>> {
+    match frame {
+        AttachV2ServerFrame::ReloadStarted {
+            reload_id,
+            total_bytes,
+            ..
+        } => {
+            set_active_reload(reload_state, Some(reload_id));
+            let text = total_bytes.map_or_else(
+                || "▌ Portl › reloading · Esc cancel".to_owned(),
+                |total| format!("▌ Portl › reloading 0 / {total} bytes · Esc cancel"),
+            );
+            display.set_bar(text).await?;
+            Ok(None)
+        }
+        AttachV2ServerFrame::ReloadDone { reload_id, .. } => {
+            if current_active_reload(reload_state) == Some(reload_id) {
+                display
+                    .set_bar("▌ Portl › reload complete · refreshing viewport".to_owned())
+                    .await?;
+            }
+            Ok(None)
+        }
+        AttachV2ServerFrame::ReloadCancelled { reload_id, .. } => {
+            if current_active_reload(reload_state) == Some(reload_id) {
+                clear_active_reload(reload_state);
+                *resync_pending = true;
+                display
+                    .set_bar("▌ Portl › reload cancelled · refreshing viewport".to_owned())
+                    .await?;
+            }
+            Ok(None)
+        }
+        AttachV2ServerFrame::BackpressureNotice { reason, .. }
+        | AttachV2ServerFrame::ResyncRequired { reason, .. } => {
+            *resync_pending = true;
+            display
+                .set_bar(format!("▌ Portl › resyncing after {reason}"))
+                .await?;
+            Ok(None)
+        }
+        AttachV2ServerFrame::Exit { code, .. } => Ok(Some(AttachEnd::Exited(code))),
+        AttachV2ServerFrame::Error { message, .. } => {
+            Ok(Some(AttachEnd::Disconnected(anyhow!(message))))
+        }
+        AttachV2ServerFrame::Heartbeat { .. } | AttachV2ServerFrame::AttachReady { .. } => Ok(None),
+        AttachV2ServerFrame::PreludeChunk { .. }
+        | AttachV2ServerFrame::ViewportSnapshot { .. }
+        | AttachV2ServerFrame::LiveOutput { .. }
+        | AttachV2ServerFrame::ReloadChunk { .. } => Ok(None),
+    }
 }
 
 async fn output_task_end_to_attach_end(
@@ -3307,6 +3759,11 @@ impl RawModeGuard {
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
+        let mut stdout = std::io::stdout();
+        let _ = stdout.write_all(
+            b"\x1b[0m\x1b[?25h\x1b[?1049l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l",
+        );
+        let _ = stdout.flush();
     }
 }
 
@@ -3481,6 +3938,10 @@ enum AttachInputCommand {
         visible: bool,
         ack: oneshot::Sender<Result<()>>,
     },
+    RequestViewport {
+        reason: String,
+        ack: oneshot::Sender<Result<()>>,
+    },
     Stop,
 }
 
@@ -3543,6 +4004,19 @@ impl AttachInputCoordinator {
         let (ack, done) = oneshot::channel();
         self.tx
             .send(AttachInputCommand::ClearSink { ack })
+            .await
+            .map_err(|_| anyhow!("attach input coordinator closed"))?;
+        done.await
+            .map_err(|_| anyhow!("attach input coordinator closed"))?
+    }
+
+    async fn request_viewport(&self, reason: &str) -> Result<()> {
+        let (ack, done) = oneshot::channel();
+        self.tx
+            .send(AttachInputCommand::RequestViewport {
+                reason: reason.to_owned(),
+                ack,
+            })
             .await
             .map_err(|_| anyhow!("attach input coordinator closed"))?;
         done.await
@@ -3734,6 +4208,13 @@ async fn handle_attach_input_command(
             }
             let _ = ack.send(Ok(()));
         }
+        AttachInputCommand::RequestViewport { reason, ack } => {
+            let result = match sink.as_mut() {
+                Some(active_sink) => active_sink.request_viewport(reason).await,
+                None => Err(anyhow!("attach input sink is not connected")),
+            };
+            let _ = ack.send(result);
+        }
         AttachInputCommand::Stop => return Ok(true),
     }
     Ok(false)
@@ -3791,11 +4272,24 @@ async fn handle_attach_input_bytes(
                 ui.display.clear_bar().await?;
                 return Ok(());
             }
-            paste.observe_queued(chunk.len());
+            let mut outbound = chunk.to_vec();
+            if chunk == b"\x1b" && active_sink.has_active_reload() {
+                let mut escape_tail = [0_u8; 16];
+                if let Ok(Ok(read)) = tokio::time::timeout(
+                    Duration::from_millis(20),
+                    stdin_src.read(&mut escape_tail),
+                )
+                .await
+                    && read > 0
+                {
+                    outbound.extend_from_slice(&escape_tail[..read]);
+                }
+            }
+            paste.observe_queued(outbound.len());
             update_paste_bar(ui, paste).await?;
             let send_started = Instant::now();
             if let Err(err) = active_sink
-                .send_stdin(chunk)
+                .send_stdin(&outbound)
                 .await
                 .context("copy local stdin")
             {
@@ -3806,7 +4300,7 @@ async fn handle_attach_input_bytes(
                 return Ok(());
             }
             paste.set_backpressured(send_started.elapsed() >= Duration::from_millis(100));
-            paste.observe_sent(chunk.len());
+            paste.observe_sent(outbound.len());
             update_paste_bar(ui, paste).await?;
         }
         AttachInputMode::Disconnected { visible } => {
@@ -4471,10 +4965,50 @@ struct AttachInputSink {
 }
 
 impl AttachInputSink {
+    fn has_active_reload(&self) -> bool {
+        matches!(
+            &self.kind,
+            AttachInputSinkKind::RemoteV2 { reload_state, .. }
+                if current_active_reload(reload_state).is_some()
+        )
+    }
+
     async fn send_stdin(&mut self, bytes: &[u8]) -> Result<()> {
         match &mut self.kind {
             AttachInputSinkKind::Remote { send, .. } => {
                 send.write_all(bytes).await.context("write remote stdin")
+            }
+            AttachInputSinkKind::RemoteV2 {
+                input,
+                control,
+                attach_id,
+                reload_state,
+                ..
+            } => {
+                if bytes == b"\x1b" {
+                    if let Some(reload_id) = current_active_reload(reload_state) {
+                        return control
+                            .write_all(
+                                &postcard::to_stdvec(&AttachV2ClientFrame::CancelReload {
+                                    attach_id: *attach_id,
+                                    reload_id,
+                                })
+                                .context("encode attach v2 cancel reload frame")?,
+                            )
+                            .await
+                            .context("write attach v2 cancel reload frame");
+                    }
+                }
+                input
+                    .write_all(
+                        &postcard::to_stdvec(&AttachV2ClientFrame::Input {
+                            attach_id: *attach_id,
+                            bytes: bytes.to_vec(),
+                        })
+                        .context("encode attach v2 input frame")?,
+                    )
+                    .await
+                    .context("write attach v2 input frame")
             }
             AttachInputSinkKind::Zmx { stdin } => {
                 zmx_control::write_frame(stdin, zmx_control::TAG_INPUT, bytes)
@@ -4496,6 +5030,20 @@ impl AttachInputSink {
         match &mut self.kind {
             AttachInputSinkKind::Remote { send, .. } => {
                 send.finish().context("finish remote stdin")
+            }
+            AttachInputSinkKind::RemoteV2 {
+                control, attach_id, ..
+            } => {
+                control
+                    .write_all(
+                        &postcard::to_stdvec(&AttachV2ClientFrame::Detach {
+                            attach_id: *attach_id,
+                        })
+                        .context("encode attach v2 detach frame")?,
+                    )
+                    .await
+                    .context("write attach v2 detach frame")?;
+                control.finish().context("finish attach v2 control")
             }
             AttachInputSinkKind::Zmx { stdin } => {
                 let _ = zmx_control::write_frame(stdin, zmx_control::TAG_CLOSE, &[]).await;
@@ -4521,6 +5069,26 @@ impl AttachInputSink {
                     .await
                     .context("write resize frame")
             }
+            AttachInputSinkKind::RemoteV2 {
+                resize,
+                attach_id,
+                next_resize_id,
+                ..
+            } => {
+                *next_resize_id = next_resize_id.saturating_add(1);
+                resize
+                    .write_all(
+                        &postcard::to_stdvec(&AttachV2ClientFrame::Resize {
+                            attach_id: *attach_id,
+                            resize_id: *next_resize_id,
+                            cols,
+                            rows,
+                        })
+                        .context("encode attach v2 resize frame")?,
+                    )
+                    .await
+                    .context("write attach v2 resize frame")
+            }
             AttachInputSinkKind::Zmx { stdin } => {
                 let payload = zmx_control::resize_payload(rows, cols);
                 zmx_control::write_frame(stdin, zmx_control::TAG_RESIZE, &payload)
@@ -4537,6 +5105,55 @@ impl AttachInputSink {
         }
     }
 
+    async fn reload(&mut self) -> Result<()> {
+        match &mut self.kind {
+            AttachInputSinkKind::RemoteV2 {
+                control,
+                attach_id,
+                next_reload_id,
+                reload_state,
+                ..
+            } => {
+                *next_reload_id = next_reload_id.saturating_add(1);
+                set_active_reload(reload_state, Some(*next_reload_id));
+                control
+                    .write_all(
+                        &postcard::to_stdvec(&AttachV2ClientFrame::Reload {
+                            attach_id: *attach_id,
+                            reload_id: *next_reload_id,
+                        })
+                        .context("encode attach v2 reload frame")?,
+                    )
+                    .await
+                    .context("write attach v2 reload frame")
+            }
+            _ => Ok(()),
+        }
+    }
+
+    async fn request_viewport(&mut self, reason: String) -> Result<()> {
+        match &mut self.kind {
+            AttachInputSinkKind::RemoteV2 {
+                control, attach_id, ..
+            } => control
+                .write_all(
+                    &postcard::to_stdvec(&AttachV2ClientFrame::RequestViewport {
+                        attach_id: *attach_id,
+                        reason,
+                        resize_id: 0,
+                    })
+                    .context("encode attach v2 viewport request frame")?,
+                )
+                .await
+                .context("write attach v2 viewport request frame"),
+            _ => Ok(()),
+        }
+    }
+
+    fn supports_reload(&self) -> bool {
+        matches!(self.kind, AttachInputSinkKind::RemoteV2 { .. })
+    }
+
     async fn kick_others(&mut self) -> Result<()> {
         match &mut self.kind {
             AttachInputSinkKind::Remote { control, .. } => {
@@ -4548,6 +5165,7 @@ impl AttachInputSink {
                     .await
                     .context("write session control frame")
             }
+            AttachInputSinkKind::RemoteV2 { .. } => Ok(()),
             AttachInputSinkKind::Zmx { .. } => Ok(()),
             AttachInputSinkKind::TmuxPty { tx } => tx
                 .send(b"detach-client -a\n".to_vec())
@@ -4563,6 +5181,15 @@ enum AttachInputSinkKind {
         send: SendStream,
         resize: SendStream,
         control: SendStream,
+    },
+    RemoteV2 {
+        input: SendStream,
+        resize: SendStream,
+        control: SendStream,
+        attach_id: [u8; 16],
+        next_resize_id: u64,
+        next_reload_id: u64,
+        reload_state: Arc<StdMutex<Option<u64>>>,
     },
     Zmx {
         stdin: ChildStdin,
@@ -4797,6 +5424,16 @@ where
                 ui.display
                     .print_message(&format!(
                         "portl: detached other clients from session \"{}\"",
+                        ui.canonical_ref
+                    ))
+                    .await?;
+                return Ok(AttachControlOutcome::Continue);
+            }
+            if command == b"r" && sink.supports_reload() {
+                sink.reload().await.context("send attach v2 reload frame")?;
+                ui.display
+                    .set_bar(format!(
+                        "▌ Portl › {} · reload requested · Esc cancel",
                         ui.canonical_ref
                     ))
                     .await?;

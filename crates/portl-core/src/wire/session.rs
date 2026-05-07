@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
+use std::io::Read as _;
 
+use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::wire::StreamPreamble;
@@ -16,6 +18,8 @@ pub struct SessionReq {
     pub cwd: Option<String>,
     pub argv: Option<Vec<String>>,
     pub pty: Option<crate::wire::shell::PtyCfg>,
+    #[serde(default)]
+    pub attach_v2: Option<AttachV2Config>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +31,8 @@ pub struct SessionReqBody {
     pub cwd: Option<String>,
     pub argv: Option<Vec<String>>,
     pub pty: Option<crate::wire::shell::PtyCfg>,
+    #[serde(default)]
+    pub attach_v2: Option<AttachV2Config>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +40,7 @@ pub enum SessionOp {
     Providers,
     List,
     Attach,
+    AttachV2,
     Run,
     History,
     Kill,
@@ -224,6 +231,247 @@ pub enum SessionStreamKind {
     Resize,
     Exit,
     Control,
+    AttachV2Input,
+    AttachV2Resize,
+    AttachV2Viewport,
+    AttachV2Live,
+    AttachV2History,
+}
+
+pub const ATTACH_V2_DEFAULT_PRELUDE_MAX_WAIT_MS: u64 = 200;
+pub const ATTACH_V2_DEFAULT_PRELUDE_MAX_BYTES: usize = 512 * 1024;
+pub const ATTACH_V2_COMPRESS_THRESHOLD: usize = 16 * 1024;
+pub const ATTACH_V2_MAX_DECODED_PAYLOAD: usize = 4 * 1024 * 1024;
+pub const ATTACH_V2_ZSTD_LEVEL: i32 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachV2Config {
+    pub prelude_max_wait_ms: u64,
+    pub prelude_max_bytes: u64,
+}
+
+impl Default for AttachV2Config {
+    fn default() -> Self {
+        Self {
+            prelude_max_wait_ms: ATTACH_V2_DEFAULT_PRELUDE_MAX_WAIT_MS,
+            prelude_max_bytes: ATTACH_V2_DEFAULT_PRELUDE_MAX_BYTES as u64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttachV2PayloadCodec {
+    None,
+    Zstd,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachV2Payload {
+    pub codec: AttachV2PayloadCodec,
+    pub dictionary_id: Option<u32>,
+    pub uncompressed_len: u64,
+    pub compressed_len: u64,
+    pub bytes: Vec<u8>,
+}
+
+impl AttachV2Payload {
+    #[must_use]
+    pub fn raw(bytes: Vec<u8>) -> Self {
+        let len = bytes.len() as u64;
+        Self {
+            codec: AttachV2PayloadCodec::None,
+            dictionary_id: None,
+            uncompressed_len: len,
+            compressed_len: len,
+            bytes,
+        }
+    }
+
+    pub fn encode_auto(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() <= ATTACH_V2_COMPRESS_THRESHOLD {
+            return Ok(Self::raw(bytes.to_vec()));
+        }
+        let compressed = zstd::stream::encode_all(bytes, ATTACH_V2_ZSTD_LEVEL)
+            .context("zstd-compress attach v2 payload")?;
+        if compressed.len() >= bytes.len() {
+            return Ok(Self::raw(bytes.to_vec()));
+        }
+        Ok(Self {
+            codec: AttachV2PayloadCodec::Zstd,
+            dictionary_id: None,
+            uncompressed_len: bytes.len() as u64,
+            compressed_len: compressed.len() as u64,
+            bytes: compressed,
+        })
+    }
+
+    pub fn decode(&self, max_uncompressed_len: usize) -> Result<Vec<u8>> {
+        let actual_len = self.bytes.len() as u64;
+        if actual_len != self.compressed_len {
+            bail!(
+                "attach v2 payload compressed length mismatch: declared {}, actual {actual_len}",
+                self.compressed_len
+            );
+        }
+        if self.uncompressed_len > max_uncompressed_len as u64 {
+            bail!(
+                "attach v2 payload decoded length {} exceeds cap {max_uncompressed_len}",
+                self.uncompressed_len
+            );
+        }
+        if self.dictionary_id.is_some() {
+            bail!("attach v2 payload dictionary is not negotiated");
+        }
+        match self.codec {
+            AttachV2PayloadCodec::None => {
+                if self.uncompressed_len != self.compressed_len {
+                    bail!(
+                        "raw attach v2 payload length mismatch: uncompressed {}, compressed {}",
+                        self.uncompressed_len,
+                        self.compressed_len
+                    );
+                }
+                Ok(self.bytes.clone())
+            }
+            AttachV2PayloadCodec::Zstd => {
+                let cap = max_uncompressed_len.saturating_add(1) as u64;
+                let decoder = zstd::stream::read::Decoder::new(self.bytes.as_slice())
+                    .context("zstd-decode attach v2 payload")?;
+                let mut decoded = Vec::with_capacity(self.uncompressed_len as usize);
+                decoder
+                    .take(cap)
+                    .read_to_end(&mut decoded)
+                    .context("read zstd attach v2 payload")?;
+                if decoded.len() as u64 != self.uncompressed_len {
+                    bail!(
+                        "attach v2 payload decoded length mismatch: declared {}, actual {}",
+                        self.uncompressed_len,
+                        decoded.len()
+                    );
+                }
+                Ok(decoded)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachV2Progress {
+    pub loaded_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub retained_history_truncated: bool,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttachV2ServerFrame {
+    AttachReady {
+        attach_id: [u8; 16],
+        provider: String,
+    },
+    Heartbeat {
+        attach_id: [u8; 16],
+        sent_at_ms: u64,
+    },
+    PreludeChunk {
+        attach_id: [u8; 16],
+        seq: u64,
+        progress: AttachV2Progress,
+        payload: AttachV2Payload,
+    },
+    ViewportSnapshot {
+        attach_id: [u8; 16],
+        generation: u64,
+        covers_live_seq: u64,
+        cols: u16,
+        rows: u16,
+        resize_id: u64,
+        payload: AttachV2Payload,
+    },
+    LiveOutput {
+        attach_id: [u8; 16],
+        start_seq: u64,
+        end_seq: u64,
+        payload: AttachV2Payload,
+    },
+    ReloadStarted {
+        attach_id: [u8; 16],
+        reload_id: u64,
+        total_bytes: Option<u64>,
+    },
+    ReloadChunk {
+        attach_id: [u8; 16],
+        reload_id: u64,
+        seq: u64,
+        progress: AttachV2Progress,
+        payload: AttachV2Payload,
+    },
+    ReloadDone {
+        attach_id: [u8; 16],
+        reload_id: u64,
+        final_generation: u64,
+    },
+    ReloadCancelled {
+        attach_id: [u8; 16],
+        reload_id: u64,
+    },
+    BackpressureNotice {
+        attach_id: [u8; 16],
+        reason: String,
+        from_seq: u64,
+    },
+    ResyncRequired {
+        attach_id: [u8; 16],
+        reason: String,
+        from_seq: u64,
+    },
+    Exit {
+        attach_id: [u8; 16],
+        code: i32,
+    },
+    Error {
+        attach_id: [u8; 16],
+        message: String,
+        recoverable: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttachV2ClientFrame {
+    Input {
+        attach_id: [u8; 16],
+        bytes: Vec<u8>,
+    },
+    Resize {
+        attach_id: [u8; 16],
+        resize_id: u64,
+        cols: u16,
+        rows: u16,
+    },
+    Signal {
+        attach_id: [u8; 16],
+        sig: u8,
+    },
+    Detach {
+        attach_id: [u8; 16],
+    },
+    HeartbeatAck {
+        attach_id: [u8; 16],
+        sent_at_ms: u64,
+    },
+    Reload {
+        attach_id: [u8; 16],
+        reload_id: u64,
+    },
+    CancelReload {
+        attach_id: [u8; 16],
+        reload_id: u64,
+    },
+    RequestViewport {
+        attach_id: [u8; 16],
+        reason: String,
+        resize_id: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,6 +524,48 @@ mod tests {
     }
 
     #[test]
+    fn attach_v2_wire_model_has_distinct_ghostty_planes() {
+        assert_eq!(SessionOp::AttachV2, SessionOp::AttachV2);
+        let planes = [
+            SessionStreamKind::AttachV2Input,
+            SessionStreamKind::AttachV2Resize,
+            SessionStreamKind::AttachV2Viewport,
+            SessionStreamKind::AttachV2Live,
+            SessionStreamKind::AttachV2History,
+        ];
+        assert_eq!(planes.len(), 5);
+    }
+
+    #[test]
+    fn attach_v2_payload_compresses_large_messages_and_round_trips() {
+        let bytes = vec![b'a'; ATTACH_V2_COMPRESS_THRESHOLD + 1024];
+        let payload = AttachV2Payload::encode_auto(&bytes).expect("encode payload");
+
+        assert_eq!(payload.codec, AttachV2PayloadCodec::Zstd);
+        assert_eq!(payload.dictionary_id, None);
+        assert!(payload.compressed_len < payload.uncompressed_len);
+        assert_eq!(
+            payload.decode(ATTACH_V2_MAX_DECODED_PAYLOAD).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn attach_v2_payload_rejects_oversized_decoded_payloads() {
+        let bytes = vec![b'x'; 128];
+        let payload = AttachV2Payload::raw(bytes);
+
+        let err = payload
+            .decode(64)
+            .expect_err("decode cap should reject payload");
+
+        assert!(
+            err.to_string().contains("exceeds"),
+            "unexpected decode error: {err:#}"
+        );
+    }
+
+    #[test]
     fn session_req_roundtrips_via_postcard() {
         let value = SessionReq {
             preamble: StreamPreamble {
@@ -293,6 +583,7 @@ mod tests {
                 cols: 120,
                 rows: 40,
             }),
+            attach_v2: None,
         };
 
         let encoded = postcard::to_stdvec(&value).expect("encode");

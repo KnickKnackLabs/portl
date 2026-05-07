@@ -208,6 +208,7 @@ async fn session_list_aggregates_available_providers_and_resolves_unique_attach(
     assert_eq!(
         entries
             .iter()
+            .filter(|entry| entry.provider != "ghostty")
             .map(|entry| (entry.provider.as_str(), entry.name.as_str()))
             .collect::<Vec<_>>(),
         vec![

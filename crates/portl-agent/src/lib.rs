@@ -317,6 +317,9 @@ pub(crate) struct AgentState {
     pub rate_limit: OfferRateLimiter,
     pub started_at: Instant,
     pub shell_registry: shell_registry::ShellRegistry,
+    #[cfg(feature = "ghostty-vt")]
+    pub ghostty_attach_v2_registry:
+        dashmap::DashMap<[u8; 16], Arc<session_handler::ghostty::GhosttyAttachV2Session>>,
     pub udp_registry: udp_registry::UdpSessionRegistry,
     pub mode: AgentMode,
     pub metrics: Arc<metrics::Metrics>,
@@ -491,6 +494,8 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
         rate_limit: OfferRateLimiter::new(&cfg.rate_limit)?,
         started_at: Instant::now(),
         shell_registry: shell_registry::ShellRegistry::default(),
+        #[cfg(feature = "ghostty-vt")]
+        ghostty_attach_v2_registry: dashmap::DashMap::new(),
         udp_registry: udp_registry::UdpSessionRegistry::new(
             cfg.udp_session_linger_secs
                 .unwrap_or(udp_registry::DEFAULT_UDP_SESSION_LINGER_SECS),
