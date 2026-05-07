@@ -5,6 +5,8 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.8.9 — 2026-05-08
+
 ### Fixed
 
 - `PORTL_SESSION_PROVIDER` now accepts the same persistent-session provider
