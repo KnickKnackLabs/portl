@@ -424,6 +424,18 @@ async fn wait_for_probe_addr(
         if discovery.relays.is_empty() && !addr.is_empty() {
             return Ok(addr);
         }
+        if discovery.relays.is_empty() {
+            let direct_addrs = endpoint
+                .inner()
+                .bound_sockets()
+                .into_iter()
+                .filter(|socket| !socket.ip().is_unspecified())
+                .map(TransportAddr::Ip)
+                .collect::<Vec<_>>();
+            if !direct_addrs.is_empty() {
+                return Ok(EndpointAddr::from_parts(endpoint.id(), direct_addrs));
+            }
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     bail!("agent endpoint did not publish a dialable address for watchdog self-probe")
