@@ -1054,11 +1054,13 @@ impl GhosttyReloadJob {
         let rel_start = usize::try_from(current_abs.saturating_sub(history_start_abs))
             .unwrap_or(usize::MAX)
             .min(history.len());
-        let chunk_len = self
-            .end_abs
-            .saturating_sub(current_abs)
-            .min(available_end.saturating_sub(current_abs))
-            .min(GHOSTTY_ATTACH_V2_HISTORY_CHUNK as u64) as usize;
+        let chunk_len = usize::try_from(
+            self.end_abs
+                .saturating_sub(current_abs)
+                .min(available_end.saturating_sub(current_abs))
+                .min(GHOSTTY_ATTACH_V2_HISTORY_CHUNK as u64),
+        )
+        .unwrap_or(usize::MAX);
         if chunk_len == 0 {
             return false;
         }
@@ -1199,7 +1201,7 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
                     .code()
                     .unwrap_or(1);
                 broadcast(&mut subscribers, &[]);
-                broadcast_v2_event(&mut v2_subscribers, GhosttyResponse::Exit { code });
+                broadcast_v2_event(&mut v2_subscribers, &GhosttyResponse::Exit { code });
                 cleanup_helper_files(&config.paths).await;
                 accept_task.abort();
                 return Ok(());
@@ -1217,7 +1219,7 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
                     );
                 } else {
                     broadcast(&mut subscribers, &[]);
-                    broadcast_v2_event(&mut v2_subscribers, GhosttyResponse::Exit { code: 0 });
+                    broadcast_v2_event(&mut v2_subscribers, &GhosttyResponse::Exit { code: 0 });
                     cleanup_helper_files(&config.paths).await;
                     accept_task.abort();
                     return Ok(());
@@ -1273,11 +1275,7 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
                             crate::metrics::record_ghostty_event("input_queue_full");
                             tracing::warn!(%err, "ghostty pty input queue full; requesting attach v2 resync");
                             broadcast(&mut subscribers, &[]);
-                            broadcast_v2_resync(
-                                &mut v2_subscribers,
-                                "input queue full".to_owned(),
-                                live_seq,
-                            );
+                            broadcast_v2_resync(&mut v2_subscribers, "input queue full", live_seq);
                         }
                     }
                     HelperCommand::Resize { cols, rows } => {
@@ -1392,7 +1390,7 @@ fn process_output(
     broadcast(subscribers, bytes);
     broadcast_v2(
         v2_subscribers,
-        GhosttyLiveOutputV2 {
+        &GhosttyLiveOutputV2 {
             start_seq,
             end_seq,
             bytes: bytes.to_vec(),
@@ -1602,7 +1600,6 @@ fn push_cell_sgr(
         codes.push("3".to_owned());
     }
     match style.underline {
-        Underline::None => {}
         Underline::Single => codes.push("4".to_owned()),
         Underline::Double => codes.push("21".to_owned()),
         Underline::Curly => codes.push("4:3".to_owned()),
@@ -1662,7 +1659,7 @@ fn broadcast(subscribers: &mut Vec<mpsc::Sender<Vec<u8>>>, bytes: &[u8]) {
 }
 
 #[cfg(unix)]
-fn broadcast_v2(subscribers: &mut Vec<GhosttyV2Subscriber>, output: GhosttyLiveOutputV2) {
+fn broadcast_v2(subscribers: &mut Vec<GhosttyV2Subscriber>, output: &GhosttyLiveOutputV2) {
     subscribers.retain_mut(
         |subscriber| match subscriber.live.try_send(output.clone()) {
             Ok(()) => {
@@ -1689,12 +1686,12 @@ fn broadcast_v2(subscribers: &mut Vec<GhosttyV2Subscriber>, output: GhosttyLiveO
 }
 
 #[cfg(unix)]
-fn broadcast_v2_event(subscribers: &mut Vec<GhosttyV2Subscriber>, event: GhosttyResponse) {
+fn broadcast_v2_event(subscribers: &mut Vec<GhosttyV2Subscriber>, event: &GhosttyResponse) {
     subscribers.retain(|subscriber| subscriber.events.send(event.clone()).is_ok());
 }
 
 #[cfg(unix)]
-fn broadcast_v2_resync(subscribers: &mut Vec<GhosttyV2Subscriber>, reason: String, from_seq: u64) {
+fn broadcast_v2_resync(subscribers: &mut Vec<GhosttyV2Subscriber>, reason: &str, from_seq: u64) {
     subscribers.retain_mut(|subscriber| {
         if subscriber.resync_pending {
             return true;
@@ -1703,7 +1700,7 @@ fn broadcast_v2_resync(subscribers: &mut Vec<GhosttyV2Subscriber>, reason: Strin
         subscriber
             .events
             .send(GhosttyResponse::ResyncRequiredV2 {
-                reason: reason.clone(),
+                reason: reason.to_owned(),
                 from_seq,
             })
             .is_ok()
@@ -2475,12 +2472,12 @@ async fn attach_v2_dispatch_loop(
                 ).await? {
                     return Ok(());
                 }
-                if output_after_resize {
-                    if let Some((resize_id, _)) = pending_resize_viewport.take() {
-                        attach
-                            .request_viewport(resize_id, "resize_output".to_owned())
-                            .await?;
-                    }
+                if output_after_resize
+                    && let Some((resize_id, _)) = pending_resize_viewport.take()
+                {
+                    attach
+                        .request_viewport(resize_id, "resize_output".to_owned())
+                        .await?;
                 }
             }
             else => return Ok(()),
@@ -2515,6 +2512,7 @@ async fn handle_attach_v2_command(
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_lines)]
 async fn handle_attach_v2_response(
     attach: &mut GhosttyAttachV2,
     response: GhosttyResponse,

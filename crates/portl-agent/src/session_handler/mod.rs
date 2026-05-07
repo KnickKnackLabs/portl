@@ -631,6 +631,7 @@ async fn serve_ghostty_attach(
 }
 
 #[cfg(feature = "ghostty-vt")]
+#[allow(clippy::too_many_lines)]
 async fn serve_attach_v2(
     session: Session,
     state: Arc<AgentState>,
