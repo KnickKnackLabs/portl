@@ -1065,9 +1065,13 @@ impl GhosttyReloadJob {
             return false;
         }
         let raw_bytes = vec_deque_chunk(history, rel_start, chunk_len);
-        let bytes = sanitize_terminal_replay(&raw_bytes);
         let loaded = self.offset.saturating_add(raw_bytes.len() as u64);
         let complete = self.start_abs.saturating_add(loaded) >= self.end_abs;
+        let bytes = bracket_reload_replay_chunk(
+            sanitize_terminal_replay(&raw_bytes),
+            self.seq == 0,
+            complete,
+        );
         let progress = portl_proto::session_v1::AttachV2Progress {
             loaded_bytes: loaded,
             total_bytes: Some(self.end_abs.saturating_sub(self.start_abs)),
@@ -1437,6 +1441,24 @@ fn trim_partial_replay_prefix(mut bytes: Vec<u8>) -> Vec<u8> {
         .is_some_and(|byte| (*byte & 0b1100_0000) == 0b1000_0000)
     {
         bytes.remove(0);
+    }
+    bytes
+}
+
+#[cfg(unix)]
+fn bracket_reload_replay_chunk(
+    mut bytes: Vec<u8>,
+    first_chunk: bool,
+    final_chunk: bool,
+) -> Vec<u8> {
+    if first_chunk {
+        let mut framed = Vec::with_capacity(bytes.len().saturating_add(8));
+        framed.extend_from_slice(b"\x1b[0m");
+        framed.append(&mut bytes);
+        bytes = framed;
+    }
+    if final_chunk {
+        bytes.extend_from_slice(b"\x1b[0m");
     }
     bytes
 }
@@ -3089,6 +3111,32 @@ mod tests {
         task.join()
             .expect("helper thread")
             .context("helper result")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reload_job_brackets_replay_with_sgr_reset() -> Result<()> {
+        let history = VecDeque::from(b"\x1b[2mdimmed".to_vec());
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut job = GhosttyReloadJob::new(3, 0, history.len(), tx, 1, false);
+
+        assert!(!job.poll_send_next(&history, 0));
+        assert!(matches!(
+            rx.recv().await,
+            Some(GhosttyResponse::ReloadStartedV2 { reload_id: 3, .. })
+        ));
+        let Some(GhosttyResponse::ReloadChunkV2 { bytes, .. }) = rx.recv().await else {
+            bail!("missing reload chunk");
+        };
+
+        assert!(
+            bytes.starts_with(b"\x1b[0m"),
+            "reload replay must start from a known SGR state: {bytes:?}"
+        );
+        assert!(
+            bytes.ends_with(b"\x1b[0m"),
+            "reload replay must not leak SGR state into the viewport/live stream: {bytes:?}"
+        );
         Ok(())
     }
 
