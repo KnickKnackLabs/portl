@@ -5,6 +5,28 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.8.8 — 2026-05-07
+
+### Added
+
+- Added an internal design note for session hostname-based network identity and
+  future connection routing work.
+
+### Fixed
+
+- Remote Ghostty attaches now treat resize snapshots as authoritative only for
+  the current terminal size and resize epoch, preventing stale mobile or TUI
+  resize snapshots from stitching old scrollback into the live viewport.
+- Ghostty attach v2 now keeps initial history, reloads, and live output ordered
+  around viewport barriers so late prelude chunks, reload completion, or reload
+  cancellation cannot redraw over the current screen.
+- Ghostty attach v2 no longer disconnects just because a data lane ends before
+  the control lane reports exit or error.
+- Ghostty viewport replay now uses absolute row positioning, safer terminal
+  replay sanitization, and semantic resync notices for helper queue pressure so
+  full-width rows, private-mode escapes, and slow helper consumers do not corrupt
+  or drop the attach session.
+
 ## 0.8.7 — 2026-05-07
 
 ### Fixed
