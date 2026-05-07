@@ -3311,6 +3311,12 @@ async fn run_remote_attach_v2_once(
         mut history,
     } = session;
     let reload_state = Arc::new(StdMutex::new(None));
+    let (initial_cols, initial_rows) = display.size().await;
+    let resize_state = Arc::new(StdMutex::new(AttachV2ResizeState {
+        resize_id: 0,
+        cols: initial_cols,
+        rows: initial_rows,
+    }));
     if let Err(err) = coordinator
         .set_sink(AttachInputSink {
             kind: AttachInputSinkKind::RemoteV2 {
@@ -3320,6 +3326,7 @@ async fn run_remote_attach_v2_once(
                 attach_id,
                 next_resize_id: 0,
                 next_reload_id: 0,
+                resize_state: Arc::clone(&resize_state),
                 reload_state: Arc::clone(&reload_state),
             },
         })
@@ -3354,7 +3361,7 @@ async fn run_remote_attach_v2_once(
             }
             frame = read_attach_v2_frame(&mut viewport) => {
                 match frame {
-                    Ok(Some(AttachV2ServerFrame::ViewportSnapshot { attach_id: frame_attach_id, generation, covers_live_seq, payload, .. })) if frame_attach_id == attach_id && generation > last_viewport_generation => {
+                    Ok(Some(AttachV2ServerFrame::ViewportSnapshot { attach_id: frame_attach_id, generation, covers_live_seq, cols, rows, resize_id, payload, .. })) if frame_attach_id == attach_id && generation > last_viewport_generation && attach_v2_viewport_matches_resize_state(resize_id, cols, rows, current_resize_state(&resize_state)) => {
                         last_viewport_generation = generation;
                         covered_live_seq = covered_live_seq.max(covers_live_seq);
                         resync_pending = false;
@@ -3368,6 +3375,16 @@ async fn run_remote_attach_v2_once(
                             }
                             Err(err) => break AttachEnd::Disconnected(err),
                         }
+                    }
+                    Ok(Some(AttachV2ServerFrame::ViewportSnapshot { attach_id: frame_attach_id, generation, cols, rows, resize_id, .. })) if frame_attach_id == attach_id && generation > last_viewport_generation => {
+                        debug!(
+                            generation,
+                            resize_id,
+                            cols,
+                            rows,
+                            current_resize = ?current_resize_state(&resize_state),
+                            "ignored stale attach v2 viewport snapshot"
+                        );
                     }
                     Ok(Some(_)) => {}
                     Ok(None) => break AttachEnd::Disconnected(anyhow!("attach v2 viewport stream ended before exit frame")),
@@ -3476,6 +3493,33 @@ fn set_active_reload(reload_state: &Arc<StdMutex<Option<u64>>>, reload_id: Optio
 
 fn clear_active_reload(reload_state: &Arc<StdMutex<Option<u64>>>) {
     set_active_reload(reload_state, None);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AttachV2ResizeState {
+    resize_id: u64,
+    cols: u16,
+    rows: u16,
+}
+
+fn current_resize_state(resize_state: &Arc<StdMutex<AttachV2ResizeState>>) -> AttachV2ResizeState {
+    resize_state.lock().map_or(
+        AttachV2ResizeState {
+            resize_id: 0,
+            cols: 80,
+            rows: 24,
+        },
+        |state| *state,
+    )
+}
+
+fn attach_v2_viewport_matches_resize_state(
+    resize_id: u64,
+    cols: u16,
+    rows: u16,
+    current: AttachV2ResizeState,
+) -> bool {
+    resize_id == current.resize_id && cols == current.cols && rows == current.rows
 }
 
 fn attach_v2_frame_matches(frame: &AttachV2ServerFrame, attach_id: [u8; 16]) -> bool {
@@ -4140,6 +4184,7 @@ async fn attach_input_coordinator_loop(
                 if let Ok(now) = size()
                     && now != last_size
                 {
+                    ui.display.update_size(now.0, now.1).await?;
                     pending_size = Some(now);
                     if let Some(active_sink) = sink.as_mut()
                         && let Err(err) = active_sink.resize(now.0, now.1).await.context("resize attached session")
@@ -4676,6 +4721,28 @@ impl AttachDisplay {
         state.flush(stream).await
     }
 
+    async fn size(&self) -> (u16, u16) {
+        let state = self.inner.lock().await;
+        (state.cols, state.rows)
+    }
+
+    async fn update_size(&self, cols: u16, rows: u16) -> Result<()> {
+        let mut state = self.inner.lock().await;
+        if state.cols == cols && state.rows == rows {
+            return Ok(());
+        }
+        let had_bar = state.bar.is_some();
+        if had_bar {
+            state.clear_bar().await?;
+        }
+        state.cols = cols;
+        state.rows = rows;
+        if had_bar {
+            state.redraw_bar().await?;
+        }
+        Ok(())
+    }
+
     async fn set_bar(&self, text: String) -> Result<()> {
         let mut state = self.inner.lock().await;
         state.gate.set_holding(true);
@@ -5075,9 +5142,17 @@ impl AttachInputSink {
                 resize,
                 attach_id,
                 next_resize_id,
+                resize_state,
                 ..
             } => {
                 *next_resize_id = next_resize_id.saturating_add(1);
+                if let Ok(mut state) = resize_state.lock() {
+                    *state = AttachV2ResizeState {
+                        resize_id: *next_resize_id,
+                        cols,
+                        rows,
+                    };
+                }
                 resize
                     .write_all(
                         &postcard::to_stdvec(&AttachV2ClientFrame::Resize {
@@ -5136,13 +5211,16 @@ impl AttachInputSink {
     async fn request_viewport(&mut self, reason: String) -> Result<()> {
         match &mut self.kind {
             AttachInputSinkKind::RemoteV2 {
-                control, attach_id, ..
+                control,
+                attach_id,
+                resize_state,
+                ..
             } => control
                 .write_all(
                     &postcard::to_stdvec(&AttachV2ClientFrame::RequestViewport {
                         attach_id: *attach_id,
                         reason,
-                        resize_id: 0,
+                        resize_id: current_resize_state(resize_state).resize_id,
                     })
                     .context("encode attach v2 viewport request frame")?,
                 )
@@ -5191,6 +5269,7 @@ enum AttachInputSinkKind {
         attach_id: [u8; 16],
         next_resize_id: u64,
         next_reload_id: u64,
+        resize_state: Arc<StdMutex<AttachV2ResizeState>>,
         reload_state: Arc<StdMutex<Option<u64>>>,
     },
     Zmx {
@@ -5330,6 +5409,7 @@ where
                 if let Ok(now) = size()
                     && now != last_size
                 {
+                    ui.display.update_size(now.0, now.1).await?;
                     if let Err(err) = sink.resize(now.0, now.1).await.context("resize attached session") {
                         debug!(%err, "resize loop ended after provider stdin closed");
                         return Ok(StdinTaskResult::Closed);
@@ -5631,6 +5711,51 @@ mod tests {
         assert_eq!(
             gate.hold(AttachOutputStream::Stdout, b"after-flush"),
             AttachOutputGateDecision::Held
+        );
+    }
+
+    #[test]
+    fn attach_v2_viewport_acceptance_requires_current_resize_epoch() {
+        let current = AttachV2ResizeState {
+            resize_id: 2,
+            cols: 80,
+            rows: 40,
+        };
+
+        assert!(attach_v2_viewport_matches_resize_state(2, 80, 40, current));
+        assert!(!attach_v2_viewport_matches_resize_state(1, 80, 40, current));
+        assert!(!attach_v2_viewport_matches_resize_state(0, 80, 40, current));
+        assert!(!attach_v2_viewport_matches_resize_state(2, 80, 24, current));
+        assert!(!attach_v2_viewport_matches_resize_state(
+            2, 100, 40, current
+        ));
+        assert!(!attach_v2_viewport_matches_resize_state(3, 80, 40, current));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attach_display_update_size_moves_bar_to_new_bottom_row() {
+        let capture = StderrCapture::start();
+        let display = AttachDisplay::new(80, 20);
+
+        display.set_bar("first".to_owned()).await.unwrap();
+        display.update_size(80, 30).await.unwrap();
+        display.set_bar("second".to_owned()).await.unwrap();
+
+        let output = capture.finish();
+        assert!(
+            output
+                .windows(b"\x1b[20;1H".len())
+                .any(|w| w == b"\x1b[20;1H"),
+            "initial bar draw should target row 20: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+        assert!(
+            output
+                .windows(b"\x1b[30;1H".len())
+                .any(|w| w == b"\x1b[30;1H"),
+            "bar redraw after resize should target row 30: {:?}",
+            String::from_utf8_lossy(&output)
         );
     }
 

@@ -968,6 +968,52 @@ struct GhosttyV2Subscriber {
 }
 
 #[cfg(unix)]
+struct AttachV2ResizeTracker {
+    current_resize_id: u64,
+    deferred_viewport: Option<(u64, String)>,
+}
+
+#[cfg(unix)]
+impl AttachV2ResizeTracker {
+    fn new(initial_resize_id: u64) -> Self {
+        Self {
+            current_resize_id: initial_resize_id,
+            deferred_viewport: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn current_resize_id(&self) -> u64 {
+        self.current_resize_id
+    }
+
+    fn recovery_resize_id(&self) -> u64 {
+        self.current_resize_id
+    }
+
+    fn record_resize(&mut self, resize_id: u64) -> Option<(u64, String)> {
+        self.current_resize_id = self.current_resize_id.max(resize_id);
+        if self
+            .deferred_viewport
+            .as_ref()
+            .is_some_and(|(pending_resize_id, _)| *pending_resize_id <= self.current_resize_id)
+        {
+            return self.deferred_viewport.take();
+        }
+        None
+    }
+
+    fn request_or_defer(&mut self, resize_id: u64, reason: String) -> Option<(u64, String)> {
+        if resize_id <= self.current_resize_id {
+            Some((resize_id, reason))
+        } else {
+            self.deferred_viewport = Some((resize_id, reason));
+            None
+        }
+    }
+}
+
+#[cfg(unix)]
 struct GhosttyReloadJob {
     reload_id: u64,
     start_abs: u64,
@@ -2443,6 +2489,7 @@ async fn attach_v2_dispatch_loop(
     history_tx: mpsc::Sender<portl_proto::session_v1::AttachV2ServerFrame>,
 ) -> Result<()> {
     let mut pending_resize_viewport: Option<(u64, tokio::time::Instant)> = None;
+    let mut resize_tracker = AttachV2ResizeTracker::new(attach.resize_id);
     let mut resync_pending = false;
     loop {
         tokio::select! {
@@ -2455,6 +2502,14 @@ async fn attach_v2_dispatch_loop(
                             tokio::time::Instant::now()
                                 + Duration::from_millis(GHOSTTY_ATTACH_V2_RESIZE_SETTLE_MS),
                         ));
+                        if let Some((request_resize_id, reason)) = resize_tracker.record_resize(resize_id) {
+                            attach.request_viewport(request_resize_id, reason).await?;
+                        }
+                    }
+                    GhosttyAttachV2Command::RequestViewport { resize_id, reason } => {
+                        if let Some((request_resize_id, reason)) = resize_tracker.request_or_defer(resize_id, reason) {
+                            attach.request_viewport(request_resize_id, reason).await?;
+                        }
                     }
                     command => handle_attach_v2_command(&mut attach, command).await?,
                 }
@@ -2490,6 +2545,7 @@ async fn attach_v2_dispatch_loop(
                     &viewport_tx,
                     &live_tx,
                     &history_tx,
+                    resize_tracker.recovery_resize_id(),
                     &mut resync_pending,
                 ).await? {
                     return Ok(());
@@ -2534,6 +2590,7 @@ async fn handle_attach_v2_command(
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 async fn handle_attach_v2_response(
     attach: &mut GhosttyAttachV2,
@@ -2542,6 +2599,7 @@ async fn handle_attach_v2_response(
     viewport_tx: &watch::Sender<Option<portl_proto::session_v1::AttachV2ServerFrame>>,
     live_tx: &mpsc::Sender<portl_proto::session_v1::AttachV2ServerFrame>,
     history_tx: &mpsc::Sender<portl_proto::session_v1::AttachV2ServerFrame>,
+    current_resize_id: u64,
     resync_pending: &mut bool,
 ) -> Result<bool> {
     use portl_proto::session_v1::{AttachV2Payload, AttachV2ServerFrame as Frame};
@@ -2571,7 +2629,7 @@ async fn handle_attach_v2_response(
                             })
                             .context("queue attach v2 live resync")?;
                         let _ = attach
-                            .request_viewport(0, "live_queue_full".to_owned())
+                            .request_viewport(current_resize_id, "live_queue_full".to_owned())
                             .await;
                     }
                 }
@@ -2631,7 +2689,7 @@ async fn handle_attach_v2_response(
                     });
                     let _ = attach.cancel_reload(reload_id).await;
                     let _ = attach
-                        .request_viewport(0, "history_queue_full".to_owned())
+                        .request_viewport(current_resize_id, "history_queue_full".to_owned())
                         .await;
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => return Ok(true),
@@ -2648,7 +2706,9 @@ async fn handle_attach_v2_response(
                     final_generation,
                 })
                 .context("queue attach v2 reload done")?;
-            let _ = attach.request_viewport(0, "reload_done".to_owned()).await;
+            let _ = attach
+                .request_viewport(current_resize_id, "reload_done".to_owned())
+                .await;
         }
         GhosttyResponse::ReloadCancelledV2 { reload_id } => {
             control_tx
@@ -2658,7 +2718,7 @@ async fn handle_attach_v2_response(
                 })
                 .context("queue attach v2 reload cancelled")?;
             let _ = attach
-                .request_viewport(0, "reload_cancelled".to_owned())
+                .request_viewport(current_resize_id, "reload_cancelled".to_owned())
                 .await;
         }
         GhosttyResponse::ResyncRequiredV2 { reason, from_seq } => {
@@ -2669,7 +2729,7 @@ async fn handle_attach_v2_response(
                     from_seq,
                 })
                 .context("queue attach v2 resync required")?;
-            let _ = attach.request_viewport(0, reason).await;
+            let _ = attach.request_viewport(current_resize_id, reason).await;
         }
         GhosttyResponse::Exit { code } => {
             let _ = control_tx.send(Frame::Exit {
@@ -3112,6 +3172,21 @@ mod tests {
             .expect("helper thread")
             .context("helper result")?;
         Ok(())
+    }
+
+    #[test]
+    fn attach_v2_resize_tracker_defers_future_viewport_requests() {
+        let mut tracker = AttachV2ResizeTracker::new(0);
+
+        assert_eq!(tracker.current_resize_id(), 0);
+        assert_eq!(tracker.request_or_defer(2, "live_seq_gap".to_owned()), None);
+        assert_eq!(tracker.record_resize(1), None);
+        assert_eq!(
+            tracker.record_resize(2),
+            Some((2, "live_seq_gap".to_owned()))
+        );
+        assert_eq!(tracker.current_resize_id(), 2);
+        assert_eq!(tracker.recovery_resize_id(), 2);
     }
 
     #[tokio::test]
