@@ -335,21 +335,23 @@ impl AttachV2Payload {
             }
             AttachV2PayloadCodec::Zstd => {
                 let cap = max_uncompressed_len.saturating_add(1) as u64;
-                let decoder = zstd::stream::read::Decoder::new(self.bytes.as_slice())
+                let zstd_reader = zstd::stream::read::Decoder::new(self.bytes.as_slice())
                     .context("zstd-decode attach v2 payload")?;
-                let mut decoded = Vec::with_capacity(self.uncompressed_len as usize);
-                decoder
+                let decoded_capacity = usize::try_from(self.uncompressed_len)
+                    .context("attach v2 decoded length does not fit usize")?;
+                let mut decoded_payload = Vec::with_capacity(decoded_capacity);
+                zstd_reader
                     .take(cap)
-                    .read_to_end(&mut decoded)
+                    .read_to_end(&mut decoded_payload)
                     .context("read zstd attach v2 payload")?;
-                if decoded.len() as u64 != self.uncompressed_len {
+                if decoded_payload.len() as u64 != self.uncompressed_len {
                     bail!(
                         "attach v2 payload decoded length mismatch: declared {}, actual {}",
                         self.uncompressed_len,
-                        decoded.len()
+                        decoded_payload.len()
                     );
                 }
-                Ok(decoded)
+                Ok(decoded_payload)
             }
         }
     }

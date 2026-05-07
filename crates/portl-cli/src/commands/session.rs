@@ -3290,6 +3290,7 @@ async fn run_remote_attach_v1_once(
     end
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_remote_attach_v2_once(
     session: SessionClientV2,
     display: &AttachDisplay,
@@ -3427,7 +3428,8 @@ async fn run_remote_attach_v2_once(
                         }
                         match payload.decode(ATTACH_V2_MAX_DECODED_PAYLOAD) {
                             Ok(bytes) => {
-                                let skip = covered_live_seq.saturating_sub(start_seq) as usize;
+                                let skip = usize::try_from(covered_live_seq.saturating_sub(start_seq))
+                                    .unwrap_or(usize::MAX);
                                 let bytes = &bytes[skip.min(bytes.len())..];
                                 covered_live_seq = end_seq;
                                 if let Err(err) = display.write_output(AttachOutputStream::Stdout, bytes).await {
@@ -3444,9 +3446,8 @@ async fn run_remote_attach_v2_once(
             }
             event = coordinator.next_event() => {
                 break match event {
-                    Some(AttachInputEvent::Detached) => AttachEnd::Detached,
+                    Some(AttachInputEvent::Detached | AttachInputEvent::Closed) => AttachEnd::Detached,
                     Some(AttachInputEvent::QuitReconnect) => AttachEnd::QuitReconnect,
-                    Some(AttachInputEvent::Closed) => AttachEnd::Detached,
                     Some(AttachInputEvent::SinkFailed(err)) => AttachEnd::Disconnected(err),
                     Some(AttachInputEvent::RetryNow | AttachInputEvent::BufferFull) => continue,
                     None => AttachEnd::Disconnected(anyhow!("attach input coordinator stopped")),
@@ -3464,7 +3465,7 @@ async fn read_attach_v2_frame(recv: &mut BufferedRecv) -> Result<Option<AttachV2
 }
 
 fn current_active_reload(reload_state: &Arc<StdMutex<Option<u64>>>) -> Option<u64> {
-    reload_state.lock().map(|state| *state).unwrap_or(None)
+    reload_state.lock().map_or(None, |state| *state)
 }
 
 fn set_active_reload(reload_state: &Arc<StdMutex<Option<u64>>>, reload_id: Option<u64>) {
@@ -3584,8 +3585,9 @@ async fn handle_attach_v2_control_frame(
         AttachV2ServerFrame::Error { message, .. } => {
             Ok(Some(AttachEnd::Disconnected(anyhow!(message))))
         }
-        AttachV2ServerFrame::Heartbeat { .. } | AttachV2ServerFrame::AttachReady { .. } => Ok(None),
-        AttachV2ServerFrame::PreludeChunk { .. }
+        AttachV2ServerFrame::Heartbeat { .. }
+        | AttachV2ServerFrame::AttachReady { .. }
+        | AttachV2ServerFrame::PreludeChunk { .. }
         | AttachV2ServerFrame::ViewportSnapshot { .. }
         | AttachV2ServerFrame::LiveOutput { .. }
         | AttachV2ServerFrame::ReloadChunk { .. } => Ok(None),
@@ -4221,6 +4223,7 @@ async fn handle_attach_input_command(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 async fn handle_attach_input_bytes(
     chunk: &[u8],
     sink: &mut Option<AttachInputSink>,
@@ -4985,19 +4988,19 @@ impl AttachInputSink {
                 reload_state,
                 ..
             } => {
-                if bytes == b"\x1b" {
-                    if let Some(reload_id) = current_active_reload(reload_state) {
-                        return control
-                            .write_all(
-                                &postcard::to_stdvec(&AttachV2ClientFrame::CancelReload {
-                                    attach_id: *attach_id,
-                                    reload_id,
-                                })
-                                .context("encode attach v2 cancel reload frame")?,
-                            )
-                            .await
-                            .context("write attach v2 cancel reload frame");
-                    }
+                if bytes == b"\x1b"
+                    && let Some(reload_id) = current_active_reload(reload_state)
+                {
+                    return control
+                        .write_all(
+                            &postcard::to_stdvec(&AttachV2ClientFrame::CancelReload {
+                                attach_id: *attach_id,
+                                reload_id,
+                            })
+                            .context("encode attach v2 cancel reload frame")?,
+                        )
+                        .await
+                        .context("write attach v2 cancel reload frame");
                 }
                 input
                     .write_all(
