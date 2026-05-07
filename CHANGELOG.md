@@ -5,6 +5,25 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.8.6 — 2026-05-07
+
+### Changed
+
+- Ghostty-backed remote session attaches now use a native attach v2 protocol
+  with separate control, input, resize, viewport, live-output, and history
+  lanes. Initial attach, reconnects, resize recovery, and backpressure recovery
+  now resync quickly with bounded history context plus the latest viewport
+  instead of replaying large scrollback snapshots as raw stdout.
+
+### Fixed
+
+- Long Ghostty scrollback, slow output consumers, and resize/TUI redraw storms
+  now trigger explicit resync and viewport refreshes instead of silent output
+  drops, helper subscriber eviction, or attach disconnects.
+- `Ctrl+\\ r` in remote Ghostty attaches now performs a cancellable full reload
+  of retained history with progress, then refreshes the viewport before live
+  output resumes.
+
 ## 0.8.5 — 2026-05-07
 
 ### Added
