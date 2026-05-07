@@ -1536,6 +1536,10 @@ fn sanitize_terminal_replay(bytes: &[u8]) -> Vec<u8> {
         let byte = bytes[index];
         if byte == 0x1b && index + 1 < bytes.len() {
             match bytes[index + 1] {
+                b'[' => {
+                    index = sanitize_escape_csi(bytes, index, &mut out);
+                    continue;
+                }
                 b']' | b'P' | b'^' | b'_' => {
                     index += 2;
                     while index < bytes.len() {
@@ -1556,6 +1560,10 @@ fn sanitize_terminal_replay(bytes: &[u8]) -> Vec<u8> {
                 }
                 _ => {}
             }
+        }
+        if byte == 0x9b {
+            index = sanitize_c1_csi(bytes, index);
+            continue;
         }
         if matches!(byte, 0x90 | 0x9d | 0x9e | 0x9f) {
             index += 1;
@@ -1579,6 +1587,44 @@ fn sanitize_terminal_replay(bytes: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(unix)]
+fn sanitize_escape_csi(bytes: &[u8], start: usize, out: &mut Vec<u8>) -> usize {
+    let mut index = start.saturating_add(2);
+    let private = bytes
+        .get(index)
+        .is_some_and(|byte| matches!(*byte, b'?' | b'>' | b'!' | b' '));
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if (0x40..=0x7e).contains(&byte) {
+            let end = index.saturating_add(1);
+            if byte == b'm' && !private {
+                out.extend_from_slice(&bytes[start..end]);
+            }
+            return end;
+        }
+        index = index.saturating_add(1);
+    }
+    bytes.len()
+}
+
+#[cfg(unix)]
+fn sanitize_c1_csi(bytes: &[u8], start: usize) -> usize {
+    let mut index = start.saturating_add(1);
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if (0x40..=0x7e).contains(&byte) {
+            return index.saturating_add(1);
+        }
+        index = index.saturating_add(1);
+    }
+    bytes.len()
+}
+
+#[cfg(unix)]
+fn push_viewport_row_prefix(out: &mut Vec<u8>, row_index: u16) {
+    out.extend_from_slice(format!("\x1b[{};1H", row_index.saturating_add(1)).as_bytes());
+}
+
+#[cfg(unix)]
 fn render_viewport_snapshot(terminal: &Terminal<'_, '_>) -> Result<Vec<u8>> {
     let mut render_state = RenderState::new().context("create ghostty render state")?;
     let snapshot = render_state
@@ -1598,9 +1644,7 @@ fn render_viewport_snapshot(terminal: &Terminal<'_, '_>) -> Result<Vec<u8>> {
     let mut row_index = 0_u16;
     let mut styled_active = false;
     while let Some(row) = rows_iter.next() {
-        if row_index > 0 {
-            out.extend_from_slice(b"\r\n");
-        }
+        push_viewport_row_prefix(&mut out, row_index);
         let mut cells = cell_iter.update(row).context("iterate ghostty cells")?;
         while let Some(cell) = cells.next() {
             let style = cell.style().context("read ghostty cell style")?;
@@ -2088,6 +2132,15 @@ async fn handle_client(mut stream: UnixStream, tx: mpsc::Sender<HelperCommand>) 
 }
 
 #[cfg(unix)]
+fn queue_helper_command_when_ready(tx: mpsc::Sender<HelperCommand>, command: HelperCommand) {
+    tokio::spawn(async move {
+        if tx.send(command).await.is_err() {
+            tracing::debug!("ghostty helper stopped before queued command could be forwarded");
+        }
+    });
+}
+
+#[cfg(unix)]
 async fn forward_helper_input(
     tx: &mpsc::Sender<HelperCommand>,
     bytes: Vec<u8>,
@@ -2095,11 +2148,13 @@ async fn forward_helper_input(
 ) -> Result<()> {
     match tx.try_send(HelperCommand::Input(bytes)) {
         Ok(()) => Ok(()),
-        Err(mpsc::error::TrySendError::Full(_)) => {
+        Err(mpsc::error::TrySendError::Full(command)) => {
+            queue_helper_command_when_ready(tx.clone(), command);
             write_frame(
                 stream,
-                &GhosttyResponse::Error {
-                    message: "ghostty helper input queue is full".to_owned(),
+                &GhosttyResponse::ResyncRequiredV2 {
+                    reason: "input_queue_full".to_owned(),
+                    from_seq: 0,
                 },
             )
             .await
@@ -2117,11 +2172,13 @@ async fn forward_helper_resize(
 ) -> Result<()> {
     match tx.try_send(HelperCommand::Resize { cols, rows }) {
         Ok(()) => Ok(()),
-        Err(mpsc::error::TrySendError::Full(_)) => {
+        Err(mpsc::error::TrySendError::Full(command)) => {
+            queue_helper_command_when_ready(tx.clone(), command);
             write_frame(
                 stream,
-                &GhosttyResponse::Error {
-                    message: "ghostty helper input queue is full".to_owned(),
+                &GhosttyResponse::ResyncRequiredV2 {
+                    reason: "resize_queue_full".to_owned(),
+                    from_seq: 0,
                 },
             )
             .await
@@ -3097,6 +3154,25 @@ mod tests {
     }
 
     #[test]
+    fn attach_v2_viewport_rows_use_absolute_positioning() {
+        let mut out = Vec::new();
+
+        push_viewport_row_prefix(&mut out, 0);
+        push_viewport_row_prefix(&mut out, 1);
+
+        assert_eq!(out, b"\x1b[1;1H\x1b[2;1H");
+        assert!(!out.windows(b"\r\n".len()).any(|w| w == b"\r\n"));
+    }
+
+    #[test]
+    fn attach_v2_terminal_replay_strips_unsafe_csi_but_keeps_sgr() {
+        assert_eq!(
+            sanitize_terminal_replay(b"a\x1b[?1049hb\x1b[2Jc\x1b[31mred\x1b[0m"),
+            b"abc\x1b[31mred\x1b[0m"
+        );
+    }
+
+    #[test]
     fn attach_v2_terminal_replay_strips_unsafe_control_strings() {
         assert_eq!(
             sanitize_terminal_replay(b"before\x1b]52;c;secret\x07after"),
@@ -3106,6 +3182,49 @@ mod tests {
             sanitize_terminal_replay(b"before\x1bPprivate\x1b\\after"),
             b"beforeafter"
         );
+    }
+
+    #[tokio::test]
+    async fn helper_v2_input_queue_full_reports_resync_not_error() -> Result<()> {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(HelperCommand::Input(b"held".to_vec()))?;
+        let (mut server, mut client) = UnixStream::pair()?;
+
+        forward_helper_input(&tx, b"queued".to_vec(), &mut server).await?;
+        let response = read_frame::<GhosttyResponse>(&mut client).await?;
+
+        assert!(matches!(
+            response,
+            Some(GhosttyResponse::ResyncRequiredV2 { reason, .. }) if reason == "input_queue_full"
+        ));
+        assert!(matches!(rx.recv().await, Some(HelperCommand::Input(bytes)) if bytes == b"held"));
+        assert!(matches!(rx.recv().await, Some(HelperCommand::Input(bytes)) if bytes == b"queued"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn helper_v2_resize_queue_full_reports_resync_and_queues_resize() -> Result<()> {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(HelperCommand::Input(b"held".to_vec()))?;
+        let (mut server, mut client) = UnixStream::pair()?;
+
+        forward_helper_resize(&tx, 100, 40, &mut server).await?;
+        let response = read_frame::<GhosttyResponse>(&mut client).await?;
+
+        assert!(matches!(
+            response,
+            Some(GhosttyResponse::ResyncRequiredV2 { reason, .. }) if reason == "resize_queue_full"
+        ));
+        assert!(matches!(rx.recv().await, Some(HelperCommand::Input(bytes)) if bytes == b"held"));
+        let resize = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await?;
+        assert!(matches!(
+            resize,
+            Some(HelperCommand::Resize {
+                cols: 100,
+                rows: 40
+            })
+        ));
+        Ok(())
     }
 
     #[tokio::test]
