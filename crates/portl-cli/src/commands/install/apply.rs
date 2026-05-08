@@ -195,6 +195,60 @@ pub(super) fn set_mode_0755(path: &Path) -> Result<()> {
 
 pub(super) fn inside_docker() -> bool {
     Path::new("/.dockerenv").exists()
+        || Path::new("/run/.containerenv").exists()
         || std::fs::read_to_string("/proc/1/cgroup")
-            .is_ok_and(|contents| contents.contains("docker") || contents.contains("containerd"))
+            .is_ok_and(|contents| cgroup_looks_like_container(&contents))
+        || std::fs::read_to_string("/proc/1/comm")
+            .is_ok_and(|name| pid1_name_looks_like_container(&name))
+        || std::fs::read_to_string("/proc/1/sched")
+            .is_ok_and(|name| pid1_name_looks_like_container(&name))
+}
+
+fn cgroup_looks_like_container(contents: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "docker",
+        "containerd",
+        "kubepods",
+        "crio",
+        "cri-o",
+        "podman",
+        "libpod",
+        "lxc",
+    ];
+    MARKERS.iter().any(|marker| contents.contains(marker))
+}
+
+fn pid1_name_looks_like_container(name: &str) -> bool {
+    let name = name
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|c: char| c == '(' || c == ')');
+    matches!(
+        name,
+        "s6-svscan" | "tini" | "dumb-init" | "supervisord" | "pause" | "bash" | "sh" | "zsh"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn container_cgroup_detection_recognizes_crio_kubepods() {
+        let cgroup = "12:perf_event:/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod7683bf62_9b4e_4760_b241_1135264208fc.slice/crio-fbdbf32c7b4a21792cd650a4bb4fd7658b337681dffe7642d74a3b9423d23538.scope\n";
+
+        assert!(cgroup_looks_like_container(cgroup));
+    }
+
+    #[test]
+    fn container_pid1_detection_recognizes_s6_supervisor() {
+        assert!(pid1_name_looks_like_container("s6-svscan"));
+    }
+
+    #[test]
+    fn container_pid1_detection_allows_systemd_and_init() {
+        assert!(!pid1_name_looks_like_container("systemd"));
+        assert!(!pid1_name_looks_like_container("init"));
+    }
 }

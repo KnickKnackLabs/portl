@@ -5,6 +5,14 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Fixed
+
+- Container installs now detect CRI-O/kubepods/s6 environments, avoid systemd
+  service setup there, and manage the unmanaged `portl-agent` runtime safely
+  when `install.sh --agent` upgrades a stale or deleted running binary.
+- `portl doctor` and `portl-agent status` now describe container runtimes as
+  unmanaged/manual instead of reporting misleading systemd service guidance.
+
 ## 0.8.9 — 2026-05-08
 
 ### Fixed

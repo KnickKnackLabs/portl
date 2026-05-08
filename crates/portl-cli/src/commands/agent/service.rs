@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, ExitCode};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -57,6 +58,13 @@ struct AgentActionReport {
     status: AgentServiceReport,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpActionOutcome {
+    ok: bool,
+    changed: bool,
+    message: String,
+}
+
 pub fn run(action: AgentAction, json: bool) -> Result<ExitCode> {
     match action {
         AgentAction::Status { service } => status(json, service),
@@ -91,24 +99,18 @@ fn up(json: bool) -> Result<ExitCode> {
         .args(["install", "--apply", "--yes"])
         .output()
         .with_context(|| format!("run {} install --apply --yes", portl.display()))?;
-    let ok = output.status.success();
+    let command_ok = output.status.success();
     let report = collect_report();
-    let message = if ok {
-        "agent service installed and running".to_owned()
-    } else {
-        format!(
-            "failed to install agent service: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-    };
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let outcome = up_action_outcome(command_ok, stderr.trim(), &report);
     print_action(
         json,
         &AgentActionReport {
             schema: "portl.agent.action.v1",
             action: "up".to_owned(),
-            ok,
-            changed: ok,
-            message,
+            ok: outcome.ok,
+            changed: outcome.changed,
+            message: outcome.message,
             status: report,
         },
     )
@@ -169,11 +171,54 @@ fn restart(json: bool) -> Result<ExitCode> {
     )
 }
 
+fn up_action_outcome(
+    command_ok: bool,
+    stderr: &str,
+    report: &AgentServiceReport,
+) -> UpActionOutcome {
+    if report.service.manager == "container" {
+        if report.ipc.ok {
+            return UpActionOutcome {
+                ok: true,
+                changed: false,
+                message: "container detected; unmanaged portl-agent runtime is reachable; no service was installed".to_owned(),
+            };
+        }
+        let mut message = "container detected; no service was installed. Start an unmanaged runtime with `nohup portl-agent > ~/.portl/logs/portl-agent.log 2>&1 &` or run portl-agent under your container supervisor".to_owned();
+        if !command_ok && !stderr.is_empty() {
+            let _ = write!(message, "; install output: {stderr}");
+        }
+        return UpActionOutcome {
+            ok: false,
+            changed: false,
+            message,
+        };
+    }
+
+    if command_ok {
+        UpActionOutcome {
+            ok: true,
+            changed: true,
+            message: "agent service installed and running".to_owned(),
+        }
+    } else {
+        UpActionOutcome {
+            ok: false,
+            changed: false,
+            message: format!("failed to install agent service: {stderr}"),
+        }
+    }
+}
+
 fn print_action(json: bool, report: &AgentActionReport) -> Result<ExitCode> {
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else if report.ok {
-        println!("service: {}", report.message);
+        if report.status.service.manager == "container" {
+            println!("runtime: {}", report.message);
+        } else {
+            println!("service: {}", report.message);
+        }
         println!("state:   {}", report.status.service.state);
         if let Some(pid) = report.status.process.pid {
             println!("pid:     {pid}");
@@ -290,6 +335,9 @@ fn yes_no(value: bool) -> &'static str {
 fn service_info() -> ServiceInfo {
     match std::env::consts::OS {
         "macos" => launchd_service_info(),
+        "linux" if crate::commands::install::detect_host().inside_docker => {
+            container_service_info()
+        }
         "linux" => systemd_service_info(),
         other => ServiceInfo {
             manager: other.to_owned(),
@@ -301,6 +349,19 @@ fn service_info() -> ServiceInfo {
             path: None,
             program: None,
         },
+    }
+}
+
+fn container_service_info() -> ServiceInfo {
+    ServiceInfo {
+        manager: "container".to_owned(),
+        scope: "manual".to_owned(),
+        installed: false,
+        loaded: false,
+        enabled: false,
+        state: "unmanaged".to_owned(),
+        path: None,
+        program: None,
     }
 }
 
@@ -479,5 +540,48 @@ fn run_checked(program: &str, args: &[&str]) -> Result<()> {
             args.join(" "),
             status
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn container_service_info_is_manual_and_unmanaged() {
+        let service = container_service_info();
+
+        assert_eq!(service.manager, "container");
+        assert_eq!(service.scope, "manual");
+        assert!(!service.installed);
+        assert!(!service.loaded);
+        assert!(!service.enabled);
+        assert_eq!(service.state, "unmanaged");
+        assert!(service.path.is_none());
+    }
+
+    #[test]
+    fn up_action_does_not_claim_service_install_in_container_without_ipc() {
+        let report = AgentServiceReport {
+            schema: "portl.agent.status.v1",
+            service: container_service_info(),
+            process: ProcessInfo::default(),
+            ipc: IpcInfo {
+                ok: false,
+                socket: "/tmp/portl/run/metrics.sock".to_owned(),
+                pid: None,
+                version: None,
+                uptime_secs: None,
+                error: Some("connection refused".to_owned()),
+            },
+        };
+
+        let outcome = up_action_outcome(true, "", &report);
+
+        assert!(!outcome.ok);
+        assert!(!outcome.changed);
+        assert!(outcome.message.contains("container detected"));
+        assert!(outcome.message.contains("no service was installed"));
+        assert!(outcome.message.contains("nohup portl-agent"));
     }
 }

@@ -723,17 +723,50 @@ fn directory_has_entries(path: &Path) -> bool {
 
 fn check_agent_runtime_socket() -> CheckResult {
     let socket = portl_core::paths::metrics_socket_path();
-    match fetch_agent_status_sync(&socket) {
-        Ok(status) => CheckResult {
-            name: "agent runtime",
-            status: Status::Ok,
-            detail: format!(
-                "agent IPC ok at {} (pid {}, v{})",
-                socket.display(),
-                status.agent.pid,
-                status.agent.version
-            ),
-        },
+    agent_runtime_check_from_fetch(
+        &socket,
+        fetch_agent_status_sync(&socket),
+        crate::commands::install::detect_host().inside_docker,
+    )
+}
+
+fn agent_runtime_check_from_fetch(
+    socket: &Path,
+    result: anyhow::Result<portl_agent::status_schema::StatusResponse>,
+    inside_container: bool,
+) -> CheckResult {
+    match result {
+        Ok(status) => {
+            let cli_version = env!("CARGO_PKG_VERSION");
+            if normalize_version(&status.agent.version) != normalize_version(cli_version) {
+                let restart_hint = if inside_container {
+                    "rerun the installer with `--agent`, or restart the unmanaged portl-agent runtime manually"
+                } else {
+                    "restart portl-agent to finish the upgrade"
+                };
+                return CheckResult {
+                    name: "agent runtime",
+                    status: Status::Warn,
+                    detail: format!(
+                        "agent IPC ok at {} (pid {}) but runtime version {} differs from installed CLI {}; {restart_hint}",
+                        socket.display(),
+                        status.agent.pid,
+                        version_tag(&status.agent.version),
+                        version_tag(cli_version)
+                    ),
+                };
+            }
+            CheckResult {
+                name: "agent runtime",
+                status: Status::Ok,
+                detail: format!(
+                    "agent IPC ok at {} (pid {}, {})",
+                    socket.display(),
+                    status.agent.pid,
+                    version_tag(&status.agent.version)
+                ),
+            }
+        }
         Err(err) if service_is_loaded() && !portl_core::paths::home_is_explicit() => CheckResult {
             name: "agent runtime",
             status: Status::Fail,
@@ -751,6 +784,14 @@ fn check_agent_runtime_socket() -> CheckResult {
             ),
         },
     }
+}
+
+fn normalize_version(version: &str) -> &str {
+    version.trim().trim_start_matches('v')
+}
+
+fn version_tag(version: &str) -> String {
+    format!("v{}", normalize_version(version))
 }
 
 fn check_agent_network_endpoint() -> CheckResult {
@@ -887,6 +928,10 @@ fn check_session_providers_with_config(configured: Option<&Path>) -> CheckResult
 /// install thread). Non-fatal — this is common during migrations
 /// but should get cleaned up before relying on the service.
 fn check_service_drift() -> CheckResult {
+    if crate::commands::install::detect_host().inside_docker {
+        return check_container_service_drift();
+    }
+
     #[cfg(target_os = "macos")]
     {
         let uid_str = format!("{}", nix::unistd::getuid());
@@ -965,6 +1010,35 @@ fn check_service_drift() -> CheckResult {
             status: Status::Ok,
             detail: "service drift check skipped on this OS".to_owned(),
         }
+    }
+}
+
+fn check_container_service_drift() -> CheckResult {
+    let socket = portl_core::paths::metrics_socket_path();
+    let status = fetch_agent_status_sync(&socket).map_err(|err| err.to_string());
+    container_service_check_from_runtime(status.as_ref().map_err(String::as_str))
+}
+
+fn container_service_check_from_runtime<E: std::fmt::Display>(
+    status: Result<&portl_agent::status_schema::StatusResponse, E>,
+) -> CheckResult {
+    match status {
+        Ok(status) => CheckResult {
+            name: "service",
+            status: Status::Ok,
+            detail: format!(
+                "container environment detected; unmanaged portl-agent runtime active (pid {}, {}); no managed service is expected",
+                status.agent.pid,
+                version_tag(&status.agent.version)
+            ),
+        },
+        Err(err) => CheckResult {
+            name: "service",
+            status: Status::Warn,
+            detail: format!(
+                "container environment detected; no managed service is expected, and no agent runtime is reachable. Start one with `nohup portl-agent > ~/.portl/logs/portl-agent.log 2>&1 &` or run portl-agent under your container supervisor. IPC error: {err}"
+            ),
+        },
     }
 }
 
@@ -1323,6 +1397,129 @@ mod tests {
             assert_eq!(result.status, Status::Ok);
             assert!(result.detail.contains("state=disabled"));
         });
+    }
+
+    #[test]
+    fn agent_runtime_check_warns_when_runtime_version_differs_from_cli() {
+        let status = portl_agent::status_schema::StatusResponse::new(
+            portl_agent::status_schema::AgentInfo {
+                pid: 32144,
+                version: "0.0.0-stale".to_owned(),
+                started_at_unix: 100,
+                home: "/tmp/portl".to_owned(),
+                metrics_socket: "/tmp/portl/run/metrics.sock".to_owned(),
+            },
+            Vec::new(),
+            portl_agent::status_schema::NetworkInfo {
+                relays: Vec::new(),
+                discovery: portl_agent::status_schema::DiscoveryInfo {
+                    dns: false,
+                    pkarr: false,
+                    local: true,
+                },
+            },
+            portl_agent::status_schema::NetworkHealthInfo::disabled(),
+            portl_agent::status_schema::SessionProvidersInfo::default(),
+            portl_agent::relay::RelayStatus::disabled(),
+        );
+
+        let result = agent_runtime_check_from_fetch(
+            Path::new("/tmp/portl/run/metrics.sock"),
+            Ok(status),
+            false,
+        );
+
+        assert_eq!(result.name, "agent runtime");
+        assert_eq!(result.status, Status::Warn);
+        assert!(result.detail.contains("runtime version v0.0.0-stale"));
+        assert!(result.detail.contains("installed CLI v"));
+        assert!(result.detail.contains("restart portl-agent"));
+    }
+
+    #[test]
+    fn agent_runtime_check_gives_container_restart_guidance_for_version_drift() {
+        let status = portl_agent::status_schema::StatusResponse::new(
+            portl_agent::status_schema::AgentInfo {
+                pid: 32144,
+                version: "0.0.0-stale".to_owned(),
+                started_at_unix: 100,
+                home: "/tmp/portl".to_owned(),
+                metrics_socket: "/tmp/portl/run/metrics.sock".to_owned(),
+            },
+            Vec::new(),
+            portl_agent::status_schema::NetworkInfo {
+                relays: Vec::new(),
+                discovery: portl_agent::status_schema::DiscoveryInfo {
+                    dns: false,
+                    pkarr: false,
+                    local: true,
+                },
+            },
+            portl_agent::status_schema::NetworkHealthInfo::disabled(),
+            portl_agent::status_schema::SessionProvidersInfo::default(),
+            portl_agent::relay::RelayStatus::disabled(),
+        );
+
+        let result = agent_runtime_check_from_fetch(
+            Path::new("/tmp/portl/run/metrics.sock"),
+            Ok(status),
+            true,
+        );
+
+        assert_eq!(result.name, "agent runtime");
+        assert_eq!(result.status, Status::Warn);
+        assert!(result.detail.contains("runtime version v0.0.0-stale"));
+        assert!(result.detail.contains("rerun the installer with `--agent`"));
+        assert!(result.detail.contains("unmanaged portl-agent runtime"));
+    }
+
+    #[test]
+    fn container_service_check_is_ok_when_unmanaged_agent_runtime_is_reachable() {
+        let status = portl_agent::status_schema::StatusResponse::new(
+            portl_agent::status_schema::AgentInfo {
+                pid: 82199,
+                version: "0.8.9".to_owned(),
+                started_at_unix: 100,
+                home: "/tmp/portl".to_owned(),
+                metrics_socket: "/tmp/portl/run/metrics.sock".to_owned(),
+            },
+            Vec::new(),
+            portl_agent::status_schema::NetworkInfo {
+                relays: Vec::new(),
+                discovery: portl_agent::status_schema::DiscoveryInfo {
+                    dns: false,
+                    pkarr: false,
+                    local: true,
+                },
+            },
+            portl_agent::status_schema::NetworkHealthInfo::disabled(),
+            portl_agent::status_schema::SessionProvidersInfo::default(),
+            portl_agent::relay::RelayStatus::disabled(),
+        );
+
+        let result = container_service_check_from_runtime(Ok::<_, &str>(&status));
+
+        assert_eq!(result.name, "service");
+        assert_eq!(result.status, Status::Ok);
+        assert!(result.detail.contains("container environment detected"));
+        assert!(
+            result
+                .detail
+                .contains("unmanaged portl-agent runtime active")
+        );
+        assert!(result.detail.contains("pid 82199"));
+        assert!(result.detail.contains("v0.8.9"));
+    }
+
+    #[test]
+    fn container_service_check_warns_with_no_runtime_and_manual_start_command() {
+        let result = container_service_check_from_runtime(Err("connection refused"));
+
+        assert_eq!(result.name, "service");
+        assert_eq!(result.status, Status::Warn);
+        assert!(result.detail.contains("container environment detected"));
+        assert!(result.detail.contains("no managed service is expected"));
+        assert!(result.detail.contains("nohup portl-agent"));
     }
 
     #[test]

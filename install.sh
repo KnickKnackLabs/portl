@@ -32,6 +32,7 @@ FORCE=0
 SKIP_INIT=0
 DRY_RUN=0
 ASSUME_YES=0
+CONTAINER_RUNTIME_HANDOFF_ACTION=""
 
 log()  { printf '%s\n' "$*" >&2; }
 info() { printf '\033[0;36m[info]\033[0m  %s\n' "$*" >&2; }
@@ -125,13 +126,16 @@ detect_target() {
 
 detect_container() {
     # Best-effort: set CONTAINER=1 so we skip service install (launchctl
-    # and systemctl don't work inside most containers).
-    if [ -f /.dockerenv ]; then return 0; fi
-    if [ -r /proc/1/cgroup ] && grep -qE 'docker|containerd|lxc|podman' /proc/1/cgroup 2>/dev/null; then
+    # and systemctl don't work inside most containers). Keep this in
+    # sync with the Rust-side installer detection.
+    if [ -f /.dockerenv ] || [ -f /run/.containerenv ]; then return 0; fi
+    if [ -r /proc/1/cgroup ] && grep -qE 'docker|containerd|kubepods|crio|cri-o|lxc|podman|libpod' /proc/1/cgroup 2>/dev/null; then
         return 0
     fi
-    if [ -r /proc/1/sched ] && ! grep -q '^init' /proc/1/sched 2>/dev/null && ! grep -q '^systemd' /proc/1/sched 2>/dev/null; then
-        # heuristic: pid 1 isn't init/systemd → probably a container
+    if [ -r /proc/1/comm ] && grep -qE '^(s6-svscan|tini|dumb-init|supervisord|pause|bash|sh|zsh)$' /proc/1/comm 2>/dev/null; then
+        return 0
+    fi
+    if [ -r /proc/1/sched ] && grep -qE '^(s6-svscan|tini|dumb-init|supervisord|pause|bash|sh|zsh)[[:space:](]' /proc/1/sched 2>/dev/null; then
         return 0
     fi
     return 1
@@ -283,9 +287,13 @@ do_install() {
     info "mode       : ${MODE:-preserve}"
     [ "$IS_CONTAINER" -eq 1 ] && info "container  : detected (service install will be skipped)"
 
-    local service_was_configured expected_service_running
+    local service_was_configured expected_service_running container_runtime_was_running
     service_was_configured=0
     expected_service_running=0
+    container_runtime_was_running=0
+    if [ "$IS_CONTAINER" -eq 1 ] && agent_runtime_available; then
+        container_runtime_was_running=1
+    fi
     if [ "$IS_CONTAINER" -eq 0 ] && service_configured; then
         service_was_configured=1
     fi
@@ -331,9 +339,13 @@ do_install() {
         fi
     fi
 
-    apply_service_mode
-    if [ "$expected_service_running" -eq 1 ]; then
-        verify_agent_service_ready
+    if [ "$IS_CONTAINER" -eq 1 ]; then
+        apply_container_runtime_mode "$container_runtime_was_running"
+    else
+        apply_service_mode
+        if [ "$expected_service_running" -eq 1 ]; then
+            verify_agent_service_ready
+        fi
     fi
 
     echo
@@ -341,8 +353,13 @@ do_install() {
         ok "dry-run complete (no changes made)"
         info "to check status after a real install: portl doctor"
     else
-        ok "done"
-        "$INSTALL_DIR/portl" doctor 2>/dev/null || true
+        if [ -n "$CONTAINER_RUNTIME_HANDOFF_ACTION" ]; then
+            ok "done (portl-agent ${CONTAINER_RUNTIME_HANDOFF_ACTION} handed off)"
+            warn "the current Portl-backed shell may disconnect shortly; reconnect and run `portl doctor --verbose`"
+        else
+            ok "done"
+            "$INSTALL_DIR/portl" doctor 2>/dev/null || true
+        fi
     fi
 }
 
@@ -584,6 +601,440 @@ verify_agent_service_ready() {
     done
     "$INSTALL_DIR/portl-agent" status || true
     err "portl-agent service did not become ready after upgrade"
+}
+
+verify_agent_runtime_ready() {
+    info "waiting for portl-agent runtime readiness"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        run "$INSTALL_DIR/portl-agent" status
+        return 0
+    fi
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        if "$INSTALL_DIR/portl-agent" status >/dev/null 2>&1; then
+            ok "portl-agent runtime is reachable"
+            return 0
+        fi
+        sleep 0.5
+    done
+    "$INSTALL_DIR/portl-agent" status || true
+    err "portl-agent runtime did not become ready"
+}
+
+agent_status_field() {
+    local field
+    field="$1"
+    [ -x "$INSTALL_DIR/portl-agent" ] || return 0
+    "$INSTALL_DIR/portl-agent" status 2>/dev/null | awk -v key="${field}:" '$1 == key { print $2; exit }' || true
+}
+
+agent_runtime_available() {
+    [ -n "$(agent_status_field pid)" ]
+}
+
+portl_home_dir() {
+    local config_path
+    config_path="$({ "$INSTALL_DIR/portl" config path 2>/dev/null || true; } | awk 'NR == 1 { print; exit }')"
+    if [ -n "$config_path" ]; then
+        dirname "$(dirname "$config_path")"
+    else
+        printf '%s\n' "${PORTL_HOME:-${HOME:-/root}/.portl}"
+    fi
+}
+
+container_agent_log_path() {
+    local home
+    home="$(portl_home_dir)"
+    printf '%s\n' "$home/logs/portl-agent.log"
+}
+
+normalize_agent_version() {
+    local version
+    version="$1"
+    version="${version#v}"
+    printf '%s\n' "$version"
+}
+
+container_handoff_delay() {
+    printf '%s\n' "${PORTL_CONTAINER_HANDOFF_DELAY:-5}"
+}
+
+agent_runtime_restart_reason() {
+    local pid version normalized_version exe
+    pid="$1"
+    version="$2"
+    normalized_version="$(normalize_agent_version "$version")"
+    if [ -n "$normalized_version" ] && [ "$normalized_version" != "$VER" ]; then
+        printf 'running version %s differs from installed %s\n' "$version" "$VER"
+        return 0
+    fi
+    if [ -n "$pid" ] && [ -e "/proc/$pid/exe" ]; then
+        exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+        case "$exe" in
+            *" (deleted)"*)
+                printf 'process %s is running from a deleted binary (%s)\n' "$pid" "$exe"
+                return 0
+                ;;
+        esac
+    fi
+    return 1
+}
+
+start_detached_container_agent() {
+    local log_path log_dir
+    log_path="$(container_agent_log_path)"
+    log_dir="$(dirname "$log_path")"
+    info "starting unmanaged portl-agent runtime"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "\$ mkdir -p $log_dir"
+        if has setsid; then
+            log "\$ setsid $INSTALL_DIR/portl-agent >> $log_path 2>&1 < /dev/null &"
+        else
+            log "\$ nohup $INSTALL_DIR/portl-agent >> $log_path 2>&1 < /dev/null &"
+        fi
+        return 0
+    fi
+    mkdir -p "$log_dir"
+    if has setsid; then
+        setsid "$INSTALL_DIR/portl-agent" >>"$log_path" 2>&1 < /dev/null &
+    else
+        nohup "$INSTALL_DIR/portl-agent" >>"$log_path" 2>&1 < /dev/null &
+    fi
+}
+
+schedule_detached_container_agent_restart() {
+    local pid reason log_path log_dir delay
+    pid="$1"
+    reason="$2"
+    delay="$(container_handoff_delay)"
+    log_path="$(container_agent_log_path)"
+    log_dir="$(dirname "$log_path")"
+    warn "stale unmanaged portl-agent runtime detected: ${reason}"
+    info "scheduling detached runtime restart after installer exits"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "\$ mkdir -p $log_dir"
+        if has setsid; then
+            log "\$ setsid sh -c 'sleep $delay; revalidate pid $pid; exec $INSTALL_DIR/portl-agent' >> $log_path 2>&1 < /dev/null &"
+        else
+            log "\$ nohup sh -c 'sleep $delay; revalidate pid $pid; exec $INSTALL_DIR/portl-agent' >> $log_path 2>&1 < /dev/null &"
+        fi
+        CONTAINER_RUNTIME_HANDOFF_ACTION="restart"
+        return 0
+    fi
+    mkdir -p "$log_dir"
+    if has setsid; then
+        setsid sh -c '
+            delay="$1"; scheduled_pid="$2"; agent="$3"; log_path="$4"; installed_version="$5"
+            trap "" HUP
+            normalize_version() { version="$1"; version="${version#v}"; printf "%s" "$version"; }
+            status_field() {
+                field="$1:"
+                printf "%s\n" "$status" | while IFS= read -r line; do
+                    case "$line" in
+                        "$field"*) value="${line#"$field"}"; set -- $value; printf "%s" "${1:-}"; break ;;
+                    esac
+                done
+            }
+            process_looks_like_portl() {
+                target_pid="$1"
+                comm="$(cat "/proc/$target_pid/comm" 2>/dev/null || true)"
+                exe="$(readlink "/proc/$target_pid/exe" 2>/dev/null || true)"
+                case "$comm:$exe" in
+                    portl:*|portl-agent:*|*:*/portl|*:*/portl-agent|*:*/portl\ \(deleted\)|*:*/portl-agent\ \(deleted\)) return 0 ;;
+                    *) return 1 ;;
+                esac
+            }
+            process_is_zombie() {
+                grep -q '^State:[[:space:]]*Z' "/proc/$1/status" 2>/dev/null
+            }
+            sleep "$delay"
+            {
+                printf "[%s] revalidating stale portl-agent pid %s before restart\n" "$(date -Is 2>/dev/null || date)" "$scheduled_pid"
+                status="$("$agent" status 2>/dev/null || true)"
+                current_pid="$(status_field pid)"
+                current_version="$(normalize_version "$(status_field version)")"
+                if [ -z "$current_pid" ]; then
+                    printf "[%s] no runtime reachable; starting %s\n" "$(date -Is 2>/dev/null || date)" "$agent"
+                elif [ "$current_pid" != "$scheduled_pid" ]; then
+                    printf "[%s] IPC owner changed from pid %s to pid %s; skipping restart\n" "$(date -Is 2>/dev/null || date)" "$scheduled_pid" "$current_pid"
+                    exit 0
+                elif ! process_looks_like_portl "$current_pid"; then
+                    printf "[%s] pid %s no longer looks like portl-agent; skipping restart\n" "$(date -Is 2>/dev/null || date)" "$current_pid"
+                    exit 0
+                else
+                    stale=0
+                    exe="$(readlink "/proc/$current_pid/exe" 2>/dev/null || true)"
+                    if [ -n "$current_version" ] && [ "$current_version" != "$installed_version" ]; then stale=1; fi
+                    case "$exe" in *" (deleted)"*) stale=1 ;; esac
+                    if [ "$stale" -ne 1 ]; then
+                        printf "[%s] pid %s is no longer stale; skipping restart\n" "$(date -Is 2>/dev/null || date)" "$current_pid"
+                        exit 0
+                    fi
+                    printf "[%s] stopping stale portl-agent pid %s\n" "$(date -Is 2>/dev/null || date)" "$current_pid"
+                    kill "$current_pid" 2>/dev/null || true
+                    i=0
+                    while [ "$i" -lt 20 ] && kill -0 "$current_pid" 2>/dev/null; do
+                        if process_is_zombie "$current_pid"; then
+                            break
+                        fi
+                        sleep 0.25
+                        i=$((i + 1))
+                    done
+                    if kill -0 "$current_pid" 2>/dev/null; then
+                        kill -KILL "$current_pid" 2>/dev/null || true
+                    fi
+                    printf "[%s] starting %s\n" "$(date -Is 2>/dev/null || date)" "$agent"
+                fi
+            } >>"$log_path" 2>&1
+            exec "$agent" >>"$log_path" 2>&1 < /dev/null
+        ' portl-agent-restart "$delay" "$pid" "$INSTALL_DIR/portl-agent" "$log_path" "$VER" >/dev/null 2>&1 < /dev/null &
+    else
+        nohup sh -c '
+            delay="$1"; scheduled_pid="$2"; agent="$3"; log_path="$4"; installed_version="$5"
+            trap "" HUP
+            normalize_version() { version="$1"; version="${version#v}"; printf "%s" "$version"; }
+            status_field() {
+                field="$1:"
+                printf "%s\n" "$status" | while IFS= read -r line; do
+                    case "$line" in
+                        "$field"*) value="${line#"$field"}"; set -- $value; printf "%s" "${1:-}"; break ;;
+                    esac
+                done
+            }
+            process_looks_like_portl() {
+                target_pid="$1"
+                comm="$(cat "/proc/$target_pid/comm" 2>/dev/null || true)"
+                exe="$(readlink "/proc/$target_pid/exe" 2>/dev/null || true)"
+                case "$comm:$exe" in
+                    portl:*|portl-agent:*|*:*/portl|*:*/portl-agent|*:*/portl\ \(deleted\)|*:*/portl-agent\ \(deleted\)) return 0 ;;
+                    *) return 1 ;;
+                esac
+            }
+            process_is_zombie() {
+                grep -q '^State:[[:space:]]*Z' "/proc/$1/status" 2>/dev/null
+            }
+            sleep "$delay"
+            {
+                printf "[%s] revalidating stale portl-agent pid %s before restart\n" "$(date -Is 2>/dev/null || date)" "$scheduled_pid"
+                status="$("$agent" status 2>/dev/null || true)"
+                current_pid="$(status_field pid)"
+                current_version="$(normalize_version "$(status_field version)")"
+                if [ -z "$current_pid" ]; then
+                    printf "[%s] no runtime reachable; starting %s\n" "$(date -Is 2>/dev/null || date)" "$agent"
+                elif [ "$current_pid" != "$scheduled_pid" ]; then
+                    printf "[%s] IPC owner changed from pid %s to pid %s; skipping restart\n" "$(date -Is 2>/dev/null || date)" "$scheduled_pid" "$current_pid"
+                    exit 0
+                elif ! process_looks_like_portl "$current_pid"; then
+                    printf "[%s] pid %s no longer looks like portl-agent; skipping restart\n" "$(date -Is 2>/dev/null || date)" "$current_pid"
+                    exit 0
+                else
+                    stale=0
+                    exe="$(readlink "/proc/$current_pid/exe" 2>/dev/null || true)"
+                    if [ -n "$current_version" ] && [ "$current_version" != "$installed_version" ]; then stale=1; fi
+                    case "$exe" in *" (deleted)"*) stale=1 ;; esac
+                    if [ "$stale" -ne 1 ]; then
+                        printf "[%s] pid %s is no longer stale; skipping restart\n" "$(date -Is 2>/dev/null || date)" "$current_pid"
+                        exit 0
+                    fi
+                    printf "[%s] stopping stale portl-agent pid %s\n" "$(date -Is 2>/dev/null || date)" "$current_pid"
+                    kill "$current_pid" 2>/dev/null || true
+                    i=0
+                    while [ "$i" -lt 20 ] && kill -0 "$current_pid" 2>/dev/null; do
+                        if process_is_zombie "$current_pid"; then
+                            break
+                        fi
+                        sleep 0.25
+                        i=$((i + 1))
+                    done
+                    if kill -0 "$current_pid" 2>/dev/null; then
+                        kill -KILL "$current_pid" 2>/dev/null || true
+                    fi
+                    printf "[%s] starting %s\n" "$(date -Is 2>/dev/null || date)" "$agent"
+                fi
+            } >>"$log_path" 2>&1
+            exec "$agent" >>"$log_path" 2>&1 < /dev/null
+        ' portl-agent-restart "$delay" "$pid" "$INSTALL_DIR/portl-agent" "$log_path" "$VER" >/dev/null 2>&1 < /dev/null &
+    fi
+    CONTAINER_RUNTIME_HANDOFF_ACTION="restart"
+    warn "if this shell is attached through Portl, it may disconnect shortly after the installer exits"
+}
+
+schedule_detached_container_agent_stop() {
+    local pid log_path log_dir delay
+    pid="$1"
+    delay="$(container_handoff_delay)"
+    log_path="$(container_agent_log_path)"
+    log_dir="$(dirname "$log_path")"
+    info "scheduling detached runtime stop after installer exits"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "\$ mkdir -p $log_dir"
+        if has setsid; then
+            log "\$ setsid sh -c 'sleep $delay; revalidate pid $pid; kill portl-agent runtime' >> $log_path 2>&1 < /dev/null &"
+        else
+            log "\$ nohup sh -c 'sleep $delay; revalidate pid $pid; kill portl-agent runtime' >> $log_path 2>&1 < /dev/null &"
+        fi
+        CONTAINER_RUNTIME_HANDOFF_ACTION="stop"
+        return 0
+    fi
+    mkdir -p "$log_dir"
+    if has setsid; then
+        setsid sh -c '
+            delay="$1"; scheduled_pid="$2"; agent="$3"; log_path="$4"
+            trap "" HUP
+            status_field() {
+                field="$1:"
+                printf "%s\n" "$status" | while IFS= read -r line; do
+                    case "$line" in
+                        "$field"*) value="${line#"$field"}"; set -- $value; printf "%s" "${1:-}"; break ;;
+                    esac
+                done
+            }
+            process_looks_like_portl() {
+                target_pid="$1"
+                comm="$(cat "/proc/$target_pid/comm" 2>/dev/null || true)"
+                exe="$(readlink "/proc/$target_pid/exe" 2>/dev/null || true)"
+                case "$comm:$exe" in
+                    portl:*|portl-agent:*|*:*/portl|*:*/portl-agent|*:*/portl\ \(deleted\)|*:*/portl-agent\ \(deleted\)) return 0 ;;
+                    *) return 1 ;;
+                esac
+            }
+            process_is_zombie() {
+                grep -q '^State:[[:space:]]*Z' "/proc/$1/status" 2>/dev/null
+            }
+            sleep "$delay"
+            {
+                printf "[%s] revalidating portl-agent pid %s before stop\n" "$(date -Is 2>/dev/null || date)" "$scheduled_pid"
+                status="$("$agent" status 2>/dev/null || true)"
+                current_pid="$(status_field pid)"
+                if [ -z "$current_pid" ]; then
+                    printf "[%s] no runtime reachable; nothing to stop\n" "$(date -Is 2>/dev/null || date)"
+                    exit 0
+                elif [ "$current_pid" != "$scheduled_pid" ]; then
+                    printf "[%s] IPC owner changed from pid %s to pid %s; skipping stop\n" "$(date -Is 2>/dev/null || date)" "$scheduled_pid" "$current_pid"
+                    exit 0
+                elif ! process_looks_like_portl "$current_pid"; then
+                    printf "[%s] pid %s no longer looks like portl-agent; skipping stop\n" "$(date -Is 2>/dev/null || date)" "$current_pid"
+                    exit 0
+                fi
+                printf "[%s] stopping unmanaged portl-agent pid %s\n" "$(date -Is 2>/dev/null || date)" "$current_pid"
+                kill "$current_pid" 2>/dev/null || true
+                i=0
+                while [ "$i" -lt 20 ] && kill -0 "$current_pid" 2>/dev/null; do
+                    if process_is_zombie "$current_pid"; then
+                        break
+                    fi
+                    sleep 0.25
+                    i=$((i + 1))
+                done
+                if kill -0 "$current_pid" 2>/dev/null; then
+                    kill -KILL "$current_pid" 2>/dev/null || true
+                fi
+            } >>"$log_path" 2>&1
+        ' portl-agent-stop "$delay" "$pid" "$INSTALL_DIR/portl-agent" "$log_path" >/dev/null 2>&1 < /dev/null &
+    else
+        nohup sh -c '
+            delay="$1"; scheduled_pid="$2"; agent="$3"; log_path="$4"
+            trap "" HUP
+            status_field() {
+                field="$1:"
+                printf "%s\n" "$status" | while IFS= read -r line; do
+                    case "$line" in
+                        "$field"*) value="${line#"$field"}"; set -- $value; printf "%s" "${1:-}"; break ;;
+                    esac
+                done
+            }
+            process_looks_like_portl() {
+                target_pid="$1"
+                comm="$(cat "/proc/$target_pid/comm" 2>/dev/null || true)"
+                exe="$(readlink "/proc/$target_pid/exe" 2>/dev/null || true)"
+                case "$comm:$exe" in
+                    portl:*|portl-agent:*|*:*/portl|*:*/portl-agent|*:*/portl\ \(deleted\)|*:*/portl-agent\ \(deleted\)) return 0 ;;
+                    *) return 1 ;;
+                esac
+            }
+            process_is_zombie() {
+                grep -q '^State:[[:space:]]*Z' "/proc/$1/status" 2>/dev/null
+            }
+            sleep "$delay"
+            {
+                printf "[%s] revalidating portl-agent pid %s before stop\n" "$(date -Is 2>/dev/null || date)" "$scheduled_pid"
+                status="$("$agent" status 2>/dev/null || true)"
+                current_pid="$(status_field pid)"
+                if [ -z "$current_pid" ]; then
+                    printf "[%s] no runtime reachable; nothing to stop\n" "$(date -Is 2>/dev/null || date)"
+                    exit 0
+                elif [ "$current_pid" != "$scheduled_pid" ]; then
+                    printf "[%s] IPC owner changed from pid %s to pid %s; skipping stop\n" "$(date -Is 2>/dev/null || date)" "$scheduled_pid" "$current_pid"
+                    exit 0
+                elif ! process_looks_like_portl "$current_pid"; then
+                    printf "[%s] pid %s no longer looks like portl-agent; skipping stop\n" "$(date -Is 2>/dev/null || date)" "$current_pid"
+                    exit 0
+                fi
+                printf "[%s] stopping unmanaged portl-agent pid %s\n" "$(date -Is 2>/dev/null || date)" "$current_pid"
+                kill "$current_pid" 2>/dev/null || true
+                i=0
+                while [ "$i" -lt 20 ] && kill -0 "$current_pid" 2>/dev/null; do
+                    if process_is_zombie "$current_pid"; then
+                        break
+                    fi
+                    sleep 0.25
+                    i=$((i + 1))
+                done
+                if kill -0 "$current_pid" 2>/dev/null; then
+                    kill -KILL "$current_pid" 2>/dev/null || true
+                fi
+            } >>"$log_path" 2>&1
+        ' portl-agent-stop "$delay" "$pid" "$INSTALL_DIR/portl-agent" "$log_path" >/dev/null 2>&1 < /dev/null &
+    fi
+    CONTAINER_RUNTIME_HANDOFF_ACTION="stop"
+    warn "agent mode is off; unmanaged portl-agent runtime will be stopped after the installer exits"
+}
+
+apply_container_runtime_mode() {
+    local was_running should_run pid version reason
+    was_running="$1"
+    should_run=0
+    warn "container detected — skipping service management"
+    case "$MODE" in
+        client)
+            pid="$(agent_status_field pid)"
+            if [ -n "$pid" ]; then
+                schedule_detached_container_agent_stop "$pid"
+            else
+                ok "no unmanaged portl-agent runtime is reachable"
+            fi
+            return 0
+            ;;
+        agent)
+            should_run=1
+            ;;
+        "")
+            [ "$was_running" -eq 1 ] && should_run=1
+            ;;
+    esac
+    if [ "$should_run" -ne 1 ]; then
+        warn "run the agent manually:  ${INSTALL_DIR}/portl-agent"
+        return 0
+    fi
+
+    pid="$(agent_status_field pid)"
+    version="$(agent_status_field version)"
+    if [ -z "$pid" ]; then
+        start_detached_container_agent
+        verify_agent_runtime_ready
+        return 0
+    fi
+
+    if reason="$(agent_runtime_restart_reason "$pid" "$version")"; then
+        schedule_detached_container_agent_restart "$pid" "$reason"
+        return 0
+    fi
+
+    if [ -n "$version" ]; then
+        ok "unmanaged portl-agent runtime is running (pid ${pid}, v$(normalize_agent_version "$version"))"
+    else
+        ok "unmanaged portl-agent runtime is running (pid ${pid}, version unknown)"
+    fi
 }
 
 apply_service_mode() {
