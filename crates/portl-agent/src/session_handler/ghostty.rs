@@ -227,6 +227,8 @@ const GHOSTTY_ATTACH_V2_QUEUE: usize = 256;
 #[cfg(unix)]
 const GHOSTTY_ATTACH_V2_HISTORY_CHUNK: usize = 64 * 1024;
 #[cfg(unix)]
+const GHOSTTY_ATTACH_V2_RELOAD_MAX_BYTES: usize = 1024 * 1024;
+#[cfg(unix)]
 const GHOSTTY_ATTACH_V2_RESIZE_SETTLE_MS: u64 = 200;
 #[cfg(unix)]
 const GHOSTTY_ATTACH_V2_MAX_RELOAD_JOBS: usize = 2;
@@ -1355,13 +1357,15 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
                                 });
                             }
                         }
+                        let (reload_start_abs, reload_len, reload_truncated) =
+                            bounded_reload_window(history_start_abs, history.len());
                         reload_jobs.push_back(GhosttyReloadJob::new(
                             reload_id,
-                            history_start_abs,
-                            history.len(),
+                            reload_start_abs,
+                            reload_len,
                             reply,
                             viewport_generation,
-                            history_start_abs > 0,
+                            reload_truncated,
                         ));
                     }
                     HelperCommand::CancelReloadV2 { reload_id } => {
@@ -1749,6 +1753,15 @@ fn append_bounded(history: &mut VecDeque<u8>, bytes: &[u8]) -> usize {
         dropped = dropped.saturating_add(1);
     }
     dropped
+}
+
+#[cfg(unix)]
+fn bounded_reload_window(history_start_abs: u64, retained_len: usize) -> (u64, usize, bool) {
+    let reload_len = retained_len.min(GHOSTTY_ATTACH_V2_RELOAD_MAX_BYTES);
+    let skipped_retained = retained_len.saturating_sub(reload_len);
+    let reload_start_abs = history_start_abs.saturating_add(skipped_retained as u64);
+    let truncated = history_start_abs > 0 || skipped_retained > 0;
+    (reload_start_abs, reload_len, truncated)
 }
 
 #[cfg(unix)]
@@ -3334,8 +3347,98 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn attach_v2_reload_window_keeps_small_untruncated_history() {
+        let (start_abs, retained_len, truncated) = bounded_reload_window(0, 42);
+
+        assert_eq!(start_abs, 0);
+        assert_eq!(retained_len, 42);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn attach_v2_reload_window_caps_to_recent_history() {
+        let overflow = 1234;
+        let history_start_abs = 10_000;
+        let retained = GHOSTTY_ATTACH_V2_RELOAD_MAX_BYTES + overflow;
+        let (start_abs, retained_len, truncated) =
+            bounded_reload_window(history_start_abs, retained);
+
+        assert_eq!(start_abs, history_start_abs + overflow as u64);
+        assert_eq!(retained_len, GHOSTTY_ATTACH_V2_RELOAD_MAX_BYTES);
+        assert!(truncated);
+    }
+
     #[tokio::test]
-    async fn helper_attach_v2_reload_streams_full_retained_history_in_chunks() -> Result<()> {
+    async fn helper_attach_v2_reload_caps_large_retained_history_to_recent_limit() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let registry =
+            GhosttyRegistry::with_roots(temp.path().join("run"), temp.path().join("state"));
+        let paths = registry.paths_for("v2-reload-cap");
+        let helper = GhosttyHelperConfig::for_test(
+            "v2-reload-cap",
+            paths.clone(),
+            vec!["/bin/sh".to_owned(), "-l".to_owned()],
+        );
+        let task = spawn_helper_thread(helper);
+        wait_for_socket(&paths.socket_path, Duration::from_secs(2)).await?;
+
+        let run = GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .run(
+                None,
+                vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "python3 - <<'PY'\nimport sys\nsys.stdout.write('old-marker-before-reload-cap\\n')\nsys.stdout.write('x' * (1024 * 1024 + 4096))\nsys.stdout.write('recent-marker-after-reload-cap\\n')\nPY"
+                        .to_owned(),
+                ],
+            )
+            .await?;
+        assert_eq!(run.code, 0);
+
+        let mut attach = GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .attach_v2(
+                80,
+                24,
+                portl_proto::session_v1::AttachV2Config {
+                    prelude_max_wait_ms: 200,
+                    prelude_max_bytes: 0,
+                },
+            )
+            .await?;
+        attach.reload(11).await?;
+        let history = attach
+            .read_reload_until_done(11, Duration::from_secs(10))
+            .await?;
+
+        assert!(
+            history.len() <= GHOSTTY_ATTACH_V2_RELOAD_MAX_BYTES + 16,
+            "reload exceeded recent-history cap: {} bytes",
+            history.len()
+        );
+        assert!(
+            !history.contains("old-marker-before-reload-cap"),
+            "reload should omit older retained history"
+        );
+        assert!(
+            history.contains("recent-marker-after-reload-cap"),
+            "reload should include the newest retained history"
+        );
+
+        GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .kill()
+            .await?;
+        task.join()
+            .expect("helper thread")
+            .context("helper result")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn helper_attach_v2_reload_streams_recent_history_in_chunks() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let registry =
             GhosttyRegistry::with_roots(temp.path().join("run"), temp.path().join("state"));

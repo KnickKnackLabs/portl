@@ -5,6 +5,11 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Changed
+
+- Remote Ghostty `Ctrl+\\ r` reload now replays only the most recent 1 MiB of
+  retained history instead of streaming the entire retained scrollback buffer.
+
 ## 0.8.10 — 2026-05-08
 
 ### Fixed
