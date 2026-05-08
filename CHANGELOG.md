@@ -5,6 +5,8 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.8.10 — 2026-05-08
+
 ### Fixed
 
 - Container installs now detect CRI-O/kubepods/s6 environments, avoid systemd
