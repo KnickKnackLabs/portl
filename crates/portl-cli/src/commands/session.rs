@@ -3375,6 +3375,7 @@ async fn run_remote_attach_v2_once(
                         }
                     }
                     Ok(Some(AttachV2ServerFrame::ViewportSnapshot { attach_id: frame_attach_id, generation, cols, rows, resize_id, .. })) if frame_attach_id == attach_id && generation > last_viewport_generation => {
+                        opening_state.mark_viewport_barrier_seen();
                         debug!(
                             generation,
                             resize_id,
@@ -3551,6 +3552,10 @@ impl AttachV2OpeningState {
     }
 
     fn mark_viewport_seen(&mut self) {
+        self.viewport_seen = true;
+    }
+
+    fn mark_viewport_barrier_seen(&mut self) {
         self.viewport_seen = true;
     }
 }
@@ -4311,7 +4316,7 @@ async fn attach_input_coordinator_loop(
     let mut mode = AttachInputMode::Disconnected { visible: false };
     let mut buffer = ReconnectInputBuffer::new(256 * 1024);
     let mut last_size = initial_size;
-    let mut pending_size = Some(initial_size);
+    let mut pending_size = initial_pending_attach_size(initial_size);
     let mut paste = PasteState::new(PasteConfig::default());
     let mut bracketed = BracketedPasteScanner::default();
     let mut read_buf = [0_u8; 8192];
@@ -4383,6 +4388,10 @@ async fn attach_input_coordinator_loop(
             }
         }
     }
+}
+
+fn initial_pending_attach_size(_initial_size: (u16, u16)) -> Option<(u16, u16)> {
+    None
 }
 
 async fn handle_attach_input_command(
@@ -5898,11 +5907,25 @@ mod tests {
     }
 
     #[test]
+    fn attach_v2_initial_size_is_not_pending_resize() {
+        assert_eq!(initial_pending_attach_size((80, 24)), None);
+    }
+
+    #[test]
     fn attach_v2_opening_drops_late_prelude_after_viewport() {
         let mut opening = AttachV2OpeningState::default();
 
         assert!(opening.should_render_prelude());
         opening.mark_viewport_seen();
+        assert!(!opening.should_render_prelude());
+    }
+
+    #[test]
+    fn attach_v2_opening_drops_late_prelude_after_stale_viewport_barrier() {
+        let mut opening = AttachV2OpeningState::default();
+
+        assert!(opening.should_render_prelude());
+        opening.mark_viewport_barrier_seen();
         assert!(!opening.should_render_prelude());
     }
 
