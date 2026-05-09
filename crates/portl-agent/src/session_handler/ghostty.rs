@@ -1306,7 +1306,11 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
                             events: event_tx,
                             resync_pending: false,
                         });
-                        let prelude = capped_prelude_snapshot(&history, config.prelude_max_bytes);
+                        let prelude = if terminal_allows_raw_history(&terminal).unwrap_or(false) {
+                            capped_prelude_snapshot(&history, config.prelude_max_bytes)
+                        } else {
+                            Vec::new()
+                        };
                         let viewport = render_viewport_snapshot(&terminal).unwrap_or_default();
                         let initial = GhosttyAttachV2Initial {
                             metadata: metadata.clone(),
@@ -1350,6 +1354,10 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
                     HelperCommand::ReloadV2 { reload_id, reply } => {
                         viewport_generation = viewport_generation.saturating_add(1);
                         reload_jobs.retain(|job| job.reload_id != reload_id);
+                        if !terminal_allows_raw_history(&terminal).unwrap_or(false) {
+                            let _ = reply.try_send(GhosttyResponse::ReloadCancelledV2 { reload_id });
+                            continue;
+                        }
                         while reload_jobs.len() >= GHOSTTY_ATTACH_V2_MAX_RELOAD_JOBS {
                             if let Some(job) = reload_jobs.pop_front() {
                                 let _ = job.reply.try_send(GhosttyResponse::ReloadCancelledV2 {
@@ -1626,6 +1634,11 @@ fn sanitize_c1_csi(bytes: &[u8], start: usize) -> usize {
 #[cfg(unix)]
 fn push_viewport_row_prefix(out: &mut Vec<u8>, row_index: u16) {
     out.extend_from_slice(format!("\x1b[{};1H", row_index.saturating_add(1)).as_bytes());
+}
+
+#[cfg(unix)]
+fn terminal_allows_raw_history(terminal: &Terminal<'_, '_>) -> Result<bool> {
+    Ok(!matches!(terminal.active_screen()?, Screen::Alternate))
 }
 
 #[cfg(unix)]
@@ -3167,6 +3180,20 @@ mod tests {
     }
 
     #[test]
+    fn attach_v2_alt_screen_disables_raw_history_replay() -> Result<()> {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 4096,
+        })?;
+
+        assert!(terminal_allows_raw_history(&terminal)?);
+        terminal.vt_write(b"\x1b[?1049hfullscreen");
+        assert!(!terminal_allows_raw_history(&terminal)?);
+        Ok(())
+    }
+
+    #[test]
     fn attach_v2_viewport_rows_use_absolute_positioning() {
         let mut out = Vec::new();
 
@@ -3237,6 +3264,133 @@ mod tests {
                 rows: 40
             })
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn helper_attach_v2_omits_prelude_in_alt_screen() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let registry =
+            GhosttyRegistry::with_roots(temp.path().join("run"), temp.path().join("state"));
+        let paths = registry.paths_for("v2-alt-prelude");
+        let helper = GhosttyHelperConfig::for_test(
+            "v2-alt-prelude",
+            paths.clone(),
+            vec!["/bin/sh".to_owned(), "-l".to_owned()],
+        );
+        let task = spawn_helper_thread(helper);
+        wait_for_socket(&paths.socket_path, Duration::from_secs(2)).await?;
+
+        let run = GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .run(
+                None,
+                vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "printf '\\033[?1049hfullscreen-alt\\n'".to_owned(),
+                ],
+            )
+            .await?;
+        assert_eq!(run.code, 0);
+
+        let attach = GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .attach_v2(
+                80,
+                24,
+                portl_proto::session_v1::AttachV2Config {
+                    prelude_max_wait_ms: 200,
+                    prelude_max_bytes: 1024,
+                },
+            )
+            .await?;
+
+        assert!(
+            attach.prelude.is_empty(),
+            "alternate-screen attaches must not replay raw history as prelude: {:?}",
+            String::from_utf8_lossy(&attach.prelude)
+        );
+        assert!(
+            String::from_utf8_lossy(&attach.viewport).contains("fullscreen-alt"),
+            "viewport should still restore alternate-screen content: {:?}",
+            String::from_utf8_lossy(&attach.viewport)
+        );
+
+        GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .kill()
+            .await?;
+        task.join()
+            .expect("helper thread")
+            .context("helper result")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn helper_attach_v2_reload_cancels_raw_history_in_alt_screen() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let registry =
+            GhosttyRegistry::with_roots(temp.path().join("run"), temp.path().join("state"));
+        let paths = registry.paths_for("v2-alt-reload");
+        let helper = GhosttyHelperConfig::for_test(
+            "v2-alt-reload",
+            paths.clone(),
+            vec!["/bin/sh".to_owned(), "-l".to_owned()],
+        );
+        let task = spawn_helper_thread(helper);
+        wait_for_socket(&paths.socket_path, Duration::from_secs(2)).await?;
+
+        let run = GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .run(
+                None,
+                vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "printf '\\033[?1049hfullscreen-alt-reload\\n'".to_owned(),
+                ],
+            )
+            .await?;
+        assert_eq!(run.code, 0);
+
+        let mut attach = GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .attach_v2(
+                80,
+                24,
+                portl_proto::session_v1::AttachV2Config {
+                    prelude_max_wait_ms: 200,
+                    prelude_max_bytes: 0,
+                },
+            )
+            .await?;
+        attach.reload(17).await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .context("timed out waiting for alt-screen reload cancellation")?;
+            match tokio::time::timeout(remaining, attach.next_response())
+                .await
+                .context("wait for alt-screen reload cancellation")??
+            {
+                Some(GhosttyResponse::ReloadCancelledV2 { reload_id: 17 }) => break,
+                Some(GhosttyResponse::ReloadChunkV2 { .. }) => {
+                    bail!("alternate-screen reload must not stream raw history chunks")
+                }
+                Some(_) => {}
+                None => bail!("ghostty attach v2 stream closed"),
+            }
+        }
+
+        GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .kill()
+            .await?;
+        task.join()
+            .expect("helper thread")
+            .context("helper result")?;
         Ok(())
     }
 
