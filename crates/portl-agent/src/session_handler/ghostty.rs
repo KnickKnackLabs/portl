@@ -1306,12 +1306,27 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
                             events: event_tx,
                             resync_pending: false,
                         });
-                        let prelude = if terminal_allows_raw_history(&terminal).unwrap_or(false) {
+                        let raw_history_allowed = terminal_allows_raw_history(&terminal).unwrap_or(false);
+                        let prelude = if raw_history_allowed {
                             capped_prelude_snapshot(&history, config.prelude_max_bytes)
                         } else {
                             Vec::new()
                         };
+                        let render_started = Instant::now();
                         let viewport = render_viewport_snapshot(&terminal).unwrap_or_default();
+                        tracing::trace!(
+                            lane = "viewport",
+                            reason = "initial_attach",
+                            generation = viewport_generation,
+                            covers_live_seq = live_seq,
+                            cols,
+                            rows,
+                            prelude_bytes = prelude.len(),
+                            viewport_bytes = viewport.len(),
+                            raw_history_allowed,
+                            render_ms = render_started.elapsed().as_millis(),
+                            "render ghostty attach v2 initial viewport"
+                        );
                         let initial = GhosttyAttachV2Initial {
                             metadata: metadata.clone(),
                             prelude,
@@ -1341,7 +1356,20 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
                     }
                     HelperCommand::ViewportV2 { resize_id, reply } => {
                         viewport_generation = viewport_generation.saturating_add(1);
+                        let render_started = Instant::now();
                         let bytes = render_viewport_snapshot(&terminal).unwrap_or_default();
+                        tracing::trace!(
+                            lane = "viewport",
+                            reason = "request",
+                            generation = viewport_generation,
+                            covers_live_seq = live_seq,
+                            cols = metadata.cols,
+                            rows = metadata.rows,
+                            resize_id,
+                            viewport_bytes = bytes.len(),
+                            render_ms = render_started.elapsed().as_millis(),
+                            "render ghostty attach v2 requested viewport"
+                        );
                         let _ = reply.send(GhosttyViewportV2 {
                             generation: viewport_generation,
                             covers_live_seq: live_seq,
@@ -1355,6 +1383,7 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
                         viewport_generation = viewport_generation.saturating_add(1);
                         reload_jobs.retain(|job| job.reload_id != reload_id);
                         if !terminal_allows_raw_history(&terminal).unwrap_or(false) {
+                            tracing::trace!(reload_id, "cancel ghostty attach v2 raw reload in alternate screen");
                             let _ = reply.try_send(GhosttyResponse::ReloadCancelledV2 { reload_id });
                             continue;
                         }
@@ -1367,6 +1396,15 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
                         }
                         let (reload_start_abs, reload_len, reload_truncated) =
                             bounded_reload_window(history_start_abs, history.len());
+                        tracing::trace!(
+                            reload_id,
+                            reload_start_abs,
+                            reload_len,
+                            reload_truncated,
+                            history_start_abs,
+                            history_len = history.len(),
+                            "start ghostty attach v2 raw reload"
+                        );
                         reload_jobs.push_back(GhosttyReloadJob::new(
                             reload_id,
                             reload_start_abs,
@@ -1449,6 +1487,18 @@ fn process_output(
     terminal.vt_write(bytes);
     let dropped = append_bounded(history, bytes);
     *history_start_abs = history_start_abs.saturating_add(dropped as u64);
+    tracing::trace!(
+        lane = "live",
+        bytes = bytes.len(),
+        start_seq,
+        end_seq,
+        dropped,
+        history_start_abs = *history_start_abs,
+        history_len = history.len(),
+        subscribers = subscribers.len(),
+        v2_subscribers = v2_subscribers.len(),
+        "process ghostty pty output"
+    );
     broadcast(subscribers, bytes);
     broadcast_v2(
         v2_subscribers,
@@ -2221,13 +2271,8 @@ async fn forward_helper_input(
     bytes: Vec<u8>,
     stream: &mut UnixStream,
 ) -> Result<()> {
-    forward_helper_command_with_resync(
-        tx,
-        HelperCommand::Input(bytes),
-        stream,
-        "input_queue_full",
-    )
-    .await
+    forward_helper_command_with_resync(tx, HelperCommand::Input(bytes), stream, "input_queue_full")
+        .await
 }
 
 #[cfg(unix)]
@@ -2732,7 +2777,15 @@ async fn handle_attach_v2_response(
                 payload: AttachV2Payload::encode_auto(&bytes)?,
             };
             match live_tx.try_send(frame) {
-                Ok(()) => {}
+                Ok(()) => {
+                    tracing::trace!(
+                        lane = "live",
+                        start_seq,
+                        end_seq,
+                        bytes = bytes.len(),
+                        "queue attach v2 live output"
+                    );
+                }
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     crate::metrics::record_ghostty_event("attach_v2_live_queue_full");
                     if !*resync_pending {
@@ -2761,6 +2814,16 @@ async fn handle_attach_v2_response(
             bytes,
         } => {
             *resync_pending = false;
+            tracing::trace!(
+                lane = "viewport",
+                generation,
+                covers_live_seq,
+                cols,
+                rows,
+                resize_id,
+                bytes = bytes.len(),
+                "queue attach v2 viewport snapshot"
+            );
             viewport_tx.send_replace(Some(Frame::ViewportSnapshot {
                 attach_id: attach.attach_id,
                 generation,
@@ -2789,6 +2852,14 @@ async fn handle_attach_v2_response(
             progress,
             bytes,
         } => {
+            tracing::trace!(
+                lane = "history",
+                reload_id,
+                seq,
+                bytes = bytes.len(),
+                complete = progress.complete,
+                "queue attach v2 reload chunk"
+            );
             match history_tx.try_send(Frame::ReloadChunk {
                 attach_id: attach.attach_id,
                 reload_id,
@@ -3249,11 +3320,15 @@ mod tests {
         let snapshot = render_viewport_snapshot(&terminal)?;
 
         assert!(
-            snapshot.windows(b"\x1b[?25l".len()).any(|w| w == b"\x1b[?25l"),
+            snapshot
+                .windows(b"\x1b[?25l".len())
+                .any(|w| w == b"\x1b[?25l"),
             "snapshot should hide cursor during repaint: {snapshot:?}"
         );
         assert!(
-            snapshot.windows(b"\x1b[?7l".len()).any(|w| w == b"\x1b[?7l"),
+            snapshot
+                .windows(b"\x1b[?7l".len())
+                .any(|w| w == b"\x1b[?7l"),
             "snapshot should disable autowrap during repaint: {snapshot:?}"
         );
         assert!(
@@ -3261,7 +3336,9 @@ mod tests {
             "snapshot should clear each row to EOL: {snapshot:?}"
         );
         assert!(
-            snapshot.windows(b"\x1b[?7h".len()).any(|w| w == b"\x1b[?7h"),
+            snapshot
+                .windows(b"\x1b[?7h".len())
+                .any(|w| w == b"\x1b[?7h"),
             "snapshot should restore autowrap after repaint: {snapshot:?}"
         );
         assert!(!snapshot.windows(b"\r\n".len()).any(|w| w == b"\r\n"));
@@ -3297,7 +3374,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn helper_v2_input_queue_full_reports_resync_and_applies_bounded_backpressure() -> Result<()> {
+    async fn helper_v2_input_queue_full_reports_resync_and_applies_bounded_backpressure()
+    -> Result<()> {
         let (tx, mut rx) = mpsc::channel(1);
         tx.try_send(HelperCommand::Input(b"held".to_vec()))?;
         let (mut server, mut client) = UnixStream::pair()?;
@@ -3325,15 +3403,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn helper_v2_resize_queue_full_reports_resync_and_applies_bounded_backpressure() -> Result<()> {
+    async fn helper_v2_resize_queue_full_reports_resync_and_applies_bounded_backpressure()
+    -> Result<()> {
         let (tx, mut rx) = mpsc::channel(1);
         tx.try_send(HelperCommand::Input(b"held".to_vec()))?;
         let (mut server, mut client) = UnixStream::pair()?;
 
         let tx_task = tx.clone();
-        let mut forward = tokio::spawn(async move {
-            forward_helper_resize(&tx_task, 100, 40, &mut server).await
-        });
+        let mut forward =
+            tokio::spawn(
+                async move { forward_helper_resize(&tx_task, 100, 40, &mut server).await },
+            );
         let response = read_frame::<GhosttyResponse>(&mut client).await?;
 
         assert!(matches!(

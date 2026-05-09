@@ -5,6 +5,18 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Fixed
+
+- Remote Ghostty attaches no longer synthesize a redundant resize epoch on
+  connect, so the initial viewport is not rejected before it can replace bounded
+  prelude output.
+- Ghostty attach v2 now suppresses raw prelude/reload history while fullscreen
+  alternate-screen TUIs are active, preventing long repaint logs from appearing
+  as duplicated scrollback.
+- Ghostty attach v2 now ignores non-final viewport snapshots during reload,
+  keeps helper queue pressure bounded, and renders viewport snapshots with safer
+  non-wrapping terminal transactions and stricter replay sanitization.
+
 ## 0.8.11 — 2026-05-08
 
 ### Changed

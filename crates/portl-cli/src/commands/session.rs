@@ -3366,6 +3366,16 @@ async fn run_remote_attach_v2_once(
                         clear_reload_after_viewport(&reload_state);
                         match payload.decode(ATTACH_V2_MAX_DECODED_PAYLOAD) {
                             Ok(bytes) => {
+                                trace!(
+                                    lane = "viewport",
+                                    generation,
+                                    covers_live_seq,
+                                    resize_id,
+                                    cols,
+                                    rows,
+                                    bytes = bytes.len(),
+                                    "render attach v2 viewport snapshot"
+                                );
                                 if let Err(err) = display.write_output(AttachOutputStream::Stdout, &bytes).await {
                                     break AttachEnd::Disconnected(err);
                                 }
@@ -3409,6 +3419,7 @@ async fn run_remote_attach_v2_once(
                         if opening_state.should_render_prelude() {
                             match payload.decode(ATTACH_V2_MAX_DECODED_PAYLOAD) {
                                 Ok(bytes) => {
+                                    trace!(lane = "history", frame = "prelude", bytes = bytes.len(), "render attach v2 prelude");
                                     if let Err(err) = display.write_output(AttachOutputStream::Stdout, &bytes).await {
                                         break AttachEnd::Disconnected(err);
                                     }
@@ -3433,6 +3444,7 @@ async fn run_remote_attach_v2_once(
                             let _ = display.set_bar(text).await;
                             match payload.decode(ATTACH_V2_MAX_DECODED_PAYLOAD) {
                                 Ok(bytes) => {
+                                    trace!(lane = "history", frame = "reload_chunk", reload_id, bytes = bytes.len(), complete = progress.complete, "render attach v2 reload chunk");
                                     if let Err(err) = display.write_output(AttachOutputStream::Stdout, &bytes).await {
                                         break AttachEnd::Disconnected(err);
                                     }
@@ -3466,7 +3478,17 @@ async fn run_remote_attach_v2_once(
                             Ok(bytes) => {
                                 let skip = usize::try_from(covered_live_seq.saturating_sub(start_seq))
                                     .unwrap_or(usize::MAX);
-                                let bytes = &bytes[skip.min(bytes.len())..];
+                                let skipped = skip.min(bytes.len());
+                                let bytes = &bytes[skipped..];
+                                trace!(
+                                    lane = "live",
+                                    start_seq,
+                                    end_seq,
+                                    covered_live_seq,
+                                    skipped,
+                                    bytes = bytes.len(),
+                                    "render attach v2 live output"
+                                );
                                 covered_live_seq = end_seq;
                                 if let Err(err) = display.write_output(AttachOutputStream::Stdout, bytes).await {
                                     break AttachEnd::Disconnected(err);
@@ -5245,6 +5267,16 @@ struct AttachInputSink {
     kind: AttachInputSinkKind,
 }
 
+fn attach_v2_input_trace_class(bytes: &[u8]) -> &'static str {
+    if bytes.is_empty() {
+        "empty"
+    } else if bytes == b"\x0f" {
+        "ctrl_o"
+    } else {
+        "data"
+    }
+}
+
 impl AttachInputSink {
     fn has_active_reload(&self) -> bool {
         matches!(
@@ -5266,6 +5298,12 @@ impl AttachInputSink {
                 reload_state,
                 ..
             } => {
+                trace!(
+                    lane = "input",
+                    input_class = attach_v2_input_trace_class(bytes),
+                    bytes = bytes.len(),
+                    "forward attach v2 stdin"
+                );
                 if bytes == b"\x1b"
                     && let Some(reload_id) = cancellable_reload_id(reload_state)
                 {
@@ -6153,6 +6191,13 @@ mod tests {
             effective_provider_from_env(Some("default"), Some("tmux")).as_deref(),
             Some("ghostty")
         );
+    }
+
+    #[test]
+    fn attach_v2_input_trace_class_identifies_ctrl_o() {
+        assert_eq!(attach_v2_input_trace_class(b"\x0f"), "ctrl_o");
+        assert_eq!(attach_v2_input_trace_class(b"abc"), "data");
+        assert_eq!(attach_v2_input_trace_class(b""), "empty");
     }
 
     #[test]
