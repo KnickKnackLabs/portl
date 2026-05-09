@@ -2158,12 +2158,29 @@ async fn handle_client(mut stream: UnixStream, tx: mpsc::Sender<HelperCommand>) 
 }
 
 #[cfg(unix)]
-fn queue_helper_command_when_ready(tx: mpsc::Sender<HelperCommand>, command: HelperCommand) {
-    tokio::spawn(async move {
-        if tx.send(command).await.is_err() {
-            tracing::debug!("ghostty helper stopped before queued command could be forwarded");
+async fn forward_helper_command_with_resync(
+    tx: &mpsc::Sender<HelperCommand>,
+    command: HelperCommand,
+    stream: &mut UnixStream,
+    reason: &'static str,
+) -> Result<()> {
+    match tx.try_send(command) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(command)) => {
+            write_frame(
+                stream,
+                &GhosttyResponse::ResyncRequiredV2 {
+                    reason: reason.to_owned(),
+                    from_seq: 0,
+                },
+            )
+            .await?;
+            tx.send(command)
+                .await
+                .map_err(|_| anyhow!("ghostty helper stopped"))
         }
-    });
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(anyhow!("ghostty helper stopped")),
+    }
 }
 
 #[cfg(unix)]
@@ -2172,21 +2189,13 @@ async fn forward_helper_input(
     bytes: Vec<u8>,
     stream: &mut UnixStream,
 ) -> Result<()> {
-    match tx.try_send(HelperCommand::Input(bytes)) {
-        Ok(()) => Ok(()),
-        Err(mpsc::error::TrySendError::Full(command)) => {
-            queue_helper_command_when_ready(tx.clone(), command);
-            write_frame(
-                stream,
-                &GhosttyResponse::ResyncRequiredV2 {
-                    reason: "input_queue_full".to_owned(),
-                    from_seq: 0,
-                },
-            )
-            .await
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => Err(anyhow!("ghostty helper stopped")),
-    }
+    forward_helper_command_with_resync(
+        tx,
+        HelperCommand::Input(bytes),
+        stream,
+        "input_queue_full",
+    )
+    .await
 }
 
 #[cfg(unix)]
@@ -2196,21 +2205,13 @@ async fn forward_helper_resize(
     rows: u16,
     stream: &mut UnixStream,
 ) -> Result<()> {
-    match tx.try_send(HelperCommand::Resize { cols, rows }) {
-        Ok(()) => Ok(()),
-        Err(mpsc::error::TrySendError::Full(command)) => {
-            queue_helper_command_when_ready(tx.clone(), command);
-            write_frame(
-                stream,
-                &GhosttyResponse::ResyncRequiredV2 {
-                    reason: "resize_queue_full".to_owned(),
-                    from_seq: 0,
-                },
-            )
-            .await
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => Err(anyhow!("ghostty helper stopped")),
-    }
+    forward_helper_command_with_resync(
+        tx,
+        HelperCommand::Resize { cols, rows },
+        stream,
+        "resize_queue_full",
+    )
+    .await
 }
 
 #[cfg(unix)]
@@ -3225,37 +3226,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn helper_v2_input_queue_full_reports_resync_not_error() -> Result<()> {
+    async fn helper_v2_input_queue_full_reports_resync_and_applies_bounded_backpressure() -> Result<()> {
         let (tx, mut rx) = mpsc::channel(1);
         tx.try_send(HelperCommand::Input(b"held".to_vec()))?;
         let (mut server, mut client) = UnixStream::pair()?;
 
-        forward_helper_input(&tx, b"queued".to_vec(), &mut server).await?;
+        let tx_task = tx.clone();
+        let mut forward = tokio::spawn(async move {
+            forward_helper_input(&tx_task, b"queued".to_vec(), &mut server).await
+        });
         let response = read_frame::<GhosttyResponse>(&mut client).await?;
 
         assert!(matches!(
             response,
             Some(GhosttyResponse::ResyncRequiredV2 { reason, .. }) if reason == "input_queue_full"
         ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut forward)
+                .await
+                .is_err(),
+            "queue-full forwarding must apply bounded backpressure instead of spawning an unbounded waiter"
+        );
         assert!(matches!(rx.recv().await, Some(HelperCommand::Input(bytes)) if bytes == b"held"));
+        tokio::time::timeout(Duration::from_secs(1), &mut forward).await???;
         assert!(matches!(rx.recv().await, Some(HelperCommand::Input(bytes)) if bytes == b"queued"));
         Ok(())
     }
 
     #[tokio::test]
-    async fn helper_v2_resize_queue_full_reports_resync_and_queues_resize() -> Result<()> {
+    async fn helper_v2_resize_queue_full_reports_resync_and_applies_bounded_backpressure() -> Result<()> {
         let (tx, mut rx) = mpsc::channel(1);
         tx.try_send(HelperCommand::Input(b"held".to_vec()))?;
         let (mut server, mut client) = UnixStream::pair()?;
 
-        forward_helper_resize(&tx, 100, 40, &mut server).await?;
+        let tx_task = tx.clone();
+        let mut forward = tokio::spawn(async move {
+            forward_helper_resize(&tx_task, 100, 40, &mut server).await
+        });
         let response = read_frame::<GhosttyResponse>(&mut client).await?;
 
         assert!(matches!(
             response,
             Some(GhosttyResponse::ResyncRequiredV2 { reason, .. }) if reason == "resize_queue_full"
         ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut forward)
+                .await
+                .is_err(),
+            "queue-full resize forwarding must apply bounded backpressure instead of spawning an unbounded waiter"
+        );
         assert!(matches!(rx.recv().await, Some(HelperCommand::Input(bytes)) if bytes == b"held"));
+        tokio::time::timeout(Duration::from_secs(1), &mut forward).await???;
         let resize = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await?;
         assert!(matches!(
             resize,
