@@ -1592,6 +1592,18 @@ fn sanitize_terminal_replay(bytes: &[u8]) -> Vec<u8> {
             }
             continue;
         }
+        if byte == 0x1b {
+            index = sanitize_plain_escape(bytes, index);
+            continue;
+        }
+        if byte < 0x20 && !matches!(byte, b'\n' | b'\r' | b'\t') {
+            index += 1;
+            continue;
+        }
+        if (0x80..=0x9f).contains(&byte) {
+            index += 1;
+            continue;
+        }
         out.push(byte);
         index += 1;
     }
@@ -1632,6 +1644,25 @@ fn sanitize_c1_csi(bytes: &[u8], start: usize) -> usize {
 }
 
 #[cfg(unix)]
+fn sanitize_plain_escape(bytes: &[u8], start: usize) -> usize {
+    let mut index = start.saturating_add(1);
+    if index >= bytes.len() {
+        return bytes.len();
+    }
+    if (0x20..=0x2f).contains(&bytes[index]) {
+        index = index.saturating_add(1);
+        while index < bytes.len() && (0x20..=0x2f).contains(&bytes[index]) {
+            index = index.saturating_add(1);
+        }
+        if index < bytes.len() && (0x30..=0x7e).contains(&bytes[index]) {
+            return index.saturating_add(1);
+        }
+        return index;
+    }
+    index.saturating_add(1).min(bytes.len())
+}
+
+#[cfg(unix)]
 fn push_viewport_row_prefix(out: &mut Vec<u8>, row_index: u16) {
     out.extend_from_slice(format!("\x1b[{};1H", row_index.saturating_add(1)).as_bytes());
 }
@@ -1656,7 +1687,7 @@ fn render_viewport_snapshot(terminal: &Terminal<'_, '_>) -> Result<Vec<u8>> {
     } else {
         out.extend_from_slice(b"\x1b[?1049l");
     }
-    out.extend_from_slice(b"\x1b[0m\x1b[2J\x1b[H");
+    out.extend_from_slice(b"\x1b[?25l\x1b[?7l\x1b[0m\x1b[2J\x1b[H");
     let mut rows_iter = row_iter.update(&snapshot).context("iterate ghostty rows")?;
     let mut row_index = 0_u16;
     let mut styled_active = false;
@@ -1684,12 +1715,13 @@ fn render_viewport_snapshot(terminal: &Terminal<'_, '_>) -> Result<Vec<u8>> {
                 }
             }
         }
+        out.extend_from_slice(b"\x1b[K");
         row_index = row_index.saturating_add(1);
         if row_index >= rows {
             break;
         }
     }
-    out.extend_from_slice(b"\x1b[0m");
+    out.extend_from_slice(b"\x1b[0m\x1b[?7h");
     if let Some(cursor) = snapshot.cursor_viewport().context("read ghostty cursor")? {
         out.extend_from_slice(
             format!(
@@ -3206,6 +3238,37 @@ mod tests {
     }
 
     #[test]
+    fn attach_v2_viewport_snapshot_disables_wrap_and_clears_rows() -> Result<()> {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 3,
+            rows: 2,
+            max_scrollback: 4096,
+        })?;
+        terminal.vt_write(b"abcde");
+
+        let snapshot = render_viewport_snapshot(&terminal)?;
+
+        assert!(
+            snapshot.windows(b"\x1b[?25l".len()).any(|w| w == b"\x1b[?25l"),
+            "snapshot should hide cursor during repaint: {snapshot:?}"
+        );
+        assert!(
+            snapshot.windows(b"\x1b[?7l".len()).any(|w| w == b"\x1b[?7l"),
+            "snapshot should disable autowrap during repaint: {snapshot:?}"
+        );
+        assert!(
+            snapshot.windows(b"\x1b[K".len()).any(|w| w == b"\x1b[K"),
+            "snapshot should clear each row to EOL: {snapshot:?}"
+        );
+        assert!(
+            snapshot.windows(b"\x1b[?7h".len()).any(|w| w == b"\x1b[?7h"),
+            "snapshot should restore autowrap after repaint: {snapshot:?}"
+        );
+        assert!(!snapshot.windows(b"\r\n".len()).any(|w| w == b"\r\n"));
+        Ok(())
+    }
+
+    #[test]
     fn attach_v2_terminal_replay_strips_unsafe_csi_but_keeps_sgr() {
         assert_eq!(
             sanitize_terminal_replay(b"a\x1b[?1049hb\x1b[2Jc\x1b[31mred\x1b[0m"),
@@ -3222,6 +3285,14 @@ mod tests {
         assert_eq!(
             sanitize_terminal_replay(b"before\x1bPprivate\x1b\\after"),
             b"beforeafter"
+        );
+    }
+
+    #[test]
+    fn attach_v2_terminal_replay_strips_plain_esc_sequences() {
+        assert_eq!(
+            sanitize_terminal_replay(b"a\x1bcb\x1b7c\x1b8d\x1b(Be\x1b=f\x1b>g"),
+            b"abcdefg"
         );
     }
 
