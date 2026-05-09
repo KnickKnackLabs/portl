@@ -5,6 +5,8 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.8.12 — 2026-05-09
+
 ### Fixed
 
 - Remote Ghostty attaches no longer synthesize a redundant resize epoch on
