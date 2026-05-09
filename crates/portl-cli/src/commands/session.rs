@@ -3358,52 +3358,66 @@ async fn run_remote_attach_v2_once(
             }
             frame = read_attach_v2_frame(&mut viewport), if data_streams.viewport_open() => {
                 match frame {
-                    Ok(Some(AttachV2ServerFrame::ViewportSnapshot { attach_id: frame_attach_id, generation, covers_live_seq, cols, rows, resize_id, payload, .. })) if frame_attach_id == attach_id && generation > last_viewport_generation && attach_v2_viewport_matches_resize_state(resize_id, cols, rows, current_resize_state(&resize_state)) && reload_allows_viewport_render(&reload_state) => {
-                        last_viewport_generation = generation;
-                        covered_live_seq = covered_live_seq.max(covers_live_seq);
-                        resync_pending = false;
-                        opening_state.mark_viewport_seen();
-                        clear_reload_after_viewport(&reload_state);
-                        match payload.decode(ATTACH_V2_MAX_DECODED_PAYLOAD) {
-                            Ok(bytes) => {
-                                trace!(
-                                    lane = "viewport",
+                    Ok(Some(AttachV2ServerFrame::ViewportSnapshot { attach_id: frame_attach_id, generation, covers_live_seq, cols, rows, resize_id, payload, .. })) if frame_attach_id == attach_id => {
+                        match attach_v2_viewport_decision(
+                            generation,
+                            last_viewport_generation,
+                            resize_id,
+                            cols,
+                            rows,
+                            current_resize_state(&resize_state),
+                            reload_state.lock().map_or(AttachV2ReloadState::Idle, |state| *state),
+                        ) {
+                            AttachV2ViewportDecision::Render => {
+                                last_viewport_generation = generation;
+                                covered_live_seq = covered_live_seq.max(covers_live_seq);
+                                resync_pending = false;
+                                opening_state.mark_viewport_seen();
+                                clear_reload_after_viewport(&reload_state);
+                                match payload.decode(ATTACH_V2_MAX_DECODED_PAYLOAD) {
+                                    Ok(bytes) => {
+                                        trace!(
+                                            lane = "viewport",
+                                            generation,
+                                            covers_live_seq,
+                                            resize_id,
+                                            cols,
+                                            rows,
+                                            bytes = bytes.len(),
+                                            "render attach v2 viewport snapshot"
+                                        );
+                                        if let Err(err) = display.write_output(AttachOutputStream::Stdout, &bytes).await {
+                                            break AttachEnd::Disconnected(err);
+                                        }
+                                        let _ = display.clear_bar().await;
+                                    }
+                                    Err(err) => break AttachEnd::Disconnected(err),
+                                }
+                            }
+                            AttachV2ViewportDecision::DeferForReload => {
+                                debug!(
                                     generation,
-                                    covers_live_seq,
                                     resize_id,
                                     cols,
                                     rows,
-                                    bytes = bytes.len(),
-                                    "render attach v2 viewport snapshot"
+                                    reload_state = ?reload_state.lock().map(|state| *state).ok(),
+                                    "ignored attach v2 viewport snapshot while reload is loading"
                                 );
-                                if let Err(err) = display.write_output(AttachOutputStream::Stdout, &bytes).await {
-                                    break AttachEnd::Disconnected(err);
-                                }
-                                let _ = display.clear_bar().await;
                             }
-                            Err(err) => break AttachEnd::Disconnected(err),
+                            AttachV2ViewportDecision::Stale => {
+                                if generation > last_viewport_generation {
+                                    opening_state.mark_viewport_barrier_seen();
+                                    debug!(
+                                        generation,
+                                        resize_id,
+                                        cols,
+                                        rows,
+                                        current_resize = ?current_resize_state(&resize_state),
+                                        "ignored stale attach v2 viewport snapshot"
+                                    );
+                                }
+                            }
                         }
-                    }
-                    Ok(Some(AttachV2ServerFrame::ViewportSnapshot { attach_id: frame_attach_id, generation, cols, rows, resize_id, .. })) if frame_attach_id == attach_id && generation > last_viewport_generation && attach_v2_viewport_matches_resize_state(resize_id, cols, rows, current_resize_state(&resize_state)) => {
-                        debug!(
-                            generation,
-                            resize_id,
-                            cols,
-                            rows,
-                            reload_state = ?reload_state.lock().map(|state| *state).ok(),
-                            "ignored attach v2 viewport snapshot while reload is loading"
-                        );
-                    }
-                    Ok(Some(AttachV2ServerFrame::ViewportSnapshot { attach_id: frame_attach_id, generation, cols, rows, resize_id, .. })) if frame_attach_id == attach_id && generation > last_viewport_generation => {
-                        opening_state.mark_viewport_barrier_seen();
-                        debug!(
-                            generation,
-                            resize_id,
-                            cols,
-                            rows,
-                            current_resize = ?current_resize_state(&resize_state),
-                            "ignored stale attach v2 viewport snapshot"
-                        );
                     }
                     Ok(Some(_)) => {}
                     Ok(None) => {
@@ -3573,12 +3587,6 @@ fn clear_reload_after_viewport(reload_state: &Arc<StdMutex<AttachV2ReloadState>>
         .is_ok_and(|mut state| state.clear_after_viewport())
 }
 
-fn reload_allows_viewport_render(reload_state: &Arc<StdMutex<AttachV2ReloadState>>) -> bool {
-    reload_state
-        .lock()
-        .map_or(true, |state| state.allows_viewport_render())
-}
-
 #[derive(Debug, Default)]
 struct AttachV2OpeningState {
     viewport_seen: bool,
@@ -3649,6 +3657,8 @@ impl AttachV2ReloadState {
             Self::Loading { reload_id: active } | Self::AwaitingViewport { reload_id: active }
                 if *active == reload_id =>
             {
+                // The agent always follows ReloadCancelled with a viewport request;
+                // keep live output suppressed until that final barrier is applied.
                 *self = Self::AwaitingViewport { reload_id };
                 true
             }
@@ -3749,6 +3759,33 @@ fn attach_v2_viewport_matches_resize_state(
     current: AttachV2ResizeState,
 ) -> bool {
     resize_id == current.resize_id && cols == current.cols && rows == current.rows
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachV2ViewportDecision {
+    Render,
+    DeferForReload,
+    Stale,
+}
+
+fn attach_v2_viewport_decision(
+    generation: u64,
+    last_viewport_generation: u64,
+    resize_id: u64,
+    cols: u16,
+    rows: u16,
+    current_resize: AttachV2ResizeState,
+    reload_state: AttachV2ReloadState,
+) -> AttachV2ViewportDecision {
+    if generation <= last_viewport_generation
+        || !attach_v2_viewport_matches_resize_state(resize_id, cols, rows, current_resize)
+    {
+        return AttachV2ViewportDecision::Stale;
+    }
+    if !reload_state.allows_viewport_render() {
+        return AttachV2ViewportDecision::DeferForReload;
+    }
+    AttachV2ViewportDecision::Render
 }
 
 fn attach_v2_frame_matches(frame: &AttachV2ServerFrame, attach_id: [u8; 16]) -> bool {
@@ -6057,6 +6094,34 @@ mod tests {
             2, 100, 40, current
         ));
         assert!(!attach_v2_viewport_matches_resize_state(3, 80, 40, current));
+    }
+
+    #[test]
+    fn attach_v2_viewport_decision_covers_resize_and_reload_state() {
+        let current = AttachV2ResizeState {
+            resize_id: 2,
+            cols: 80,
+            rows: 40,
+        };
+        let mut reload = AttachV2ReloadState::default();
+
+        assert_eq!(
+            attach_v2_viewport_decision(3, 2, 2, 80, 40, current, reload),
+            AttachV2ViewportDecision::Render
+        );
+        assert_eq!(
+            attach_v2_viewport_decision(2, 2, 2, 80, 40, current, reload),
+            AttachV2ViewportDecision::Stale
+        );
+        assert_eq!(
+            attach_v2_viewport_decision(3, 2, 1, 80, 40, current, reload),
+            AttachV2ViewportDecision::Stale
+        );
+        reload.start(9);
+        assert_eq!(
+            attach_v2_viewport_decision(3, 2, 2, 80, 40, current, reload),
+            AttachV2ViewportDecision::DeferForReload
+        );
     }
 
     #[cfg(unix)]

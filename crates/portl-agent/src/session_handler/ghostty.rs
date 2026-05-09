@@ -1380,13 +1380,13 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
                         });
                     }
                     HelperCommand::ReloadV2 { reload_id, reply } => {
-                        viewport_generation = viewport_generation.saturating_add(1);
                         reload_jobs.retain(|job| job.reload_id != reload_id);
                         if !terminal_allows_raw_history(&terminal).unwrap_or(false) {
                             tracing::trace!(reload_id, "cancel ghostty attach v2 raw reload in alternate screen");
                             let _ = reply.try_send(GhosttyResponse::ReloadCancelledV2 { reload_id });
                             continue;
                         }
+                        viewport_generation = viewport_generation.saturating_add(1);
                         while reload_jobs.len() >= GHOSTTY_ATTACH_V2_MAX_RELOAD_JOBS {
                             if let Some(job) = reload_jobs.pop_front() {
                                 let _ = job.reply.try_send(GhosttyResponse::ReloadCancelledV2 {
@@ -1764,6 +1764,10 @@ fn render_viewport_snapshot(terminal: &Terminal<'_, '_>) -> Result<Vec<u8>> {
                     out.extend_from_slice(grapheme.encode_utf8(&mut buf).as_bytes());
                 }
             }
+        }
+        if styled_active {
+            out.extend_from_slice(b"\x1b[0m");
+            styled_active = false;
         }
         out.extend_from_slice(b"\x1b[K");
         row_index = row_index.saturating_add(1);
@@ -3189,11 +3193,8 @@ mod tests {
         let registry =
             GhosttyRegistry::with_roots(temp.path().join("run"), temp.path().join("state"));
         let paths = registry.paths_for("dev");
-        let helper = GhosttyHelperConfig::for_test(
-            "dev",
-            paths.clone(),
-            vec!["/bin/sh".to_owned(), "-l".to_owned()],
-        );
+        let helper =
+            GhosttyHelperConfig::for_test("dev", paths.clone(), vec!["/bin/sh".to_owned()]);
         let task = spawn_helper_thread(helper);
         wait_for_socket(&paths.socket_path, Duration::from_secs(2)).await?;
 
@@ -3234,11 +3235,8 @@ mod tests {
         let registry =
             GhosttyRegistry::with_roots(temp.path().join("run"), temp.path().join("state"));
         let paths = registry.paths_for("v2-prelude");
-        let helper = GhosttyHelperConfig::for_test(
-            "v2-prelude",
-            paths.clone(),
-            vec!["/bin/sh".to_owned(), "-l".to_owned()],
-        );
+        let helper =
+            GhosttyHelperConfig::for_test("v2-prelude", paths.clone(), vec!["/bin/sh".to_owned()]);
         let task = spawn_helper_thread(helper);
         wait_for_socket(&paths.socket_path, Duration::from_secs(2)).await?;
 
@@ -3346,6 +3344,26 @@ mod tests {
     }
 
     #[test]
+    fn attach_v2_viewport_snapshot_resets_style_before_clearing_rows() -> Result<()> {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 3,
+            rows: 1,
+            max_scrollback: 4096,
+        })?;
+        terminal.vt_write(b"\x1b[44mabc");
+
+        let snapshot = render_viewport_snapshot(&terminal)?;
+
+        assert!(
+            snapshot
+                .windows(b"\x1b[0m\x1b[K".len())
+                .any(|w| w == b"\x1b[0m\x1b[K"),
+            "row clear should not inherit styled cell background: {snapshot:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn attach_v2_terminal_replay_strips_unsafe_csi_but_keeps_sgr() {
         assert_eq!(
             sanitize_terminal_replay(b"a\x1b[?1049hb\x1b[2Jc\x1b[31mred\x1b[0m"),
@@ -3448,7 +3466,7 @@ mod tests {
         let helper = GhosttyHelperConfig::for_test(
             "v2-alt-prelude",
             paths.clone(),
-            vec!["/bin/sh".to_owned(), "-l".to_owned()],
+            vec!["/bin/sh".to_owned()],
         );
         let task = spawn_helper_thread(helper);
         wait_for_socket(&paths.socket_path, Duration::from_secs(2)).await?;
@@ -3508,7 +3526,7 @@ mod tests {
         let helper = GhosttyHelperConfig::for_test(
             "v2-alt-reload",
             paths.clone(),
-            vec!["/bin/sh".to_owned(), "-l".to_owned()],
+            vec!["/bin/sh".to_owned()],
         );
         let task = spawn_helper_thread(helper);
         wait_for_socket(&paths.socket_path, Duration::from_secs(2)).await?;
@@ -3575,7 +3593,7 @@ mod tests {
         let helper = GhosttyHelperConfig::for_test(
             "v2-reload-cancel",
             paths.clone(),
-            vec!["/bin/sh".to_owned(), "-l".to_owned()],
+            vec!["/bin/sh".to_owned()],
         );
         let task = spawn_helper_thread(helper);
         wait_for_socket(&paths.socket_path, Duration::from_secs(2)).await?;
@@ -3704,7 +3722,7 @@ mod tests {
         let helper = GhosttyHelperConfig::for_test(
             "v2-reload-cap",
             paths.clone(),
-            vec!["/bin/sh".to_owned(), "-l".to_owned()],
+            vec!["/bin/sh".to_owned()],
         );
         let task = spawn_helper_thread(helper);
         wait_for_socket(&paths.socket_path, Duration::from_secs(2)).await?;
@@ -3769,11 +3787,8 @@ mod tests {
         let registry =
             GhosttyRegistry::with_roots(temp.path().join("run"), temp.path().join("state"));
         let paths = registry.paths_for("v2-reload");
-        let helper = GhosttyHelperConfig::for_test(
-            "v2-reload",
-            paths.clone(),
-            vec!["/bin/sh".to_owned(), "-l".to_owned()],
-        );
+        let helper =
+            GhosttyHelperConfig::for_test("v2-reload", paths.clone(), vec!["/bin/sh".to_owned()]);
         let task = spawn_helper_thread(helper);
         wait_for_socket(&paths.socket_path, Duration::from_secs(2)).await?;
 
