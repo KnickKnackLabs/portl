@@ -1,7 +1,9 @@
 #![cfg(all(unix, feature = "ghostty-vt"))]
 
+use std::fs;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command};
@@ -14,12 +16,20 @@ use nix::unistd::Pid;
 use nix::unistd::{dup, read, write};
 use tempfile::tempdir;
 
+use iroh_tickets::Ticket;
+use portl_agent::{AgentConfig, DiscoveryConfig, run_task};
+use portl_core::id::Identity;
+use portl_core::ticket::mint::mint_root;
+use portl_core::ticket::schema::{Capabilities, EnvPolicy, PortlTicket, ShellCaps};
+
 const DETACH_KEY: &[u8] = b"\x1c";
 const STANDIN_TUI: &str = "saved=$(stty -g); stty raw -echo; printf 'TUI-BEGIN\\r\\n'; printf '\\033[c\\033[>c\\033[?u'; printf '\\r\\nTUI-READY\\r\\n'; sleep 1; stty \"$saved\"";
 const SYMPTOM2_STANDIN_TUI: &[u8] = b"saved=$(stty -g); stty raw -echo; printf 'SYM2-TUI-BEGIN\\r\\n'; printf '\\033[>1u\\033[?1049h'; printf '\\033[?1049l'; stty \"$saved\"; printf '\\r\\nSYM2-TUI-DONE\\r\\n'\n";
 const DEFENSIVE_KITTY_RESET: &[u8] = b"\x1b[<u\x1b[=0u\x1b[>4;0m";
 const EXTENDED_CLEANUP: &[u8] = b"\x1b[0m\x1b[?1049l\x1b[r\x1b[?7h\x1b[!p\x1b[?25h\x1b[<u\x1b[=0u\x1b[>4;0m\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\r\r\n";
 const EMERGENCY_CLEANUP: &[u8] = b"\x1b[0m\x1b[?1049l\x1b[r\x1b[?7h\x1b[!p\x1b[?25h\x1b[<u\x1b[=0u\x1b[>4;0m\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\r\r\n\x1bc";
+const PANIC_HOOK_EMERGENCY_CLEANUP: &[u8] = b"\x1b[0m\x1b[?1049l\x1b[r\x1b[?7h\x1b[!p\x1b[?25h\x1b[<u\x1b[=0u\x1b[>4;0m\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\r\n\x1bc";
+const REMOTE_TICKET_LABEL: &str = "remote-reconnect";
 
 #[test]
 fn symptom1_startup_queries_do_not_leak_response_payloads() {
@@ -244,7 +254,7 @@ fn symptom3_signals_emit_emergency_cleanup_and_leave_host_usable() {
             "portl status marker missing after {signal:?}:\n{}",
             escaped(&transcript.1)
         );
-        assert_cleanup_before_marker(&transcript.1, b"HOST_AFTER_ATTACH", EMERGENCY_CLEANUP);
+        assert_cleanup_ends_before_marker(&transcript.1, b"HOST_AFTER_ATTACH", EMERGENCY_CLEANUP);
     }
 }
 
@@ -290,7 +300,7 @@ exit 0
         "host shell failed after panic injection: {status}; transcript:\n{}",
         escaped(&transcript)
     );
-    assert_cleanup_before_marker(&transcript, b"HOST_AFTER_ATTACH", EMERGENCY_CLEANUP);
+    assert_panic_cleanup_suffix_exact(&transcript, b"HOST_AFTER_ATTACH");
 }
 
 #[test]
@@ -371,7 +381,7 @@ exit 0
         "host shell failed after reattach: {status}; transcript:\n{}",
         escaped(&transcript)
     );
-    assert_cleanup_before_marker(&transcript, b"HOST_AFTER_FIRST", EMERGENCY_CLEANUP);
+    assert_cleanup_ends_before_marker(&transcript, b"HOST_AFTER_FIRST", EMERGENCY_CLEANUP);
     let second_frame = &transcript[second_start..];
     let clean_idx =
         find_subslice(second_frame, b"REATTACH-PROMPT>").expect("second attach marker exists");
@@ -702,6 +712,141 @@ struct HostCommand {
     rx: mpsc::Receiver<Vec<u8>>,
 }
 
+struct RemoteReconnectAgent {
+    stop: Option<mpsc::Sender<()>>,
+    handle: Option<thread::JoinHandle<()>>,
+    _temp: tempfile::TempDir,
+}
+
+impl Drop for RemoteReconnectAgent {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn start_remote_reconnect_agent(portl: &Path, home: &Path) -> RemoteReconnectAgent {
+    let temp = tempdir().expect("temp remote agent fixture");
+    let provider_path = temp.path().join("zmx");
+    write_remote_reconnect_zmx(&provider_path).expect("write fake remote zmx provider");
+    let agent_home = temp.path().join("agent-home");
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().expect("remote agent runtime");
+        runtime.block_on(async move {
+            if let Err(err) =
+                start_remote_reconnect_agent_async(provider_path, agent_home, stop_rx, ready_tx)
+                    .await
+            {
+                eprintln!("remote reconnect agent fixture failed: {err:#}");
+            }
+        });
+    });
+    let ticket = ready_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("remote agent fixture should report readiness")
+        .expect("remote agent fixture should start");
+    let save_status = Command::new(portl)
+        .env("PORTL_HOME", home)
+        .args(["ticket", "save", REMOTE_TICKET_LABEL, &ticket])
+        .status()
+        .expect("save remote reconnect ticket");
+    assert!(
+        save_status.success(),
+        "saving reconnect ticket failed: {save_status}"
+    );
+    RemoteReconnectAgent {
+        stop: Some(stop_tx),
+        handle: Some(handle),
+        _temp: temp,
+    }
+}
+
+async fn start_remote_reconnect_agent_async(
+    provider_path: std::path::PathBuf,
+    agent_home: std::path::PathBuf,
+    stop_rx: mpsc::Receiver<()>,
+    ready_tx: mpsc::Sender<Result<String, String>>,
+) -> anyhow::Result<()> {
+    let server = portl_core::test_util::endpoint().await?;
+    let operator = Identity::new();
+    let paths = portl_core::paths::for_home(&agent_home);
+    let agent = run_task(AgentConfig {
+        discovery: DiscoveryConfig::in_process(),
+        trust_roots: vec![operator.verifying_key()],
+        peers_path: Some(paths.peers_path()),
+        revocations_path: Some(paths.revocations_path()),
+        endpoint: Some(server.clone()),
+        session_provider_path: Some(provider_path),
+        ..AgentConfig::default()
+    })
+    .await?;
+    let ticket = root_ticket(&operator, server.addr(), shell_caps(true)).serialize();
+    let _ = ready_tx.send(Ok(ticket));
+    tokio::task::spawn_blocking(move || {
+        let _ = stop_rx.recv();
+    })
+    .await?;
+    server.inner().close().await;
+    let join = tokio::time::timeout(Duration::from_secs(5), agent).await?;
+    join??;
+    Ok(())
+}
+
+fn root_ticket(
+    operator: &Identity,
+    addr: iroh_base::EndpointAddr,
+    caps: Capabilities,
+) -> PortlTicket {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("unix time")
+        .as_secs();
+    mint_root(operator.signing_key(), addr, caps, now, now + 300, None).expect("mint root ticket")
+}
+
+fn shell_caps(allow: bool) -> Capabilities {
+    Capabilities {
+        presence: u8::from(allow),
+        shell: allow.then_some(ShellCaps {
+            user_allowlist: None,
+            pty_allowed: true,
+            exec_allowed: true,
+            command_allowlist: None,
+            env_policy: EnvPolicy::Merge { allow: None },
+        }),
+        tcp: None,
+        udp: None,
+        fs: None,
+        vpn: None,
+        meta: None,
+    }
+}
+
+fn write_remote_reconnect_zmx(path: &Path) -> io::Result<()> {
+    fs::write(
+        path,
+        r#"#!/bin/sh
+case "$1" in
+  version) echo "zmx 0.0.reconnect" ;;
+  list) printf 'dev\nfrontend\n' ;;
+  attach) session="$2"; printf 'REMOTE_ATTACH:%s\nOK\n' "$session" ;;
+  kill) echo "killed:$2" ;;
+  *) echo "unknown:$1" >&2; exit 64 ;;
+esac
+"#,
+    )?;
+    let mut perms = fs::metadata(path)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
 fn initialized_portl_home(portl: &Path) -> tempfile::TempDir {
     let home = tempdir().expect("temp portl home");
     let init_status = Command::new(portl)
@@ -779,14 +924,14 @@ exit 0
 fn run_reconnect_fixture(scenario: &str, signal: Option<Signal>) -> Vec<u8> {
     let portl = assert_cmd::cargo::cargo_bin("portl");
     let home = initialized_portl_home(&portl);
-    let session = unique_session("tuistory-symptom3-reconnect");
+    let _agent = start_remote_reconnect_agent(&portl, home.path());
+    let session = "dev".to_owned();
     let host_script = r#"
 set +e
-/bin/sh -c 'printf "ATTACH_PID=%s\n" "$$"; PORTL_TEST_RECONNECT_SCENARIO="$PORTL_RECONNECT_SCENARIO" exec "$PORTL_BIN" attach "$PORTL_SESSION" --provider ghostty -- /bin/sh -c "sleep 30"'
+/bin/sh -c 'printf "ATTACH_PID=%s\n" "$$"; PORTL_TEST_RECONNECT_SCENARIO="$PORTL_RECONNECT_SCENARIO" exec "$PORTL_BIN" attach "$PORTL_SESSION" --target "$PORTL_TARGET_LABEL" --provider zmx'
 status=$?
 printf 'HOST_AFTER_RECONNECT_FIXTURE status=%s\n' "$status"
 printf 'HOST_READY_PROBE\n'
-"$PORTL_BIN" kill "$PORTL_SESSION" --provider ghostty >/dev/null 2>&1 || true
 exit 0
 "#;
     let child = spawn_host_command(
@@ -796,6 +941,7 @@ exit 0
             ("PORTL_BIN", portl.to_str().expect("portl path utf8")),
             ("PORTL_HOME", home.path().to_str().expect("home path utf8")),
             ("PORTL_SESSION", &session),
+            ("PORTL_TARGET_LABEL", REMOTE_TICKET_LABEL),
             ("PORTL_RECONNECT_SCENARIO", scenario),
             ("TERM", "xterm-kitty"),
             ("RUST_LOG", "off"),
@@ -1013,17 +1159,6 @@ fn bytes_between_markers<'a>(bytes: &'a [u8], start: &[u8], end: &[u8]) -> Optio
     Some(&after_start[..end_idx])
 }
 
-fn assert_cleanup_before_marker(bytes: &[u8], marker: &[u8], cleanup: &[u8]) {
-    let before_marker = bytes_before_marker(bytes, marker).unwrap_or(bytes);
-    assert!(
-        contains_subslice(before_marker, cleanup) || cleanup_components_in_order(before_marker),
-        "expected cleanup {} before marker {} in transcript:\n{}",
-        escaped(cleanup),
-        escaped(marker),
-        escaped(bytes)
-    );
-}
-
 fn assert_cleanup_ends_before_marker(bytes: &[u8], marker: &[u8], cleanup: &[u8]) {
     let before_marker = bytes_before_marker(bytes, marker).unwrap_or(bytes);
     assert!(
@@ -1031,6 +1166,34 @@ fn assert_cleanup_ends_before_marker(bytes: &[u8], marker: &[u8], cleanup: &[u8]
         "expected stream before marker {} to end exactly with cleanup {}:\n{}",
         escaped(marker),
         escaped(cleanup),
+        escaped(bytes)
+    );
+}
+
+fn assert_cleanup_before_marker(bytes: &[u8], marker: &[u8], cleanup: &[u8]) {
+    let before_marker = bytes_before_marker(bytes, marker).unwrap_or(bytes);
+    assert!(
+        contains_subslice(before_marker, cleanup),
+        "expected cleanup {} before marker {} in transcript:\n{}",
+        escaped(cleanup),
+        escaped(marker),
+        escaped(bytes)
+    );
+}
+
+fn assert_panic_cleanup_suffix_exact(bytes: &[u8], marker: &[u8]) {
+    let before_marker = bytes_before_marker(bytes, marker).unwrap_or(bytes);
+    assert_eq!(
+        before_marker.last().copied(),
+        Some(b'c'),
+        "panic cleanup stream must end with RIS final byte before marker {}:\n{}",
+        escaped(marker),
+        escaped(bytes)
+    );
+    assert!(
+        before_marker.ends_with(PANIC_HOOK_EMERGENCY_CLEANUP),
+        "panic cleanup suffix before marker {} was not byte-exact emergency cleanup:\n{}",
+        escaped(marker),
         escaped(bytes)
     );
 }
@@ -1058,32 +1221,6 @@ fn assert_no_cleanup_leaked(bytes: &[u8]) {
             escaped(bytes)
         );
     }
-}
-
-fn cleanup_components_in_order(bytes: &[u8]) -> bool {
-    let mut search_from = 0;
-    for component in [
-        b"\x1b[0m".as_slice(),
-        b"\x1b[?1049l",
-        b"\x1b[r",
-        b"\x1b[?7h",
-        b"\x1b[!p",
-        b"\x1b[?25h",
-        b"\x1b[<u",
-        b"\x1b[=0u",
-        b"\x1b[>4;0m",
-        b"\x1b[?2004l",
-        b"\x1b[?1000l",
-        b"\x1b[?1002l",
-        b"\x1b[?1003l",
-        b"\x1b[?1006l",
-    ] {
-        let Some(relative) = find_subslice(&bytes[search_from..], component) else {
-            return false;
-        };
-        search_from += relative + component.len();
-    }
-    true
 }
 
 fn attach_pid_from_transcript(bytes: &[u8]) -> Pid {

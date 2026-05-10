@@ -1123,10 +1123,6 @@ async fn local_ghostty_attach(
     };
     maybe_panic_inject_attach();
     let mut signal_watcher = AttachSignalWatcher::new()?;
-    #[cfg(debug_assertions)]
-    if std::env::var_os("PORTL_TEST_RECONNECT_SCENARIO").is_some() {
-        return run_test_reconnect_fixture(raw_guard, &mut signal_watcher).await;
-    }
     let display = AttachDisplay::new(cols, rows);
     let mode_tracker = new_terminal_mode_tracker();
     let stdin_task = maybe_spawn_stdin_task(
@@ -1465,44 +1461,6 @@ fn finish_local_attach(
             exit_code_from_i32(code)
         }
     }
-}
-
-#[cfg(debug_assertions)]
-async fn run_test_reconnect_fixture(
-    raw_guard: Option<RawModeGuard>,
-    signal_watcher: &mut AttachSignalWatcher,
-) -> Result<ExitCode> {
-    let scenario = std::env::var("PORTL_TEST_RECONNECT_SCENARIO").unwrap_or_default();
-    match scenario.as_str() {
-        "sighup-wait" => {
-            write_reconnect_fixture_marker(b"RECONNECT_WAIT_READY\r\n")?;
-            let variant = signal_watcher.next().await;
-            finish_raw_guard(raw_guard, variant);
-            Ok(ExitCode::from(1))
-        }
-        "exhausted" => {
-            write_reconnect_fixture_marker(b"RECONNECT_BUDGET_EXHAUSTED\r\n")?;
-            finish_raw_guard(raw_guard, RawModeExitVariant::ReconnectExhausted);
-            Ok(ExitCode::from(1))
-        }
-        "transient" => {
-            write_reconnect_fixture_marker(b"DISCONNECT_WINDOW_BEGIN\r\n")?;
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            write_reconnect_fixture_marker(b"RECONNECT_SUCCESS\r\nOK\r\n")?;
-            finish_raw_guard(raw_guard, RawModeExitVariant::Normal);
-            Ok(ExitCode::SUCCESS)
-        }
-        other => anyhow::bail!("unknown PORTL_TEST_RECONNECT_SCENARIO '{other}'"),
-    }
-}
-
-#[cfg(debug_assertions)]
-fn write_reconnect_fixture_marker(bytes: &[u8]) -> Result<()> {
-    let mut stdout = std::io::stdout();
-    stdout
-        .write_all(bytes)
-        .context("write reconnect fixture marker")?;
-    stdout.flush().context("flush reconnect fixture marker")
 }
 
 async fn resolve_local_provider_for_session(
@@ -2513,16 +2471,39 @@ async fn remote_session_attach_with_reconnect_on_endpoint(
 
     let mut reconnect_state = ReconnectAttemptState::new();
     let mut attach_started = Instant::now();
+    #[cfg(feature = "test-reconnect-injection")]
+    let mut injected_initial_disconnect = test_reconnect_scenario()?;
     loop {
-        match run_remote_attach_once(
+        #[cfg(feature = "test-reconnect-injection")]
+        let attach_end = if let Some(scenario) = injected_initial_disconnect.take() {
+            connected
+                .connection
+                .close(0u32.into(), b"test reconnect injection");
+            if matches!(scenario, TestReconnectScenario::Transient) {
+                write_reconnect_test_marker(&display, b"DISCONNECT_WINDOW_BEGIN\r\n").await?;
+            }
+            AttachEnd::Disconnected(anyhow!("test reconnect injection"))
+        } else {
+            run_remote_attach_once(
+                session,
+                &display,
+                &mut coordinator,
+                &mode_tracker,
+                &mut signal_watcher,
+            )
+            .await
+        };
+        #[cfg(not(feature = "test-reconnect-injection"))]
+        let attach_end = run_remote_attach_once(
             session,
             &display,
             &mut coordinator,
             &mode_tracker,
             &mut signal_watcher,
         )
-        .await
-        {
+        .await;
+
+        match attach_end {
             AttachEnd::Exited(code) => {
                 display.clear_bar().await?;
                 coordinator.stop().await;
@@ -2608,7 +2589,6 @@ async fn remote_session_attach_with_reconnect_on_endpoint(
                     ReconnectOutcome::Expired => {
                         display.clear_bar().await?;
                         coordinator.stop().await;
-                        raw_guard.finish(RawModeExitVariant::ReconnectExhausted);
                         eprintln!(
                             "portl: could not reconnect to session \"{canonical_ref}\" after 2m"
                         );
@@ -2619,6 +2599,7 @@ async fn remote_session_attach_with_reconnect_on_endpoint(
                         eprintln!();
                         eprintln!("The session may still be running. To reconnect, run:");
                         eprintln!("  portl attach {canonical_ref}");
+                        raw_guard.finish(RawModeExitVariant::ReconnectExhausted);
                         return Ok(ExitCode::from(1));
                     }
                     ReconnectOutcome::Signal(variant) => {
@@ -3016,12 +2997,20 @@ async fn reconnect_remote_session(
     flight_recorder: &mut AttachFlightRecorder,
     signal_watcher: &mut AttachSignalWatcher,
 ) -> Result<ReconnectOutcome> {
-    let policy = ReconnectPolicy::default_interactive().with_observed_rtt(state.last_rtt);
+    let policy = reconnect_policy_for_environment(ReconnectPolicy::default_interactive())
+        .with_observed_rtt(state.last_rtt);
     if !policy.retry_budget_remaining(state.started.elapsed()) {
         flight_recorder.record(format!(
             "reconnect expired after {}",
             format_compact_duration(state.started.elapsed())
         ));
+        #[cfg(feature = "test-reconnect-injection")]
+        if matches!(
+            test_reconnect_scenario()?,
+            Some(TestReconnectScenario::Exhausted)
+        ) {
+            write_reconnect_test_marker(display, b"RECONNECT_BUDGET_EXHAUSTED\r\n").await?;
+        }
         return Ok(ReconnectOutcome::Expired);
     }
 
@@ -3041,13 +3030,21 @@ async fn reconnect_remote_session(
     }
 
     loop {
-        let policy = ReconnectPolicy::default_interactive().with_observed_rtt(state.last_rtt);
+        let policy = reconnect_policy_for_environment(ReconnectPolicy::default_interactive())
+            .with_observed_rtt(state.last_rtt);
         let attempt = state.next_attempt();
         if !policy.retry_budget_remaining(state.started.elapsed()) {
             flight_recorder.record(format!(
                 "reconnect budget expired after {} attempts",
                 attempt.saturating_sub(1)
             ));
+            #[cfg(feature = "test-reconnect-injection")]
+            if matches!(
+                test_reconnect_scenario()?,
+                Some(TestReconnectScenario::Exhausted)
+            ) {
+                write_reconnect_test_marker(display, b"RECONNECT_BUDGET_EXHAUSTED\r\n").await?;
+            }
             return Ok(ReconnectOutcome::Expired);
         }
         let visible = state.started.elapsed() >= policy.transparent_grace;
@@ -3057,6 +3054,14 @@ async fn reconnect_remote_session(
             format_compact_duration(delay),
             if visible { " (visible)" } else { "" }
         ));
+        #[cfg(feature = "test-reconnect-injection")]
+        if matches!(
+            test_reconnect_scenario()?,
+            Some(TestReconnectScenario::SighupWait)
+        ) && attempt == 1
+        {
+            write_reconnect_test_marker(display, b"RECONNECT_WAIT_READY\r\n").await?;
+        }
         match wait_reconnect_delay(
             delay,
             visible,
@@ -3072,6 +3077,15 @@ async fn reconnect_remote_session(
             ReconnectDelayOutcome::Detached => return Ok(ReconnectOutcome::Detached),
             ReconnectDelayOutcome::Quit => return Ok(ReconnectOutcome::Quit),
             ReconnectDelayOutcome::Signal(variant) => return Ok(ReconnectOutcome::Signal(variant)),
+        }
+        #[cfg(feature = "test-reconnect-injection")]
+        if let Some(scenario) = test_reconnect_scenario()?
+            && test_reconnect_forces_connect_failure(scenario, attempt)
+        {
+            flight_recorder.record(format!(
+                "reconnect attempt {attempt} test-injected connect failure"
+            ));
+            continue;
         }
         if visible {
             if !coordinator.set_reconnect_visible(true).await? {
@@ -3165,6 +3179,13 @@ async fn reconnect_remote_session(
                 state.observe_path(path.as_ref());
                 flight_recorder
                     .record_with_path(format!("reconnect attempt {attempt} reattached"), path);
+                #[cfg(feature = "test-reconnect-injection")]
+                if matches!(
+                    test_reconnect_scenario()?,
+                    Some(TestReconnectScenario::Transient)
+                ) {
+                    write_reconnect_test_marker(display, b"RECONNECT_SUCCESS\r\n").await?;
+                }
                 if visible {
                     display
                         .set_bar(format!("▌ Portl › {canonical_ref} · reattached"))
@@ -4687,8 +4708,8 @@ fn finish_raw_guard(raw_guard: Option<RawModeGuard>, variant: RawModeExitVariant
 #[cfg(feature = "panic-inject-attach")]
 fn maybe_panic_inject_attach() {
     if std::env::var_os("PORTL_PANIC_INJECT_ATTACH").is_some() {
-        write_panic_cleanup_to_fd_if_armed(nix::libc::STDERR_FILENO);
-        std::process::abort();
+        let _ = std::panic::catch_unwind(|| panic!("inject attach panic"));
+        std::process::exit(101);
     }
 }
 
@@ -4907,6 +4928,64 @@ impl ReconnectPolicy {
     fn retry_budget_remaining(&self, elapsed: Duration) -> bool {
         elapsed < self.max_elapsed
     }
+}
+
+#[cfg(feature = "test-reconnect-injection")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestReconnectScenario {
+    SighupWait,
+    Exhausted,
+    Transient,
+}
+
+#[cfg(feature = "test-reconnect-injection")]
+fn test_reconnect_scenario() -> Result<Option<TestReconnectScenario>> {
+    match std::env::var("PORTL_TEST_RECONNECT_SCENARIO") {
+        Ok(value) => match value.as_str() {
+            "sighup-wait" => Ok(Some(TestReconnectScenario::SighupWait)),
+            "exhausted" => Ok(Some(TestReconnectScenario::Exhausted)),
+            "transient" => Ok(Some(TestReconnectScenario::Transient)),
+            other => anyhow::bail!("unknown PORTL_TEST_RECONNECT_SCENARIO '{other}'"),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(err).context("read PORTL_TEST_RECONNECT_SCENARIO"),
+    }
+}
+
+#[cfg(not(feature = "test-reconnect-injection"))]
+fn test_reconnect_scenario() -> Result<Option<()>> {
+    Ok(None)
+}
+
+#[cfg(feature = "test-reconnect-injection")]
+fn reconnect_policy_for_environment(mut policy: ReconnectPolicy) -> ReconnectPolicy {
+    if test_reconnect_scenario().ok().flatten().is_some() {
+        policy.base_delay = Duration::from_millis(25);
+        policy.max_delay = Duration::from_millis(25);
+        policy.max_elapsed = Duration::from_millis(90);
+        policy.delay_floor = Duration::from_millis(25);
+        policy.transparent_grace = Duration::ZERO;
+    }
+    policy
+}
+
+#[cfg(not(feature = "test-reconnect-injection"))]
+fn reconnect_policy_for_environment(policy: ReconnectPolicy) -> ReconnectPolicy {
+    policy
+}
+
+#[cfg(feature = "test-reconnect-injection")]
+async fn write_reconnect_test_marker(display: &AttachDisplay, marker: &[u8]) -> Result<()> {
+    display
+        .write_output(AttachOutputStream::Stdout, marker)
+        .await
+        .context("write reconnect test marker")
+}
+
+#[cfg(feature = "test-reconnect-injection")]
+fn test_reconnect_forces_connect_failure(scenario: TestReconnectScenario, attempt: u32) -> bool {
+    matches!(scenario, TestReconnectScenario::Exhausted)
+        || (matches!(scenario, TestReconnectScenario::Transient) && attempt == 1)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

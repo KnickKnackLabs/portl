@@ -15,6 +15,7 @@ workspace = true
 ghostty-vt = ["dep:libghostty-vt", "libghostty-vt/link-static", "portl-agent/ghostty-vt"]
 ghostty-vt-static = ["ghostty-vt", "portl-agent/ghostty-vt-static"]
 panic-inject-attach = []
+test-reconnect-injection = []
 
 [[bin]]
 name = "portl"
