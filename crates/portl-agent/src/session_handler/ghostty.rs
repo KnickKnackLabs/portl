@@ -1525,6 +1525,8 @@ fn configure_portl_terminal_capabilities(
     terminal: &mut Terminal<'_, '_>,
     pty_replies: TerminalPtyReplies,
 ) -> Result<()> {
+    use crate::session_handler::vt_capability::PORTL_CANONICAL_KITTY_KEYBOARD_FLAGS;
+
     terminal
         .on_pty_write(move |_term, data| {
             pty_replies.borrow_mut().push(data.to_vec());
@@ -1547,6 +1549,10 @@ fn configure_portl_terminal_capabilities(
                 tertiary: TertiaryDeviceAttributes { unit_id: 0 },
             })
         })?;
+    match PORTL_CANONICAL_KITTY_KEYBOARD_FLAGS {
+        0 => terminal.vt_write(b"\x1b[=0u"),
+        flags => terminal.vt_write(format!("\x1b[={flags}u").as_bytes()),
+    }
     Ok(())
 }
 
@@ -3255,6 +3261,7 @@ mod tests {
     use super::*;
     use crate::session_handler::vt_capability::{
         PORTL_CANONICAL_DA1_PARAMETER_LIST, PORTL_CANONICAL_DA2_PARAMETER_LIST,
+        PORTL_CANONICAL_KITTY_KEYBOARD_FLAGS,
     };
 
     fn configured_test_terminal() -> Result<(Terminal<'static, 'static>, TerminalPtyReplies)> {
@@ -3286,6 +3293,10 @@ mod tests {
         out.extend_from_slice(PORTL_CANONICAL_DA2_PARAMETER_LIST);
         out.push(b'c');
         out
+    }
+
+    fn expected_kitty_flag_response() -> Vec<u8> {
+        format!("\x1b[?{PORTL_CANONICAL_KITTY_KEYBOARD_FLAGS}u").into_bytes()
     }
 
     #[test]
@@ -3356,6 +3367,34 @@ mod tests {
     }
 
     #[test]
+    fn kitty_flag_query_uses_canonical_fixed_response() -> Result<()> {
+        let expected = expected_kitty_flag_response();
+
+        assert_eq!(terminal_replies_for(b"\x1b[?u")?, expected);
+        assert_eq!(terminal_replies_for(b"unrelated\x1b[?u")?, expected);
+        assert_eq!(terminal_replies_for(b"\x1b[?u")?, expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn kitty_flag_query_is_host_environment_independent() -> Result<()> {
+        for _host_profile in [
+            ("xterm-kitty", "truecolor", "kitty"),
+            ("xterm-256color", "24bit", "ghostty"),
+            ("screen", "", "tmux"),
+            ("dumb", "", ""),
+        ] {
+            assert_eq!(
+                terminal_replies_for(b"\x1b[?u")?,
+                expected_kitty_flag_response()
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn malformed_da_input_does_not_emit_spurious_response_and_resyncs() -> Result<()> {
         for malformed in [
             b"\x1b[".as_slice(),
@@ -3392,7 +3431,8 @@ mod tests {
     }
 
     #[test]
-    fn da1_response_is_queued_to_guest_pty_input_not_broadcast_to_host() -> Result<()> {
+    fn da1_da2_and_kitty_flag_query_replies_are_queued_to_guest_pty_input_not_broadcast_to_host()
+    -> Result<()> {
         let mut terminal = GhosttyTerminalIo::new(TerminalOptions {
             cols: 80,
             rows: 24,
@@ -3412,15 +3452,20 @@ mod tests {
             &mut v2_subscribers,
             &mut history_start_abs,
             &mut live_seq,
-            b"\x1b[c",
+            b"\x1b[c\x1b[>c\x1b[?u",
         );
 
-        let expected = expected_da1_response();
-        assert_eq!(
-            terminal.pending_input.front_chunk(),
-            Some(expected.as_slice())
-        );
-        assert_eq!(rx.try_recv()?, b"\x1b[c".to_vec());
+        let mut expected = expected_da1_response();
+        expected.extend_from_slice(&expected_da2_response());
+        expected.extend_from_slice(&expected_kitty_flag_response());
+        let mut queued_replies = Vec::new();
+        while let Some(chunk) = terminal.pending_input.front_chunk() {
+            let len = chunk.len();
+            queued_replies.extend_from_slice(chunk);
+            terminal.pending_input.consume(len);
+        }
+        assert_eq!(queued_replies, expected);
+        assert_eq!(rx.try_recv()?, b"\x1b[c\x1b[>c\x1b[?u".to_vec());
         assert!(rx.try_recv().is_err());
 
         Ok(())
