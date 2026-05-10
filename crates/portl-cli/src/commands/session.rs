@@ -26,6 +26,9 @@ use portl_core::net::{
     open_session_run,
 };
 use portl_core::terminal::{tmux_cc, zmx_control};
+#[cfg(test)]
+use portl_core::terminal_mode_tracker::TerminalModeState;
+use portl_core::terminal_mode_tracker::TerminalModeTracker;
 use portl_core::ticket::schema::{Capabilities, EnvPolicy, ShellCaps};
 use portl_core::wire::session::{
     ATTACH_V2_MAX_DECODED_PAYLOAD, AttachV2ClientFrame, AttachV2Config, AttachV2ServerFrame,
@@ -1116,6 +1119,7 @@ async fn local_ghostty_attach(
         None
     };
     let display = AttachDisplay::new(cols, rows);
+    let mode_tracker = new_terminal_mode_tracker();
     let stdin_task = maybe_spawn_stdin_task(
         AttachInputSink {
             kind: AttachInputSinkKind::Ghostty {
@@ -1132,13 +1136,27 @@ async fn local_ghostty_attach(
     .await?;
     let stdout_display = display.clone();
     let mut stdout_rx = attach.stdout_rx;
+    let stdout_tracker = Arc::clone(&mode_tracker);
     let stdout_task = tokio::spawn(async move {
-        copy_mpsc_output(&mut stdout_rx, &stdout_display, AttachOutputStream::Stdout).await
+        copy_mpsc_output(
+            &mut stdout_rx,
+            &stdout_display,
+            AttachOutputStream::Stdout,
+            &stdout_tracker,
+        )
+        .await
     });
     let stderr_display = display.clone();
     let mut stderr_rx = attach.stderr_rx;
+    let stderr_tracker = Arc::clone(&mode_tracker);
     let stderr_task = tokio::spawn(async move {
-        copy_mpsc_output(&mut stderr_rx, &stderr_display, AttachOutputStream::Stderr).await
+        copy_mpsc_output(
+            &mut stderr_rx,
+            &stderr_display,
+            AttachOutputStream::Stderr,
+            &stderr_tracker,
+        )
+        .await
     });
     let (code, detached) = wait_ghostty_attach_completion(&mut attach.exit_rx, stdin_task).await?;
     if detached {
@@ -1261,6 +1279,7 @@ async fn local_zmx_control_attach(
         None
     };
     let display = AttachDisplay::new(cols, rows);
+    let mode_tracker = new_terminal_mode_tracker();
     let stdin_task = maybe_spawn_stdin_task(
         AttachInputSink {
             kind: AttachInputSinkKind::Zmx { stdin },
@@ -1273,11 +1292,20 @@ async fn local_zmx_control_attach(
     )
     .await?;
     let stdout_display = display.clone();
-    let stdout_task =
-        tokio::spawn(async move { copy_zmx_control_output(&mut stdout, &stdout_display).await });
+    let stdout_tracker = Arc::clone(&mode_tracker);
+    let stdout_task = tokio::spawn(async move {
+        copy_zmx_control_output(&mut stdout, &stdout_display, &stdout_tracker).await
+    });
     let stderr_display = display.clone();
+    let stderr_tracker = Arc::clone(&mode_tracker);
     let stderr_task = tokio::spawn(async move {
-        copy_remote_output(&mut stderr, &stderr_display, AttachOutputStream::Stderr).await
+        copy_remote_output(
+            &mut stderr,
+            &stderr_display,
+            AttachOutputStream::Stderr,
+            &stderr_tracker,
+        )
+        .await
     });
     let (code, detached) = wait_local_attach_completion(&mut child, stdin_task).await?;
     if detached {
@@ -1356,10 +1384,15 @@ async fn local_tmux_control_attach(
         None
     };
     let display = AttachDisplay::new(cols, rows);
+    let mode_tracker = new_terminal_mode_tracker();
     if let Some(initial_viewport) = initial_viewport {
-        display
-            .write_output(AttachOutputStream::Stdout, &initial_viewport)
-            .await?;
+        write_tracked_output(
+            &display,
+            AttachOutputStream::Stdout,
+            &initial_viewport,
+            &mode_tracker,
+        )
+        .await?;
     }
     let (tmux_pty_tx, tmux_pty_rx) = mpsc::unbounded_channel();
     if session != tmux_session {
@@ -1381,8 +1414,9 @@ async fn local_tmux_control_attach(
     )
     .await?;
     let stdout_display = display.clone();
+    let stdout_tracker = Arc::clone(&mode_tracker);
     let stdout_task = tokio::spawn(async move {
-        pump_local_tmux_control_pty(master, &stdout_display, tmux_pty_rx).await
+        pump_local_tmux_control_pty(master, &stdout_display, tmux_pty_rx, &stdout_tracker).await
     });
     let (code, detached) = wait_local_attach_completion(&mut child, stdin_task).await?;
     if detached {
@@ -2398,6 +2432,7 @@ async fn remote_session_attach_with_reconnect_on_endpoint(
     );
     let raw_guard = RawModeGuard::new()?;
     let display = AttachDisplay::new(request.cols, request.rows);
+    let mode_tracker = new_terminal_mode_tracker();
     let mut coordinator = AttachInputCoordinator::spawn(
         AttachControlUi {
             canonical_ref: canonical_ref.clone(),
@@ -2410,7 +2445,7 @@ async fn remote_session_attach_with_reconnect_on_endpoint(
     let mut reconnect_state = ReconnectAttemptState::new();
     let mut attach_started = Instant::now();
     loop {
-        match run_remote_attach_once(session, &display, &mut coordinator).await {
+        match run_remote_attach_once(session, &display, &mut coordinator, &mode_tracker).await {
             AttachEnd::Exited(code) => {
                 display.clear_bar().await?;
                 coordinator.stop().await;
@@ -2563,6 +2598,7 @@ async fn bridge_attach(
         control,
     } = session;
     let display = AttachDisplay::new(cols, rows);
+    let mode_tracker = new_terminal_mode_tracker();
     let stdin_task = maybe_spawn_stdin_task(
         AttachInputSink {
             kind: AttachInputSinkKind::Remote {
@@ -2579,20 +2615,24 @@ async fn bridge_attach(
     )
     .await?;
     let stdout_display = display.clone();
+    let stdout_tracker = Arc::clone(&mode_tracker);
     let stdout_task = tokio::spawn(async move {
         copy_remote_output(
             &mut stdout_recv,
             &stdout_display,
             AttachOutputStream::Stdout,
+            &stdout_tracker,
         )
         .await
     });
     let stderr_display = display.clone();
+    let stderr_tracker = Arc::clone(&mode_tracker);
     let stderr_task = tokio::spawn(async move {
         copy_remote_output(
             &mut stderr_recv,
             &stderr_display,
             AttachOutputStream::Stderr,
+            &stderr_tracker,
         )
         .await
     });
@@ -2629,6 +2669,7 @@ async fn bridge_attach_v2(
         None
     };
     let display = AttachDisplay::new(cols, rows);
+    let mode_tracker = new_terminal_mode_tracker();
     let mut coordinator = AttachInputCoordinator::spawn(
         AttachControlUi {
             canonical_ref: canonical_ref.clone(),
@@ -2637,7 +2678,7 @@ async fn bridge_attach_v2(
         },
         (cols, rows),
     );
-    let end = run_remote_attach_v2_once(session, &display, &mut coordinator).await;
+    let end = run_remote_attach_v2_once(session, &display, &mut coordinator, &mode_tracker).await;
     display.clear_bar().await?;
     coordinator.stop().await;
     drop(raw_guard);
@@ -3180,13 +3221,14 @@ async fn run_remote_attach_once(
     session: RemoteAttachSession,
     display: &AttachDisplay,
     coordinator: &mut AttachInputCoordinator,
+    mode_tracker: &SharedTerminalModeTracker,
 ) -> AttachEnd {
     match session {
         RemoteAttachSession::V1(session) => {
-            run_remote_attach_v1_once(session, display, coordinator).await
+            run_remote_attach_v1_once(session, display, coordinator, mode_tracker).await
         }
         RemoteAttachSession::V2(session) => {
-            run_remote_attach_v2_once(session, display, coordinator).await
+            run_remote_attach_v2_once(session, display, coordinator, mode_tracker).await
         }
     }
 }
@@ -3195,6 +3237,7 @@ async fn run_remote_attach_v1_once(
     session: SessionClient,
     display: &AttachDisplay,
     coordinator: &mut AttachInputCoordinator,
+    mode_tracker: &SharedTerminalModeTracker,
 ) -> AttachEnd {
     if let Some(end) = coordinator.drain_before_attach() {
         return end;
@@ -3227,20 +3270,24 @@ async fn run_remote_attach_v1_once(
         return AttachEnd::Disconnected(err);
     }
     let stdout_display = display.clone();
+    let stdout_tracker = Arc::clone(mode_tracker);
     let mut stdout_task = tokio::spawn(async move {
         copy_remote_output(
             &mut stdout_recv,
             &stdout_display,
             AttachOutputStream::Stdout,
+            &stdout_tracker,
         )
         .await
     });
     let stderr_display = display.clone();
+    let stderr_tracker = Arc::clone(mode_tracker);
     let mut stderr_task = tokio::spawn(async move {
         copy_remote_output(
             &mut stderr_recv,
             &stderr_display,
             AttachOutputStream::Stderr,
+            &stderr_tracker,
         )
         .await
     });
@@ -3290,6 +3337,7 @@ async fn run_remote_attach_v2_once(
     session: SessionClientV2,
     display: &AttachDisplay,
     coordinator: &mut AttachInputCoordinator,
+    mode_tracker: &SharedTerminalModeTracker,
 ) -> AttachEnd {
     if let Some(end) = coordinator.drain_before_attach() {
         return end;
@@ -3386,7 +3434,7 @@ async fn run_remote_attach_v2_once(
                                             bytes = bytes.len(),
                                             "render attach v2 viewport snapshot"
                                         );
-                                        if let Err(err) = display.write_output(AttachOutputStream::Stdout, &bytes).await {
+                                        if let Err(err) = write_tracked_output(display, AttachOutputStream::Stdout, &bytes, mode_tracker).await {
                                             break AttachEnd::Disconnected(err);
                                         }
                                         let _ = display.clear_bar().await;
@@ -3434,7 +3482,7 @@ async fn run_remote_attach_v2_once(
                             match payload.decode(ATTACH_V2_MAX_DECODED_PAYLOAD) {
                                 Ok(bytes) => {
                                     trace!(lane = "history", frame = "prelude", bytes = bytes.len(), "render attach v2 prelude");
-                                    if let Err(err) = display.write_output(AttachOutputStream::Stdout, &bytes).await {
+                                    if let Err(err) = write_tracked_output(display, AttachOutputStream::Stdout, &bytes, mode_tracker).await {
                                         break AttachEnd::Disconnected(err);
                                     }
                                 }
@@ -3459,7 +3507,7 @@ async fn run_remote_attach_v2_once(
                             match payload.decode(ATTACH_V2_MAX_DECODED_PAYLOAD) {
                                 Ok(bytes) => {
                                     trace!(lane = "history", frame = "reload_chunk", reload_id, bytes = bytes.len(), complete = progress.complete, "render attach v2 reload chunk");
-                                    if let Err(err) = display.write_output(AttachOutputStream::Stdout, &bytes).await {
+                                    if let Err(err) = write_tracked_output(display, AttachOutputStream::Stdout, &bytes, mode_tracker).await {
                                         break AttachEnd::Disconnected(err);
                                     }
                                 }
@@ -3504,7 +3552,7 @@ async fn run_remote_attach_v2_once(
                                     "render attach v2 live output"
                                 );
                                 covered_live_seq = end_seq;
-                                if let Err(err) = display.write_output(AttachOutputStream::Stdout, bytes).await {
+                                if let Err(err) = write_tracked_output(display, AttachOutputStream::Stdout, bytes, mode_tracker).await {
                                     break AttachEnd::Disconnected(err);
                                 }
                             }
@@ -4059,6 +4107,39 @@ fn exit_code_from_i32(code: i32) -> ExitCode {
 }
 
 struct RawModeGuard;
+
+type SharedTerminalModeTracker = Arc<StdMutex<TerminalModeTracker>>;
+
+fn new_terminal_mode_tracker() -> SharedTerminalModeTracker {
+    Arc::new(StdMutex::new(TerminalModeTracker::new()))
+}
+
+fn track_host_bound_bytes(tracker: &SharedTerminalModeTracker, bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut tracker = tracker
+        .lock()
+        .map_err(|_| anyhow!("terminal mode tracker lock poisoned"))?;
+    tracker.feed(bytes);
+    Ok(tracker.take_alt_screen_leave_kitty_reset())
+}
+
+#[cfg(test)]
+fn tracked_terminal_mode_state(tracker: &SharedTerminalModeTracker) -> TerminalModeState {
+    tracker.lock().expect("terminal mode tracker lock").state()
+}
+
+async fn write_tracked_output(
+    display: &AttachDisplay,
+    stream: AttachOutputStream,
+    bytes: &[u8],
+    tracker: &SharedTerminalModeTracker,
+) -> Result<()> {
+    let defensive_reset = track_host_bound_bytes(tracker, bytes)?;
+    display.write_output(stream, bytes).await?;
+    if !defensive_reset.is_empty() {
+        display.write_output(stream, &defensive_reset).await?;
+    }
+    Ok(())
+}
 
 impl RawModeGuard {
     fn new() -> Result<Self> {
@@ -4664,12 +4745,13 @@ async fn copy_mpsc_output(
     recv: &mut mpsc::Receiver<Vec<u8>>,
     display: &AttachDisplay,
     stream: AttachOutputStream,
+    mode_tracker: &SharedTerminalModeTracker,
 ) -> Result<()> {
     while let Some(bytes) = recv.recv().await {
         if bytes.is_empty() {
             break;
         }
-        display.write_output(stream, &bytes).await?;
+        write_tracked_output(display, stream, &bytes, mode_tracker).await?;
     }
     display.flush(stream).await
 }
@@ -4678,6 +4760,7 @@ async fn copy_remote_output<R>(
     recv: &mut R,
     display: &AttachDisplay,
     stream: AttachOutputStream,
+    mode_tracker: &SharedTerminalModeTracker,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -4689,7 +4772,7 @@ where
             display.flush(stream).await?;
             return Ok(());
         }
-        display.write_output(stream, &buf[..read]).await?;
+        write_tracked_output(display, stream, &buf[..read], mode_tracker).await?;
     }
 }
 
@@ -4698,6 +4781,7 @@ async fn pump_local_tmux_control_pty(
     master: OwnedFd,
     display: &AttachDisplay,
     mut write_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mode_tracker: &SharedTerminalModeTracker,
 ) -> Result<()> {
     set_fd_nonblocking(&master)?;
     let master = tokio::io::unix::AsyncFd::new(master).context("register tmux -CC pty")?;
@@ -4723,9 +4807,13 @@ async fn pump_local_tmux_control_pty(
                         line_buf.clear();
                         match tmux_cc::parse_control_line(&line) {
                             tmux_cc::TmuxControlEvent::Output(bytes) => {
-                                display
-                                    .write_output(AttachOutputStream::Stdout, &bytes)
-                                    .await?;
+                                write_tracked_output(
+                                    display,
+                                    AttachOutputStream::Stdout,
+                                    &bytes,
+                                    mode_tracker,
+                                )
+                                .await?;
                             }
                             tmux_cc::TmuxControlEvent::Error(error) => {
                                 display
@@ -4853,7 +4941,11 @@ fn spawn_local_pty_blocking(
     Ok((master, child))
 }
 
-async fn copy_zmx_control_output<R>(recv: &mut R, display: &AttachDisplay) -> Result<()>
+async fn copy_zmx_control_output<R>(
+    recv: &mut R,
+    display: &AttachDisplay,
+    mode_tracker: &SharedTerminalModeTracker,
+) -> Result<()>
 where
     R: AsyncRead + Unpin,
 {
@@ -4867,8 +4959,7 @@ where
                 | zmx_control::TAG_VIEWPORT_SNAPSHOT
                 | zmx_control::TAG_LIVE_OUTPUT
         ) {
-            display
-                .write_output(AttachOutputStream::Stdout, &payload)
+            write_tracked_output(display, AttachOutputStream::Stdout, &payload, mode_tracker)
                 .await?;
         }
     }
@@ -6277,6 +6368,56 @@ mod tests {
                 .windows(b"\x1b[>4;0m".len())
                 .any(|w| w == b"\x1b[>4;0m"),
             "cleanup should disable xterm modifyOtherKeys"
+        );
+    }
+
+    #[test]
+    fn attach_mode_tracker_persists_across_reconnect_and_resets_for_fresh_attach() {
+        let tracker = new_terminal_mode_tracker();
+
+        assert_eq!(
+            track_host_bound_bytes(&tracker, b"\x1b[>1u\x1b[?1049h").unwrap(),
+            b""
+        );
+        assert!(tracked_terminal_mode_state(&tracker).kitty_keyboard_depth > 0);
+        assert!(tracked_terminal_mode_state(&tracker).alt_screen.is_some());
+
+        assert_eq!(
+            track_host_bound_bytes(&tracker, b"reconnected output").unwrap(),
+            b""
+        );
+        assert!(tracked_terminal_mode_state(&tracker).kitty_keyboard_depth > 0);
+        assert!(tracked_terminal_mode_state(&tracker).alt_screen.is_some());
+
+        let fresh_attach_tracker = new_terminal_mode_tracker();
+        assert_eq!(
+            tracked_terminal_mode_state(&fresh_attach_tracker),
+            TerminalModeState::default()
+        );
+    }
+
+    #[test]
+    fn attach_mode_tracker_defensive_emit_fires_once_per_symptom2_transition() {
+        let tracker = new_terminal_mode_tracker();
+
+        assert_eq!(
+            track_host_bound_bytes(&tracker, b"\x1b[>1u\x1b[=15u\x1b[>4;2m\x1b[?1049h").unwrap(),
+            b""
+        );
+        assert_eq!(
+            track_host_bound_bytes(&tracker, b"\x1b[?1049l").unwrap(),
+            b"\x1b[<u\x1b[=0u\x1b[>4;0m"
+        );
+        assert_eq!(
+            track_host_bound_bytes(&tracker, b"\x1b[?1049l").unwrap(),
+            b""
+        );
+
+        let clean_tracker = new_terminal_mode_tracker();
+        assert_eq!(
+            track_host_bound_bytes(&clean_tracker, b"\x1b[>1u\x1b[?1049h\x1b[?1049l\x1b[<u",)
+                .unwrap(),
+            b""
         );
     }
 

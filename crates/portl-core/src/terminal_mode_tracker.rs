@@ -273,6 +273,9 @@ impl TerminalModeTracker {
             }
             (Some(b'<'), b'u') => {
                 self.modes.kitty_keyboard_depth = self.modes.kitty_keyboard_depth.saturating_sub(1);
+                if !self.is_kitty_keyboard_enabled() {
+                    self.pending_alt_screen_kitty_reset = false;
+                }
             }
             (Some(b'='), b'u') => {
                 self.modes.kitty_flags = parse_params(&params[1..]).first().copied().unwrap_or(0);
@@ -598,6 +601,10 @@ mod tests {
 
         let mut tracker = TerminalModeTracker::new();
         tracker.feed(b"\x1b[>1u\x1b[?1049h\x1b[<u\x1b[?1049l");
+        assert_eq!(tracker.take_alt_screen_leave_kitty_reset(), EMPTY);
+
+        let mut tracker = TerminalModeTracker::new();
+        tracker.feed(b"\x1b[>1u\x1b[?1049h\x1b[?1049l\x1b[<u");
         assert_eq!(tracker.take_alt_screen_leave_kitty_reset(), EMPTY);
     }
 
