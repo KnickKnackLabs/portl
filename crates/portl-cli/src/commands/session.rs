@@ -3098,13 +3098,18 @@ async fn reconnect_remote_session(
                 .await?;
         }
         let connected = match tokio::select! {
-            connected = connect_peer_with_endpoint(
-                &request.target,
-                session_caps(),
-                identity,
-                endpoint,
-                true,
-            ) => connected,
+            connected = async {
+                #[cfg(feature = "test-reconnect-injection")]
+                test_reconnect_block_connect_attempt(display, attempt).await?;
+                connect_peer_with_endpoint(
+                    &request.target,
+                    session_caps(),
+                    identity,
+                    endpoint,
+                    true,
+                )
+                .await
+            } => connected,
             signal = signal_watcher.next() => return Ok(ReconnectOutcome::Signal(signal)),
         } {
             Ok(connected) => connected,
@@ -4936,6 +4941,7 @@ enum TestReconnectScenario {
     SighupWait,
     Exhausted,
     Transient,
+    SignalConnectAttempt,
 }
 
 #[cfg(feature = "test-reconnect-injection")]
@@ -4945,6 +4951,7 @@ fn test_reconnect_scenario() -> Result<Option<TestReconnectScenario>> {
             "sighup-wait" => Ok(Some(TestReconnectScenario::SighupWait)),
             "exhausted" => Ok(Some(TestReconnectScenario::Exhausted)),
             "transient" => Ok(Some(TestReconnectScenario::Transient)),
+            "signal-connect-attempt" => Ok(Some(TestReconnectScenario::SignalConnectAttempt)),
             other => anyhow::bail!("unknown PORTL_TEST_RECONNECT_SCENARIO '{other}'"),
         },
         Err(std::env::VarError::NotPresent) => Ok(None),
@@ -4980,6 +4987,19 @@ async fn write_reconnect_test_marker(display: &AttachDisplay, marker: &[u8]) -> 
         .write_output(AttachOutputStream::Stdout, marker)
         .await
         .context("write reconnect test marker")
+}
+
+#[cfg(feature = "test-reconnect-injection")]
+async fn test_reconnect_block_connect_attempt(display: &AttachDisplay, attempt: u32) -> Result<()> {
+    if matches!(
+        test_reconnect_scenario()?,
+        Some(TestReconnectScenario::SignalConnectAttempt)
+    ) && attempt == 1
+    {
+        write_reconnect_test_marker(display, b"RECONNECT_CONNECT_ATTEMPT_READY\r\n").await?;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "test-reconnect-injection")]

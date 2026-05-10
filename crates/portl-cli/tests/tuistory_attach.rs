@@ -655,6 +655,27 @@ fn symptom3_sighup_during_reconnect_wait_emits_terminal_cleanup() {
 }
 
 #[test]
+fn symptom3_sigterm_during_reconnect_connect_attempt_emits_terminal_cleanup() {
+    let transcript = run_reconnect_fixture("signal-connect-attempt", Some(Signal::SIGTERM));
+
+    assert!(
+        contains_subslice(&transcript, b"HOST_READY_PROBE"),
+        "host shell did not recover after reconnect-attempt SIGTERM:\n{}",
+        escaped(&transcript)
+    );
+    let after_attempt_marker = bytes_after_marker(&transcript, b"RECONNECT_CONNECT_ATTEMPT_READY")
+        .expect("reconnect connect-attempt marker");
+    let cleanup_start = find_subslice(after_attempt_marker, EMERGENCY_CLEANUP)
+        .expect("emergency cleanup after reconnect connect attempt");
+    assert_no_cleanup_leaked(&after_attempt_marker[..cleanup_start]);
+    assert_cleanup_ends_before_marker(
+        &transcript,
+        b"HOST_AFTER_RECONNECT_FIXTURE",
+        EMERGENCY_CLEANUP,
+    );
+}
+
+#[test]
 fn symptom3_reconnect_budget_exhaustion_emits_cleanup_without_ris() {
     let transcript = run_reconnect_fixture("exhausted", None);
 
@@ -951,6 +972,7 @@ exit 0
     let mut transcript = Vec::new();
     let ready = match scenario {
         "sighup-wait" => b"RECONNECT_WAIT_READY".as_slice(),
+        "signal-connect-attempt" => b"RECONNECT_CONNECT_ATTEMPT_READY".as_slice(),
         "exhausted" => b"RECONNECT_BUDGET_EXHAUSTED".as_slice(),
         "transient" => b"RECONNECT_SUCCESS".as_slice(),
         other => panic!("unknown reconnect fixture scenario {other}"),
