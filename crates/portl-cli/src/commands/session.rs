@@ -1121,6 +1121,7 @@ async fn local_ghostty_attach(
     } else {
         None
     };
+    #[cfg(feature = "panic-inject-attach")]
     maybe_panic_inject_attach();
     let mut signal_watcher = AttachSignalWatcher::new()?;
     let display = AttachDisplay::new(cols, rows);
@@ -4718,9 +4719,6 @@ fn maybe_panic_inject_attach() {
     }
 }
 
-#[cfg(not(feature = "panic-inject-attach"))]
-fn maybe_panic_inject_attach() {}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RawModeExitVariant {
     Normal,
@@ -4957,11 +4955,6 @@ fn test_reconnect_scenario() -> Result<Option<TestReconnectScenario>> {
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(err) => Err(err).context("read PORTL_TEST_RECONNECT_SCENARIO"),
     }
-}
-
-#[cfg(not(feature = "test-reconnect-injection"))]
-fn test_reconnect_scenario() -> Result<Option<()>> {
-    Ok(None)
 }
 
 #[cfg(feature = "test-reconnect-injection")]

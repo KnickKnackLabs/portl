@@ -5,6 +5,34 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.8.13 — 2026-05-10
+
+### Fixed
+
+- Guest TUI capability queries (DA1, DA2, Kitty keyboard flags, cursor
+  position reports) no longer leak through Portl onto the host terminal. The
+  embedded Ghostty terminal in `portl-agent` answers DA1/DA2 and Kitty flag
+  queries with canonical, host-independent responses, and the host-bound
+  output stream strips any DA/Kitty/CPR responses that still reach it.
+  Opening Droid CLI inside `portl attach` no longer leaves stray text such as
+  `0u62;52;c` in the host shell prompt.
+- Persistent-attach Ghostty sessions no longer leave Kitty CSI-u keyboard
+  mode active on the host after a guest TUI exits without popping it. A new
+  wire-side mode tracker watches alt-screen and Kitty push/pop/flag changes,
+  defers a small idle window, and emits a defensive Kitty pop and
+  `modifyOtherKeys` reset when needed. Ctrl-modified keys after pi-agent or
+  similar TUIs exit are now interpreted normally instead of printing payloads
+  like `9;5:3u`.
+- Abnormal `portl attach` disconnects (SIGHUP, SIGTERM, SIGINT, panics, agent
+  crash, exhausted reconnect budget) now restore the host terminal before
+  exit. The cleanup sequence disables alt-screen, mouse, bracketed paste,
+  Kitty keyboard, modifyOtherKeys, restores autowrap, scroll region, cursor,
+  and SGR, and ends with a fresh line. Emergency exits append a terminal
+  hard reset (RIS) as the last byte; planned exits do not. Coverage now
+  spans remote attach, local Ghostty attach, zmx-control, tmux-control, and
+  `shell::run`, plus a signal-safe panic hook armed only while raw mode is
+  active.
+
 ## 0.8.12 — 2026-05-09
 
 ### Fixed
