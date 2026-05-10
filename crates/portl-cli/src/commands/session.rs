@@ -6,7 +6,10 @@ use std::io::{IsTerminal, Write as IoWrite};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::{ExitCode, Stdio};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{
+    Arc, Mutex as StdMutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -4110,6 +4113,12 @@ struct RawModeGuard {
     cleanup: RawModeCleanupWriter,
 }
 
+type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
+
+static PANIC_HOOK_ARMED: AtomicBool = AtomicBool::new(false);
+static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
+static PREVIOUS_PANIC_HOOK: OnceLock<PanicHook> = OnceLock::new();
+
 const DEFERRED_DEFENSIVE_KITTY_RESET_WINDOW_BYTES: usize = 256;
 // A 100 ms idle fallback keeps Symptom-2 recovery bounded for silent guests
 // while preserving a short window for a split Kitty pop to arrive.
@@ -4271,6 +4280,7 @@ async fn flush_tracked_output(
 impl RawModeGuard {
     fn new() -> Result<Self> {
         enable_raw_mode().context("enable raw mode")?;
+        set_panic_hook_armed(true);
         Ok(Self {
             cleanup: RawModeCleanupWriter::default(),
         })
@@ -4316,6 +4326,48 @@ pub(crate) fn raw_mode_cleanup_sequence(variant: RawModeExitVariant) -> &'static
     }
 }
 
+pub(crate) fn install_panic_hook() {
+    PANIC_HOOK_INSTALLED.get_or_init(|| {
+        let previous = std::panic::take_hook();
+        let _ = PREVIOUS_PANIC_HOOK.set(previous);
+        std::panic::set_hook(Box::new(|info| {
+            if let Some(previous) = PREVIOUS_PANIC_HOOK.get() {
+                previous(info);
+            }
+            write_panic_cleanup_to_fd_if_armed(nix::libc::STDERR_FILENO);
+        }));
+    });
+}
+
+fn set_panic_hook_armed(armed: bool) {
+    PANIC_HOOK_ARMED.store(armed, Ordering::SeqCst);
+}
+
+fn panic_hook_cleanup_bytes() -> &'static [u8] {
+    raw_mode_cleanup_sequence(RawModeExitVariant::Panic)
+}
+
+#[allow(unsafe_code)]
+fn write_panic_cleanup_to_fd_if_armed(fd: i32) {
+    if !PANIC_HOOK_ARMED.load(Ordering::SeqCst) {
+        return;
+    }
+
+    let mut ptr = panic_hook_cleanup_bytes().as_ptr();
+    let mut remaining = panic_hook_cleanup_bytes().len();
+    while remaining > 0 {
+        let written = unsafe { nix::libc::write(fd, ptr.cast(), remaining) };
+        if written <= 0 {
+            break;
+        }
+        let Ok(written) = usize::try_from(written) else {
+            break;
+        };
+        ptr = unsafe { ptr.add(written) };
+        remaining = remaining.saturating_sub(written);
+    }
+}
+
 #[derive(Debug, Default)]
 struct RawModeCleanupWriter {
     written: bool,
@@ -4338,6 +4390,7 @@ impl RawModeCleanupWriter {
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        set_panic_hook_armed(false);
         let _ = disable_raw_mode();
         let mut stdout = std::io::stdout();
         let _ = self
@@ -6630,6 +6683,39 @@ mod tests {
             assert!(cleanup.ends_with(b"\x1bc"));
             assert_eq!(&cleanup[cleanup.len() - b"\r\n\x1bc".len()..], b"\r\n\x1bc");
         }
+    }
+
+    #[test]
+    fn panic_hook_cleanup_bytes_match_panic_cleanup_variant() {
+        assert_eq!(
+            panic_hook_cleanup_bytes(),
+            raw_mode_cleanup_sequence(RawModeExitVariant::Panic)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn panic_hook_write_is_noop_when_not_armed() {
+        set_panic_hook_armed(false);
+        let capture = StderrCapture::start();
+
+        write_panic_cleanup_to_fd_if_armed(nix::libc::STDERR_FILENO);
+
+        let output = capture.finish();
+        assert_eq!(output, b"");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn panic_hook_write_emits_panic_cleanup_when_armed() {
+        set_panic_hook_armed(true);
+        let capture = StderrCapture::start();
+
+        write_panic_cleanup_to_fd_if_armed(nix::libc::STDERR_FILENO);
+
+        set_panic_hook_armed(false);
+        let output = capture.finish();
+        assert_eq!(output, raw_mode_cleanup_sequence(RawModeExitVariant::Panic));
     }
 
     #[test]

@@ -611,6 +611,7 @@ fn validate_bool_env(name: &str) -> Result<(), String> {
 }
 
 pub fn run(argv: Vec<OsString>) -> ExitCode {
+    commands::session::install_panic_hook();
     portl_core::tls::install_default_crypto_provider();
     match is_hidden_ghostty_command_invocation(&argv) {
         Ok(true) => {
