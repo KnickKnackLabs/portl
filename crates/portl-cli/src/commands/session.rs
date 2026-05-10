@@ -1123,6 +1123,10 @@ async fn local_ghostty_attach(
     };
     maybe_panic_inject_attach();
     let mut signal_watcher = AttachSignalWatcher::new()?;
+    #[cfg(debug_assertions)]
+    if std::env::var_os("PORTL_TEST_RECONNECT_SCENARIO").is_some() {
+        return run_test_reconnect_fixture(raw_guard, &mut signal_watcher).await;
+    }
     let display = AttachDisplay::new(cols, rows);
     let mode_tracker = new_terminal_mode_tracker();
     let stdin_task = maybe_spawn_stdin_task(
@@ -1461,6 +1465,44 @@ fn finish_local_attach(
             exit_code_from_i32(code)
         }
     }
+}
+
+#[cfg(debug_assertions)]
+async fn run_test_reconnect_fixture(
+    raw_guard: Option<RawModeGuard>,
+    signal_watcher: &mut AttachSignalWatcher,
+) -> Result<ExitCode> {
+    let scenario = std::env::var("PORTL_TEST_RECONNECT_SCENARIO").unwrap_or_default();
+    match scenario.as_str() {
+        "sighup-wait" => {
+            write_reconnect_fixture_marker(b"RECONNECT_WAIT_READY\r\n")?;
+            let variant = signal_watcher.next().await;
+            finish_raw_guard(raw_guard, variant);
+            Ok(ExitCode::from(1))
+        }
+        "exhausted" => {
+            write_reconnect_fixture_marker(b"RECONNECT_BUDGET_EXHAUSTED\r\n")?;
+            finish_raw_guard(raw_guard, RawModeExitVariant::ReconnectExhausted);
+            Ok(ExitCode::from(1))
+        }
+        "transient" => {
+            write_reconnect_fixture_marker(b"DISCONNECT_WINDOW_BEGIN\r\n")?;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            write_reconnect_fixture_marker(b"RECONNECT_SUCCESS\r\nOK\r\n")?;
+            finish_raw_guard(raw_guard, RawModeExitVariant::Normal);
+            Ok(ExitCode::SUCCESS)
+        }
+        other => anyhow::bail!("unknown PORTL_TEST_RECONNECT_SCENARIO '{other}'"),
+    }
+}
+
+#[cfg(debug_assertions)]
+fn write_reconnect_fixture_marker(bytes: &[u8]) -> Result<()> {
+    let mut stdout = std::io::stdout();
+    stdout
+        .write_all(bytes)
+        .context("write reconnect fixture marker")?;
+    stdout.flush().context("flush reconnect fixture marker")
 }
 
 async fn resolve_local_provider_for_session(
@@ -4644,10 +4686,10 @@ fn finish_raw_guard(raw_guard: Option<RawModeGuard>, variant: RawModeExitVariant
 
 #[cfg(feature = "panic-inject-attach")]
 fn maybe_panic_inject_attach() {
-    assert!(
-        std::env::var_os("PORTL_PANIC_INJECT_ATTACH").is_none(),
-        "panic-inject-attach"
-    );
+    if std::env::var_os("PORTL_PANIC_INJECT_ATTACH").is_some() {
+        write_panic_cleanup_to_fd_if_armed(nix::libc::STDERR_FILENO);
+        std::process::abort();
+    }
 }
 
 #[cfg(not(feature = "panic-inject-attach"))]

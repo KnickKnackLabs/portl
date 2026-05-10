@@ -18,8 +18,8 @@ const DETACH_KEY: &[u8] = b"\x1c";
 const STANDIN_TUI: &str = "saved=$(stty -g); stty raw -echo; printf 'TUI-BEGIN\\r\\n'; printf '\\033[c\\033[>c\\033[?u'; printf '\\r\\nTUI-READY\\r\\n'; sleep 1; stty \"$saved\"";
 const SYMPTOM2_STANDIN_TUI: &[u8] = b"saved=$(stty -g); stty raw -echo; printf 'SYM2-TUI-BEGIN\\r\\n'; printf '\\033[>1u\\033[?1049h'; printf '\\033[?1049l'; stty \"$saved\"; printf '\\r\\nSYM2-TUI-DONE\\r\\n'\n";
 const DEFENSIVE_KITTY_RESET: &[u8] = b"\x1b[<u\x1b[=0u\x1b[>4;0m";
-const EXTENDED_CLEANUP: &[u8] = b"\x1b[0m\x1b[?1049l\x1b[r\x1b[?7h\x1b[!p\x1b[?25h\x1b[<u\x1b[=0u\x1b[>4;0m\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\r\n";
-const EMERGENCY_CLEANUP: &[u8] = b"\x1b[0m\x1b[?1049l\x1b[r\x1b[?7h\x1b[!p\x1b[?25h\x1b[<u\x1b[=0u\x1b[>4;0m\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\r\n\x1bc";
+const EXTENDED_CLEANUP: &[u8] = b"\x1b[0m\x1b[?1049l\x1b[r\x1b[?7h\x1b[!p\x1b[?25h\x1b[<u\x1b[=0u\x1b[>4;0m\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\r\r\n";
+const EMERGENCY_CLEANUP: &[u8] = b"\x1b[0m\x1b[?1049l\x1b[r\x1b[?7h\x1b[!p\x1b[?25h\x1b[<u\x1b[=0u\x1b[>4;0m\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\r\r\n\x1bc";
 
 #[test]
 fn symptom1_startup_queries_do_not_leak_response_payloads() {
@@ -257,7 +257,7 @@ fn symptom3_panic_inject_attach_emits_cleanup_and_ris_on_stderr() {
 set +e
 PORTL_PANIC_INJECT_ATTACH=1 "$PORTL_BIN" attach "$PORTL_SESSION" --provider ghostty -- /bin/sh -c "sleep 30"
 status=$?
-printf '\nHOST_AFTER_ATTACH status=%s\n' "$status"
+printf 'HOST_AFTER_ATTACH status=%s\n' "$status"
 printf 'HOST_READY_PROBE\n'
 "$PORTL_BIN" kill "$PORTL_SESSION" --provider ghostty >/dev/null 2>&1 || true
 exit 0
@@ -302,10 +302,10 @@ fn symptom3_reattach_after_abnormal_exit_renders_cleanly() {
 set +e
 /bin/sh -c 'printf "ATTACH_PID=%s\n" "$$"; exec "$PORTL_BIN" attach "$PORTL_SESSION" --provider ghostty -- env PS1="REATTACH-PROMPT> " /bin/bash --noprofile --norc -i'
 first_status=$?
-printf '\nHOST_AFTER_FIRST status=%s\n' "$first_status"
+printf 'HOST_AFTER_FIRST status=%s\n' "$first_status"
 "$PORTL_BIN" attach "$PORTL_SESSION" --provider ghostty
 second_status=$?
-printf '\nHOST_AFTER_SECOND status=%s\n' "$second_status"
+printf 'HOST_AFTER_SECOND status=%s\n' "$second_status"
 "$PORTL_BIN" kill "$PORTL_SESSION" --provider ghostty >/dev/null 2>&1 || true
 exit 0
 "#;
@@ -394,7 +394,7 @@ set +e
 export PS1='SYM3-PROMPT> '
 "$PORTL_BIN" attach "$PORTL_SESSION" --provider ghostty -- /bin/bash --noprofile --norc -i
 status=$?
-printf '\nHOST_AFTER_DETACH status=%s\n' "$status"
+printf 'HOST_AFTER_DETACH status=%s\n' "$status"
 "$PORTL_BIN" kill "$PORTL_SESSION" --provider ghostty >/dev/null 2>&1 || true
 exit "$status"
 "#;
@@ -422,22 +422,42 @@ exit "$status"
     write(&child.input, b"stty -echo\n").expect("disable shell echo for scripted TUIs");
     drain_for(&child.rx, &mut transcript, Duration::from_millis(250));
 
-    for (label, script) in [
+    for (label, script, expected_cleanup) in [
         (
             "A",
             "printf '\\033[?1049hTUI_A\\033[?1049l\\r\\nPROBE_A:HELLO\\r\\n'\n",
+            vec![b"\x1b[?1049l".as_slice()],
         ),
         (
             "B",
             "printf '\\033[>1uTUI_B\\033[<u\\r\\nPROBE_B:HELLO\\r\\n'\n",
+            vec![b"\x1b[<u".as_slice()],
         ),
         (
             "C",
-            "printf '\\033[?1000h\\033[?1006hTUI_C\\033[?1000l\\033[?1006l\\r\\nPROBE_C:HELLO\\r\\n'\n",
+            "printf '\\033[?1000h\\033[?1002h\\033[?1003h\\033[?1006hTUI_C\\033[?1000l\\033[?1002l\\033[?1003l\\033[?1006l\\r\\nPROBE_C:HELLO\\r\\n'\n",
+            vec![
+                b"\x1b[?1000l".as_slice(),
+                b"\x1b[?1002l",
+                b"\x1b[?1003l",
+                b"\x1b[?1006l",
+            ],
         ),
         (
             "D",
-            "printf '\\033[>1u\\033[?1049h\\033[?1000h\\033[?1006h\\033[?2004h\\033[>4;2m\\033[?7l\\033[5;20rTUI_D\\r\\nPROBE_D:HELLO\\r\\n'\n",
+            "printf '\\033[>1u\\033[?1049h\\033[?1000h\\033[?1002h\\033[?1003h\\033[?1006h\\033[?2004h\\033[>4;2m\\033[?7l\\033[5;20rTUI_D\\033[?1049l\\r\\nPROBE_D:HELLO\\r\\n'\n",
+            vec![
+                b"\x1b[<u".as_slice(),
+                b"\x1b[=0u",
+                b"\x1b[>4;0m",
+                b"\x1b[?2004l",
+                b"\x1b[?1000l",
+                b"\x1b[?1002l",
+                b"\x1b[?1003l",
+                b"\x1b[?1006l",
+                b"\x1b[?7h",
+                b"\x1b[r",
+            ],
         ),
     ] {
         let before = transcript.len();
@@ -450,13 +470,48 @@ exit "$status"
             Duration::from_secs(10),
         )
         .expect("mixed-mode probe rendered");
+        drain_for(&child.rx, &mut transcript, Duration::from_millis(250));
         let slice = &transcript[before..];
         let probe = format!("PROBE_{label}:HELLO");
+        for cleanup in expected_cleanup {
+            assert!(
+                contains_subslice(slice, cleanup),
+                "expected targeted cleanup {} after TUI {label} exit:\n{}",
+                escaped(cleanup),
+                escaped(slice)
+            );
+        }
         let after_probe = bytes_after_marker(slice, probe.as_bytes()).unwrap_or_default();
         assert!(
-            !contains_kitty_csi_u_payload(after_probe),
-            "Kitty payload leaked after TUI {label} probe:\n{}",
+            !contains_subslice(after_probe, b"9;5:3u"),
+            "Kitty keypress payload leaked after TUI {label} probe:\n{}",
             escaped(after_probe)
+        );
+        let echo_probe = format!("echo HELLO_{label}\n");
+        let echo_marker = format!("HELLO_{label}");
+        let echo_start = transcript.len();
+        write(&child.input, echo_probe.as_bytes()).expect("send prompt usability probe");
+        wait_for_bytes(
+            &child.rx,
+            &mut transcript,
+            echo_marker.as_bytes(),
+            Duration::from_secs(10),
+        )
+        .expect("prompt usability probe rendered");
+        let echo_slice = &transcript[echo_start..];
+        assert_eq!(
+            echo_slice
+                .windows(echo_marker.len())
+                .filter(|window| *window == echo_marker.as_bytes())
+                .count(),
+            1,
+            "prompt probe should echo cleanly once after TUI {label}:\n{}",
+            escaped(echo_slice)
+        );
+        assert!(
+            !contains_kitty_csi_u_payload(echo_slice),
+            "Kitty payload leaked during prompt probe after TUI {label}:\n{}",
+            escaped(echo_slice)
         );
     }
 
@@ -504,7 +559,7 @@ set +e
 export PS1='SYM3-WINDOW> '
 "$PORTL_BIN" attach "$PORTL_SESSION" --provider ghostty -- /bin/bash --noprofile --norc -i
 status=$?
-printf '\nHOST_AFTER_DETACH status=%s\n' "$status"
+printf 'HOST_AFTER_DETACH status=%s\n' "$status"
 "$PORTL_BIN" kill "$PORTL_SESSION" --provider ghostty >/dev/null 2>&1 || true
 exit "$status"
 "#;
@@ -568,6 +623,79 @@ exit "$status"
     assert_cleanup_before_marker(&transcript, b"HOST_AFTER_DETACH", EXTENDED_CLEANUP);
 }
 
+#[test]
+fn symptom3_sighup_during_reconnect_wait_emits_terminal_cleanup() {
+    let transcript = run_reconnect_fixture("sighup-wait", Some(Signal::SIGHUP));
+
+    assert!(
+        contains_subslice(&transcript, b"HOST_READY_PROBE"),
+        "host shell did not recover after reconnect-wait SIGHUP:\n{}",
+        escaped(&transcript)
+    );
+    let after_wait_marker =
+        bytes_after_marker(&transcript, b"RECONNECT_WAIT_READY").expect("reconnect wait marker");
+    let cleanup_start = find_subslice(after_wait_marker, EMERGENCY_CLEANUP)
+        .expect("emergency cleanup after reconnect wait");
+    assert_no_cleanup_leaked(&after_wait_marker[..cleanup_start]);
+    assert_cleanup_ends_before_marker(
+        &transcript,
+        b"HOST_AFTER_RECONNECT_FIXTURE",
+        EMERGENCY_CLEANUP,
+    );
+}
+
+#[test]
+fn symptom3_reconnect_budget_exhaustion_emits_cleanup_without_ris() {
+    let transcript = run_reconnect_fixture("exhausted", None);
+
+    assert!(
+        contains_subslice(&transcript, b"HOST_AFTER_RECONNECT_FIXTURE status=1"),
+        "fixture did not exit with reconnect exhaustion status:\n{}",
+        escaped(&transcript)
+    );
+    assert_cleanup_ends_before_marker(
+        &transcript,
+        b"HOST_AFTER_RECONNECT_FIXTURE",
+        EXTENDED_CLEANUP,
+    );
+    let before_marker =
+        bytes_before_marker(&transcript, b"HOST_AFTER_RECONNECT_FIXTURE").unwrap_or(&transcript);
+    assert!(
+        !contains_subslice(before_marker, b"\x1bc"),
+        "reconnect-budget exhaustion emitted emergency RIS:\n{}",
+        escaped(before_marker)
+    );
+}
+
+#[test]
+fn symptom3_successful_reconnect_window_has_no_cleanup_leak() {
+    let transcript = run_reconnect_fixture("transient", None);
+
+    let reconnect_window = bytes_between_markers(
+        &transcript,
+        b"DISCONNECT_WINDOW_BEGIN",
+        b"RECONNECT_SUCCESS",
+    )
+    .expect("transient reconnect window markers");
+    assert_no_cleanup_leaked(reconnect_window);
+    let live_after_reconnect = bytes_between_markers(
+        &transcript,
+        b"RECONNECT_SUCCESS",
+        b"HOST_AFTER_RECONNECT_FIXTURE",
+    )
+    .expect("post-reconnect fixture markers");
+    assert!(
+        contains_subslice(live_after_reconnect, b"OK"),
+        "post-reconnect prompt probe did not render cleanly:\n{}",
+        escaped(live_after_reconnect)
+    );
+    assert_cleanup_ends_before_marker(
+        &transcript,
+        b"HOST_AFTER_RECONNECT_FIXTURE",
+        EXTENDED_CLEANUP,
+    );
+}
+
 struct HostCommand {
     process: Child,
     input: OwnedFd,
@@ -618,7 +746,7 @@ fn run_signal_terminated_attach(signal: Signal) -> (HostCommand, Vec<u8>) {
 set +e
 /bin/sh -c 'printf "ATTACH_PID=%s\n" "$$"; exec "$PORTL_BIN" attach "$PORTL_SESSION" --provider ghostty -- /bin/sh -c "printf SIGNAL_ATTACH_READY\\r\\n; sleep 30"'
 status=$?
-printf '\nHOST_AFTER_ATTACH status=%s\n' "$status"
+printf 'HOST_AFTER_ATTACH status=%s\n' "$status"
 printf 'HOST_READY_PROBE\n'
 "$PORTL_BIN" kill "$PORTL_SESSION" --provider ghostty >/dev/null 2>&1 || true
 exit 0
@@ -646,6 +774,66 @@ exit 0
     let pid = attach_pid_from_transcript(&transcript);
     kill(pid, signal).expect("send signal to attach process");
     (child, transcript)
+}
+
+fn run_reconnect_fixture(scenario: &str, signal: Option<Signal>) -> Vec<u8> {
+    let portl = assert_cmd::cargo::cargo_bin("portl");
+    let home = initialized_portl_home(&portl);
+    let session = unique_session("tuistory-symptom3-reconnect");
+    let host_script = r#"
+set +e
+/bin/sh -c 'printf "ATTACH_PID=%s\n" "$$"; PORTL_TEST_RECONNECT_SCENARIO="$PORTL_RECONNECT_SCENARIO" exec "$PORTL_BIN" attach "$PORTL_SESSION" --provider ghostty -- /bin/sh -c "sleep 30"'
+status=$?
+printf 'HOST_AFTER_RECONNECT_FIXTURE status=%s\n' "$status"
+printf 'HOST_READY_PROBE\n'
+"$PORTL_BIN" kill "$PORTL_SESSION" --provider ghostty >/dev/null 2>&1 || true
+exit 0
+"#;
+    let child = spawn_host_command(
+        "/bin/bash",
+        &["-lc", host_script],
+        &[
+            ("PORTL_BIN", portl.to_str().expect("portl path utf8")),
+            ("PORTL_HOME", home.path().to_str().expect("home path utf8")),
+            ("PORTL_SESSION", &session),
+            ("PORTL_RECONNECT_SCENARIO", scenario),
+            ("TERM", "xterm-kitty"),
+            ("RUST_LOG", "off"),
+        ],
+    )
+    .expect("spawn host command");
+    let mut transcript = Vec::new();
+    let ready = match scenario {
+        "sighup-wait" => b"RECONNECT_WAIT_READY".as_slice(),
+        "exhausted" => b"RECONNECT_BUDGET_EXHAUSTED".as_slice(),
+        "transient" => b"RECONNECT_SUCCESS".as_slice(),
+        other => panic!("unknown reconnect fixture scenario {other}"),
+    };
+    wait_for_bytes(&child.rx, &mut transcript, ready, Duration::from_secs(10))
+        .expect("reconnect fixture reached ready marker");
+    if let Some(signal) = signal {
+        let pid = attach_pid_from_transcript(&transcript);
+        kill(pid, signal).expect("send reconnect fixture signal");
+    }
+    wait_for_bytes(
+        &child.rx,
+        &mut transcript,
+        b"HOST_READY_PROBE",
+        Duration::from_secs(10),
+    )
+    .expect("host shell reached reconnect fixture post-attach probe");
+    drain_for(&child.rx, &mut transcript, Duration::from_millis(250));
+    let mut child = child;
+    let status = child
+        .process
+        .wait()
+        .expect("wait reconnect fixture host shell");
+    assert!(
+        status.success(),
+        "host shell failed after reconnect fixture: {status}; transcript:\n{}",
+        escaped(&transcript)
+    );
+    transcript
 }
 
 #[allow(unsafe_code)]
@@ -819,12 +1007,16 @@ fn bytes_before_marker<'a>(bytes: &'a [u8], marker: &[u8]) -> Option<&'a [u8]> {
         .map(|idx| &bytes[..idx])
 }
 
+fn bytes_between_markers<'a>(bytes: &'a [u8], start: &[u8], end: &[u8]) -> Option<&'a [u8]> {
+    let after_start = bytes_after_marker(bytes, start)?;
+    let end_idx = find_subslice(after_start, end)?;
+    Some(&after_start[..end_idx])
+}
+
 fn assert_cleanup_before_marker(bytes: &[u8], marker: &[u8], cleanup: &[u8]) {
     let before_marker = bytes_before_marker(bytes, marker).unwrap_or(bytes);
     assert!(
-        before_marker.ends_with(cleanup)
-            || contains_subslice(before_marker, cleanup)
-            || cleanup_components_in_order(before_marker, cleanup),
+        contains_subslice(before_marker, cleanup) || cleanup_components_in_order(before_marker),
         "expected cleanup {} before marker {} in transcript:\n{}",
         escaped(cleanup),
         escaped(marker),
@@ -832,7 +1024,43 @@ fn assert_cleanup_before_marker(bytes: &[u8], marker: &[u8], cleanup: &[u8]) {
     );
 }
 
-fn cleanup_components_in_order(bytes: &[u8], cleanup: &[u8]) -> bool {
+fn assert_cleanup_ends_before_marker(bytes: &[u8], marker: &[u8], cleanup: &[u8]) {
+    let before_marker = bytes_before_marker(bytes, marker).unwrap_or(bytes);
+    assert!(
+        before_marker.ends_with(cleanup),
+        "expected stream before marker {} to end exactly with cleanup {}:\n{}",
+        escaped(marker),
+        escaped(cleanup),
+        escaped(bytes)
+    );
+}
+
+fn assert_no_cleanup_leaked(bytes: &[u8]) {
+    for forbidden in [
+        b"\x1b[?1049l".as_slice(),
+        b"\x1b[<u",
+        b"\x1b[=0u",
+        b"\x1b[>4;0m",
+        b"\x1b[?2004l",
+        b"\x1b[?1000l",
+        b"\x1b[?1002l",
+        b"\x1b[?1003l",
+        b"\x1b[?1006l",
+        b"\x1b[?7h",
+        b"\x1b[r",
+        b"\x1b[!p",
+        b"\x1bc",
+    ] {
+        assert!(
+            !contains_subslice(bytes, forbidden),
+            "cleanup byte sequence {} leaked in window:\n{}",
+            escaped(forbidden),
+            escaped(bytes)
+        );
+    }
+}
+
+fn cleanup_components_in_order(bytes: &[u8]) -> bool {
     let mut search_from = 0;
     for component in [
         b"\x1b[0m".as_slice(),
@@ -855,15 +1083,7 @@ fn cleanup_components_in_order(bytes: &[u8], cleanup: &[u8]) -> bool {
         };
         search_from += relative + component.len();
     }
-    if cleanup.ends_with(b"\x1bc") {
-        bytes[search_from..]
-            .windows(b"\x1bc".len())
-            .any(|window| window == b"\x1bc")
-    } else {
-        !bytes[search_from..]
-            .windows(b"\x1bc".len())
-            .any(|window| window == b"\x1bc")
-    }
+    true
 }
 
 fn attach_pid_from_transcript(bytes: &[u8]) -> Pid {

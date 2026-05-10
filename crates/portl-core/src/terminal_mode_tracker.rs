@@ -159,6 +159,7 @@ impl TerminalModeTracker {
         }
         plan.extend_from_slice(KITTY_FLAGS_CLEAR);
         plan.extend_from_slice(MODIFY_OTHER_KEYS_CLEAR);
+        plan.extend_from_slice(&self.cleanup_plan());
         plan
     }
 
@@ -650,6 +651,30 @@ mod tests {
             "push pop should not be emitted when only direct flags were active: {reset:?}"
         );
         assert_eq!(tracker.cleanup_plan(), EMPTY);
+    }
+
+    #[test]
+    fn terminal_mode_tracker_alt_screen_leave_reset_includes_targeted_non_kitty_cleanup() {
+        let mut tracker = TerminalModeTracker::new();
+
+        tracker.feed(
+            b"\x1b[>1u\x1b[=15u\x1b[>4;2m\x1b[?1049h\x1b[?1000h\x1b[?1002h\
+              \x1b[?1003h\x1b[?1006h\x1b[?2004h\x1b[?7l\x1b[5;20r\x1b[?1049l",
+        );
+
+        assert_eq!(
+            tracker.take_alt_screen_leave_kitty_reset(),
+            b"\x1b[<u\x1b[=0u\x1b[>4;0m\x1b[?2004l\x1b[?1000l\x1b[?1002l\
+              \x1b[?1003l\x1b[?1006l\x1b[?7h\x1b[r"
+        );
+        assert!(!tracker.is_bracketed_paste_enabled());
+        assert!(
+            MOUSE_MODES
+                .iter()
+                .all(|mode| !tracker.is_mouse_mode_enabled(*mode))
+        );
+        assert!(tracker.decawm());
+        assert!(!tracker.scroll_region_non_default());
     }
 
     #[test]
