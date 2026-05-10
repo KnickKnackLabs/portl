@@ -4290,6 +4290,7 @@ const DEFERRED_DEFENSIVE_KITTY_RESET_IDLE: Duration = Duration::from_millis(100)
 
 struct HostBoundModeTracker {
     tracker: TerminalModeTracker,
+    sanitizer: HostOutputSanitizer,
     deferred_alt_screen_kitty_reset: bool,
     deferred_bytes_seen: usize,
 }
@@ -4298,6 +4299,7 @@ impl HostBoundModeTracker {
     fn new() -> Self {
         Self {
             tracker: TerminalModeTracker::new(),
+            sanitizer: HostOutputSanitizer::new(),
             deferred_alt_screen_kitty_reset: false,
             deferred_bytes_seen: 0,
         }
@@ -4365,6 +4367,136 @@ impl HostBoundModeTracker {
         self.deferred_bytes_seen = 0;
         self.tracker.take_alt_screen_leave_kitty_reset()
     }
+
+    fn sanitize(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.sanitizer.feed(bytes)
+    }
+
+    fn finish_sanitizer(&mut self) -> Vec<u8> {
+        self.sanitizer.finish()
+    }
+}
+
+const HOST_OUTPUT_SANITIZER_BUFFER_CAPACITY: usize = 128;
+
+#[derive(Debug)]
+struct HostOutputSanitizer {
+    state: HostOutputSanitizerState,
+    buffer: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostOutputSanitizerState {
+    Ground,
+    Escape,
+    Csi,
+}
+
+impl HostOutputSanitizer {
+    fn new() -> Self {
+        Self {
+            state: HostOutputSanitizerState::Ground,
+            buffer: Vec::with_capacity(HOST_OUTPUT_SANITIZER_BUFFER_CAPACITY),
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut output = Vec::with_capacity(bytes.len());
+        for &byte in bytes {
+            self.feed_byte(byte, &mut output);
+        }
+        output
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        self.state = HostOutputSanitizerState::Ground;
+        std::mem::take(&mut self.buffer)
+    }
+
+    fn feed_byte(&mut self, byte: u8, output: &mut Vec<u8>) {
+        match self.state {
+            HostOutputSanitizerState::Ground => {
+                if byte == 0x1b {
+                    self.buffer.push(byte);
+                    self.state = HostOutputSanitizerState::Escape;
+                } else {
+                    output.push(byte);
+                }
+            }
+            HostOutputSanitizerState::Escape => match byte {
+                b'[' => {
+                    self.buffer.push(byte);
+                    self.state = HostOutputSanitizerState::Csi;
+                }
+                0x1b => {
+                    output.extend_from_slice(&self.buffer);
+                    self.buffer.clear();
+                    self.buffer.push(byte);
+                }
+                _ => {
+                    output.extend_from_slice(&self.buffer);
+                    self.buffer.clear();
+                    output.push(byte);
+                    self.state = HostOutputSanitizerState::Ground;
+                }
+            },
+            HostOutputSanitizerState::Csi => {
+                if byte == 0x1b {
+                    output.extend_from_slice(&self.buffer);
+                    self.buffer.clear();
+                    self.buffer.push(byte);
+                    self.state = HostOutputSanitizerState::Escape;
+                    return;
+                }
+
+                self.buffer.push(byte);
+                if self.buffer.len() > HOST_OUTPUT_SANITIZER_BUFFER_CAPACITY {
+                    output.extend_from_slice(&self.buffer);
+                    self.buffer.clear();
+                    self.state = HostOutputSanitizerState::Ground;
+                    return;
+                }
+
+                if (0x40..=0x7e).contains(&byte) {
+                    if !host_output_is_stripped_response(&self.buffer) {
+                        output.extend_from_slice(&self.buffer);
+                    }
+                    self.buffer.clear();
+                    self.state = HostOutputSanitizerState::Ground;
+                }
+            }
+        }
+    }
+}
+
+fn host_output_is_stripped_response(csi: &[u8]) -> bool {
+    let Some((&final_byte, body_with_intro)) = csi.split_last() else {
+        return false;
+    };
+    let Some(params) = body_with_intro.strip_prefix(b"\x1b[") else {
+        return false;
+    };
+
+    match (params.first().copied(), final_byte) {
+        (Some(b'?'), b'u') => host_output_params_match(&params[1..], b";:", true),
+        (Some(b'?' | b'>'), b'c') | (Some(b'?'), b'R') => {
+            host_output_params_match(&params[1..], b";", true)
+        }
+        (_, b'R') => host_output_params_match(params, b";", true),
+        _ => false,
+    }
+}
+
+fn host_output_params_match(params: &[u8], separators: &[u8], require_digit: bool) -> bool {
+    let mut saw_digit = false;
+    for &byte in params {
+        match byte {
+            b'0'..=b'9' => saw_digit = true,
+            other if separators.contains(&other) => {}
+            _ => return false,
+        }
+    }
+    !require_digit || saw_digit
 }
 
 type SharedTerminalModeTracker = Arc<StdMutex<HostBoundModeTracker>>;
@@ -4378,6 +4510,20 @@ fn track_host_bound_bytes(tracker: &SharedTerminalModeTracker, bytes: &[u8]) -> 
         .lock()
         .map_err(|_| anyhow!("terminal mode tracker lock poisoned"))?;
     Ok(tracker.track(bytes))
+}
+
+fn sanitize_host_bound_bytes(tracker: &SharedTerminalModeTracker, bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut tracker = tracker
+        .lock()
+        .map_err(|_| anyhow!("terminal mode tracker lock poisoned"))?;
+    Ok(tracker.sanitize(bytes))
+}
+
+fn finish_host_output_sanitizer(tracker: &SharedTerminalModeTracker) -> Result<Vec<u8>> {
+    let mut tracker = tracker
+        .lock()
+        .map_err(|_| anyhow!("terminal mode tracker lock poisoned"))?;
+    Ok(tracker.finish_sanitizer())
 }
 
 fn flush_host_bound_mode_tracker(tracker: &SharedTerminalModeTracker) -> Result<Vec<u8>> {
@@ -4407,7 +4553,10 @@ async fn write_tracked_output(
     tracker: &SharedTerminalModeTracker,
 ) -> Result<()> {
     let defensive_reset = track_host_bound_bytes(tracker, bytes)?;
-    display.write_output(stream, bytes).await?;
+    let sanitized = sanitize_host_bound_bytes(tracker, bytes)?;
+    if !sanitized.is_empty() {
+        display.write_output(stream, &sanitized).await?;
+    }
     if !defensive_reset.is_empty() {
         display.write_output(stream, &defensive_reset).await?;
     } else if host_bound_mode_tracker_has_deferred_reset(tracker)? {
@@ -4423,13 +4572,13 @@ fn schedule_deferred_mode_reset_flush(
 ) {
     tokio::spawn(async move {
         tokio::time::sleep(DEFERRED_DEFENSIVE_KITTY_RESET_IDLE).await;
-        if let Err(err) = flush_tracked_output(&display, stream, &tracker).await {
+        if let Err(err) = flush_deferred_mode_reset_output(&display, stream, &tracker).await {
             debug!(error = %err, "failed to flush deferred terminal mode reset");
         }
     });
 }
 
-async fn flush_tracked_output(
+async fn flush_deferred_mode_reset_output(
     display: &AttachDisplay,
     stream: AttachOutputStream,
     tracker: &SharedTerminalModeTracker,
@@ -4439,6 +4588,18 @@ async fn flush_tracked_output(
         display.write_output(stream, &defensive_reset).await?;
     }
     display.flush(stream).await
+}
+
+async fn flush_tracked_output(
+    display: &AttachDisplay,
+    stream: AttachOutputStream,
+    tracker: &SharedTerminalModeTracker,
+) -> Result<()> {
+    let sanitized = finish_host_output_sanitizer(tracker)?;
+    if !sanitized.is_empty() {
+        display.write_output(stream, &sanitized).await?;
+    }
+    flush_deferred_mode_reset_output(display, stream, tracker).await
 }
 
 impl RawModeGuard {
@@ -7223,6 +7384,176 @@ mod tests {
             b"\x1b[<u\x1b[>4;0m"
         );
         assert_eq!(flush_host_bound_mode_tracker(&tracker).unwrap(), b"");
+    }
+
+    fn sanitize_host_output_chunks(chunks: &[&[u8]]) -> Vec<u8> {
+        let mut sanitizer = HostOutputSanitizer::new();
+        let mut output = Vec::new();
+        for chunk in chunks {
+            output.extend_from_slice(&sanitizer.feed(chunk));
+        }
+        output.extend_from_slice(&sanitizer.finish());
+        output
+    }
+
+    fn assert_sanitizes_to(input: &[u8], expected: &[u8]) {
+        let output = sanitize_host_output_chunks(&[input]);
+        assert_eq!(
+            output,
+            expected,
+            "sanitized output mismatch for {:?}",
+            String::from_utf8_lossy(input)
+        );
+    }
+
+    #[test]
+    fn host_output_sanitizer_drops_da1_response() {
+        let input = b"hello\x1b[?62;52;cworld";
+        assert_sanitizes_to(input, b"helloworld");
+        assert_eq!(input.len() - b"\x1b[?62;52;c".len(), b"helloworld".len());
+    }
+
+    #[test]
+    fn host_output_sanitizer_drops_da2_response() {
+        let output = sanitize_host_output_chunks(&[b"before\x1b[>1;100;0cafter"]);
+        assert_eq!(output, b"beforeafter");
+        assert!(!contains_bytes(&output, b"\x1b[>1;100;0c"));
+    }
+
+    #[test]
+    fn host_output_sanitizer_drops_kitty_csi_u_response_values() {
+        for response in [b"\x1b[?0u".as_slice(), b"\x1b[?15u", b"\x1b[?1;2:3u"] {
+            let mut input = b"pre".to_vec();
+            input.extend_from_slice(response);
+            input.extend_from_slice(b"post");
+            let output = sanitize_host_output_chunks(&[&input]);
+            assert_eq!(output, b"prepost");
+            assert!(!contains_bytes(&output, b"\x1b[?"));
+            assert!(!contains_bytes(&output, response));
+        }
+    }
+
+    #[test]
+    fn host_output_sanitizer_drops_dsr_cpr_responses() {
+        assert_sanitizes_to(b"pre\x1b[12;40Rpost", b"prepost");
+        assert_sanitizes_to(b"pre\x1b[?12;40Rpost", b"prepost");
+    }
+
+    #[test]
+    fn host_output_sanitizer_is_chunk_boundary_safe_inside_responses() {
+        for response in [
+            b"\x1b[?62;52;c".as_slice(),
+            b"\x1b[>1;100;0c",
+            b"\x1b[?1;2:3u",
+            b"\x1b[12;40R",
+            b"\x1b[?12;40R",
+        ] {
+            let mut input = b"pre".to_vec();
+            let response_start = input.len();
+            input.extend_from_slice(response);
+            let response_end = input.len();
+            input.extend_from_slice(b"post");
+
+            for split in response_start..=response_end {
+                let output = sanitize_host_output_chunks(&[&input[..split], &input[split..]]);
+                assert_eq!(
+                    output,
+                    b"prepost",
+                    "response {:?} leaked with split {split}",
+                    String::from_utf8_lossy(response)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn host_output_sanitizer_preserves_unrelated_csi_and_osc_traffic() {
+        let inputs = [
+            b"cursor\x1b[10;20Hdone".as_slice(),
+            b"sgr\x1b[31mdone",
+            b"altscreen\x1b[?1049h\x1b[?1049ldone",
+            b"title\x1b]0;Portl title\x07done",
+            b"title-st\x1b]0;Portl title\x1b\\done",
+            b"paste\x1b[?2004h\x1b[?2004ldone",
+            b"kitty-push\x1b[>1udone",
+            b"modify-other-keys\x1b[>4;0mdone",
+        ];
+        for input in inputs {
+            let output = sanitize_host_output_chunks(&[input]);
+            assert_eq!(
+                output,
+                input,
+                "unrelated sequence must be preserved: {:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    #[test]
+    fn host_output_sanitizer_strips_multiple_sequential_responses() {
+        assert_sanitizes_to(b"pre\x1b[?62;52;c\x1b[>1;100;0c\x1b[?0upost", b"prepost");
+        assert_sanitizes_to(b"a\x1b[?62;52;cb\x1b[12;40Rc\x1b[?15ud", b"abcd");
+    }
+
+    #[tokio::test]
+    async fn host_output_sanitizer_composes_with_host_write_path() {
+        let display = AttachDisplay::new(80, 24);
+        hold_stdout(&display).await;
+        let tracker = new_terminal_mode_tracker();
+
+        for chunk in [
+            b"pre\x1b".as_slice(),
+            b"[?62;52;c\x1b[>1",
+            b";100;0c\x1b[?0u",
+            b"\x1b[12;40Rpost",
+        ] {
+            write_tracked_output(&display, AttachOutputStream::Stdout, chunk, &tracker)
+                .await
+                .unwrap();
+        }
+        flush_tracked_output(&display, AttachOutputStream::Stdout, &tracker)
+            .await
+            .unwrap();
+
+        let output = take_held_stdout(&display).await;
+        assert_eq!(output, b"prepost");
+        for forbidden in [
+            b"\x1b[?62;52;c".as_slice(),
+            b"\x1b[>1;100;0c",
+            b"\x1b[?0u",
+            b"\x1b[12;40R",
+        ] {
+            assert!(!contains_bytes(&output, forbidden));
+        }
+    }
+
+    #[tokio::test]
+    async fn host_output_sanitizer_deferred_mode_reset_does_not_emit_response_prefix() {
+        let display = AttachDisplay::new(80, 24);
+        hold_stdout(&display).await;
+        let tracker = new_terminal_mode_tracker();
+
+        write_tracked_output(
+            &display,
+            AttachOutputStream::Stdout,
+            b"\x1b[>1u\x1b[?1049h\x1b[?1049lpre\x1b[?62",
+            &tracker,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let output = take_held_stdout(&display).await;
+        assert!(!contains_bytes(&output, b"\x1b[?62"));
+        assert!(contains_bytes(&output, b"\x1b[<u\x1b[>4;0m"));
+
+        write_tracked_output(&display, AttachOutputStream::Stdout, b";52;cpost", &tracker)
+            .await
+            .unwrap();
+        flush_tracked_output(&display, AttachOutputStream::Stdout, &tracker)
+            .await
+            .unwrap();
+        let output = take_held_stdout(&display).await;
+        assert_eq!(output, b"post");
     }
 
     async fn hold_stdout(display: &AttachDisplay) {
