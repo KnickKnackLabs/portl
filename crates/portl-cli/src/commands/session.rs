@@ -4531,19 +4531,8 @@ fn write_panic_cleanup_to_fd_if_armed(fd: i32) {
         return;
     }
 
-    let mut ptr = panic_hook_cleanup_bytes().as_ptr();
-    let mut remaining = panic_hook_cleanup_bytes().len();
-    while remaining > 0 {
-        let written = unsafe { nix::libc::write(fd, ptr.cast(), remaining) };
-        if written <= 0 {
-            break;
-        }
-        let Ok(written) = usize::try_from(written) else {
-            break;
-        };
-        ptr = unsafe { ptr.add(written) };
-        remaining = remaining.saturating_sub(written);
-    }
+    let cleanup = panic_hook_cleanup_bytes();
+    let _ = unsafe { nix::libc::write(fd, cleanup.as_ptr().cast(), cleanup.len()) };
 }
 
 #[derive(Debug, Default)]
@@ -6958,6 +6947,34 @@ mod tests {
         set_panic_hook_armed(false);
         let output = capture.finish();
         assert_eq!(output, raw_mode_cleanup_sequence(RawModeExitVariant::Panic));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn panic_hook_armed_writer_source_uses_single_raw_write() {
+        let source = include_str!("session.rs");
+        let function_start = source
+            .find("fn write_panic_cleanup_to_fd_if_armed")
+            .expect("panic cleanup writer source");
+        let function_body = &source[function_start..];
+        let function_end = function_body
+            .find("\n\n#[derive(Debug, Default)]")
+            .expect("end of panic cleanup writer source");
+        let function_body = &function_body[..function_end];
+
+        assert!(
+            !function_body.contains("while "),
+            "armed panic cleanup writer must not retry short writes with while"
+        );
+        assert!(
+            !function_body.contains("loop "),
+            "armed panic cleanup writer must not retry short writes with loop"
+        );
+        assert_eq!(
+            function_body.matches("nix::libc::write(fd,").count(),
+            1,
+            "armed panic cleanup writer must perform exactly one raw libc::write"
+        );
     }
 
     #[cfg(unix)]
