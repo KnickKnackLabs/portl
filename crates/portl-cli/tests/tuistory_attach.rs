@@ -31,7 +31,8 @@ set +e
 "$PORTL_BIN" attach "$PORTL_SESSION" --provider ghostty -- /bin/sh -c "$STANDIN_TUI"
 status=$?
 printf '\nHOST_AFTER_DETACH status=%s\n' "$status"
-IFS= read -r -t 1 leaked || leaked=''
+IFS= read -r -t 1 leaked
+leaked=${leaked-}
 printf 'HOST_STDIN:%s\n' "$leaked"
 "$PORTL_BIN" kill "$PORTL_SESSION" --provider ghostty >/dev/null 2>&1 || true
 exit "$status"
@@ -63,7 +64,16 @@ exit "$status"
             escaped(&transcript)
         );
     }
-    write(&child.input, DETACH_KEY).expect("send detach key");
+    write(&child.input, DETACH_KEY).expect("enter attach control mode");
+    wait_for_bytes(
+        &child.rx,
+        &mut transcript,
+        b"detach",
+        Duration::from_secs(5),
+    )
+    .expect("attach control mode displayed detach action");
+    let detach_prompt = transcript.len();
+    write(&child.input, b"d").expect("confirm detach");
     wait_for_bytes(
         &child.rx,
         &mut transcript,
@@ -77,6 +87,13 @@ exit "$status"
     assert!(
         status.success(),
         "host shell exited with {status}; transcript:\n{}",
+        escaped(&transcript)
+    );
+    let post_detach_marker = find_subslice(&transcript, b"HOST_AFTER_DETACH status=0")
+        .expect("normal detach status marker");
+    assert!(
+        post_detach_marker >= detach_prompt,
+        "post-detach marker appeared before detach confirmation:\n{}",
         escaped(&transcript)
     );
 
@@ -96,7 +113,8 @@ export PS1='SYM2-PROMPT> '
 "$PORTL_BIN" attach "$PORTL_SESSION" --provider ghostty -- /bin/bash --noprofile --norc -i
 status=$?
 printf '\nHOST_AFTER_DETACH status=%s\n' "$status"
-IFS= read -r -t 1 leaked || leaked=''
+IFS= read -r -t 1 leaked
+leaked=${leaked-}
 printf 'HOST_STDIN:%s\n' "$leaked"
 "$PORTL_BIN" kill "$PORTL_SESSION" --provider ghostty >/dev/null 2>&1 || true
 exit "$status"

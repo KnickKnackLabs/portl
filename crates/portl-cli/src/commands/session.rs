@@ -4291,7 +4291,8 @@ const DEFERRED_DEFENSIVE_KITTY_RESET_IDLE: Duration = Duration::from_millis(100)
 
 struct HostBoundModeTracker {
     tracker: TerminalModeTracker,
-    sanitizer: HostOutputSanitizer,
+    stdout_sanitizer: HostOutputSanitizer,
+    stderr_sanitizer: HostOutputSanitizer,
     deferred_alt_screen_kitty_reset: bool,
     deferred_bytes_seen: usize,
 }
@@ -4300,7 +4301,8 @@ impl HostBoundModeTracker {
     fn new() -> Self {
         Self {
             tracker: TerminalModeTracker::new(),
-            sanitizer: HostOutputSanitizer::new(),
+            stdout_sanitizer: HostOutputSanitizer::new(),
+            stderr_sanitizer: HostOutputSanitizer::new(),
             deferred_alt_screen_kitty_reset: false,
             deferred_bytes_seen: 0,
         }
@@ -4369,12 +4371,19 @@ impl HostBoundModeTracker {
         self.tracker.take_alt_screen_leave_kitty_reset()
     }
 
-    fn sanitize(&mut self, bytes: &[u8]) -> Vec<u8> {
-        self.sanitizer.feed(bytes)
+    fn sanitize(&mut self, stream: AttachOutputStream, bytes: &[u8]) -> Vec<u8> {
+        self.sanitizer_for(stream).feed(bytes)
     }
 
-    fn finish_sanitizer(&mut self) -> Vec<u8> {
-        self.sanitizer.finish()
+    fn finish_sanitizer(&mut self, stream: AttachOutputStream) -> Vec<u8> {
+        self.sanitizer_for(stream).finish()
+    }
+
+    fn sanitizer_for(&mut self, stream: AttachOutputStream) -> &mut HostOutputSanitizer {
+        match stream {
+            AttachOutputStream::Stdout => &mut self.stdout_sanitizer,
+            AttachOutputStream::Stderr => &mut self.stderr_sanitizer,
+        }
     }
 }
 
@@ -4513,18 +4522,25 @@ fn track_host_bound_bytes(tracker: &SharedTerminalModeTracker, bytes: &[u8]) -> 
     Ok(tracker.track(bytes))
 }
 
-fn sanitize_host_bound_bytes(tracker: &SharedTerminalModeTracker, bytes: &[u8]) -> Result<Vec<u8>> {
+fn sanitize_host_bound_bytes(
+    tracker: &SharedTerminalModeTracker,
+    stream: AttachOutputStream,
+    bytes: &[u8],
+) -> Result<Vec<u8>> {
     let mut tracker = tracker
         .lock()
         .map_err(|_| anyhow!("terminal mode tracker lock poisoned"))?;
-    Ok(tracker.sanitize(bytes))
+    Ok(tracker.sanitize(stream, bytes))
 }
 
-fn finish_host_output_sanitizer(tracker: &SharedTerminalModeTracker) -> Result<Vec<u8>> {
+fn finish_host_output_sanitizer(
+    tracker: &SharedTerminalModeTracker,
+    stream: AttachOutputStream,
+) -> Result<Vec<u8>> {
     let mut tracker = tracker
         .lock()
         .map_err(|_| anyhow!("terminal mode tracker lock poisoned"))?;
-    Ok(tracker.finish_sanitizer())
+    Ok(tracker.finish_sanitizer(stream))
 }
 
 fn flush_host_bound_mode_tracker(tracker: &SharedTerminalModeTracker) -> Result<Vec<u8>> {
@@ -4554,7 +4570,7 @@ async fn write_tracked_output(
     tracker: &SharedTerminalModeTracker,
 ) -> Result<()> {
     let defensive_reset = track_host_bound_bytes(tracker, bytes)?;
-    let sanitized = sanitize_host_bound_bytes(tracker, bytes)?;
+    let sanitized = sanitize_host_bound_bytes(tracker, stream, bytes)?;
     if !sanitized.is_empty() {
         display.write_output(stream, &sanitized).await?;
     }
@@ -4596,7 +4612,7 @@ async fn flush_tracked_output(
     stream: AttachOutputStream,
     tracker: &SharedTerminalModeTracker,
 ) -> Result<()> {
-    let sanitized = finish_host_output_sanitizer(tracker)?;
+    let sanitized = finish_host_output_sanitizer(tracker, stream)?;
     if !sanitized.is_empty() {
         display.write_output(stream, &sanitized).await?;
     }
@@ -7576,6 +7592,58 @@ mod tests {
     async fn take_held_stdout(display: &AttachDisplay) -> Vec<u8> {
         let mut state = display.inner.lock().await;
         state.gate.take_stdout()
+    }
+
+    async fn take_held_stderr(display: &AttachDisplay) -> Vec<u8> {
+        let mut state = display.inner.lock().await;
+        state.gate.take_stderr()
+    }
+
+    #[tokio::test]
+    async fn host_output_sanitizer_keeps_stdout_and_stderr_state_isolated() {
+        let display = AttachDisplay::new(80, 24);
+        hold_stdout(&display).await;
+        let tracker = new_terminal_mode_tracker();
+
+        write_tracked_output(
+            &display,
+            AttachOutputStream::Stderr,
+            b"err-pre\x1b[?",
+            &tracker,
+        )
+        .await
+        .unwrap();
+        write_tracked_output(
+            &display,
+            AttachOutputStream::Stdout,
+            b"out-pre\x1b[?62;52;c",
+            &tracker,
+        )
+        .await
+        .unwrap();
+        flush_tracked_output(&display, AttachOutputStream::Stdout, &tracker)
+            .await
+            .unwrap();
+
+        let stdout = take_held_stdout(&display).await;
+        let stderr = take_held_stderr(&display).await;
+        assert_eq!(stdout, b"out-pre");
+        assert_eq!(stderr, b"err-pre");
+        for stream in [&stdout, &stderr] {
+            assert!(!contains_bytes(stream, b";c"));
+            assert!(!contains_bytes(stream, b";u"));
+            assert!(!contains_bytes(stream, b";R"));
+            assert!(!contains_bytes(stream, b"\x1b[?"));
+        }
+
+        write_tracked_output(&display, AttachOutputStream::Stderr, b"62;52;c", &tracker)
+            .await
+            .unwrap();
+        flush_tracked_output(&display, AttachOutputStream::Stderr, &tracker)
+            .await
+            .unwrap();
+        let stderr = take_held_stderr(&display).await;
+        assert!(stderr.is_empty());
     }
 
     #[tokio::test]
