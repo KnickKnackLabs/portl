@@ -147,7 +147,6 @@ impl TerminalModeTracker {
         }
         self.pending_alt_screen_kitty_reset = false;
         let needs_kitty_pop = self.modes.kitty_keyboard_depth > 0;
-        let needs_flags_clear = self.modes.kitty_flags != 0;
         self.modes.kitty_keyboard_depth = 0;
         self.modes.kitty_flags = 0;
         self.modes.modify_other_keys = 0;
@@ -158,9 +157,7 @@ impl TerminalModeTracker {
         if needs_kitty_pop {
             plan.extend_from_slice(KITTY_POP);
         }
-        if needs_flags_clear {
-            plan.extend_from_slice(KITTY_FLAGS_CLEAR);
-        }
+        plan.extend_from_slice(KITTY_FLAGS_CLEAR);
         plan.extend_from_slice(MODIFY_OTHER_KEYS_CLEAR);
         plan
     }
@@ -623,6 +620,13 @@ mod tests {
         let mut tracker = TerminalModeTracker::new();
         tracker.feed(b"\x1b[>1u\x1b[?1049h\x1b[?1049l\x1b[<u");
         assert_eq!(tracker.take_alt_screen_leave_kitty_reset(), EMPTY);
+
+        let mut tracker = TerminalModeTracker::new();
+        tracker.feed(b"\x1b[>1u\x1b[?1049h\x1b[?1049l");
+        assert_eq!(
+            tracker.take_alt_screen_leave_kitty_reset(),
+            b"\x1b[<u\x1b[=0u\x1b[>4;0m"
+        );
     }
 
     #[test]
