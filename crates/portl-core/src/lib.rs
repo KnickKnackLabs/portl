@@ -21,6 +21,7 @@ pub mod rendezvous;
 pub mod runtime;
 pub mod store_index;
 pub mod terminal;
+pub mod terminal_mode_tracker;
 pub mod ticket;
 pub mod ticket_store;
 pub mod tls;
