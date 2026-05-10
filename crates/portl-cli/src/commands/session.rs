@@ -2434,6 +2434,7 @@ async fn remote_session_attach_with_reconnect_on_endpoint(
         attach_path_snapshot(&connected.connection),
     );
     let raw_guard = RawModeGuard::new()?;
+    let mut signal_watcher = AttachSignalWatcher::new()?;
     let display = AttachDisplay::new(request.cols, request.rows);
     let mode_tracker = new_terminal_mode_tracker();
     let mut coordinator = AttachInputCoordinator::spawn(
@@ -2448,18 +2449,26 @@ async fn remote_session_attach_with_reconnect_on_endpoint(
     let mut reconnect_state = ReconnectAttemptState::new();
     let mut attach_started = Instant::now();
     loop {
-        match run_remote_attach_once(session, &display, &mut coordinator, &mode_tracker).await {
+        match run_remote_attach_once(
+            session,
+            &display,
+            &mut coordinator,
+            &mode_tracker,
+            &mut signal_watcher,
+        )
+        .await
+        {
             AttachEnd::Exited(code) => {
                 display.clear_bar().await?;
                 coordinator.stop().await;
-                drop(raw_guard);
+                raw_guard.finish(RawModeExitVariant::Normal);
                 connected.connection.close(0u32.into(), b"session complete");
                 return Ok(exit_code_from_i32(code));
             }
             AttachEnd::Detached => {
                 display.clear_bar().await?;
                 coordinator.stop().await;
-                drop(raw_guard);
+                raw_guard.finish(RawModeExitVariant::Normal);
                 connected.connection.close(0u32.into(), b"session detached");
                 print_detached_message(&canonical_ref);
                 return Ok(ExitCode::SUCCESS);
@@ -2467,12 +2476,21 @@ async fn remote_session_attach_with_reconnect_on_endpoint(
             AttachEnd::QuitReconnect => {
                 display.clear_bar().await?;
                 coordinator.stop().await;
-                drop(raw_guard);
+                raw_guard.finish(RawModeExitVariant::Normal);
                 connected
                     .connection
                     .close(0u32.into(), b"session reconnect quit");
                 print_reconnect_quit_message(&canonical_ref);
                 return Ok(ExitCode::SUCCESS);
+            }
+            AttachEnd::Signal(variant) => {
+                display.clear_bar().await?;
+                coordinator.stop().await;
+                raw_guard.finish(variant);
+                connected
+                    .connection
+                    .close(0u32.into(), b"session attach signal");
+                return Ok(ExitCode::from(1));
             }
             AttachEnd::Disconnected(err) => {
                 debug!(%err, "remote session attach disconnected");
@@ -2496,6 +2514,7 @@ async fn remote_session_attach_with_reconnect_on_endpoint(
                     &mut coordinator,
                     &mut reconnect_state,
                     &mut flight_recorder,
+                    &mut signal_watcher,
                 )
                 .await?;
                 match reattached {
@@ -2510,21 +2529,21 @@ async fn remote_session_attach_with_reconnect_on_endpoint(
                     ReconnectOutcome::Detached => {
                         display.clear_bar().await?;
                         coordinator.stop().await;
-                        drop(raw_guard);
+                        raw_guard.finish(RawModeExitVariant::Normal);
                         print_detached_message(&canonical_ref);
                         return Ok(ExitCode::SUCCESS);
                     }
                     ReconnectOutcome::Quit => {
                         display.clear_bar().await?;
                         coordinator.stop().await;
-                        drop(raw_guard);
+                        raw_guard.finish(RawModeExitVariant::Normal);
                         print_reconnect_quit_message(&canonical_ref);
                         return Ok(ExitCode::SUCCESS);
                     }
                     ReconnectOutcome::Expired => {
                         display.clear_bar().await?;
                         coordinator.stop().await;
-                        drop(raw_guard);
+                        raw_guard.finish(RawModeExitVariant::ReconnectExhausted);
                         eprintln!(
                             "portl: could not reconnect to session \"{canonical_ref}\" after 2m"
                         );
@@ -2535,6 +2554,12 @@ async fn remote_session_attach_with_reconnect_on_endpoint(
                         eprintln!();
                         eprintln!("The session may still be running. To reconnect, run:");
                         eprintln!("  portl attach {canonical_ref}");
+                        return Ok(ExitCode::from(1));
+                    }
+                    ReconnectOutcome::Signal(variant) => {
+                        display.clear_bar().await?;
+                        coordinator.stop().await;
+                        raw_guard.finish(variant);
                         return Ok(ExitCode::from(1));
                     }
                 }
@@ -2571,6 +2596,7 @@ fn print_reconnect_quit_message(canonical_ref: &str) {
     eprintln!("  portl attach {canonical_ref}");
 }
 
+#[allow(clippy::too_many_lines)]
 async fn bridge_attach(
     session: RemoteAttachSession,
     cols: u16,
@@ -2588,6 +2614,7 @@ async fn bridge_attach(
     } else {
         None
     };
+    let mut signal_watcher = AttachSignalWatcher::new()?;
     let SessionClient {
         provider,
         control_send: _control_send,
@@ -2639,25 +2666,49 @@ async fn bridge_attach(
         )
         .await
     });
-    let (code, detached) = wait_attach_completion(&mut exit, stdin_task).await?;
-    if detached {
+    let completion = wait_attach_completion(&mut exit, stdin_task, &mut signal_watcher).await?;
+    if matches!(
+        completion,
+        AttachCompletion::Detached | AttachCompletion::Signal(_)
+    ) {
         stdout_task.abort();
         stderr_task.abort();
         let _ = stdout_task.await;
         let _ = stderr_task.await;
         display.clear_bar().await?;
-        drop(raw_guard);
-        eprintln!("portl: detached from session \"{canonical_ref}\"");
-        eprintln!();
-        eprintln!("The session is still running. To reconnect, run:");
-        eprintln!("  portl attach {canonical_ref}");
+        match completion {
+            AttachCompletion::Detached => {
+                if let Some(raw_guard) = raw_guard {
+                    raw_guard.finish(RawModeExitVariant::Normal);
+                }
+                eprintln!("portl: detached from session \"{canonical_ref}\"");
+                eprintln!();
+                eprintln!("The session is still running. To reconnect, run:");
+                eprintln!("  portl attach {canonical_ref}");
+                Ok(0)
+            }
+            AttachCompletion::Signal(variant) => {
+                if let Some(raw_guard) = raw_guard {
+                    raw_guard.finish(variant);
+                }
+                Ok(1)
+            }
+            AttachCompletion::Exited(_) => unreachable!("matches excludes exited"),
+        }
     } else {
         await_output_task(stdout_task, "stdout").await?;
         await_output_task(stderr_task, "stderr").await?;
         display.clear_bar().await?;
-        drop(raw_guard);
+        if let Some(raw_guard) = raw_guard {
+            raw_guard.finish(RawModeExitVariant::Normal);
+        }
+        match completion {
+            AttachCompletion::Exited(code) => Ok(code),
+            AttachCompletion::Detached | AttachCompletion::Signal(_) => {
+                unreachable!("handled before output await")
+            }
+        }
     }
-    Ok(code)
 }
 
 async fn bridge_attach_v2(
@@ -2671,6 +2722,7 @@ async fn bridge_attach_v2(
     } else {
         None
     };
+    let mut signal_watcher = AttachSignalWatcher::new()?;
     let display = AttachDisplay::new(cols, rows);
     let mode_tracker = new_terminal_mode_tracker();
     let mut coordinator = AttachInputCoordinator::spawn(
@@ -2681,16 +2733,29 @@ async fn bridge_attach_v2(
         },
         (cols, rows),
     );
-    let end = run_remote_attach_v2_once(session, &display, &mut coordinator, &mode_tracker).await;
+    let end = run_remote_attach_v2_once(
+        session,
+        &display,
+        &mut coordinator,
+        &mode_tracker,
+        &mut signal_watcher,
+    )
+    .await;
     display.clear_bar().await?;
     coordinator.stop().await;
-    drop(raw_guard);
+    if let Some(raw_guard) = raw_guard {
+        raw_guard.finish(
+            end.raw_mode_exit_variant()
+                .unwrap_or(RawModeExitVariant::Normal),
+        );
+    }
     match end {
         AttachEnd::Exited(code) => Ok(code),
         AttachEnd::Detached | AttachEnd::QuitReconnect => {
             print_detached_message(&canonical_ref);
             Ok(0)
         }
+        AttachEnd::Signal(_) => Ok(1),
         AttachEnd::Disconnected(err) => Err(err),
     }
 }
@@ -2850,6 +2915,18 @@ enum ReconnectOutcome {
     Detached,
     Quit,
     Expired,
+    Signal(RawModeExitVariant),
+}
+
+impl ReconnectOutcome {
+    #[cfg(test)]
+    fn raw_mode_exit_variant(&self) -> Option<RawModeExitVariant> {
+        match self {
+            Self::Expired => Some(RawModeExitVariant::ReconnectExhausted),
+            Self::Signal(variant) => Some(*variant),
+            Self::Reattached { .. } | Self::Detached | Self::Quit => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2857,6 +2934,7 @@ enum ReconnectDelayOutcome {
     Retry,
     Detached,
     Quit,
+    Signal(RawModeExitVariant),
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -2871,6 +2949,7 @@ async fn reconnect_remote_session(
     coordinator: &mut AttachInputCoordinator,
     state: &mut ReconnectAttemptState,
     flight_recorder: &mut AttachFlightRecorder,
+    signal_watcher: &mut AttachSignalWatcher,
 ) -> Result<ReconnectOutcome> {
     let policy = ReconnectPolicy::default_interactive().with_observed_rtt(state.last_rtt);
     if !policy.retry_budget_remaining(state.started.elapsed()) {
@@ -2881,16 +2960,18 @@ async fn reconnect_remote_session(
         return Ok(ReconnectOutcome::Expired);
     }
 
-    if let Some(outcome) = try_same_connection_reattach(
-        request,
-        provider,
-        current_connected,
-        canonical_ref,
-        state,
-        flight_recorder,
-    )
-    .await?
-    {
+    let same_connection_outcome = tokio::select! {
+        outcome = try_same_connection_reattach(
+            request,
+            provider,
+            current_connected,
+            canonical_ref,
+            state,
+            flight_recorder,
+        ) => outcome?,
+        signal = signal_watcher.next() => return Ok(ReconnectOutcome::Signal(signal)),
+    };
+    if let Some(outcome) = same_connection_outcome {
         return Ok(outcome);
     }
 
@@ -2911,12 +2992,21 @@ async fn reconnect_remote_session(
             format_compact_duration(delay),
             if visible { " (visible)" } else { "" }
         ));
-        match wait_reconnect_delay(delay, visible, attempt, canonical_ref, display, coordinator)
-            .await?
+        match wait_reconnect_delay(
+            delay,
+            visible,
+            attempt,
+            canonical_ref,
+            display,
+            coordinator,
+            signal_watcher,
+        )
+        .await?
         {
             ReconnectDelayOutcome::Retry => {}
             ReconnectDelayOutcome::Detached => return Ok(ReconnectOutcome::Detached),
             ReconnectDelayOutcome::Quit => return Ok(ReconnectOutcome::Quit),
+            ReconnectDelayOutcome::Signal(variant) => return Ok(ReconnectOutcome::Signal(variant)),
         }
         if visible {
             if !coordinator.set_reconnect_visible(true).await? {
@@ -2928,15 +3018,16 @@ async fn reconnect_remote_session(
                 ))
                 .await?;
         }
-        let connected = match connect_peer_with_endpoint(
-            &request.target,
-            session_caps(),
-            identity,
-            endpoint,
-            true,
-        )
-        .await
-        {
+        let connected = match tokio::select! {
+            connected = connect_peer_with_endpoint(
+                &request.target,
+                session_caps(),
+                identity,
+                endpoint,
+                true,
+            ) => connected,
+            signal = signal_watcher.next() => return Ok(ReconnectOutcome::Signal(signal)),
+        } {
             Ok(connected) => connected,
             Err(err) => {
                 debug!(%err, attempt, "session reconnect connect failed");
@@ -2945,13 +3036,14 @@ async fn reconnect_remote_session(
                 continue;
             }
         };
-        let groups = match open_session_list_detailed_checked(
-            &connected.connection,
-            &connected.session,
-            Some(provider.to_owned()),
-        )
-        .await
-        {
+        let groups = match tokio::select! {
+            groups = open_session_list_detailed_checked(
+                &connected.connection,
+                &connected.session,
+                Some(provider.to_owned()),
+            ) => groups,
+            signal = signal_watcher.next() => return Ok(ReconnectOutcome::Signal(signal)),
+        } {
             Ok(groups) => groups,
             Err(err @ SessionOpenError::Rejected { .. }) => return Err(anyhow::Error::from(err)),
             Err(SessionOpenError::Transport(err)) => {
@@ -2986,22 +3078,23 @@ async fn reconnect_remote_session(
                 request.session_name
             );
         }
-        match open_remote_attach_session_checked(
-            &connected.connection,
-            &connected.session,
-            Some(provider.to_owned()),
-            request.session_name.clone(),
-            None,
-            request.user.clone(),
-            request.cwd.clone(),
-            portl_core::net::shell_client::PtyCfg {
-                term: request.term.clone(),
-                cols: request.cols,
-                rows: request.rows,
-            },
-        )
-        .await
-        {
+        match tokio::select! {
+            session = open_remote_attach_session_checked(
+                &connected.connection,
+                &connected.session,
+                Some(provider.to_owned()),
+                request.session_name.clone(),
+                None,
+                request.user.clone(),
+                request.cwd.clone(),
+                portl_core::net::shell_client::PtyCfg {
+                    term: request.term.clone(),
+                    cols: request.cols,
+                    rows: request.rows,
+                },
+            ) => session,
+            signal = signal_watcher.next() => return Ok(ReconnectOutcome::Signal(signal)),
+        } {
             Ok(session) => {
                 let path = attach_path_snapshot(&connected.connection);
                 state.observe_path(path.as_ref());
@@ -3174,6 +3267,7 @@ async fn wait_reconnect_delay(
     canonical_ref: &str,
     display: &AttachDisplay,
     coordinator: &mut AttachInputCoordinator,
+    signal_watcher: &mut AttachSignalWatcher,
 ) -> Result<ReconnectDelayOutcome> {
     if delay.is_zero() {
         return Ok(ReconnectDelayOutcome::Retry);
@@ -3216,6 +3310,7 @@ async fn wait_reconnect_delay(
                     }
                 }
             }
+            signal = signal_watcher.next() => return Ok(ReconnectDelayOutcome::Signal(signal)),
         }
     }
 }
@@ -3225,13 +3320,16 @@ async fn run_remote_attach_once(
     display: &AttachDisplay,
     coordinator: &mut AttachInputCoordinator,
     mode_tracker: &SharedTerminalModeTracker,
+    signal_watcher: &mut AttachSignalWatcher,
 ) -> AttachEnd {
     match session {
         RemoteAttachSession::V1(session) => {
-            run_remote_attach_v1_once(session, display, coordinator, mode_tracker).await
+            run_remote_attach_v1_once(session, display, coordinator, mode_tracker, signal_watcher)
+                .await
         }
         RemoteAttachSession::V2(session) => {
-            run_remote_attach_v2_once(session, display, coordinator, mode_tracker).await
+            run_remote_attach_v2_once(session, display, coordinator, mode_tracker, signal_watcher)
+                .await
         }
     }
 }
@@ -3241,6 +3339,7 @@ async fn run_remote_attach_v1_once(
     display: &AttachDisplay,
     coordinator: &mut AttachInputCoordinator,
     mode_tracker: &SharedTerminalModeTracker,
+    signal_watcher: &mut AttachSignalWatcher,
 ) -> AttachEnd {
     if let Some(end) = coordinator.drain_before_attach() {
         return end;
@@ -3327,6 +3426,7 @@ async fn run_remote_attach_v1_once(
                 let stderr = stderr.context("join stderr task").and_then(|result| result);
                 break output_task_end_to_attach_end(stderr, "stderr", &mut exit_fut).await;
             }
+            signal = signal_watcher.next() => break AttachEnd::Signal(signal),
         }
     };
     stdout_task.abort();
@@ -3341,6 +3441,7 @@ async fn run_remote_attach_v2_once(
     display: &AttachDisplay,
     coordinator: &mut AttachInputCoordinator,
     mode_tracker: &SharedTerminalModeTracker,
+    signal_watcher: &mut AttachSignalWatcher,
 ) -> AttachEnd {
     if let Some(end) = coordinator.drain_before_attach() {
         return end;
@@ -3579,6 +3680,7 @@ async fn run_remote_attach_v2_once(
                     None => AttachEnd::Disconnected(anyhow!("attach input coordinator stopped")),
                 };
             }
+            signal = signal_watcher.next() => break AttachEnd::Signal(signal),
         }
     };
     let _ = coordinator.clear_sink().await;
@@ -4048,25 +4150,40 @@ async fn wait_ghostty_attach_completion(
 async fn wait_attach_completion(
     exit: &mut BufferedRecv,
     stdin_task: Option<tokio::task::JoinHandle<Result<StdinTaskResult>>>,
-) -> Result<(i32, bool)> {
+    signal_watcher: &mut AttachSignalWatcher,
+) -> Result<AttachCompletion> {
     let mut exit_fut = Box::pin(read_exit(exit));
     let Some(mut stdin_task) = stdin_task else {
-        return Ok((exit_fut.await?, false));
+        return tokio::select! {
+            code = &mut exit_fut => Ok(AttachCompletion::Exited(code?)),
+            signal = signal_watcher.next() => Ok(AttachCompletion::Signal(signal)),
+        };
     };
 
     tokio::select! {
         code = &mut exit_fut => {
             stdin_task.abort();
             let _ = stdin_task.await;
-            Ok((code?, false))
+            Ok(AttachCompletion::Exited(code?))
         }
         stdin_result = &mut stdin_task => {
             match stdin_result.context("join stdin task")?? {
-                StdinTaskResult::Detached => Ok((0, true)),
-                StdinTaskResult::Closed => Ok((exit_fut.await?, false)),
+                StdinTaskResult::Detached => Ok(AttachCompletion::Detached),
+                StdinTaskResult::Closed => Ok(AttachCompletion::Exited(exit_fut.await?)),
             }
         }
+        signal = signal_watcher.next() => {
+            stdin_task.abort();
+            let _ = stdin_task.await;
+            Ok(AttachCompletion::Signal(signal))
+        }
     }
+}
+
+enum AttachCompletion {
+    Exited(i32),
+    Detached,
+    Signal(RawModeExitVariant),
 }
 
 fn session_caps() -> Capabilities {
@@ -4285,6 +4402,13 @@ impl RawModeGuard {
             cleanup: RawModeCleanupWriter::default(),
         })
     }
+
+    fn finish(mut self, variant: RawModeExitVariant) {
+        set_panic_hook_armed(false);
+        let _ = disable_raw_mode();
+        let mut stdout = std::io::stdout();
+        let _ = self.cleanup.write_to(&mut stdout, variant);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4396,6 +4520,48 @@ impl Drop for RawModeGuard {
         let _ = self
             .cleanup
             .write_to(&mut stdout, RawModeExitVariant::Normal);
+    }
+}
+
+#[cfg(unix)]
+struct AttachSignalWatcher {
+    sighup: tokio::signal::unix::Signal,
+    sigterm: tokio::signal::unix::Signal,
+    sigint: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl AttachSignalWatcher {
+    fn new() -> Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        Ok(Self {
+            sighup: signal(SignalKind::hangup()).context("install SIGHUP handler")?,
+            sigterm: signal(SignalKind::terminate()).context("install SIGTERM handler")?,
+            sigint: signal(SignalKind::interrupt()).context("install SIGINT handler")?,
+        })
+    }
+
+    async fn next(&mut self) -> RawModeExitVariant {
+        tokio::select! {
+            _ = self.sighup.recv() => RawModeExitVariant::Sighup,
+            _ = self.sigterm.recv() => RawModeExitVariant::Sigterm,
+            _ = self.sigint.recv() => RawModeExitVariant::Sigint,
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct AttachSignalWatcher;
+
+#[cfg(not(unix))]
+impl AttachSignalWatcher {
+    fn new() -> Result<Self> {
+        Ok(Self)
+    }
+
+    async fn next(&mut self) -> RawModeExitVariant {
+        std::future::pending().await
     }
 }
 
@@ -4556,6 +4722,26 @@ enum AttachEnd {
     Detached,
     QuitReconnect,
     Disconnected(anyhow::Error),
+    Signal(RawModeExitVariant),
+}
+
+impl AttachEnd {
+    fn raw_mode_exit_variant(&self) -> Option<RawModeExitVariant> {
+        match self {
+            Self::Signal(variant) => Some(*variant),
+            Self::Exited(_) | Self::Detached | Self::QuitReconnect | Self::Disconnected(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn exit_code(&self) -> Option<ExitCode> {
+        match self {
+            Self::Exited(code) => Some(exit_code_from_i32(*code)),
+            Self::Detached | Self::QuitReconnect => Some(ExitCode::SUCCESS),
+            Self::Signal(_) => Some(ExitCode::from(1)),
+            Self::Disconnected(_) => None,
+        }
+    }
 }
 
 enum AttachInputCommand {
@@ -6777,6 +6963,33 @@ mod tests {
             writer.write_to(&mut sink, variant).unwrap();
             assert_eq!(&sink[first_len..], b"");
         }
+    }
+
+    #[test]
+    fn signal_attach_end_maps_to_emergency_cleanup_and_failure_exit() {
+        for variant in [
+            RawModeExitVariant::Sighup,
+            RawModeExitVariant::Sigterm,
+            RawModeExitVariant::Sigint,
+        ] {
+            let end = AttachEnd::Signal(variant);
+
+            assert_eq!(end.raw_mode_exit_variant(), Some(variant));
+            assert_eq!(end.exit_code(), Some(ExitCode::from(1)));
+            assert!(raw_mode_cleanup_sequence(variant).ends_with(b"\x1bc"));
+        }
+    }
+
+    #[test]
+    fn signal_feature_reconnect_expired_maps_to_planned_cleanup_without_ris() {
+        assert_eq!(
+            ReconnectOutcome::Expired.raw_mode_exit_variant(),
+            Some(RawModeExitVariant::ReconnectExhausted)
+        );
+        assert_eq!(
+            raw_mode_cleanup_sequence(RawModeExitVariant::ReconnectExhausted),
+            RAW_MODE_CLEANUP_NORMAL
+        );
     }
 
     #[test]
