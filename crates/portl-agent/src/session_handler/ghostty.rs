@@ -3299,6 +3299,133 @@ mod tests {
         format!("\x1b[?{PORTL_CANONICAL_KITTY_KEYBOARD_FLAGS}u").into_bytes()
     }
 
+    const HOST_ENV_SIGNAL_VARS: &[&str] = &[
+        "TERM",
+        "COLORTERM",
+        "TERM_PROGRAM",
+        "KITTY_WINDOW_ID",
+        "KITTY_PID",
+    ];
+
+    struct HostEnvProfile {
+        name: &'static str,
+        vars: &'static [(&'static str, Option<&'static str>)],
+    }
+
+    const HOST_ENV_PROFILES: &[HostEnvProfile] = &[
+        HostEnvProfile {
+            name: "xterm without kitty advertisement",
+            vars: &[("TERM", Some("xterm-256color"))],
+        },
+        HostEnvProfile {
+            name: "kitty advertisement",
+            vars: &[
+                ("TERM", Some("xterm-kitty")),
+                ("TERM_PROGRAM", Some("kitty")),
+                ("KITTY_WINDOW_ID", Some("1")),
+            ],
+        },
+        HostEnvProfile {
+            name: "dumb terminal",
+            vars: &[("TERM", Some("dumb"))],
+        },
+        HostEnvProfile {
+            name: "truecolor colorterm",
+            vars: &[
+                ("TERM", Some("screen-256color")),
+                ("COLORTERM", Some("truecolor")),
+            ],
+        },
+        HostEnvProfile {
+            name: "ghostty term program",
+            vars: &[
+                ("TERM", Some("xterm-256color")),
+                ("TERM_PROGRAM", Some("ghostty")),
+            ],
+        },
+        HostEnvProfile {
+            name: "empty host environment",
+            vars: &[],
+        },
+    ];
+
+    fn host_env_lock() -> &'static Mutex<()> {
+        static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct HostEnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl HostEnvGuard {
+        #[allow(unsafe_code)]
+        fn apply(profile: &HostEnvProfile) -> Self {
+            let guard = host_env_lock().lock().expect("host env lock");
+            let saved = HOST_ENV_SIGNAL_VARS
+                .iter()
+                .map(|name| (*name, std::env::var_os(name)))
+                .collect::<Vec<_>>();
+
+            for name in HOST_ENV_SIGNAL_VARS {
+                // SAFETY: all test env mutation in this module is serialized by host_env_lock.
+                unsafe { std::env::remove_var(name) };
+            }
+            for (name, value) in profile.vars {
+                match value {
+                    Some(value) => {
+                        // SAFETY: all test env mutation in this module is serialized by host_env_lock.
+                        unsafe { std::env::set_var(name, value) };
+                    }
+                    None => {
+                        // SAFETY: all test env mutation in this module is serialized by host_env_lock.
+                        unsafe { std::env::remove_var(name) };
+                    }
+                }
+            }
+
+            for name in HOST_ENV_SIGNAL_VARS {
+                assert_eq!(
+                    std::env::var(name).ok().as_deref(),
+                    expected_profile_value(profile, name),
+                    "host env profile {} did not apply {name}",
+                    profile.name
+                );
+            }
+
+            Self {
+                saved,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for HostEnvGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            for (name, value) in &self.saved {
+                match value {
+                    Some(value) => {
+                        // SAFETY: all test env mutation in this module is serialized by host_env_lock.
+                        unsafe { std::env::set_var(name, value) };
+                    }
+                    None => {
+                        // SAFETY: all test env mutation in this module is serialized by host_env_lock.
+                        unsafe { std::env::remove_var(name) };
+                    }
+                }
+            }
+        }
+    }
+
+    fn expected_profile_value<'a>(profile: &'a HostEnvProfile, name: &str) -> Option<&'a str> {
+        profile
+            .vars
+            .iter()
+            .find_map(|(var, value)| (*var == name).then_some(*value).flatten())
+    }
+
     #[test]
     fn session_names_are_encoded_for_single_path_component() {
         assert_eq!(encode_session_component("dev"), "dev");
@@ -3354,11 +3481,8 @@ mod tests {
 
     #[test]
     fn da1_and_da2_queries_are_host_environment_independent() -> Result<()> {
-        for _host_profile in [
-            ("xterm-256color", "truecolor", "Apple_Terminal"),
-            ("screen", "", "tmux"),
-            ("dumb", "24bit", "ghostty"),
-        ] {
+        for profile in HOST_ENV_PROFILES {
+            let _env = HostEnvGuard::apply(profile);
             assert_eq!(terminal_replies_for(b"\x1b[c")?, expected_da1_response());
             assert_eq!(terminal_replies_for(b"\x1b[>c")?, expected_da2_response());
         }
@@ -3379,12 +3503,8 @@ mod tests {
 
     #[test]
     fn kitty_flag_query_is_host_environment_independent() -> Result<()> {
-        for _host_profile in [
-            ("xterm-kitty", "truecolor", "kitty"),
-            ("xterm-256color", "24bit", "ghostty"),
-            ("screen", "", "tmux"),
-            ("dumb", "", ""),
-        ] {
+        for profile in HOST_ENV_PROFILES {
+            let _env = HostEnvGuard::apply(profile);
             assert_eq!(
                 terminal_replies_for(b"\x1b[?u")?,
                 expected_kitty_flag_response()
