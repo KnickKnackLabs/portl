@@ -1121,6 +1121,7 @@ async fn local_ghostty_attach(
     } else {
         None
     };
+    let mut signal_watcher = AttachSignalWatcher::new()?;
     let display = AttachDisplay::new(cols, rows);
     let mode_tracker = new_terminal_mode_tracker();
     let stdin_task = maybe_spawn_stdin_task(
@@ -1161,25 +1162,25 @@ async fn local_ghostty_attach(
         )
         .await
     });
-    let (code, detached) = wait_ghostty_attach_completion(&mut attach.exit_rx, stdin_task).await?;
-    if detached {
+    let completion =
+        wait_ghostty_attach_completion(&mut attach.exit_rx, stdin_task, &mut signal_watcher)
+            .await?;
+    if matches!(
+        completion,
+        AttachCompletion::Detached | AttachCompletion::Signal(_)
+    ) {
         stdout_task.abort();
         stderr_task.abort();
         let _ = stdout_task.await;
         let _ = stderr_task.await;
         display.clear_bar().await?;
-        drop(raw_guard);
-        eprintln!("portl: detached from session \"{canonical_ref}\"");
-        eprintln!();
-        eprintln!("The session is still running. To reconnect, run:");
-        eprintln!("  portl attach {canonical_ref}");
+        Ok(finish_local_attach(raw_guard, completion, &canonical_ref))
     } else {
         await_output_task(stdout_task, "stdout").await?;
         await_output_task(stderr_task, "stderr").await?;
         display.clear_bar().await?;
-        drop(raw_guard);
+        Ok(finish_local_attach(raw_guard, completion, &canonical_ref))
     }
-    Ok(exit_code_from_i32(code))
 }
 
 async fn local_zmx_attach(
@@ -1281,6 +1282,7 @@ async fn local_zmx_control_attach(
     } else {
         None
     };
+    let mut signal_watcher = AttachSignalWatcher::new()?;
     let display = AttachDisplay::new(cols, rows);
     let mode_tracker = new_terminal_mode_tracker();
     let stdin_task = maybe_spawn_stdin_task(
@@ -1310,8 +1312,12 @@ async fn local_zmx_control_attach(
         )
         .await
     });
-    let (code, detached) = wait_local_attach_completion(&mut child, stdin_task).await?;
-    if detached {
+    let completion =
+        wait_local_attach_completion(&mut child, stdin_task, &mut signal_watcher).await?;
+    if matches!(
+        completion,
+        AttachCompletion::Detached | AttachCompletion::Signal(_)
+    ) {
         reap_local_child_after_detach(&mut child).await;
         stdout_task.abort();
         stderr_task.abort();
@@ -1322,14 +1328,7 @@ async fn local_zmx_control_attach(
         await_output_task(stderr_task, "stderr").await?;
     }
     display.clear_bar().await?;
-    drop(raw_guard);
-    if detached {
-        eprintln!("portl: detached from session \"{canonical_ref}\"");
-        eprintln!();
-        eprintln!("The session is still running. To reconnect, run:");
-        eprintln!("  portl attach {canonical_ref}");
-    }
-    Ok(exit_code_from_i32(code))
+    Ok(finish_local_attach(raw_guard, completion, &canonical_ref))
 }
 
 async fn local_tmux_attach(
@@ -1386,6 +1385,7 @@ async fn local_tmux_control_attach(
     } else {
         None
     };
+    let mut signal_watcher = AttachSignalWatcher::new()?;
     let display = AttachDisplay::new(cols, rows);
     let mode_tracker = new_terminal_mode_tracker();
     if let Some(initial_viewport) = initial_viewport {
@@ -1421,8 +1421,12 @@ async fn local_tmux_control_attach(
     let stdout_task = tokio::spawn(async move {
         pump_local_tmux_control_pty(master, &stdout_display, tmux_pty_rx, &stdout_tracker).await
     });
-    let (code, detached) = wait_local_attach_completion(&mut child, stdin_task).await?;
-    if detached {
+    let completion =
+        wait_local_attach_completion(&mut child, stdin_task, &mut signal_watcher).await?;
+    if matches!(
+        completion,
+        AttachCompletion::Detached | AttachCompletion::Signal(_)
+    ) {
         reap_local_child_after_detach(&mut child).await;
         stdout_task.abort();
         let _ = stdout_task.await;
@@ -1430,14 +1434,32 @@ async fn local_tmux_control_attach(
         await_output_task(stdout_task, "stdout").await?;
     }
     display.clear_bar().await?;
-    drop(raw_guard);
-    if detached {
-        eprintln!("portl: detached from session \"{canonical_ref}\"");
-        eprintln!();
-        eprintln!("The session is still running. To reconnect, run:");
-        eprintln!("  portl attach {canonical_ref}");
+    Ok(finish_local_attach(raw_guard, completion, &canonical_ref))
+}
+
+fn finish_local_attach(
+    raw_guard: Option<RawModeGuard>,
+    completion: AttachCompletion,
+    canonical_ref: &str,
+) -> ExitCode {
+    match completion {
+        AttachCompletion::Detached => {
+            finish_raw_guard(raw_guard, RawModeExitVariant::Normal);
+            eprintln!("portl: detached from session \"{canonical_ref}\"");
+            eprintln!();
+            eprintln!("The session is still running. To reconnect, run:");
+            eprintln!("  portl attach {canonical_ref}");
+            ExitCode::SUCCESS
+        }
+        AttachCompletion::Signal(variant) => {
+            finish_raw_guard(raw_guard, variant);
+            ExitCode::from(1)
+        }
+        AttachCompletion::Exited(code) => {
+            finish_raw_guard(raw_guard, RawModeExitVariant::Normal);
+            exit_code_from_i32(code)
+        }
     }
-    Ok(exit_code_from_i32(code))
 }
 
 async fn resolve_local_provider_for_session(
@@ -4086,27 +4108,37 @@ async fn reap_local_child_after_detach(child: &mut Child) {
 async fn wait_local_attach_completion(
     child: &mut Child,
     stdin_task: Option<tokio::task::JoinHandle<Result<StdinTaskResult>>>,
-) -> Result<(i32, bool)> {
+    signal_watcher: &mut AttachSignalWatcher,
+) -> Result<AttachCompletion> {
     let mut exit_fut = Box::pin(child.wait());
     let Some(mut stdin_task) = stdin_task else {
-        let status = exit_fut.await.context("wait for local provider exit")?;
-        return Ok((status.code().unwrap_or(1), false));
+        return tokio::select! {
+            status = &mut exit_fut => Ok(AttachCompletion::Exited(status.context("wait for local provider exit")?.code().unwrap_or(1))),
+            signal = signal_watcher.next() => Ok(AttachCompletion::Signal(signal)),
+        };
     };
 
     tokio::select! {
         status = &mut exit_fut => {
             stdin_task.abort();
             let _ = stdin_task.await;
-            Ok((status.context("wait for local provider exit")?.code().unwrap_or(1), false))
+            Ok(AttachCompletion::Exited(status.context("wait for local provider exit")?.code().unwrap_or(1)))
         }
         stdin_result = &mut stdin_task => {
             match stdin_result.context("join stdin task")?? {
-                StdinTaskResult::Detached => Ok((0, true)),
+                StdinTaskResult::Detached => Ok(AttachCompletion::Detached),
                 StdinTaskResult::Closed => {
-                    let status = exit_fut.await.context("wait for local provider exit")?;
-                    Ok((status.code().unwrap_or(1), false))
+                    tokio::select! {
+                        status = &mut exit_fut => Ok(AttachCompletion::Exited(status.context("wait for local provider exit")?.code().unwrap_or(1))),
+                        signal = signal_watcher.next() => Ok(AttachCompletion::Signal(signal)),
+                    }
                 }
             }
+        }
+        signal = signal_watcher.next() => {
+            stdin_task.abort();
+            let _ = stdin_task.await;
+            Ok(AttachCompletion::Signal(signal))
         }
     }
 }
@@ -4115,7 +4147,8 @@ async fn wait_local_attach_completion(
 async fn wait_ghostty_attach_completion(
     exit: &mut tokio::sync::watch::Receiver<Option<i32>>,
     stdin_task: Option<tokio::task::JoinHandle<Result<StdinTaskResult>>>,
-) -> Result<(i32, bool)> {
+    signal_watcher: &mut AttachSignalWatcher,
+) -> Result<AttachCompletion> {
     async fn wait_exit(exit: &mut tokio::sync::watch::Receiver<Option<i32>>) -> Result<i32> {
         loop {
             if let Some(code) = *exit.borrow_and_update() {
@@ -4129,20 +4162,33 @@ async fn wait_ghostty_attach_completion(
 
     let mut exit_fut = Box::pin(wait_exit(exit));
     let Some(mut stdin_task) = stdin_task else {
-        return Ok((exit_fut.await?, false));
+        return tokio::select! {
+            code = &mut exit_fut => Ok(AttachCompletion::Exited(code?)),
+            signal = signal_watcher.next() => Ok(AttachCompletion::Signal(signal)),
+        };
     };
 
     tokio::select! {
         code = &mut exit_fut => {
             stdin_task.abort();
             let _ = stdin_task.await;
-            Ok((code?, false))
+            Ok(AttachCompletion::Exited(code?))
         }
         stdin_result = &mut stdin_task => {
             match stdin_result.context("join stdin task")?? {
-                StdinTaskResult::Detached => Ok((0, true)),
-                StdinTaskResult::Closed => Ok((exit_fut.await?, false)),
+                StdinTaskResult::Detached => Ok(AttachCompletion::Detached),
+                StdinTaskResult::Closed => {
+                    tokio::select! {
+                        code = &mut exit_fut => Ok(AttachCompletion::Exited(code?)),
+                        signal = signal_watcher.next() => Ok(AttachCompletion::Signal(signal)),
+                    }
+                }
             }
+        }
+        signal = signal_watcher.next() => {
+            stdin_task.abort();
+            let _ = stdin_task.await;
+            Ok(AttachCompletion::Signal(signal))
         }
     }
 }
@@ -4180,6 +4226,7 @@ async fn wait_attach_completion(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttachCompletion {
     Exited(i32),
     Detached,
@@ -4226,7 +4273,7 @@ fn exit_code_from_i32(code: i32) -> ExitCode {
     ExitCode::from(u8::try_from(code).unwrap_or(1))
 }
 
-struct RawModeGuard {
+pub(crate) struct RawModeGuard {
     cleanup: RawModeCleanupWriter,
 }
 
@@ -4395,7 +4442,7 @@ async fn flush_tracked_output(
 }
 
 impl RawModeGuard {
-    fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         enable_raw_mode().context("enable raw mode")?;
         set_panic_hook_armed(true);
         Ok(Self {
@@ -4403,11 +4450,17 @@ impl RawModeGuard {
         })
     }
 
-    fn finish(mut self, variant: RawModeExitVariant) {
+    pub(crate) fn finish(mut self, variant: RawModeExitVariant) {
         set_panic_hook_armed(false);
         let _ = disable_raw_mode();
         let mut stdout = std::io::stdout();
         let _ = self.cleanup.write_to(&mut stdout, variant);
+    }
+}
+
+fn finish_raw_guard(raw_guard: Option<RawModeGuard>, variant: RawModeExitVariant) {
+    if let Some(raw_guard) = raw_guard {
+        raw_guard.finish(variant);
     }
 }
 
@@ -4455,10 +4508,11 @@ pub(crate) fn install_panic_hook() {
         let previous = std::panic::take_hook();
         let _ = PREVIOUS_PANIC_HOOK.set(previous);
         std::panic::set_hook(Box::new(|info| {
-            if let Some(previous) = PREVIOUS_PANIC_HOOK.get() {
+            if PANIC_HOOK_ARMED.load(Ordering::SeqCst) {
+                write_panic_cleanup_to_fd_if_armed(nix::libc::STDERR_FILENO);
+            } else if let Some(previous) = PREVIOUS_PANIC_HOOK.get() {
                 previous(info);
             }
-            write_panic_cleanup_to_fd_if_armed(nix::libc::STDERR_FILENO);
         }));
     });
 }
@@ -4524,7 +4578,7 @@ impl Drop for RawModeGuard {
 }
 
 #[cfg(unix)]
-struct AttachSignalWatcher {
+pub(crate) struct AttachSignalWatcher {
     sighup: tokio::signal::unix::Signal,
     sigterm: tokio::signal::unix::Signal,
     sigint: tokio::signal::unix::Signal,
@@ -4532,7 +4586,7 @@ struct AttachSignalWatcher {
 
 #[cfg(unix)]
 impl AttachSignalWatcher {
-    fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         use tokio::signal::unix::{SignalKind, signal};
 
         Ok(Self {
@@ -4542,7 +4596,7 @@ impl AttachSignalWatcher {
         })
     }
 
-    async fn next(&mut self) -> RawModeExitVariant {
+    pub(crate) async fn next(&mut self) -> RawModeExitVariant {
         tokio::select! {
             _ = self.sighup.recv() => RawModeExitVariant::Sighup,
             _ = self.sigterm.recv() => RawModeExitVariant::Sigterm,
@@ -4552,15 +4606,15 @@ impl AttachSignalWatcher {
 }
 
 #[cfg(not(unix))]
-struct AttachSignalWatcher;
+pub(crate) struct AttachSignalWatcher;
 
 #[cfg(not(unix))]
 impl AttachSignalWatcher {
-    fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         Ok(Self)
     }
 
-    async fn next(&mut self) -> RawModeExitVariant {
+    pub(crate) async fn next(&mut self) -> RawModeExitVariant {
         std::future::pending().await
     }
 }
@@ -6882,6 +6936,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn panic_hook_write_is_noop_when_not_armed() {
+        let _guard = panic_hook_test_lock().lock().expect("panic hook test lock");
         set_panic_hook_armed(false);
         let capture = StderrCapture::start();
 
@@ -6894,6 +6949,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn panic_hook_write_emits_panic_cleanup_when_armed() {
+        let _guard = panic_hook_test_lock().lock().expect("panic hook test lock");
         set_panic_hook_armed(true);
         let capture = StderrCapture::start();
 
@@ -6902,6 +6958,35 @@ mod tests {
         set_panic_hook_armed(false);
         let output = capture.finish();
         assert_eq!(output, raw_mode_cleanup_sequence(RawModeExitVariant::Panic));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(unsafe_code)]
+    fn installed_panic_hook_armed_path_writes_only_cleanup_bytes() {
+        let _guard = panic_hook_test_lock().lock().expect("panic hook test lock");
+        std::panic::set_hook(Box::new(|_| {
+            let text = b"previous panic text";
+            let _ = unsafe {
+                nix::libc::write(nix::libc::STDERR_FILENO, text.as_ptr().cast(), text.len())
+            };
+        }));
+        install_panic_hook();
+        set_panic_hook_armed(true);
+        let capture = StderrCapture::start();
+
+        let _ = std::panic::catch_unwind(|| panic!("armed panic hook test"));
+
+        set_panic_hook_armed(false);
+        let output = capture.finish();
+        assert_eq!(output, raw_mode_cleanup_sequence(RawModeExitVariant::Panic));
+        assert!(output.ends_with(b"\x1bc"));
+    }
+
+    #[cfg(unix)]
+    fn panic_hook_test_lock() -> &'static StdMutex<()> {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
     }
 
     #[test]
@@ -6978,6 +7063,51 @@ mod tests {
             assert_eq!(end.exit_code(), Some(ExitCode::from(1)));
             assert!(raw_mode_cleanup_sequence(variant).ends_with(b"\x1bc"));
         }
+    }
+
+    #[test]
+    fn local_raw_mode_lifecycles_install_signal_watcher() {
+        let session_source = include_str!("session.rs");
+        let shell_source = include_str!("shell.rs");
+
+        assert_signal_watcher_signature(
+            function_body(session_source, "local_ghostty_attach"),
+            "wait_ghostty_attach_completion(&mut attach.exit_rx, stdin_task, &mut signal_watcher)",
+        );
+        assert_signal_watcher_signature(
+            function_body(session_source, "local_zmx_control_attach"),
+            "wait_local_attach_completion(&mut child, stdin_task, &mut signal_watcher)",
+        );
+        assert_signal_watcher_signature(
+            function_body(session_source, "local_tmux_control_attach"),
+            "wait_local_attach_completion(&mut child, stdin_task, &mut signal_watcher)",
+        );
+        assert_signal_watcher_signature(
+            function_body(shell_source, "run"),
+            "signal_watcher.next()",
+        );
+    }
+
+    fn assert_signal_watcher_signature(body: &str, completion_signature: &str) {
+        assert!(
+            body.contains("AttachSignalWatcher::new()?"),
+            "raw-mode lifecycle must install AttachSignalWatcher:\n{body}"
+        );
+        assert!(
+            body.contains(completion_signature),
+            "raw-mode lifecycle must select on the installed signal watcher:\n{body}"
+        );
+    }
+
+    fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
+        let marker = format!("fn {name}");
+        let start = source.find(&marker).expect("function marker");
+        let after_start = start + marker.len();
+        let next = source[after_start..]
+            .find("\nasync fn ")
+            .or_else(|| source[after_start..].find("\nfn "))
+            .map_or(source.len(), |offset| after_start + offset);
+        &source[start..next]
     }
 
     #[test]

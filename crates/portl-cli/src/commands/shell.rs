@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
+use crossterm::terminal::size;
 use iroh::endpoint::SendStream;
 use portl_core::io::BufferedRecv;
 use portl_core::net::shell_client::PtyCfg;
@@ -13,6 +13,7 @@ use tokio::io::{AsyncWriteExt, copy};
 use tracing::debug;
 
 use crate::commands::peer_resolve::{close_connected, connect_peer};
+use crate::commands::session::{AttachSignalWatcher, RawModeExitVariant, RawModeGuard};
 
 pub fn run(peer: &str, cwd: Option<&str>, user: Option<&str>) -> Result<ExitCode> {
     let runtime = tokio::runtime::Runtime::new()?;
@@ -34,6 +35,7 @@ pub fn run(peer: &str, cwd: Option<&str>, user: Option<&str>) -> Result<ExitCode
         } else {
             None
         };
+        let mut signal_watcher = AttachSignalWatcher::new()?;
 
         let ShellClient {
             control_send: _control_send,
@@ -90,7 +92,10 @@ pub fn run(peer: &str, cwd: Option<&str>, user: Option<&str>) -> Result<ExitCode
             })
         });
 
-        let code = read_exit(&mut exit).await?;
+        let completion = tokio::select! {
+            code = read_exit(&mut exit) => ShellCompletion::Exited(code?),
+            signal = signal_watcher.next() => ShellCompletion::Signal(signal),
+        };
         if let Some(task) = resize_task {
             task.abort();
         }
@@ -98,9 +103,7 @@ pub fn run(peer: &str, cwd: Option<&str>, user: Option<&str>) -> Result<ExitCode
             stdin_task.abort();
             let _ = stdin_task.await;
         }
-        await_output_task(stdout_task, "stdout").await?;
-        await_output_task(stderr_task, "stderr").await?;
-        drop(raw_guard);
+        let code = finish_shell_completion(completion, raw_guard, stdout_task, stderr_task).await?;
         close_connected(connected, b"shell complete").await;
         Ok(exit_code_from_i32(code))
     });
@@ -126,24 +129,42 @@ fn shell_caps() -> Capabilities {
     }
 }
 
+enum ShellCompletion {
+    Exited(i32),
+    Signal(RawModeExitVariant),
+}
+
+async fn finish_shell_completion(
+    completion: ShellCompletion,
+    raw_guard: Option<RawModeGuard>,
+    stdout_task: tokio::task::JoinHandle<Result<()>>,
+    stderr_task: tokio::task::JoinHandle<Result<()>>,
+) -> Result<i32> {
+    match completion {
+        ShellCompletion::Exited(code) => {
+            await_output_task(stdout_task, "stdout").await?;
+            await_output_task(stderr_task, "stderr").await?;
+            if let Some(raw_guard) = raw_guard {
+                raw_guard.finish(RawModeExitVariant::Normal);
+            }
+            Ok(code)
+        }
+        ShellCompletion::Signal(variant) => {
+            stdout_task.abort();
+            stderr_task.abort();
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            if let Some(raw_guard) = raw_guard {
+                raw_guard.finish(variant);
+            }
+            Ok(1)
+        }
+    }
+}
+
 fn exit_code_from_i32(code: i32) -> ExitCode {
     let code = u8::try_from(code).unwrap_or(1);
     ExitCode::from(code)
-}
-
-struct RawModeGuard;
-
-impl RawModeGuard {
-    fn new() -> Result<Self> {
-        enable_raw_mode().context("enable raw mode")?;
-        Ok(Self)
-    }
-}
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-    }
 }
 
 async fn await_output_task(
