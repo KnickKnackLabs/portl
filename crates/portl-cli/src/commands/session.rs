@@ -4109,6 +4109,9 @@ fn exit_code_from_i32(code: i32) -> ExitCode {
 struct RawModeGuard;
 
 const DEFERRED_DEFENSIVE_KITTY_RESET_WINDOW_BYTES: usize = 256;
+// A 100 ms idle fallback keeps Symptom-2 recovery bounded for silent guests
+// while preserving a short window for a split Kitty pop to arrive.
+const DEFERRED_DEFENSIVE_KITTY_RESET_IDLE: Duration = Duration::from_millis(100);
 
 struct HostBoundModeTracker {
     tracker: TerminalModeTracker,
@@ -4209,6 +4212,14 @@ fn flush_host_bound_mode_tracker(tracker: &SharedTerminalModeTracker) -> Result<
     Ok(tracker.flush_deferred_reset())
 }
 
+fn host_bound_mode_tracker_has_deferred_reset(tracker: &SharedTerminalModeTracker) -> Result<bool> {
+    let tracker = tracker
+        .lock()
+        .map_err(|_| anyhow!("terminal mode tracker lock poisoned"))?;
+    Ok(tracker.deferred_alt_screen_kitty_reset
+        && tracker.tracker.has_pending_alt_screen_leave_kitty_reset())
+}
+
 #[cfg(test)]
 fn tracked_terminal_mode_state(tracker: &SharedTerminalModeTracker) -> TerminalModeState {
     tracker.lock().expect("terminal mode tracker lock").state()
@@ -4224,8 +4235,23 @@ async fn write_tracked_output(
     display.write_output(stream, bytes).await?;
     if !defensive_reset.is_empty() {
         display.write_output(stream, &defensive_reset).await?;
+    } else if host_bound_mode_tracker_has_deferred_reset(tracker)? {
+        schedule_deferred_mode_reset_flush(display.clone(), stream, Arc::clone(tracker));
     }
     Ok(())
+}
+
+fn schedule_deferred_mode_reset_flush(
+    display: AttachDisplay,
+    stream: AttachOutputStream,
+    tracker: SharedTerminalModeTracker,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(DEFERRED_DEFENSIVE_KITTY_RESET_IDLE).await;
+        if let Err(err) = flush_tracked_output(&display, stream, &tracker).await {
+            debug!(error = %err, "failed to flush deferred terminal mode reset");
+        }
+    });
 }
 
 async fn flush_tracked_output(
@@ -5070,7 +5096,7 @@ where
                 .await?;
         }
     }
-    display.flush(AttachOutputStream::Stdout).await
+    flush_tracked_output(display, AttachOutputStream::Stdout, mode_tracker).await
 }
 
 #[derive(Clone)]
@@ -6562,6 +6588,78 @@ mod tests {
             b"\x1b[<u\x1b[>4;0m"
         );
         assert_eq!(flush_host_bound_mode_tracker(&tracker).unwrap(), b"");
+    }
+
+    async fn hold_stdout(display: &AttachDisplay) {
+        let mut state = display.inner.lock().await;
+        state.gate.set_holding(true);
+    }
+
+    async fn take_held_stdout(display: &AttachDisplay) -> Vec<u8> {
+        let mut state = display.inner.lock().await;
+        state.gate.take_stdout()
+    }
+
+    #[tokio::test]
+    async fn attach_mode_tracker_idle_timer_flushes_silent_guest_defensive_reset() {
+        let display = AttachDisplay::new(80, 24);
+        hold_stdout(&display).await;
+        let tracker = new_terminal_mode_tracker();
+
+        write_tracked_output(
+            &display,
+            AttachOutputStream::Stdout,
+            b"\x1b[>1u\x1b[?1049h",
+            &tracker,
+        )
+        .await
+        .unwrap();
+        write_tracked_output(
+            &display,
+            AttachOutputStream::Stdout,
+            b"\x1b[?1049l",
+            &tracker,
+        )
+        .await
+        .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let output = take_held_stdout(&display).await;
+        assert!(
+            output
+                .windows(b"\x1b[<u\x1b[>4;0m".len())
+                .any(|window| window == b"\x1b[<u\x1b[>4;0m"),
+            "idle timer should flush defensive reset before any later output: {output:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn zmx_control_eof_flushes_deferred_defensive_reset() {
+        let display = AttachDisplay::new(80, 24);
+        hold_stdout(&display).await;
+        let tracker = new_terminal_mode_tracker();
+        let mut frames = Vec::new();
+        zmx_control::write_frame(
+            &mut frames,
+            zmx_control::TAG_OUTPUT,
+            b"\x1b[>1u\x1b[?1049h\x1b[?1049l",
+        )
+        .await
+        .unwrap();
+        let mut reader = frames.as_slice();
+
+        copy_zmx_control_output(&mut reader, &display, &tracker)
+            .await
+            .unwrap();
+
+        let output = take_held_stdout(&display).await;
+        assert!(
+            output
+                .windows(b"\x1b[<u\x1b[>4;0m".len())
+                .any(|window| window == b"\x1b[<u\x1b[>4;0m"),
+            "zmx EOF should flush defensive reset before stream closes: {output:?}"
+        );
     }
 
     #[test]
