@@ -4106,7 +4106,9 @@ fn exit_code_from_i32(code: i32) -> ExitCode {
     ExitCode::from(u8::try_from(code).unwrap_or(1))
 }
 
-struct RawModeGuard;
+struct RawModeGuard {
+    cleanup: RawModeCleanupWriter,
+}
 
 const DEFERRED_DEFENSIVE_KITTY_RESET_WINDOW_BYTES: usize = 256;
 // A 100 ms idle fallback keeps Symptom-2 recovery bounded for silent guests
@@ -4269,20 +4271,78 @@ async fn flush_tracked_output(
 impl RawModeGuard {
     fn new() -> Result<Self> {
         enable_raw_mode().context("enable raw mode")?;
-        Ok(Self)
+        Ok(Self {
+            cleanup: RawModeCleanupWriter::default(),
+        })
     }
 }
 
-fn raw_mode_cleanup_sequence() -> &'static [u8] {
-    b"\x1b[0m\x1b[<u\x1b[=0u\x1b[>4;0m\x1b[?25h\x1b[?1049l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RawModeExitVariant {
+    Normal,
+    ReconnectExhausted,
+    Sighup,
+    Sigterm,
+    Sigint,
+    Panic,
+}
+
+const _: [RawModeExitVariant; 6] = [
+    RawModeExitVariant::Normal,
+    RawModeExitVariant::ReconnectExhausted,
+    RawModeExitVariant::Sighup,
+    RawModeExitVariant::Sigterm,
+    RawModeExitVariant::Sigint,
+    RawModeExitVariant::Panic,
+];
+
+impl RawModeExitVariant {
+    pub(crate) const fn is_emergency(self) -> bool {
+        matches!(
+            self,
+            Self::Sighup | Self::Sigterm | Self::Sigint | Self::Panic
+        )
+    }
+}
+
+const RAW_MODE_CLEANUP_NORMAL: &[u8] = b"\x1b[0m\x1b[?1049l\x1b[r\x1b[?7h\x1b[!p\x1b[?25h\x1b[<u\x1b[=0u\x1b[>4;0m\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\r\n";
+const RAW_MODE_CLEANUP_EMERGENCY: &[u8] = b"\x1b[0m\x1b[?1049l\x1b[r\x1b[?7h\x1b[!p\x1b[?25h\x1b[<u\x1b[=0u\x1b[>4;0m\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\r\n\x1bc";
+
+pub(crate) fn raw_mode_cleanup_sequence(variant: RawModeExitVariant) -> &'static [u8] {
+    if variant.is_emergency() {
+        RAW_MODE_CLEANUP_EMERGENCY
+    } else {
+        RAW_MODE_CLEANUP_NORMAL
+    }
+}
+
+#[derive(Debug, Default)]
+struct RawModeCleanupWriter {
+    written: bool,
+}
+
+impl RawModeCleanupWriter {
+    fn write_to<W: IoWrite>(
+        &mut self,
+        writer: &mut W,
+        variant: RawModeExitVariant,
+    ) -> std::io::Result<()> {
+        if self.written {
+            return Ok(());
+        }
+        self.written = true;
+        writer.write_all(raw_mode_cleanup_sequence(variant))?;
+        writer.flush()
+    }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let mut stdout = std::io::stdout();
-        let _ = stdout.write_all(raw_mode_cleanup_sequence());
-        let _ = stdout.flush();
+        let _ = self
+            .cleanup
+            .write_to(&mut stdout, RawModeExitVariant::Normal);
     }
 }
 
@@ -6491,7 +6551,7 @@ mod tests {
 
     #[test]
     fn raw_mode_cleanup_resets_enhanced_keyboard_protocols() {
-        let cleanup = raw_mode_cleanup_sequence();
+        let cleanup = raw_mode_cleanup_sequence(RawModeExitVariant::Normal);
         assert!(
             cleanup.windows(b"\x1b[<u".len()).any(|w| w == b"\x1b[<u"),
             "cleanup should pop kitty keyboard protocol state"
@@ -6502,6 +6562,135 @@ mod tests {
                 .any(|w| w == b"\x1b[>4;0m"),
             "cleanup should disable xterm modifyOtherKeys"
         );
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    fn byte_index(haystack: &[u8], needle: &[u8]) -> usize {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .unwrap_or_else(|| panic!("missing cleanup component: {needle:?}"))
+    }
+
+    #[test]
+    fn raw_mode_cleanup_normal_exit_uses_ordered_extended_template_without_ris() {
+        let cleanup = raw_mode_cleanup_sequence(RawModeExitVariant::Normal);
+
+        assert_eq!(
+            cleanup,
+            b"\x1b[0m\x1b[?1049l\x1b[r\x1b[?7h\x1b[!p\x1b[?25h\x1b[<u\x1b[=0u\x1b[>4;0m\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\r\n"
+        );
+        for component in [
+            b"\x1b[0m".as_slice(),
+            b"\x1b[?1049l",
+            b"\x1b[r",
+            b"\x1b[?7h",
+            b"\x1b[!p",
+            b"\x1b[?25h",
+            b"\x1b[<u",
+            b"\x1b[=0u",
+            b"\x1b[>4;0m",
+            b"\x1b[?2004l",
+            b"\x1b[?1000l",
+            b"\x1b[?1002l",
+            b"\x1b[?1003l",
+            b"\x1b[?1006l",
+        ] {
+            assert!(contains_bytes(cleanup, component));
+        }
+        assert!(!contains_bytes(cleanup, b"\x1bc"));
+        assert!(cleanup.ends_with(b"\r\n"));
+    }
+
+    #[test]
+    fn raw_mode_cleanup_emits_ris_only_for_emergency_variants() {
+        for variant in [
+            RawModeExitVariant::Normal,
+            RawModeExitVariant::ReconnectExhausted,
+        ] {
+            let cleanup = raw_mode_cleanup_sequence(variant);
+            assert_eq!(cleanup, RAW_MODE_CLEANUP_NORMAL);
+            assert!(!contains_bytes(cleanup, b"\x1bc"));
+            assert!(cleanup.ends_with(b"\r\n"));
+        }
+
+        for variant in [
+            RawModeExitVariant::Sighup,
+            RawModeExitVariant::Sigterm,
+            RawModeExitVariant::Sigint,
+            RawModeExitVariant::Panic,
+        ] {
+            let cleanup = raw_mode_cleanup_sequence(variant);
+            assert_eq!(cleanup, RAW_MODE_CLEANUP_EMERGENCY);
+            assert!(cleanup.ends_with(b"\x1bc"));
+            assert_eq!(&cleanup[cleanup.len() - b"\r\n\x1bc".len()..], b"\r\n\x1bc");
+        }
+    }
+
+    #[test]
+    fn raw_mode_cleanup_ordering_is_visually_safe() {
+        for variant in [
+            RawModeExitVariant::Normal,
+            RawModeExitVariant::ReconnectExhausted,
+            RawModeExitVariant::Sighup,
+            RawModeExitVariant::Sigterm,
+            RawModeExitVariant::Sigint,
+            RawModeExitVariant::Panic,
+        ] {
+            let cleanup = raw_mode_cleanup_sequence(variant);
+            let sgr = byte_index(cleanup, b"\x1b[0m");
+            let alt_leave = byte_index(cleanup, b"\x1b[?1049l");
+            let scroll_region = byte_index(cleanup, b"\x1b[r");
+            let autowrap = byte_index(cleanup, b"\x1b[?7h");
+            let decstr = byte_index(cleanup, b"\x1b[!p");
+            let show_cursor = byte_index(cleanup, b"\x1b[?25h");
+            let kitty_pop = byte_index(cleanup, b"\x1b[<u");
+            let modify_other_keys = byte_index(cleanup, b"\x1b[>4;0m");
+            let first_mouse = byte_index(cleanup, b"\x1b[?1000l");
+
+            assert!(sgr < alt_leave);
+            assert!(alt_leave < scroll_region);
+            assert!(alt_leave < autowrap);
+            assert!(scroll_region < decstr);
+            assert!(autowrap < decstr);
+            assert!(decstr < show_cursor);
+            assert!(show_cursor < kitty_pop);
+            assert!(kitty_pop < modify_other_keys);
+            assert!(modify_other_keys < first_mouse);
+
+            if variant.is_emergency() {
+                assert!(cleanup.ends_with(b"\x1bc"));
+            } else {
+                assert!(cleanup.ends_with(b"\r\n"));
+            }
+        }
+    }
+
+    #[test]
+    fn raw_mode_cleanup_writer_is_idempotent_for_each_variant() {
+        for variant in [
+            RawModeExitVariant::Normal,
+            RawModeExitVariant::ReconnectExhausted,
+            RawModeExitVariant::Sighup,
+            RawModeExitVariant::Sigterm,
+            RawModeExitVariant::Sigint,
+            RawModeExitVariant::Panic,
+        ] {
+            let mut writer = RawModeCleanupWriter::default();
+            let mut sink = Vec::new();
+
+            writer.write_to(&mut sink, variant).unwrap();
+            assert_eq!(sink, raw_mode_cleanup_sequence(variant));
+
+            let first_len = sink.len();
+            writer.write_to(&mut sink, variant).unwrap();
+            assert_eq!(&sink[first_len..], b"");
+        }
     }
 
     #[test]
