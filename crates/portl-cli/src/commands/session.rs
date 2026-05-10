@@ -1121,6 +1121,7 @@ async fn local_ghostty_attach(
     } else {
         None
     };
+    maybe_panic_inject_attach();
     let mut signal_watcher = AttachSignalWatcher::new()?;
     let display = AttachDisplay::new(cols, rows);
     let mode_tracker = new_terminal_mode_tracker();
@@ -4624,6 +4625,17 @@ fn finish_raw_guard(raw_guard: Option<RawModeGuard>, variant: RawModeExitVariant
         raw_guard.finish(variant);
     }
 }
+
+#[cfg(feature = "panic-inject-attach")]
+fn maybe_panic_inject_attach() {
+    assert!(
+        std::env::var_os("PORTL_PANIC_INJECT_ATTACH").is_none(),
+        "panic-inject-attach"
+    );
+}
+
+#[cfg(not(feature = "panic-inject-attach"))]
+fn maybe_panic_inject_attach() {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RawModeExitVariant {
