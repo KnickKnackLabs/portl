@@ -31,6 +31,8 @@ use crate::{AgentState, audit};
 pub(crate) mod ghostty;
 pub(crate) mod provider;
 mod tmux_control;
+#[allow(dead_code)]
+pub(crate) mod vt_capability;
 
 const MAX_CONTROL_BYTES: usize = 256 * 1024;
 
