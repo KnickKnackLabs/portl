@@ -1,10 +1,14 @@
 #[cfg(unix)]
+use std::cell::RefCell;
+#[cfg(unix)]
 use std::collections::VecDeque;
 #[cfg(unix)]
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Stdio;
+#[cfg(unix)]
+use std::rc::Rc;
 #[cfg(unix)]
 use std::sync::{Arc, Mutex};
 #[cfg(unix)]
@@ -18,7 +22,13 @@ use libghostty_vt::screen::Screen;
 #[cfg(unix)]
 use libghostty_vt::style::{RgbColor, Underline};
 #[cfg(unix)]
-use libghostty_vt::{RenderState, Terminal, TerminalOptions};
+use libghostty_vt::{
+    RenderState, Terminal, TerminalOptions,
+    terminal::{
+        ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType,
+        PrimaryDeviceAttributes, SecondaryDeviceAttributes, TertiaryDeviceAttributes,
+    },
+};
 #[cfg(unix)]
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -36,6 +46,48 @@ pub(crate) const GHOSTTY_PROTOCOL_VERSION: u16 = 1;
 
 #[cfg(unix)]
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 104;
+
+#[cfg(unix)]
+type TerminalPtyReplies = Rc<RefCell<Vec<Vec<u8>>>>;
+
+#[cfg(unix)]
+struct GhosttyTerminalIo {
+    terminal: Terminal<'static, 'static>,
+    pty_replies: TerminalPtyReplies,
+    pending_input: crate::shell_handler::pty_master::PendingPtyWrite,
+}
+
+#[cfg(unix)]
+impl GhosttyTerminalIo {
+    fn new(options: TerminalOptions) -> Result<Self> {
+        let mut terminal = Terminal::new(options)?;
+        let pty_replies = Rc::new(RefCell::new(Vec::new()));
+        configure_portl_terminal_capabilities(&mut terminal, Rc::clone(&pty_replies))?;
+        Ok(Self {
+            terminal,
+            pty_replies,
+            pending_input: crate::shell_handler::pty_master::PendingPtyWrite::new(
+                crate::shell_handler::pty_master::DEFAULT_PTY_INPUT_QUEUE_BYTES,
+            ),
+        })
+    }
+}
+
+#[cfg(unix)]
+impl std::ops::Deref for GhosttyTerminalIo {
+    type Target = Terminal<'static, 'static>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.terminal
+    }
+}
+
+#[cfg(unix)]
+impl std::ops::DerefMut for GhosttyTerminalIo {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.terminal
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct GhosttySessionMetadata {
@@ -1225,7 +1277,7 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
 
     crate::shell_handler::pty_master::set_nonblocking(&master)?;
     let master = tokio::io::unix::AsyncFd::new(master).context("register ghostty pty")?;
-    let mut terminal = Terminal::new(TerminalOptions {
+    let mut terminal = GhosttyTerminalIo::new(TerminalOptions {
         cols: config.cols,
         rows: config.rows,
         max_scrollback: 4096,
@@ -1240,9 +1292,6 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
     let mut reload_jobs: VecDeque<GhosttyReloadJob> = VecDeque::new();
     let mut read_buf = vec![0_u8; IO_CHUNK];
     let mut child_wait = Box::pin(child.wait());
-    let mut pending_input = crate::shell_handler::pty_master::PendingPtyWrite::new(
-        crate::shell_handler::pty_master::DEFAULT_PTY_INPUT_QUEUE_BYTES,
-    );
 
     loop {
         reload_jobs.retain_mut(|job| !job.poll_send_next(&history, history_start_abs));
@@ -1277,7 +1326,7 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
                     return Ok(());
                 }
             }
-            result = crate::shell_handler::pty_master::write_one_pending_pty_chunk(&master, &mut pending_input), if !pending_input.is_empty() => {
+            result = crate::shell_handler::pty_master::write_one_pending_pty_chunk(&master, &mut terminal.pending_input), if !terminal.pending_input.is_empty() => {
                 result.context("write queued ghostty pty input")?;
             }
             () = tokio::time::sleep(Duration::from_millis(25)), if !reload_jobs.is_empty() => {}
@@ -1342,7 +1391,7 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
                         let _ = reply.send(initial);
                     }
                     HelperCommand::Input(bytes) => {
-                        if let Err(err) = pending_input.push(bytes) {
+                        if let Err(err) = terminal.pending_input.push(bytes) {
                             crate::metrics::record_ghostty_event("input_queue_full");
                             tracing::warn!(%err, "ghostty pty input queue full; requesting attach v2 resync");
                             broadcast(&mut subscribers, &[]);
@@ -1472,8 +1521,52 @@ fn resize_helper(
 }
 
 #[cfg(unix)]
-fn process_output(
+fn configure_portl_terminal_capabilities(
     terminal: &mut Terminal<'_, '_>,
+    pty_replies: TerminalPtyReplies,
+) -> Result<()> {
+    terminal
+        .on_pty_write(move |_term, data| {
+            pty_replies.borrow_mut().push(data.to_vec());
+        })?
+        .on_device_attributes(|_term| {
+            Some(DeviceAttributes {
+                primary: PrimaryDeviceAttributes::new(
+                    ConformanceLevel::VT220,
+                    [
+                        DeviceAttributeFeature::COLUMNS_132,
+                        DeviceAttributeFeature::SELECTIVE_ERASE,
+                        DeviceAttributeFeature::ANSI_COLOR,
+                    ],
+                ),
+                secondary: SecondaryDeviceAttributes {
+                    device_type: DeviceType::VT220,
+                    firmware_version: 1,
+                    rom_cartridge: 0,
+                },
+                tertiary: TertiaryDeviceAttributes { unit_id: 0 },
+            })
+        })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn drain_terminal_pty_replies(terminal: &mut GhosttyTerminalIo) -> bool {
+    let mut replies = terminal.pty_replies.borrow_mut();
+    let mut queued_all = true;
+    for reply in replies.drain(..) {
+        if let Err(err) = terminal.pending_input.push(reply) {
+            queued_all = false;
+            crate::metrics::record_ghostty_event("input_queue_full");
+            tracing::warn!(%err, "ghostty pty input queue full while queueing terminal capability response");
+        }
+    }
+    queued_all
+}
+
+#[cfg(unix)]
+fn process_output(
+    terminal: &mut GhosttyTerminalIo,
     history: &mut VecDeque<u8>,
     subscribers: &mut Vec<mpsc::Sender<Vec<u8>>>,
     v2_subscribers: &mut Vec<GhosttyV2Subscriber>,
@@ -1485,6 +1578,7 @@ fn process_output(
     *live_seq = live_seq.saturating_add(bytes.len() as u64);
     let end_seq = *live_seq;
     terminal.vt_write(bytes);
+    let queued_terminal_replies = drain_terminal_pty_replies(terminal);
     let dropped = append_bounded(history, bytes);
     *history_start_abs = history_start_abs.saturating_add(dropped as u64);
     tracing::trace!(
@@ -1508,6 +1602,10 @@ fn process_output(
             bytes: bytes.to_vec(),
         },
     );
+    if !queued_terminal_replies {
+        broadcast(subscribers, &[]);
+        broadcast_v2_resync(v2_subscribers, "input queue full", *live_seq);
+    }
 }
 
 #[cfg(unix)]
@@ -3155,6 +3253,40 @@ mod tests {
     use anyhow::{Context, Result};
 
     use super::*;
+    use crate::session_handler::vt_capability::{
+        PORTL_CANONICAL_DA1_PARAMETER_LIST, PORTL_CANONICAL_DA2_PARAMETER_LIST,
+    };
+
+    fn configured_test_terminal() -> Result<(Terminal<'static, 'static>, TerminalPtyReplies)> {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 4096,
+        })?;
+        let replies = Rc::new(RefCell::new(Vec::new()));
+        configure_portl_terminal_capabilities(&mut terminal, Rc::clone(&replies))?;
+        Ok((terminal, replies))
+    }
+
+    fn terminal_replies_for(input: &[u8]) -> Result<Vec<u8>> {
+        let (mut terminal, replies) = configured_test_terminal()?;
+        terminal.vt_write(input);
+        Ok(replies.borrow_mut().drain(..).flatten().collect())
+    }
+
+    fn expected_da1_response() -> Vec<u8> {
+        let mut out = b"\x1b[?".to_vec();
+        out.extend_from_slice(PORTL_CANONICAL_DA1_PARAMETER_LIST);
+        out.push(b'c');
+        out
+    }
+
+    fn expected_da2_response() -> Vec<u8> {
+        let mut out = b"\x1b[>".to_vec();
+        out.extend_from_slice(PORTL_CANONICAL_DA2_PARAMETER_LIST);
+        out.push(b'c');
+        out
+    }
 
     #[test]
     fn session_names_are_encoded_for_single_path_component() {
@@ -3184,6 +3316,113 @@ mod tests {
         let decoded: GhosttySessionMetadata = serde_json::from_slice(&encoded)?;
 
         assert_eq!(decoded, metadata);
+        Ok(())
+    }
+
+    #[test]
+    fn da1_query_uses_canonical_primary_device_attributes() -> Result<()> {
+        let expected = expected_da1_response();
+
+        assert_eq!(terminal_replies_for(b"\x1b[c")?, expected);
+        assert_eq!(terminal_replies_for(b"unrelated\x1b[c")?, expected);
+        assert_eq!(terminal_replies_for(b"\x1b[c")?, expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn da2_query_uses_canonical_secondary_device_attributes() -> Result<()> {
+        let expected = expected_da2_response();
+
+        assert_eq!(terminal_replies_for(b"\x1b[>c")?, expected);
+        assert_eq!(terminal_replies_for(b"unrelated\x1b[>c")?, expected);
+        assert_eq!(terminal_replies_for(b"\x1b[>c")?, expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn da1_and_da2_queries_are_host_environment_independent() -> Result<()> {
+        for _host_profile in [
+            ("xterm-256color", "truecolor", "Apple_Terminal"),
+            ("screen", "", "tmux"),
+            ("dumb", "24bit", "ghostty"),
+        ] {
+            assert_eq!(terminal_replies_for(b"\x1b[c")?, expected_da1_response());
+            assert_eq!(terminal_replies_for(b"\x1b[>c")?, expected_da2_response());
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_da_input_does_not_emit_spurious_response_and_resyncs() -> Result<()> {
+        for malformed in [
+            b"\x1b[".as_slice(),
+            b"\x1b[?".as_slice(),
+            b"\x1b[?;;x".as_slice(),
+            b"\x1b[>;;x".as_slice(),
+            b"\x1b[\x07".as_slice(),
+        ] {
+            let (mut terminal, replies) = configured_test_terminal()?;
+            terminal.vt_write(malformed);
+            assert!(
+                replies.borrow().is_empty(),
+                "malformed input emitted {:?}",
+                replies.borrow()
+            );
+
+            terminal.vt_write(b"\x1b[c");
+            let response: Vec<u8> = replies.borrow_mut().drain(..).flatten().collect();
+            assert_eq!(response, expected_da1_response());
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn multiple_sequential_da_queries_in_one_chunk_each_receive_a_response() -> Result<()> {
+        let mut expected = expected_da1_response();
+        expected.extend_from_slice(&expected_da2_response());
+        expected.extend_from_slice(&expected_da1_response());
+
+        assert_eq!(terminal_replies_for(b"\x1b[c\x1b[>c\x1b[c")?, expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn da1_response_is_queued_to_guest_pty_input_not_broadcast_to_host() -> Result<()> {
+        let mut terminal = GhosttyTerminalIo::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 4096,
+        })?;
+        let mut history = VecDeque::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut subscribers = vec![tx];
+        let mut v2_subscribers = Vec::new();
+        let mut history_start_abs = 0;
+        let mut live_seq = 0;
+
+        process_output(
+            &mut terminal,
+            &mut history,
+            &mut subscribers,
+            &mut v2_subscribers,
+            &mut history_start_abs,
+            &mut live_seq,
+            b"\x1b[c",
+        );
+
+        let expected = expected_da1_response();
+        assert_eq!(
+            terminal.pending_input.front_chunk(),
+            Some(expected.as_slice())
+        );
+        assert_eq!(rx.try_recv()?, b"\x1b[c".to_vec());
+        assert!(rx.try_recv().is_err());
+
         Ok(())
     }
 
