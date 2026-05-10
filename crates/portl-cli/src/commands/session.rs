@@ -4108,18 +4108,105 @@ fn exit_code_from_i32(code: i32) -> ExitCode {
 
 struct RawModeGuard;
 
-type SharedTerminalModeTracker = Arc<StdMutex<TerminalModeTracker>>;
+const DEFERRED_DEFENSIVE_KITTY_RESET_WINDOW_BYTES: usize = 256;
+
+struct HostBoundModeTracker {
+    tracker: TerminalModeTracker,
+    deferred_alt_screen_kitty_reset: bool,
+    deferred_bytes_seen: usize,
+}
+
+impl HostBoundModeTracker {
+    fn new() -> Self {
+        Self {
+            tracker: TerminalModeTracker::new(),
+            deferred_alt_screen_kitty_reset: false,
+            deferred_bytes_seen: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn state(&self) -> TerminalModeState {
+        self.tracker.state()
+    }
+
+    fn track(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let pending_at_start = self.deferred_alt_screen_kitty_reset
+            || self.tracker.has_pending_alt_screen_leave_kitty_reset();
+        if !pending_at_start {
+            self.tracker.feed(bytes);
+            if self.tracker.has_pending_alt_screen_leave_kitty_reset() {
+                self.deferred_alt_screen_kitty_reset = true;
+                self.deferred_bytes_seen = 0;
+            }
+            return Vec::new();
+        }
+
+        for (index, &byte) in bytes.iter().enumerate() {
+            self.tracker.feed(&[byte]);
+            if !self.tracker.has_pending_alt_screen_leave_kitty_reset() {
+                self.deferred_alt_screen_kitty_reset = false;
+                self.deferred_bytes_seen = 0;
+                self.tracker.feed(&bytes[index + 1..]);
+                if self.tracker.has_pending_alt_screen_leave_kitty_reset() {
+                    self.deferred_alt_screen_kitty_reset = true;
+                    self.deferred_bytes_seen = 0;
+                }
+                return Vec::new();
+            }
+            self.deferred_bytes_seen = self.deferred_bytes_seen.saturating_add(1);
+            if self.deferred_bytes_seen >= DEFERRED_DEFENSIVE_KITTY_RESET_WINDOW_BYTES {
+                let reset = self.take_deferred_reset();
+                self.tracker.feed(&bytes[index + 1..]);
+                if self.tracker.has_pending_alt_screen_leave_kitty_reset() {
+                    self.deferred_alt_screen_kitty_reset = true;
+                    self.deferred_bytes_seen = 0;
+                }
+                return reset;
+            }
+        }
+
+        // Defer across the leave chunk so a clean Kitty pop split into the next
+        // transport read can suppress the defensive reset, but do not wait for
+        // an unbounded stream: if a following chunk/frame contains no pop in the
+        // small byte window above, flush the Symptom-2 reset.
+        self.take_deferred_reset()
+    }
+
+    fn flush_deferred_reset(&mut self) -> Vec<u8> {
+        if self.deferred_alt_screen_kitty_reset
+            && self.tracker.has_pending_alt_screen_leave_kitty_reset()
+        {
+            return self.take_deferred_reset();
+        }
+        Vec::new()
+    }
+
+    fn take_deferred_reset(&mut self) -> Vec<u8> {
+        self.deferred_alt_screen_kitty_reset = false;
+        self.deferred_bytes_seen = 0;
+        self.tracker.take_alt_screen_leave_kitty_reset()
+    }
+}
+
+type SharedTerminalModeTracker = Arc<StdMutex<HostBoundModeTracker>>;
 
 fn new_terminal_mode_tracker() -> SharedTerminalModeTracker {
-    Arc::new(StdMutex::new(TerminalModeTracker::new()))
+    Arc::new(StdMutex::new(HostBoundModeTracker::new()))
 }
 
 fn track_host_bound_bytes(tracker: &SharedTerminalModeTracker, bytes: &[u8]) -> Result<Vec<u8>> {
     let mut tracker = tracker
         .lock()
         .map_err(|_| anyhow!("terminal mode tracker lock poisoned"))?;
-    tracker.feed(bytes);
-    Ok(tracker.take_alt_screen_leave_kitty_reset())
+    Ok(tracker.track(bytes))
+}
+
+fn flush_host_bound_mode_tracker(tracker: &SharedTerminalModeTracker) -> Result<Vec<u8>> {
+    let mut tracker = tracker
+        .lock()
+        .map_err(|_| anyhow!("terminal mode tracker lock poisoned"))?;
+    Ok(tracker.flush_deferred_reset())
 }
 
 #[cfg(test)]
@@ -4139,6 +4226,18 @@ async fn write_tracked_output(
         display.write_output(stream, &defensive_reset).await?;
     }
     Ok(())
+}
+
+async fn flush_tracked_output(
+    display: &AttachDisplay,
+    stream: AttachOutputStream,
+    tracker: &SharedTerminalModeTracker,
+) -> Result<()> {
+    let defensive_reset = flush_host_bound_mode_tracker(tracker)?;
+    if !defensive_reset.is_empty() {
+        display.write_output(stream, &defensive_reset).await?;
+    }
+    display.flush(stream).await
 }
 
 impl RawModeGuard {
@@ -4753,7 +4852,7 @@ async fn copy_mpsc_output(
         }
         write_tracked_output(display, stream, &bytes, mode_tracker).await?;
     }
-    display.flush(stream).await
+    flush_tracked_output(display, stream, mode_tracker).await
 }
 
 async fn copy_remote_output<R>(
@@ -4769,7 +4868,7 @@ where
     loop {
         let read = recv.read(&mut buf).await.context("read remote output")?;
         if read == 0 {
-            display.flush(stream).await?;
+            flush_tracked_output(display, stream, mode_tracker).await?;
             return Ok(());
         }
         write_tracked_output(display, stream, &buf[..read], mode_tracker).await?;
@@ -4796,7 +4895,7 @@ async fn pump_local_tmux_control_pty(
             }
             read = read_pty_chunk(&master, &mut read_buf) => {
                 let Some(read) = read.context("read tmux -CC pty")? else {
-                    display.flush(AttachOutputStream::Stdout).await?;
+                    flush_tracked_output(display, AttachOutputStream::Stdout, mode_tracker).await?;
                     return Ok(());
                 };
                 let control_bytes = decoder.decode(&read_buf[..read]);
@@ -4823,7 +4922,15 @@ async fn pump_local_tmux_control_pty(
                                     )
                                     .await?;
                             }
-                            tmux_cc::TmuxControlEvent::Exit => return Ok(()),
+                            tmux_cc::TmuxControlEvent::Exit => {
+                                flush_tracked_output(
+                                    display,
+                                    AttachOutputStream::Stdout,
+                                    mode_tracker,
+                                )
+                                .await?;
+                                return Ok(());
+                            }
                             tmux_cc::TmuxControlEvent::Ignore => {}
                         }
                     }
@@ -6406,12 +6513,13 @@ mod tests {
         );
         assert_eq!(
             track_host_bound_bytes(&tracker, b"\x1b[?1049l").unwrap(),
-            b"\x1b[<u\x1b[=0u\x1b[>4;0m"
-        );
-        assert_eq!(
-            track_host_bound_bytes(&tracker, b"\x1b[?1049l").unwrap(),
             b""
         );
+        assert_eq!(
+            track_host_bound_bytes(&tracker, b"prompt").unwrap(),
+            b"\x1b[<u\x1b[=0u\x1b[>4;0m"
+        );
+        assert_eq!(flush_host_bound_mode_tracker(&tracker).unwrap(), b"");
 
         let clean_tracker = new_terminal_mode_tracker();
         assert_eq!(
@@ -6419,6 +6527,41 @@ mod tests {
                 .unwrap(),
             b""
         );
+    }
+
+    #[test]
+    fn attach_mode_tracker_defers_defensive_emit_for_split_kitty_pop() {
+        let tracker = new_terminal_mode_tracker();
+
+        assert_eq!(
+            track_host_bound_bytes(&tracker, b"\x1b[>1u\x1b[?1049h").unwrap(),
+            b""
+        );
+        assert_eq!(
+            track_host_bound_bytes(&tracker, b"\x1b[?1049l").unwrap(),
+            b""
+        );
+        assert_eq!(track_host_bound_bytes(&tracker, b"\x1b[<u").unwrap(), b"");
+        assert_eq!(flush_host_bound_mode_tracker(&tracker).unwrap(), b"");
+    }
+
+    #[test]
+    fn attach_mode_tracker_emits_defensive_reset_after_bounded_window_without_pop() {
+        let tracker = new_terminal_mode_tracker();
+
+        assert_eq!(
+            track_host_bound_bytes(&tracker, b"\x1b[>1u\x1b[?1049h").unwrap(),
+            b""
+        );
+        assert_eq!(
+            track_host_bound_bytes(&tracker, b"\x1b[?1049l").unwrap(),
+            b""
+        );
+        assert_eq!(
+            track_host_bound_bytes(&tracker, b"next frame without pop").unwrap(),
+            b"\x1b[<u\x1b[>4;0m"
+        );
+        assert_eq!(flush_host_bound_mode_tracker(&tracker).unwrap(), b"");
     }
 
     #[test]

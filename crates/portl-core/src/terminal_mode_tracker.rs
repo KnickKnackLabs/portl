@@ -97,6 +97,10 @@ impl TerminalModeTracker {
         self.modes.kitty_keyboard_depth > 0
     }
 
+    pub fn is_kitty_active(&self) -> bool {
+        self.modes.kitty_keyboard_depth > 0 || self.modes.kitty_flags != 0
+    }
+
     pub fn kitty_keyboard_depth(&self) -> u8 {
         self.modes.kitty_keyboard_depth
     }
@@ -142,6 +146,8 @@ impl TerminalModeTracker {
             return Vec::new();
         }
         self.pending_alt_screen_kitty_reset = false;
+        let needs_kitty_pop = self.modes.kitty_keyboard_depth > 0;
+        let needs_flags_clear = self.modes.kitty_flags != 0;
         self.modes.kitty_keyboard_depth = 0;
         self.modes.kitty_flags = 0;
         self.modes.modify_other_keys = 0;
@@ -149,10 +155,18 @@ impl TerminalModeTracker {
         let mut plan = Vec::with_capacity(
             KITTY_POP.len() + KITTY_FLAGS_CLEAR.len() + MODIFY_OTHER_KEYS_CLEAR.len(),
         );
-        plan.extend_from_slice(KITTY_POP);
-        plan.extend_from_slice(KITTY_FLAGS_CLEAR);
+        if needs_kitty_pop {
+            plan.extend_from_slice(KITTY_POP);
+        }
+        if needs_flags_clear {
+            plan.extend_from_slice(KITTY_FLAGS_CLEAR);
+        }
         plan.extend_from_slice(MODIFY_OTHER_KEYS_CLEAR);
         plan
+    }
+
+    pub fn has_pending_alt_screen_leave_kitty_reset(&self) -> bool {
+        self.pending_alt_screen_kitty_reset
     }
 
     pub fn cleanup_plan(&mut self) -> Vec<u8> {
@@ -273,12 +287,15 @@ impl TerminalModeTracker {
             }
             (Some(b'<'), b'u') => {
                 self.modes.kitty_keyboard_depth = self.modes.kitty_keyboard_depth.saturating_sub(1);
-                if !self.is_kitty_keyboard_enabled() {
+                if !self.is_kitty_active() {
                     self.pending_alt_screen_kitty_reset = false;
                 }
             }
             (Some(b'='), b'u') => {
                 self.modes.kitty_flags = parse_params(&params[1..]).first().copied().unwrap_or(0);
+                if !self.is_kitty_active() {
+                    self.pending_alt_screen_kitty_reset = false;
+                }
             }
             (Some(b'>'), b'm') => {
                 let parsed = parse_params(&params[1..]);
@@ -312,7 +329,7 @@ impl TerminalModeTracker {
         if enable {
             self.modes.alt_screen = Some(mode);
         } else if self.modes.alt_screen == Some(mode) || self.modes.alt_screen.is_some() {
-            let kitty_was_active = self.is_kitty_keyboard_enabled();
+            let kitty_was_active = self.is_kitty_active();
             self.modes.alt_screen = None;
             if kitty_was_active {
                 self.pending_alt_screen_kitty_reset = true;
@@ -606,6 +623,29 @@ mod tests {
         let mut tracker = TerminalModeTracker::new();
         tracker.feed(b"\x1b[>1u\x1b[?1049h\x1b[?1049l\x1b[<u");
         assert_eq!(tracker.take_alt_screen_leave_kitty_reset(), EMPTY);
+    }
+
+    #[test]
+    fn terminal_mode_tracker_symptom2_treats_direct_kitty_flags_as_active() {
+        let mut tracker = TerminalModeTracker::new();
+        tracker.feed(b"\x1b[=15u");
+        tracker.feed(b"\x1b[?1049h");
+        tracker.feed(b"\x1b[?1049l");
+
+        let reset = tracker.take_alt_screen_leave_kitty_reset();
+        assert!(
+            reset
+                .windows(KITTY_FLAGS_CLEAR.len())
+                .any(|window| window == KITTY_FLAGS_CLEAR),
+            "direct Kitty flags must be cleared by defensive reset: {reset:?}"
+        );
+        assert!(
+            !reset
+                .windows(KITTY_POP.len())
+                .any(|window| window == KITTY_POP),
+            "push pop should not be emitted when only direct flags were active: {reset:?}"
+        );
+        assert_eq!(tracker.cleanup_plan(), EMPTY);
     }
 
     #[test]
