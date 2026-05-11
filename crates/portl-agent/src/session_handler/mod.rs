@@ -1046,7 +1046,7 @@ fn spawn_tmux_control_process(
         exit_code,
         exit_tx,
         signal_target: None,
-        strip_stdout_queries: std::sync::atomic::AtomicBool::new(false),
+        strip_stdout_queries: std::sync::atomic::AtomicBool::new(true),
         pty_tx: Some(pty_tx),
         started_at,
     }))
@@ -1897,6 +1897,62 @@ mod tests {
             .map_err(|reason| anyhow::anyhow!("unexpected rejection: {reason:?}"))?;
 
         assert_eq!(selected.name(), "zmx");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tmux_control_process_enables_stdout_query_stripping() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let fake = temp.path().join("tmux");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\ncase \"$1\" in -CC) while IFS= read -r line; do [ \"$line\" = \"detach-client\" ] && exit 0; done;; esac\n",
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake, perms)?;
+        }
+        let tmux = provider::TmuxProvider::with_path(fake);
+        let session = Session {
+            peer_token: [0; 16],
+            caps: portl_core::ticket::schema::Capabilities {
+                presence: 0,
+                shell: None,
+                tcp: None,
+                udp: None,
+                fs: None,
+                vpn: None,
+                meta: None,
+            },
+            ticket_id: [1; 16],
+            ticket_chain_ids: Vec::new(),
+            caller_endpoint_id: [2; 32],
+            bearer: None,
+        };
+        let pty = portl_proto::shell_v1::PtyCfg {
+            term: "xterm-256color".to_owned(),
+            cols: 80,
+            rows: 24,
+        };
+        let process = spawn_tmux_control_process(
+            &session,
+            &tmux,
+            "dev",
+            None,
+            None,
+            Some(&pty),
+            None,
+            &[],
+            "tmux-strip-test",
+            None,
+            None,
+        )?;
+
+        assert!(process.strip_stdout_queries());
+        let _ = process.stdin_tx.send(StdinMessage::Close).await;
         Ok(())
     }
 }

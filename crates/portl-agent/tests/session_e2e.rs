@@ -514,6 +514,50 @@ async fn session_tmux_provider_attaches_with_control_mode() -> Result<()> {
 }
 
 #[tokio::test]
+async fn session_tmux_control_attach_strips_terminal_queries_without_answers() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let fake_tmux = temp.path().join("tmux");
+    let log = temp.path().join("tmux.log");
+    write_fake_tmux_query_strip_control(&fake_tmux, &log)?;
+
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator, Some(fake_tmux)).await?;
+    let ticket = root_ticket(&operator, server.addr(), shell_caps(true));
+
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let mut attach = open_session_attach(
+        &connection,
+        &session,
+        Some("tmux".to_owned()),
+        "dev".to_owned(),
+        None,
+        None,
+        None,
+        PtyCfg {
+            term: "xterm-256color".to_owned(),
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await?;
+    attach.close_stdin()?;
+    let mut attached = Vec::new();
+    AsyncReadExt::read_to_end(&mut attach.stdout, &mut attached).await?;
+
+    assert_eq!(
+        attached,
+        b"prepostmalformed:\x1b[Xhello\x1b[?Xhello\x1b[?;;uhello\x1bZdone"
+    );
+    assert_no_query_bytes(&attached);
+    assert_eq!(attach.wait_exit().await?, 0);
+    let calls = fs::read_to_string(log)?;
+    assert_no_response_bytes(calls.as_bytes());
+
+    shutdown(connection, client, server, agent).await
+}
+
+#[tokio::test]
 async fn session_provider_command_failure_returns_session_ack() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let fake_zmx = temp.path().join("zmx");
@@ -732,6 +776,41 @@ case "$1" in
     done
     ;;
   *) echo "not zmx" >&2; exit 64 ;;
+esac
+"#,
+            log.display(),
+            log.display()
+        ),
+    )?;
+    let mut perms = fs::metadata(path)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+fn write_fake_tmux_query_strip_control(
+    path: &std::path::Path,
+    log: &std::path::Path,
+) -> Result<()> {
+    fs::write(
+        path,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$@" >> "{}"
+case "$1" in
+  -V) echo "tmux 3.6" ;;
+  list-sessions) printf 'dev\n' ;;
+  display-message) exit 1 ;;
+  list-panes) exit 1 ;;
+  -CC)
+    stty -echo 2>/dev/null || true
+    printf '\033P1000p%%output %%1 pre\\033[c\\033[>c\\033[6n\\033[?u\\033[>1u\\033[=15u\\033[<upostmalformed:\\033[Xhello\\033[?Xhello\\033[?;;uhello\\033Zdone\r\n'
+    while IFS= read -r line; do
+      printf 'stdin:%s\n' "$line" >> "{}"
+      [ "$line" = "detach-client" ] && exit 0
+    done
+    ;;
+  *) echo "not tmux query fixture" >&2; exit 64 ;;
 esac
 "#,
             log.display(),
