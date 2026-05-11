@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -59,6 +60,7 @@ pub(crate) struct ShellProcess {
     pub(crate) exit_code: Arc<Mutex<Option<i32>>>,
     pub(crate) exit_tx: watch::Sender<Option<i32>>,
     pub(crate) signal_target: Option<i32>,
+    pub(crate) strip_stdout_queries: AtomicBool,
     /// Control channel for PTY-only operations handled by the single
     /// async PTY master task. `None` for the non-PTY exec path.
     pub(crate) pty_tx: Option<mpsc::UnboundedSender<PtyCommand>>,
@@ -71,6 +73,14 @@ pub(crate) struct ShellProcess {
 impl ShellProcess {
     pub(crate) fn exit_rx(&self) -> watch::Receiver<Option<i32>> {
         self.exit_tx.subscribe()
+    }
+
+    pub(crate) fn strip_stdout_queries(&self) -> bool {
+        self.strip_stdout_queries.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn enable_stdout_query_stripping(&self) {
+        self.strip_stdout_queries.store(true, Ordering::Relaxed);
     }
 
     /// Record the instant associated with the paired `shell_start`

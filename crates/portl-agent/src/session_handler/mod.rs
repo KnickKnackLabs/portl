@@ -528,6 +528,7 @@ async fn serve_attach(
             return Ok(());
         }
     };
+    process.enable_stdout_query_stripping();
     process.set_started_at(Instant::now());
     state
         .shell_registry
@@ -1045,6 +1046,7 @@ fn spawn_tmux_control_process(
         exit_code,
         exit_tx,
         signal_target: None,
+        strip_stdout_queries: std::sync::atomic::AtomicBool::new(false),
         pty_tx: Some(pty_tx),
         started_at,
     }))
@@ -1181,6 +1183,7 @@ fn spawn_zmx_control_process(
         exit_code,
         exit_tx,
         signal_target: None,
+        strip_stdout_queries: std::sync::atomic::AtomicBool::new(true),
         pty_tx: Some(pty_tx),
         started_at,
     }))

@@ -726,6 +726,7 @@ fn ghostty_attach_process(pid: u32, mut attach: GhosttyAttach) -> Arc<ShellProce
         exit_code,
         exit_tx,
         signal_target,
+        strip_stdout_queries: std::sync::atomic::AtomicBool::new(false),
         pty_tx: Some(pty_tx),
         started_at: Arc::new(Mutex::new(Some(Instant::now()))),
     })

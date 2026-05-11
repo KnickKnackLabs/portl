@@ -156,6 +156,7 @@ fn spawn_exec_process(
         exit_code,
         exit_tx,
         signal_target: Some(process_group_signal_target_from_pid(pid)?),
+        strip_stdout_queries: std::sync::atomic::AtomicBool::new(false),
         pty_tx: None,
         started_at,
     }))
@@ -286,6 +287,7 @@ fn spawn_pty_process(
         exit_code,
         exit_tx,
         signal_target,
+        strip_stdout_queries: std::sync::atomic::AtomicBool::new(false),
         pty_tx: Some(pty_tx),
         started_at,
     }))

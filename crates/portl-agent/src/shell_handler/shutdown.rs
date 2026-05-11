@@ -219,6 +219,7 @@ pub(super) mod tests {
                 exit_code,
                 exit_tx,
                 signal_target: None,
+                strip_stdout_queries: std::sync::atomic::AtomicBool::new(false),
                 pty_tx: None,
                 started_at: Arc::new(std::sync::Mutex::new(None)),
             }),

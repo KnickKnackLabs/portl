@@ -191,6 +191,88 @@ async fn session_attach_prefers_zmx_control_when_probe_succeeds() -> Result<()> 
 }
 
 #[tokio::test]
+async fn session_zmx_legacy_attach_strips_terminal_queries_without_answers() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let fake_zmx = temp.path().join("zmx");
+    let stdin_log = temp.path().join("zmx.stdin");
+    write_fake_zmx_query_strip_legacy(&fake_zmx, &stdin_log)?;
+
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator, Some(fake_zmx)).await?;
+    let ticket = root_ticket(&operator, server.addr(), shell_caps(true));
+
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let mut attach = open_session_attach(
+        &connection,
+        &session,
+        Some("zmx".to_owned()),
+        "dev".to_owned(),
+        None,
+        None,
+        None,
+        PtyCfg {
+            term: "xterm-256color".to_owned(),
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await?;
+    attach.close_stdin()?;
+    let mut attached = Vec::new();
+    AsyncReadExt::read_to_end(&mut attach.stdout, &mut attached).await?;
+
+    assert_eq!(attached, b"prepost");
+    assert_no_query_bytes(&attached);
+    let stdin_bytes = fs::read(stdin_log)?;
+    assert_no_response_bytes(&stdin_bytes);
+    assert_eq!(attach.wait_exit().await?, 0);
+
+    shutdown(connection, client, server, agent).await
+}
+
+#[tokio::test]
+async fn session_zmx_control_attach_strips_terminal_queries_without_answers() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let fake_zmx = temp.path().join("zmx");
+    let stdin_log = temp.path().join("zmx-control.stdin");
+    write_fake_zmx_query_strip_control(&fake_zmx, &stdin_log)?;
+
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator, Some(fake_zmx)).await?;
+    let ticket = root_ticket(&operator, server.addr(), shell_caps(true));
+
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let mut attach = open_session_attach(
+        &connection,
+        &session,
+        Some("zmx".to_owned()),
+        "dev".to_owned(),
+        None,
+        None,
+        None,
+        PtyCfg {
+            term: "xterm-256color".to_owned(),
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await?;
+    attach.close_stdin()?;
+    let mut attached = Vec::new();
+    AsyncReadExt::read_to_end(&mut attach.stdout, &mut attached).await?;
+
+    assert_eq!(attached, b"prepost");
+    assert_no_query_bytes(&attached);
+    let stdin_bytes = fs::read(stdin_log)?;
+    assert_no_response_bytes(&stdin_bytes);
+    assert_eq!(attach.wait_exit().await?, 0);
+
+    shutdown(connection, client, server, agent).await
+}
+
+#[tokio::test]
 async fn session_list_aggregates_available_providers_and_resolves_unique_attach() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let fake_provider = temp.path().join("tmux");
@@ -723,6 +805,67 @@ esac
     Ok(())
 }
 
+fn write_fake_zmx_query_strip_legacy(
+    path: &std::path::Path,
+    stdin_log: &std::path::Path,
+) -> Result<()> {
+    fs::write(
+        path,
+        format!(
+            r#"#!/bin/sh
+case "$1" in
+  version) echo "zmx 0.0.fake" ;;
+  list) printf 'dev\n' ;;
+  attach)
+    : > "{}"
+    printf 'pre\033[c\033[>c\033[6n\033[?u\033[>1u\033[=15u\033[<upost'
+    ;;
+  *) echo "unknown:$1" >&2; exit 64 ;;
+esac
+"#,
+            stdin_log.display()
+        ),
+    )?;
+    let mut perms = fs::metadata(path)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+fn write_fake_zmx_query_strip_control(
+    path: &std::path::Path,
+    stdin_log: &std::path::Path,
+) -> Result<()> {
+    fs::write(
+        path,
+        format!(
+            r#"#!/bin/sh
+if [ "$1" = "control" ] && [ "$2" = "--protocol" ] && [ "$3" = "zmx-control/v1" ] && [ "$4" = "--probe" ]; then
+  printf 'protocol=zmx-control/v1\n'
+  printf 'tier=control\n'
+  printf 'features=viewport_snapshot.v1,live_output.v1\n'
+  exit 0
+fi
+if [ "$1" = "control" ] && [ "$2" = "--protocol" ] && [ "$3" = "zmx-control/v1" ]; then
+  printf '\001\045\000\000\000pre\033[c\033[>c\033[6n\033[?u\033[>1u\033[=15u\033[<upost'
+  cat > "{}"
+  exit 0
+fi
+case "$1" in
+  version) echo "zmx 0.0.fake" ;;
+  list) printf 'dev\n' ;;
+  *) echo "unknown:$1" >&2; exit 64 ;;
+esac
+"#,
+            stdin_log.display()
+        ),
+    )?;
+    let mut perms = fs::metadata(path)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
 fn write_fake_zmx(path: &std::path::Path) -> Result<()> {
     fs::write(
         path,
@@ -742,6 +885,98 @@ esac
     perms.set_mode(0o755);
     fs::set_permissions(path, perms)?;
     Ok(())
+}
+
+fn assert_no_query_bytes(bytes: &[u8]) {
+    for query in [
+        b"\x1b[c".as_slice(),
+        b"\x1b[>c",
+        b"\x1b[6n",
+        b"\x1b[?u",
+        b"\x1b[>1u",
+        b"\x1b[=15u",
+        b"\x1b[<u",
+    ] {
+        assert!(
+            !contains_bytes(bytes, query),
+            "query {} leaked in {}",
+            escaped(query),
+            escaped(bytes)
+        );
+    }
+}
+
+fn assert_no_response_bytes(bytes: &[u8]) {
+    assert!(
+        !contains_response_shape(bytes),
+        "response shape leaked in {}",
+        escaped(bytes)
+    );
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn contains_response_shape(bytes: &[u8]) -> bool {
+    let mut offset = 0;
+    while offset + 2 < bytes.len() {
+        if bytes[offset] != 0x1b || bytes[offset + 1] != b'[' {
+            offset += 1;
+            continue;
+        }
+        let body_start = offset + 2;
+        let Some(final_rel) = bytes[body_start..]
+            .iter()
+            .position(|byte| (0x40..=0x7e).contains(byte))
+        else {
+            return false;
+        };
+        let final_byte = bytes[body_start + final_rel];
+        let body = &bytes[body_start..body_start + final_rel];
+        let response = match final_byte {
+            b'c' => body
+                .strip_prefix(b"?")
+                .or_else(|| body.strip_prefix(b">"))
+                .is_some_and(semicolon_digits),
+            b'u' => body.strip_prefix(b"?").is_some_and(colon_semicolon_digits),
+            b'R' => body
+                .strip_prefix(b"?")
+                .unwrap_or(body)
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || *byte == b';'),
+            _ => false,
+        };
+        if response {
+            return true;
+        }
+        offset = body_start + final_rel + 1;
+    }
+    false
+}
+
+fn semicolon_digits(bytes: &[u8]) -> bool {
+    !bytes.is_empty()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || *byte == b';')
+}
+
+fn colon_semicolon_digits(bytes: &[u8]) -> bool {
+    !bytes.is_empty()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || *byte == b';' || *byte == b':')
+}
+
+fn escaped(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .flat_map(|byte| std::ascii::escape_default(*byte))
+        .map(char::from)
+        .collect()
 }
 
 async fn shutdown(

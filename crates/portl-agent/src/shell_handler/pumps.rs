@@ -68,8 +68,21 @@ pub(crate) async fn pump_output(
 ) -> Result<()> {
     let output = output_for(process, kind);
     if let Some(mut rx) = output.take_channel().await? {
+        let mut query_stripper = matches!(kind, ShellOutputKind::Stdout)
+            .then(|| process.strip_stdout_queries())
+            .filter(|enabled| *enabled)
+            .map(|_| portl_core::QueryStripper::new());
         while let Some(chunk) = rx.recv().await {
-            send.write_all(&chunk).await.context("write shell output")?;
+            let chunk = output_chunk_for_wire(&mut query_stripper, chunk);
+            if !chunk.is_empty() {
+                send.write_all(&chunk).await.context("write shell output")?;
+            }
+        }
+        if let Some(stripper) = query_stripper.as_mut() {
+            let tail = stripper.finish();
+            if !tail.is_empty() {
+                send.write_all(&tail).await.context("write shell output")?;
+            }
         }
         send.finish().context("finish shell output")?;
         return Ok(());
@@ -89,6 +102,17 @@ pub(crate) async fn pump_output(
     }
     send.finish().context("finish empty shell output")?;
     Ok(())
+}
+
+fn output_chunk_for_wire(
+    query_stripper: &mut Option<portl_core::QueryStripper>,
+    chunk: Vec<u8>,
+) -> Vec<u8> {
+    if let Some(stripper) = query_stripper.as_mut() {
+        stripper.feed(&chunk)
+    } else {
+        chunk
+    }
 }
 
 pub(crate) async fn pump_signals(mut recv: BufferedRecv, process: &ShellProcess) -> Result<()> {
@@ -156,4 +180,47 @@ pub(crate) async fn pump_exit(mut send: SendStream, process: &ShellProcess) -> R
     send.write_all(&postcard::to_stdvec(&frame)?).await?;
     send.finish().context("finish shell exit stream")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::output_chunk_for_wire;
+
+    #[test]
+    fn zmx_stdout_query_stripper_removes_queries_and_keeps_surrounding_bytes() {
+        let mut stripper = Some(portl_core::QueryStripper::new());
+        let chunk = b"pre\x1b[c\x1b[>c\x1b[6n\x1b[?u\x1b[>1u\x1b[=15u\x1b[<upost".to_vec();
+
+        let output = output_chunk_for_wire(&mut stripper, chunk);
+
+        assert_eq!(output, b"prepost");
+    }
+
+    #[test]
+    fn zmx_stdout_query_stripper_holds_split_queries() {
+        let mut stripper = Some(portl_core::QueryStripper::new());
+
+        let first = output_chunk_for_wire(&mut stripper, b"pre\x1b[=".to_vec());
+        let second = output_chunk_for_wire(&mut stripper, b"15upost".to_vec());
+
+        assert_eq!(first, b"pre");
+        assert_eq!(second, b"post");
+    }
+
+    #[test]
+    fn zmx_stdout_query_stripper_does_not_panic_on_malformed_bursts() {
+        let mut stripper = Some(portl_core::QueryStripper::new());
+        let mut burst = Vec::new();
+        for _ in 0..120 {
+            burst.extend_from_slice(b"\x1b[Xhello\x1b[?Xhello\x1b[?;;uhello\x1bZhello");
+        }
+
+        let output = output_chunk_for_wire(&mut stripper, burst);
+
+        assert!(
+            output
+                .windows(b"hello".len())
+                .any(|window| window == b"hello")
+        );
+    }
 }
