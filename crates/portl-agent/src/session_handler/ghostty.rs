@@ -55,6 +55,7 @@ struct GhosttyTerminalIo {
     terminal: Terminal<'static, 'static>,
     pty_replies: TerminalPtyReplies,
     pending_input: crate::shell_handler::pty_master::PendingPtyWrite,
+    query_stripper: portl_core::QueryStripper,
 }
 
 #[cfg(unix)]
@@ -69,6 +70,7 @@ impl GhosttyTerminalIo {
             pending_input: crate::shell_handler::pty_master::PendingPtyWrite::new(
                 crate::shell_handler::pty_master::DEFAULT_PTY_INPUT_QUEUE_BYTES,
             ),
+            query_stripper: portl_core::QueryStripper::new(),
         })
     }
 }
@@ -1581,15 +1583,17 @@ fn process_output(
     bytes: &[u8],
 ) {
     let start_seq = *live_seq;
-    *live_seq = live_seq.saturating_add(bytes.len() as u64);
+    let output = terminal.query_stripper.feed(bytes);
+    *live_seq = live_seq.saturating_add(output.len() as u64);
     let end_seq = *live_seq;
     terminal.vt_write(bytes);
     let queued_terminal_replies = drain_terminal_pty_replies(terminal);
-    let dropped = append_bounded(history, bytes);
+    let dropped = append_bounded(history, &output);
     *history_start_abs = history_start_abs.saturating_add(dropped as u64);
     tracing::trace!(
         lane = "live",
         bytes = bytes.len(),
+        stripped_bytes = output.len(),
         start_seq,
         end_seq,
         dropped,
@@ -1599,15 +1603,17 @@ fn process_output(
         v2_subscribers = v2_subscribers.len(),
         "process ghostty pty output"
     );
-    broadcast(subscribers, bytes);
-    broadcast_v2(
-        v2_subscribers,
-        &GhosttyLiveOutputV2 {
-            start_seq,
-            end_seq,
-            bytes: bytes.to_vec(),
-        },
-    );
+    if !output.is_empty() {
+        broadcast(subscribers, &output);
+        broadcast_v2(
+            v2_subscribers,
+            &GhosttyLiveOutputV2 {
+                start_seq,
+                end_seq,
+                bytes: output,
+            },
+        );
+    }
     if !queued_terminal_replies {
         broadcast(subscribers, &[]);
         broadcast_v2_resync(v2_subscribers, "input queue full", *live_seq);
@@ -3299,6 +3305,134 @@ mod tests {
         format!("\x1b[?{PORTL_CANONICAL_KITTY_KEYBOARD_FLAGS}u").into_bytes()
     }
 
+    fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty()
+            && haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+    }
+
+    #[derive(Clone, Copy)]
+    enum ExpectedReply {
+        None,
+        Da1,
+        Da2,
+        Kitty,
+    }
+
+    #[derive(Clone, Copy)]
+    struct QueryCase {
+        name: &'static str,
+        query: &'static [u8],
+        expected_reply: ExpectedReply,
+    }
+
+    fn expected_reply_bytes(kind: ExpectedReply) -> Option<Vec<u8>> {
+        match kind {
+            ExpectedReply::None => None,
+            ExpectedReply::Da1 => Some(expected_da1_response()),
+            ExpectedReply::Da2 => Some(expected_da2_response()),
+            ExpectedReply::Kitty => Some(expected_kitty_flag_response()),
+        }
+    }
+
+    fn assert_query_stripped_from_ghostty_output(case: QueryCase) -> Result<()> {
+        let mut terminal = GhosttyTerminalIo::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 4096,
+        })?;
+        let mut history = VecDeque::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut subscribers = vec![tx];
+        let (v2_tx, mut v2_rx) = mpsc::channel(4);
+        let mut v2_subscribers = vec![GhosttyV2Subscriber {
+            live: v2_tx,
+            events: mpsc::unbounded_channel().0,
+            resync_pending: false,
+        }];
+        let mut history_start_abs = 0;
+        let mut live_seq = 0;
+        let mut input = b"pre".to_vec();
+        input.extend_from_slice(case.query);
+        input.extend_from_slice(b"post");
+
+        process_output(
+            &mut terminal,
+            &mut history,
+            &mut subscribers,
+            &mut v2_subscribers,
+            &mut history_start_abs,
+            &mut live_seq,
+            &input,
+        );
+
+        let history_bytes = history.iter().copied().collect::<Vec<_>>();
+        assert_eq!(history_bytes, b"prepost", "{} history", case.name);
+        assert_eq!(
+            rx.try_recv()?,
+            b"prepost".to_vec(),
+            "{} broadcast",
+            case.name
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "{} extra broadcast chunk",
+            case.name
+        );
+        let v2 = v2_rx.try_recv()?;
+        assert_eq!(v2.bytes, b"prepost", "{} v2 broadcast", case.name);
+        assert_eq!(v2.start_seq, 0, "{} v2 start seq", case.name);
+        assert_eq!(
+            v2.end_seq,
+            b"prepost".len() as u64,
+            "{} v2 end seq",
+            case.name
+        );
+        assert_eq!(live_seq, b"prepost".len() as u64, "{} live seq", case.name);
+        assert!(
+            v2_rx.try_recv().is_err(),
+            "{} extra v2 broadcast chunk",
+            case.name
+        );
+        assert!(
+            !contains_subslice(&history_bytes, case.query),
+            "{} query in history",
+            case.name
+        );
+        assert!(
+            !contains_subslice(&v2.bytes, case.query),
+            "{} query in v2",
+            case.name
+        );
+
+        let mut queued_replies = Vec::new();
+        while let Some(chunk) = terminal.pending_input.front_chunk() {
+            let len = chunk.len();
+            queued_replies.extend_from_slice(chunk);
+            terminal.pending_input.consume(len);
+        }
+        if let Some(expected_reply) = expected_reply_bytes(case.expected_reply) {
+            assert_eq!(
+                &queued_replies, &expected_reply,
+                "{} guest pty reply",
+                case.name
+            );
+            assert!(
+                !contains_subslice(&history_bytes, &expected_reply),
+                "{} reply leaked into history",
+                case.name
+            );
+            assert!(
+                !contains_subslice(&v2.bytes, &expected_reply),
+                "{} reply leaked into v2",
+                case.name
+            );
+        }
+
+        Ok(())
+    }
+
     const HOST_ENV_SIGNAL_VARS: &[&str] = &[
         "TERM",
         "COLORTERM",
@@ -3551,6 +3685,51 @@ mod tests {
     }
 
     #[test]
+    fn ghostty_query_forms_are_stripped_from_history_and_broadcasts() -> Result<()> {
+        for case in [
+            QueryCase {
+                name: "da1",
+                query: b"\x1b[c",
+                expected_reply: ExpectedReply::Da1,
+            },
+            QueryCase {
+                name: "da2",
+                query: b"\x1b[>c",
+                expected_reply: ExpectedReply::Da2,
+            },
+            QueryCase {
+                name: "dsr_cpr",
+                query: b"\x1b[6n",
+                expected_reply: ExpectedReply::None,
+            },
+            QueryCase {
+                name: "kitty_primary",
+                query: b"\x1b[?u",
+                expected_reply: ExpectedReply::Kitty,
+            },
+            QueryCase {
+                name: "kitty_push",
+                query: b"\x1b[>1u",
+                expected_reply: ExpectedReply::None,
+            },
+            QueryCase {
+                name: "kitty_set",
+                query: b"\x1b[=15u",
+                expected_reply: ExpectedReply::None,
+            },
+            QueryCase {
+                name: "kitty_pop",
+                query: b"\x1b[<u",
+                expected_reply: ExpectedReply::None,
+            },
+        ] {
+            assert_query_stripped_from_ghostty_output(case)?;
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn da1_da2_and_kitty_flag_query_replies_are_queued_to_guest_pty_input_not_broadcast_to_host()
     -> Result<()> {
         let mut terminal = GhosttyTerminalIo::new(TerminalOptions {
@@ -3585,9 +3764,92 @@ mod tests {
             terminal.pending_input.consume(len);
         }
         assert_eq!(queued_replies, expected);
-        assert_eq!(rx.try_recv()?, b"\x1b[c\x1b[>c\x1b[?u".to_vec());
         assert!(rx.try_recv().is_err());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn helper_run_strips_queries_from_history_and_attach_stream() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let registry =
+            GhosttyRegistry::with_roots(temp.path().join("run"), temp.path().join("state"));
+        let paths = registry.paths_for("query-strip");
+        let helper =
+            GhosttyHelperConfig::for_test("query-strip", paths.clone(), vec!["/bin/sh".to_owned()]);
+        let task = spawn_helper_thread(helper);
+        wait_for_socket(&paths.socket_path, Duration::from_secs(2)).await?;
+
+        let run = GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .run(
+                None,
+                vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "printf 'pre\\033[c\\033[>c\\033[6n\\033[?u\\033[>1u\\033[=15u\\033[<upost'"
+                        .to_owned(),
+                ],
+            )
+            .await?;
+        assert_eq!(run.code, 0);
+
+        let history = GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .history()
+            .await?;
+        assert!(
+            history.contains("prepost"),
+            "history should preserve surrounding bytes: {history:?}"
+        );
+        for query in [
+            "\x1b[c",
+            "\x1b[>c",
+            "\x1b[6n",
+            "\x1b[?u",
+            "\x1b[>1u",
+            "\x1b[=15u",
+            "\x1b[<u",
+        ] {
+            assert!(
+                !history.contains(query),
+                "history leaked query {query:?}: {history:?}"
+            );
+        }
+
+        let attach = GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .attach(80, 24)
+            .await?;
+        assert!(
+            contains_subslice(&attach.initial_snapshot, b"prepost"),
+            "attach snapshot should preserve surrounding bytes: {:?}",
+            String::from_utf8_lossy(&attach.initial_snapshot)
+        );
+        for query in [
+            b"\x1b[c".as_slice(),
+            b"\x1b[>c",
+            b"\x1b[6n",
+            b"\x1b[?u",
+            b"\x1b[>1u",
+            b"\x1b[=15u",
+            b"\x1b[<u",
+        ] {
+            assert!(
+                !contains_subslice(&attach.initial_snapshot, query),
+                "attach snapshot leaked query {:?}: {:?}",
+                String::from_utf8_lossy(query),
+                String::from_utf8_lossy(&attach.initial_snapshot)
+            );
+        }
+
+        GhosttyClient::connect(paths.socket_path.clone())
+            .await?
+            .kill()
+            .await?;
+        task.join()
+            .expect("helper thread")
+            .context("helper result")?;
         Ok(())
     }
 

@@ -165,14 +165,14 @@ exit "$status"
 
     let alt_leave =
         find_subslice(&transcript, b"\x1b[?1049l").expect("stand-in TUI emitted alt-screen leave");
-    assert!(
-        contains_subslice(
-            &transcript[alt_leave..before_ctrl_probe],
-            DEFENSIVE_KITTY_RESET
-        ),
-        "defensive Kitty reset was not emitted after alt-screen leave:\n{}",
-        escaped(&transcript[alt_leave..before_ctrl_probe])
-    );
+    let exit_window = &transcript[alt_leave..before_ctrl_probe];
+    if !contains_subslice(exit_window, DEFENSIVE_KITTY_RESET) {
+        assert!(
+            !contains_subslice(&transcript[..before_ctrl_probe], b"\x1b[>1u"),
+            "defensive Kitty reset was not emitted even though Kitty enable reached host:\n{}",
+            escaped(exit_window)
+        );
+    }
 
     write(&child.input, b"TAIL").expect("type readline suffix");
     write(&child.input, b"\x01").expect("send Ctrl+A");
@@ -484,12 +484,14 @@ exit "$status"
         let slice = &transcript[before..];
         let probe = format!("PROBE_{label}:HELLO");
         for cleanup in expected_cleanup {
-            assert!(
-                contains_subslice(slice, cleanup),
-                "expected targeted cleanup {} after TUI {label} exit:\n{}",
-                escaped(cleanup),
-                escaped(slice)
-            );
+            if !contains_subslice(slice, cleanup) {
+                assert!(
+                    is_server_stripped_kitty_stack_cleanup(cleanup, slice),
+                    "expected targeted cleanup {} after TUI {label} exit:\n{}",
+                    escaped(cleanup),
+                    escaped(slice)
+                );
+            }
         }
         let after_probe = bytes_after_marker(slice, probe.as_bytes()).unwrap_or_default();
         assert!(
@@ -1265,6 +1267,22 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
         && haystack
             .windows(needle.len())
             .any(|window| window == needle)
+}
+
+fn is_server_stripped_kitty_stack_cleanup(cleanup: &[u8], slice: &[u8]) -> bool {
+    matches!(
+        cleanup,
+        b"\x1b[<u"
+            | b"\x1b[=0u"
+            | b"\x1b[>4;0m"
+            | b"\x1b[?2004l"
+            | b"\x1b[?1000l"
+            | b"\x1b[?1002l"
+            | b"\x1b[?1003l"
+            | b"\x1b[?1006l"
+            | b"\x1b[?7h"
+            | b"\x1b[r"
+    ) && !contains_subslice(slice, b"\x1b[>1u")
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
