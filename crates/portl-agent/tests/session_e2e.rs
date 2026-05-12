@@ -20,6 +20,7 @@ use tokio::io::AsyncReadExt;
 
 const QUERY_EMISSION_PRINTF: &str =
     "printf 'pre\\033[c\\033[>c\\033[6n\\033[?u\\033[>1u\\033[=15u\\033[<upost'";
+const QUERY_EMISSION_BYTES: &[u8] = b"pre\x1b[c\x1b[>c\x1b[6n\x1b[?u\x1b[>1u\x1b[=15u\x1b[<upost";
 const QUERY_STRIPPED_EXPECTED: &[u8] = b"prepost";
 
 #[tokio::test]
@@ -282,6 +283,14 @@ async fn session_provider_parity_real_paths_strip_queries_to_identical_wire_capt
     let temp = tempfile::tempdir()?;
     let mut captures = Vec::new();
 
+    #[cfg(feature = "ghostty-vt")]
+    let ghostty_guest_pty_input = {
+        let (wire_capture, guest_pty_input) =
+            portl_agent::ghostty_provider_query_strip_capture_for_test(QUERY_EMISSION_BYTES)?;
+        captures.push(("ghostty", wire_capture));
+        guest_pty_input
+    };
+
     let fake_zmx_legacy = temp.path().join("zmx-legacy");
     let zmx_legacy_stdin = temp.path().join("zmx-legacy.stdin");
     write_fake_zmx_query_strip_legacy(&fake_zmx_legacy, &zmx_legacy_stdin)?;
@@ -325,8 +334,8 @@ async fn session_provider_parity_real_paths_strip_queries_to_identical_wire_capt
     ));
 
     assert!(
-        captures.len() >= 4,
-        "provider parity should exercise zmx legacy, zmx-control, tmux-control, and raw shell actual paths"
+        captures.len() >= if cfg!(feature = "ghostty-vt") { 5 } else { 4 },
+        "provider parity should exercise ghostty, zmx legacy, zmx-control, tmux-control, and raw shell actual paths when ghostty-vt is enabled"
     );
     for (provider, capture) in &captures {
         assert_eq!(
@@ -353,6 +362,19 @@ async fn session_provider_parity_real_paths_strip_queries_to_identical_wire_capt
         assert_no_response_bytes(&stdin_bytes);
         assert_no_query_bytes(&stdin_bytes);
         let _ = provider;
+    }
+
+    #[cfg(feature = "ghostty-vt")]
+    {
+        for response in [b"\x1b[?62;1;6;22c".as_slice(), b"\x1b[>1;1;0c", b"\x1b[?0u"] {
+            assert!(
+                contains_bytes(&ghostty_guest_pty_input, response),
+                "ghostty guest PTY input missing canonical responder bytes {} in {}",
+                escaped(response),
+                escaped(&ghostty_guest_pty_input)
+            );
+        }
+        assert_no_query_bytes(&ghostty_guest_pty_input);
     }
 
     Ok(())

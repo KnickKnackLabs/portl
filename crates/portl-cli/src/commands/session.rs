@@ -7543,7 +7543,7 @@ mod tests {
         );
         assert_eq!(
             track_host_bound_bytes(&tracker, b"next frame without pop").unwrap(),
-            b"\x1b[<u\x1b[=0u\x1b[>4;0m"
+            b"\x1b[<u"
         );
         assert_eq!(flush_host_bound_mode_tracker(&tracker).unwrap(), b"");
     }
@@ -7706,7 +7706,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(250)).await;
         let output = take_held_stdout(&display).await;
         assert!(!contains_bytes(&output, b"\x1b[?62"));
-        assert!(contains_bytes(&output, b"\x1b[<u\x1b[=0u\x1b[>4;0m"));
+        assert!(contains_bytes(&output, b"\x1b[<u"));
+        assert!(!contains_bytes(&output, b"\x1b[=0u"));
+        assert!(!contains_bytes(&output, b"\x1b[>4;0m"));
 
         write_tracked_output(&display, AttachOutputStream::Stdout, b";52;cpost", &tracker)
             .await
@@ -7808,10 +7810,12 @@ mod tests {
         let output = take_held_stdout(&display).await;
         assert!(
             output
-                .windows(b"\x1b[<u\x1b[=0u\x1b[>4;0m".len())
-                .any(|window| window == b"\x1b[<u\x1b[=0u\x1b[>4;0m"),
+                .windows(b"\x1b[<u".len())
+                .any(|window| window == b"\x1b[<u"),
             "idle timer should flush defensive reset before any later output: {output:?}"
         );
+        assert!(!contains_bytes(&output, b"\x1b[=0u"));
+        assert!(!contains_bytes(&output, b"\x1b[>4;0m"));
     }
 
     #[tokio::test]
@@ -7836,10 +7840,12 @@ mod tests {
         let output = take_held_stdout(&display).await;
         assert!(
             output
-                .windows(b"\x1b[<u\x1b[=0u\x1b[>4;0m".len())
-                .any(|window| window == b"\x1b[<u\x1b[=0u\x1b[>4;0m"),
+                .windows(b"\x1b[<u".len())
+                .any(|window| window == b"\x1b[<u"),
             "zmx EOF should flush defensive reset before stream closes: {output:?}"
         );
+        assert!(!contains_bytes(&output, b"\x1b[=0u"));
+        assert!(!contains_bytes(&output, b"\x1b[>4;0m"));
     }
 
     #[test]

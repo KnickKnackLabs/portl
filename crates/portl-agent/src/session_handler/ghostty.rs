@@ -1622,6 +1622,39 @@ fn process_output(
 }
 
 #[cfg(unix)]
+pub(crate) fn query_strip_capture_for_test(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut terminal = GhosttyTerminalIo::new(TerminalOptions {
+        cols: 80,
+        rows: 24,
+        max_scrollback: 4096,
+    })?;
+    let mut history = VecDeque::new();
+    let mut subscribers = Vec::new();
+    let mut v2_subscribers = Vec::new();
+    let mut history_start_abs = 0;
+    let mut live_seq = 0;
+
+    process_output(
+        &mut terminal,
+        &mut history,
+        &mut subscribers,
+        &mut v2_subscribers,
+        &mut history_start_abs,
+        &mut live_seq,
+        bytes,
+    );
+
+    let wire_capture = history.iter().copied().collect::<Vec<_>>();
+    let mut guest_pty_input = Vec::new();
+    while let Some(chunk) = terminal.pending_input.front_chunk() {
+        let len = chunk.len();
+        guest_pty_input.extend_from_slice(chunk);
+        terminal.pending_input.consume(len);
+    }
+    Ok((wire_capture, guest_pty_input))
+}
+
+#[cfg(unix)]
 fn capped_attach_snapshot(history: &VecDeque<u8>) -> Vec<u8> {
     let len = history.len().min(MAX_ATTACH_SNAPSHOT_BYTES);
     history

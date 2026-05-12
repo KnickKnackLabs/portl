@@ -147,6 +147,8 @@ impl TerminalModeTracker {
         }
         self.pending_alt_screen_kitty_reset = false;
         let needs_kitty_pop = self.modes.kitty_keyboard_depth > 0;
+        let needs_flags_clear = self.modes.kitty_flags != 0;
+        let needs_mok_clear = self.modes.modify_other_keys != 0;
         self.modes.kitty_keyboard_depth = 0;
         self.modes.kitty_flags = 0;
         self.modes.modify_other_keys = 0;
@@ -157,8 +159,12 @@ impl TerminalModeTracker {
         if needs_kitty_pop {
             plan.extend_from_slice(KITTY_POP);
         }
-        plan.extend_from_slice(KITTY_FLAGS_CLEAR);
-        plan.extend_from_slice(MODIFY_OTHER_KEYS_CLEAR);
+        if needs_flags_clear {
+            plan.extend_from_slice(KITTY_FLAGS_CLEAR);
+        }
+        if needs_mok_clear {
+            plan.extend_from_slice(MODIFY_OTHER_KEYS_CLEAR);
+        }
         plan.extend_from_slice(&self.cleanup_plan());
         plan
     }
@@ -629,10 +635,7 @@ mod tests {
 
         let mut tracker = TerminalModeTracker::new();
         tracker.feed(b"\x1b[>1u\x1b[?1049h\x1b[?1049l");
-        assert_eq!(
-            tracker.take_alt_screen_leave_kitty_reset(),
-            b"\x1b[<u\x1b[=0u\x1b[>4;0m"
-        );
+        assert_eq!(tracker.take_alt_screen_leave_kitty_reset(), b"\x1b[<u");
     }
 
     #[test]
@@ -712,6 +715,43 @@ mod tests {
         assert!(tracker.decawm());
         assert!(!tracker.scroll_region_non_default());
         assert_eq!(tracker.cleanup_plan(), EMPTY);
+    }
+
+    #[test]
+    fn terminal_mode_tracker_alt_screen_leave_does_not_emit_kitty_resets_when_only_non_kitty_dirty()
+    {
+        for setup in [
+            b"\x1b[?1049h\x1b[?2004h\x1b[?1049l".as_slice(),
+            b"\x1b[?1049h\x1b[?7l\x1b[?1049l",
+            b"\x1b[?1049h\x1b[?1006h\x1b[?1049l",
+            b"\x1b[?1049h\x1b[5;20r\x1b[?1049l",
+        ] {
+            let mut tracker = TerminalModeTracker::new();
+            tracker.feed(setup);
+            let reset = tracker.take_alt_screen_leave_kitty_reset();
+            assert!(
+                !reset
+                    .windows(KITTY_POP.len())
+                    .any(|window| window == KITTY_POP),
+                "spurious kitty pop in {reset:?}"
+            );
+            assert!(
+                !reset
+                    .windows(KITTY_FLAGS_CLEAR.len())
+                    .any(|window| window == KITTY_FLAGS_CLEAR),
+                "spurious kitty flags clear in {reset:?}"
+            );
+            assert!(
+                !reset
+                    .windows(MODIFY_OTHER_KEYS_CLEAR.len())
+                    .any(|window| window == MODIFY_OTHER_KEYS_CLEAR),
+                "spurious modify-other-keys clear in {reset:?}"
+            );
+            assert!(
+                !reset.is_empty(),
+                "non-kitty cleanup must still fire: {setup:?}"
+            );
+        }
     }
 
     #[test]

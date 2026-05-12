@@ -207,6 +207,12 @@ pub async fn run_ghostty_session_helper(
     .await
 }
 
+#[cfg(all(unix, feature = "ghostty-vt"))]
+#[doc(hidden)]
+pub fn ghostty_provider_query_strip_capture_for_test(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    session_handler::ghostty::query_strip_capture_for_test(bytes)
+}
+
 #[must_use]
 pub fn session_provider_discovery_info(
     configured_path: Option<&Path>,
