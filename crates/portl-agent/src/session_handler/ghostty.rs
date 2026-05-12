@@ -3619,6 +3619,50 @@ mod tests {
         Ok(())
     }
 
+    fn da1_burst_bytes(size: usize) -> Vec<u8> {
+        let query = b"\x1b[c";
+        let mut burst = Vec::with_capacity(size + query.len());
+        while burst.len() < size {
+            burst.extend_from_slice(query);
+        }
+        burst
+    }
+
+    fn assert_no_query_bytes(bytes: &[u8], context: &str) {
+        for query in [
+            b"\x1b[c".as_slice(),
+            b"\x1b[>c",
+            b"\x1b[6n",
+            b"\x1b[?u",
+            b"\x1b[>1u",
+            b"\x1b[=15u",
+            b"\x1b[<u",
+        ] {
+            assert!(
+                !contains_subslice(bytes, query),
+                "{context} leaked query bytes {query:?}: {bytes:?}"
+            );
+        }
+    }
+
+    fn assert_linear_dos_samples(provider: &str, samples: &[(usize, Duration)]) {
+        let (mid_len, mid_elapsed) = samples[1];
+        let (large_len, large_elapsed) = samples[2];
+        let mid_bytes = u32::try_from(mid_len).expect("mid DoS size fits in u32");
+        let large_bytes = u32::try_from(large_len).expect("large DoS size fits in u32");
+        let mid_slope = mid_elapsed.as_secs_f64() / f64::from(mid_bytes);
+        let large_slope = large_elapsed.as_secs_f64() / f64::from(large_bytes);
+        let ratio = if mid_slope > large_slope {
+            mid_slope / large_slope.max(0.000_000_001)
+        } else {
+            large_slope / mid_slope.max(0.000_000_001)
+        };
+        assert!(
+            ratio <= 3.0,
+            "{provider} DoS timing was not linear within 3x: samples={samples:?}, ratio={ratio}"
+        );
+    }
+
     const HOST_ENV_SIGNAL_VARS: &[&str] = &[
         "TERM",
         "COLORTERM",
@@ -3911,6 +3955,71 @@ mod tests {
         ] {
             assert_query_stripped_from_ghostty_output(case)?;
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn ghostty_process_output_dos_da1_burst_is_bounded_linear_and_wire_clean() -> Result<()> {
+        #[cfg(feature = "test-attach-taps")]
+        portl_core::QueryStripper::reset_max_buffered_watermark_for_test();
+
+        let mut terminal = GhosttyTerminalIo::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 4096,
+        })?;
+        let mut history = VecDeque::new();
+        let mut subscribers = Vec::new();
+        let mut v2_subscribers = Vec::new();
+        let mut history_start_abs = 0;
+        let mut live_seq = 0;
+        let sizes = [1024_usize, 100 * 1024, 10 * 1024 * 1024];
+        let mut expected = Vec::new();
+        let mut samples = Vec::new();
+
+        for size in sizes {
+            let burst = da1_burst_bytes(size);
+            let prefix = format!("GHOSTTY_DOS_PRE_{size}:");
+            let suffix = format!(":GHOSTTY_DOS_POST_{size}");
+            let mut input = Vec::with_capacity(prefix.len() + burst.len() + suffix.len());
+            input.extend_from_slice(prefix.as_bytes());
+            input.extend_from_slice(&burst);
+            input.extend_from_slice(suffix.as_bytes());
+
+            let started = Instant::now();
+            for chunk in input.chunks(4096) {
+                process_output(
+                    &mut terminal,
+                    &mut history,
+                    &mut subscribers,
+                    &mut v2_subscribers,
+                    &mut history_start_abs,
+                    &mut live_seq,
+                    chunk,
+                );
+            }
+            samples.push((burst.len(), started.elapsed()));
+            expected.extend_from_slice(prefix.as_bytes());
+            expected.extend_from_slice(suffix.as_bytes());
+        }
+
+        let history_bytes = history.iter().copied().collect::<Vec<_>>();
+        assert_eq!(
+            history_bytes, expected,
+            "Ghostty process_output should preserve only surrounding non-query bytes"
+        );
+        assert_no_query_bytes(&history_bytes, "Ghostty process_output DoS history");
+        #[cfg(feature = "test-attach-taps")]
+        {
+            let high_water = portl_core::QueryStripper::max_buffered_watermark_for_test();
+            assert!(
+                high_water <= portl_core::QueryStripper::MAX_BUFFERED,
+                "Ghostty process_output QueryStripper high-water {high_water} exceeded bound {}",
+                portl_core::QueryStripper::MAX_BUFFERED
+            );
+        }
+        assert_linear_dos_samples("Ghostty process_output", &samples);
 
         Ok(())
     }
