@@ -1082,6 +1082,7 @@ struct GhosttyReloadJob {
     final_generation: u64,
     retained_history_truncated: bool,
     pending_response: Option<GhosttyResponse>,
+    replay_sanitizer: TerminalReplaySanitizer,
 }
 
 #[cfg(unix)]
@@ -1105,6 +1106,7 @@ impl GhosttyReloadJob {
             final_generation,
             retained_history_truncated,
             pending_response: None,
+            replay_sanitizer: TerminalReplaySanitizer::new(),
         }
     }
 
@@ -1175,7 +1177,7 @@ impl GhosttyReloadJob {
         let loaded = self.offset.saturating_add(raw_bytes.len() as u64);
         let complete = self.start_abs.saturating_add(loaded) >= self.end_abs;
         let bytes = bracket_reload_replay_chunk(
-            sanitize_terminal_replay(&raw_bytes),
+            self.replay_sanitizer.feed(&raw_bytes, complete),
             self.seq == 0,
             complete,
         );
@@ -1707,6 +1709,44 @@ fn bracket_reload_replay_chunk(bytes: Vec<u8>, _first_chunk: bool, _final_chunk:
 }
 
 #[cfg(unix)]
+#[derive(Debug, Default)]
+struct TerminalReplaySanitizer {
+    pending: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl TerminalReplaySanitizer {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn feed(&mut self, bytes: &[u8], final_chunk: bool) -> Vec<u8> {
+        let mut combined = Vec::with_capacity(self.pending.len() + bytes.len());
+        combined.extend_from_slice(&self.pending);
+        combined.extend_from_slice(bytes);
+        self.pending.clear();
+
+        if final_chunk {
+            return sanitize_terminal_replay(&combined);
+        }
+
+        let split = [
+            trailing_incomplete_replay_escape_start(&combined),
+            trailing_incomplete_utf8_start(&combined),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        if let Some(split) = split {
+            self.pending.extend_from_slice(&combined[split..]);
+            sanitize_terminal_replay(&combined[..split])
+        } else {
+            sanitize_terminal_replay(&combined)
+        }
+    }
+}
+
+#[cfg(unix)]
 fn vec_deque_chunk(history: &VecDeque<u8>, rel_start: usize, chunk_len: usize) -> Vec<u8> {
     let (front, back) = history.as_slices();
     let mut out = Vec::with_capacity(chunk_len);
@@ -1725,6 +1765,104 @@ fn vec_deque_chunk(history: &VecDeque<u8>, rel_start: usize, chunk_len: usize) -
     let snap_len = utf8_boundary_snap_len(&out);
     out.truncate(snap_len);
     out
+}
+
+#[cfg(unix)]
+fn trailing_incomplete_replay_escape_start(bytes: &[u8]) -> Option<usize> {
+    #[derive(Clone, Copy)]
+    enum State {
+        Ground,
+        Escape { start: usize },
+        Csi { start: usize },
+        ControlString { start: usize, esc: bool },
+        PlainEscape { start: usize },
+    }
+
+    let mut state = State::Ground;
+    let mut index = 0_usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match state {
+            State::Ground => {
+                if byte == 0x1b {
+                    state = State::Escape { start: index };
+                }
+                index += 1;
+            }
+            State::Escape { start } => match byte {
+                b'[' => {
+                    state = State::Csi { start };
+                    index += 1;
+                }
+                b']' | b'P' | b'^' | b'_' => {
+                    state = State::ControlString { start, esc: false };
+                    index += 1;
+                }
+                0x20..=0x2f => {
+                    state = State::PlainEscape { start };
+                    index += 1;
+                }
+                _ => {
+                    state = State::Ground;
+                    index += 1;
+                }
+            },
+            State::PlainEscape { .. } => {
+                if (0x20..=0x2f).contains(&byte) {
+                    index += 1;
+                } else {
+                    state = State::Ground;
+                    index += 1;
+                }
+            }
+            State::Csi { start } => {
+                if byte == 0x1b {
+                    state = State::Escape { start: index };
+                    index += 1;
+                } else if byte >= 0x80 {
+                    state = State::Ground;
+                } else {
+                    if (0x40..=0x7e).contains(&byte) {
+                        state = State::Ground;
+                    }
+                    index += 1;
+                }
+                let _ = start;
+            }
+            State::ControlString { start, esc } => {
+                if esc {
+                    if byte == b'\\' {
+                        state = State::Ground;
+                    } else {
+                        state = State::ControlString { start, esc: false };
+                    }
+                    index += 1;
+                } else if byte == 0x07 {
+                    state = State::Ground;
+                    index += 1;
+                } else if byte == 0x1b {
+                    state = State::ControlString { start, esc: true };
+                    index += 1;
+                } else {
+                    index += 1;
+                }
+            }
+        }
+    }
+
+    match state {
+        State::Ground => None,
+        State::Escape { start }
+        | State::Csi { start }
+        | State::ControlString { start, .. }
+        | State::PlainEscape { start } => Some(start),
+    }
+}
+
+#[cfg(unix)]
+fn trailing_incomplete_utf8_start(bytes: &[u8]) -> Option<usize> {
+    let snap_len = utf8_boundary_snap_len(bytes);
+    (snap_len < bytes.len()).then_some(snap_len)
 }
 
 #[cfg(unix)]
@@ -4153,6 +4291,43 @@ mod tests {
             sanitize_terminal_replay(b"\x1b[31mred\x1b[0m plain \x1b[1;4mbold\x1b[0m"),
             b"\x1b[31mred\x1b[0m plain \x1b[1;4mbold\x1b[0m"
         );
+    }
+
+    #[test]
+    fn reload_edge_sanitizer_preserves_split_sgr_and_drops_split_private_modes() {
+        let mut sanitizer = TerminalReplaySanitizer::new();
+
+        assert_eq!(sanitizer.feed(b"pre\x1b[", false), b"pre");
+        assert_eq!(sanitizer.feed(b"31mred\x1b[?", false), b"\x1b[31mred");
+        assert_eq!(sanitizer.feed(b"1049lpost", true), b"post");
+    }
+
+    #[test]
+    fn reload_edge_sanitizer_drops_split_osc_without_orphaned_bytes() {
+        let mut sanitizer = TerminalReplaySanitizer::new();
+
+        assert_eq!(sanitizer.feed(b"before\x1b]52;c;", false), b"before");
+        assert_eq!(sanitizer.feed(b"secret", false), b"");
+        assert_eq!(sanitizer.feed(b"\x07after", true), b"after");
+    }
+
+    #[test]
+    fn reload_edge_sanitizer_preserves_utf8_edge_classes_across_chunks() {
+        let mut sanitizer = TerminalReplaySanitizer::new();
+        let payload = "e\u{0301} 👨\u{200d}💻 漢字 \u{200e}\u{200f}\t";
+        let bytes = payload.as_bytes();
+        let split = bytes
+            .iter()
+            .position(|byte| *byte >= 0x80)
+            .expect("multibyte payload")
+            + 1;
+
+        let mut out = sanitizer.feed(&bytes[..split], false);
+        assert_eq!(out, b"e");
+        out.extend_from_slice(&sanitizer.feed(&bytes[split..], true));
+
+        assert_eq!(out, bytes);
+        assert!(!out.windows("�".len()).any(|w| w == "�".as_bytes()));
     }
 
     #[test]

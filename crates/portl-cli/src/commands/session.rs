@@ -30,9 +30,9 @@ use portl_core::net::{
     open_session_run,
 };
 use portl_core::terminal::{tmux_cc, zmx_control};
-#[cfg(test)]
-use portl_core::terminal_mode_tracker::TerminalModeState;
 use portl_core::terminal_mode_tracker::TerminalModeTracker;
+#[cfg(test)]
+use portl_core::terminal_mode_tracker::{AltScreenMode, TerminalModeState};
 use portl_core::ticket::schema::{Capabilities, EnvPolicy, ShellCaps};
 use portl_core::wire::session::{
     ATTACH_V2_MAX_DECODED_PAYLOAD, AttachV2ClientFrame, AttachV2Config, AttachV2ServerFrame,
@@ -7328,6 +7328,117 @@ mod tests {
             .filter(|window| *window == b"\x1b[0m")
             .count();
         assert_eq!(reset_count, 2, "stdout output: {output:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reload_edge_control_frames_preserve_terminal_modes_without_defensive_resets() {
+        let display = AttachDisplay::new(80, 24);
+        display.inner.lock().await.gate.set_holding(true);
+        let reload_state = Arc::new(StdMutex::new(ReloadCoordinator::default()));
+        let tracker = new_terminal_mode_tracker();
+        let mut resync_pending = false;
+        let attach_id = [9_u8; 16];
+
+        write_tracked_output(
+            &display,
+            AttachOutputStream::Stdout,
+            b"\x1b[?1049h\x1b[>1u\x1b[=15u\x1b[>4;2m\x1b[?2004h\x1b[?1006h\x1b[?7l\x1b[5;20r",
+            &tracker,
+        )
+        .await
+        .unwrap();
+        let _ = display.inner.lock().await.gate.take_stdout();
+
+        handle_attach_v2_control_frame(
+            AttachV2ServerFrame::ReloadStarted {
+                attach_id,
+                reload_id: 3,
+                total_bytes: Some(0),
+            },
+            &display,
+            &reload_state,
+            &mut resync_pending,
+            &tracker,
+        )
+        .await
+        .unwrap();
+        handle_attach_v2_control_frame(
+            AttachV2ServerFrame::ReloadDone {
+                attach_id,
+                reload_id: 3,
+                final_generation: 4,
+            },
+            &display,
+            &reload_state,
+            &mut resync_pending,
+            &tracker,
+        )
+        .await
+        .unwrap();
+
+        let reload_output = display.inner.lock().await.gate.take_stdout();
+        assert_eq!(reload_output, b"\x1b[0m\x1b[0m");
+        for reset in [
+            b"\x1b[?1049l".as_slice(),
+            b"\x1b[<u",
+            b"\x1b[=0u",
+            b"\x1b[>4;0m",
+            b"\x1b[?2004l",
+            b"\x1b[?1006l",
+            b"\x1b[?7h",
+            b"\x1b[r",
+        ] {
+            assert!(
+                !contains_bytes(&reload_output, reset),
+                "reload emitted defensive reset {reset:?}: {reload_output:?}"
+            );
+        }
+
+        let state = tracked_terminal_mode_state(&tracker);
+        assert_eq!(state.alt_screen, Some(AltScreenMode::Mode1049));
+        assert_eq!(state.kitty_keyboard_depth, 1);
+        assert_eq!(state.kitty_flags, 15);
+        assert_eq!(state.modify_other_keys, 2);
+        assert!(state.bracketed_paste);
+        assert!(state.mouse_modes[3]);
+        assert!(!state.decawm);
+        assert!(state.scroll_region_non_default);
+    }
+
+    #[test]
+    fn reload_edge_cancelled_reload_queues_live_until_recovery_viewport() {
+        let mut coordinator = ReloadCoordinator::default();
+
+        coordinator.start(13);
+        assert!(coordinator.mark_cancelled(13));
+        assert_eq!(
+            coordinator.handle_live_output(0, 4, b"live".to_vec()),
+            ReloadLiveDecision::Queued
+        );
+        assert_eq!(coordinator.queued_live_len(), 1);
+        coordinator.record_post_reload_viewport(4, b"live".to_vec());
+
+        assert!(coordinator.drain_queued_live(4).is_empty());
+        assert!(!coordinator.is_reloading());
+    }
+
+    #[test]
+    fn reload_edge_back_to_back_reload_supersedes_older_reload() {
+        let mut coordinator = ReloadCoordinator::default();
+
+        coordinator.start(1);
+        assert!(coordinator.accepts_chunk(1));
+        coordinator.start(2);
+
+        assert!(!coordinator.accepts_chunk(1));
+        assert!(coordinator.accepts_chunk(2));
+        assert!(!coordinator.mark_done(1));
+        assert!(coordinator.mark_done(2));
+        coordinator.record_post_reload_viewport(0, b"latest".to_vec());
+        assert!(coordinator.drain_queued_live(0).is_empty());
+        assert!(!coordinator.is_reloading());
+        assert_eq!(coordinator.post_reload_viewport_len(), Some(6));
     }
 
     #[test]
