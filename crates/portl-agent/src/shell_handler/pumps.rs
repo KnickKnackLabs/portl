@@ -68,10 +68,10 @@ pub(crate) async fn pump_output(
 ) -> Result<()> {
     let output = output_for(process, kind);
     if let Some(mut rx) = output.take_channel().await? {
-        let mut query_stripper = matches!(kind, ShellOutputKind::Stdout)
-            .then(|| process.strip_stdout_queries())
-            .filter(|enabled| *enabled)
-            .map(|_| portl_core::QueryStripper::new());
+        let strip_stdout_queries = matches!(kind, ShellOutputKind::Stdout)
+            && process.strip_stdout_queries()
+            && server_query_strip_enabled_for_tests();
+        let mut query_stripper = strip_stdout_queries.then(portl_core::QueryStripper::new);
         while let Some(chunk) = rx.recv().await {
             let chunk = output_chunk_for_wire(&mut query_stripper, chunk);
             if !chunk.is_empty() {
@@ -102,6 +102,11 @@ pub(crate) async fn pump_output(
     }
     send.finish().context("finish empty shell output")?;
     Ok(())
+}
+
+fn server_query_strip_enabled_for_tests() -> bool {
+    !cfg!(feature = "force-disable-server-query-strip")
+        || std::env::var_os("PORTL_TEST_FORCE_DISABLE_SERVER_QUERY_STRIP").is_none()
 }
 
 fn output_chunk_for_wire(

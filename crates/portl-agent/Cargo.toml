@@ -16,6 +16,7 @@ description  = "portl agent runtime: handshake, discovery, and session acceptanc
 test-panic-trigger = []
 ghostty-vt = ["dep:libghostty-vt", "libghostty-vt/link-static"]
 ghostty-vt-static = ["ghostty-vt"]
+force-disable-server-query-strip = []
 
 [lints]
 workspace = true

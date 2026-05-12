@@ -4781,7 +4781,7 @@ fn host_output_is_stripped_response_or_query(csi: &[u8]) -> bool {
         return false;
     };
 
-    if host_output_is_stripped_query(params, final_byte) {
+    if client_query_strip_enabled_for_tests() && host_output_is_stripped_query(params, final_byte) {
         return true;
     }
 
@@ -6478,7 +6478,7 @@ fn filter_attach_stdin_outbound(
     sink: &AttachInputSink,
     bytes: &[u8],
 ) -> Vec<u8> {
-    if bytes == b"\x1b" && sink.has_active_reload() {
+    if !client_query_strip_enabled_for_tests() || bytes == b"\x1b" && sink.has_active_reload() {
         bytes.to_vec()
     } else {
         filter.feed(bytes)
@@ -6486,8 +6486,36 @@ fn filter_attach_stdin_outbound(
 }
 
 fn flush_attach_stdin_filter_timeout(filter: &mut StdinResponseFilter) -> Vec<u8> {
-    filter.flush_timeout()
+    if client_query_strip_enabled_for_tests() {
+        filter.flush_timeout()
+    } else {
+        Vec::new()
+    }
 }
+
+fn client_query_strip_enabled_for_tests() -> bool {
+    !cfg!(feature = "force-disable-client-query-strip")
+        || std::env::var_os("PORTL_TEST_FORCE_DISABLE_CLIENT_QUERY_STRIP").is_none()
+}
+
+#[cfg(feature = "test-attach-taps")]
+fn record_attach_stdin_tap(bytes: &[u8]) {
+    use std::io::Write as _;
+
+    let Some(path) = std::env::var_os("PORTL_TEST_ATTACH_STDIN_TAP") else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = file.write_all(bytes);
+    }
+}
+
+#[cfg(not(feature = "test-attach-taps"))]
+fn record_attach_stdin_tap(_bytes: &[u8]) {}
 
 impl AttachInputSink {
     fn has_active_reload(&self) -> bool {
@@ -6499,6 +6527,7 @@ impl AttachInputSink {
     }
 
     async fn send_stdin(&mut self, bytes: &[u8]) -> Result<()> {
+        record_attach_stdin_tap(bytes);
         match &mut self.kind {
             AttachInputSinkKind::Remote { send, .. } => {
                 send.write_all(bytes).await.context("write remote stdin")

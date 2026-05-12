@@ -1590,7 +1590,11 @@ fn process_output(
     bytes: &[u8],
 ) {
     let start_seq = *live_seq;
-    let output = terminal.query_stripper.feed(bytes);
+    let output = if server_query_strip_enabled_for_tests() {
+        terminal.query_stripper.feed(bytes)
+    } else {
+        bytes.to_vec()
+    };
     *live_seq = live_seq.saturating_add(output.len() as u64);
     let end_seq = *live_seq;
     terminal.vt_write(bytes);
@@ -1625,6 +1629,12 @@ fn process_output(
         broadcast(subscribers, &[]);
         broadcast_v2_resync(v2_subscribers, "input queue full", *live_seq);
     }
+}
+
+#[cfg(unix)]
+fn server_query_strip_enabled_for_tests() -> bool {
+    !cfg!(feature = "force-disable-server-query-strip")
+        || std::env::var_os("PORTL_TEST_FORCE_DISABLE_SERVER_QUERY_STRIP").is_none()
 }
 
 #[cfg(unix)]

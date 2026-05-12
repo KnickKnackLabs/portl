@@ -12,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nix::sys::signal::{Signal, kill};
+use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
 use nix::unistd::Pid;
 use nix::unistd::{dup, read, write};
 use tempfile::tempdir;
@@ -749,6 +750,220 @@ impl Drop for RemoteReconnectAgent {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+mod two_host_fixture {
+    use super::*;
+
+    const DA1_QUERY: &[u8] = b"\x1b[c";
+    const GHOSTTY_DA1: &[u8] = b"\x1b[?62;52;c";
+
+    #[test]
+    fn fake_host_side_pty_answers_da1_like_ghostty() {
+        let size = nix::libc::winsize {
+            ws_row: 24,
+            ws_col: 100,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let nix::pty::OpenptyResult { master, slave } =
+            nix::pty::openpty(Some(&size), None).expect("open client-wrapper pty");
+        set_raw(&slave);
+        let input = dup(&master).expect("duplicate wrapper master for answer-back input");
+        let slave_write = dup(&slave).expect("duplicate wrapper slave for host output stimulus");
+        let host_rx = spawn_reader(master);
+        let stdin_rx = spawn_reader(slave);
+        let answer = spawn_fake_host_answerback(
+            host_rx,
+            input,
+            vec![(DA1_QUERY.to_vec(), GHOSTTY_DA1.to_vec())],
+        );
+
+        write(&slave_write, DA1_QUERY).expect("write DA1 onto fake host-bound output");
+        let mut answered = Vec::new();
+        wait_for_bytes(
+            &stdin_rx,
+            &mut answered,
+            GHOSTTY_DA1,
+            Duration::from_millis(500),
+        )
+        .expect("fake Ghostty answer-back should reach wrapper stdin");
+        assert!(
+            contains_subslice(&answered, GHOSTTY_DA1),
+            "DA1 answer-back missing from wrapper stdin tap:\n{}",
+            escaped(&answered)
+        );
+        drop(slave_write);
+        let _ = answer.join();
+    }
+
+    #[test]
+    fn real_attach_fixture_roundtrips_payloads_and_keeps_taps_separate() {
+        let mut fixture = TwoHostFixture::spawn("printf 'VIS'; sleep 30");
+        wait_for_bytes(
+            &fixture.child.rx,
+            &mut fixture.host_bound,
+            b"VIS",
+            Duration::from_secs(10),
+        )
+        .expect("host-bound output tap sees guest payload");
+
+        write(&fixture.child.input, b"INV").expect("write client-wrapper stdin payload");
+        let wire = fixture.wait_for_wire_bytes(b"INV", Duration::from_secs(10));
+        assert!(
+            contains_subslice(&fixture.host_bound, b"VIS"),
+            "host-bound tap missing VIS:\n{}",
+            escaped(&fixture.host_bound)
+        );
+        assert!(
+            !contains_subslice(&fixture.host_bound, b"INV"),
+            "host-bound tap captured wire-bound input bytes:\n{}",
+            escaped(&fixture.host_bound)
+        );
+        assert!(
+            contains_subslice(&wire, b"INV"),
+            "wire-bound tap missing INV:\n{}",
+            escaped(&wire)
+        );
+        assert!(
+            !contains_subslice(&wire, b"VIS"),
+            "wire-bound tap captured host-bound output bytes:\n{}",
+            escaped(&wire)
+        );
+        fixture.detach();
+    }
+
+    #[test]
+    fn wire_bound_tap_records_arbitrary_stdin_bytes_in_order() {
+        let mut fixture = TwoHostFixture::spawn("sleep 30");
+        let payload = b"abc plain input def";
+        write(&fixture.child.input, payload).expect("write client-wrapper stdin payload");
+        let wire = fixture.wait_for_wire_bytes(payload, Duration::from_secs(10));
+        assert!(
+            contains_subslice(&wire, payload),
+            "wire-bound tap did not preserve payload in order:\n{}",
+            escaped(&wire)
+        );
+        fixture.detach();
+    }
+
+    struct TwoHostFixture {
+        child: HostCommand,
+        host_bound: Vec<u8>,
+        wire_tap: std::path::PathBuf,
+        _home: tempfile::TempDir,
+        _agent: RemoteReconnectAgent,
+    }
+
+    impl TwoHostFixture {
+        fn spawn(guest_script: &str) -> Self {
+            let portl = assert_cmd::cargo::cargo_bin("portl");
+            let home = initialized_portl_home(&portl);
+            let agent = start_remote_reconnect_agent(&portl, home.path());
+            let session = unique_session("two-host-fixture");
+            let wire_tap = home.path().join("wire-bound-input.tap");
+            let host_script = r#"
+set +e
+"$PORTL_BIN" attach "$PORTL_SESSION" --target "$PORTL_TARGET_LABEL" --provider raw -- /bin/sh -c "$GUEST_SCRIPT"
+status=$?
+printf 'HOST_AFTER_ATTACH status=%s\n' "$status"
+"$PORTL_BIN" kill "$PORTL_SESSION" --target "$PORTL_TARGET_LABEL" --provider raw >/dev/null 2>&1 || true
+exit 0
+"#;
+            let child = spawn_host_command(
+                "/bin/bash",
+                &["-lc", host_script],
+                &[
+                    ("PORTL_BIN", portl.to_str().expect("portl path utf8")),
+                    ("PORTL_HOME", home.path().to_str().expect("home path utf8")),
+                    ("PORTL_SESSION", &session),
+                    ("PORTL_TARGET_LABEL", REMOTE_TICKET_LABEL),
+                    ("GUEST_SCRIPT", guest_script),
+                    (
+                        "PORTL_TEST_ATTACH_STDIN_TAP",
+                        wire_tap.to_str().expect("tap path utf8"),
+                    ),
+                    ("TERM", "xterm-kitty"),
+                    ("RUST_LOG", "off"),
+                ],
+            )
+            .expect("spawn two-host attach wrapper");
+            Self {
+                child,
+                host_bound: Vec::new(),
+                wire_tap,
+                _home: home,
+                _agent: agent,
+            }
+        }
+
+        fn wait_for_wire_bytes(&self, needle: &[u8], timeout: Duration) -> Vec<u8> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                let bytes = fs::read(&self.wire_tap).unwrap_or_default();
+                if contains_subslice(&bytes, needle) {
+                    return bytes;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for wire tap {}; tap:\n{}",
+                    escaped(needle),
+                    escaped(&bytes)
+                );
+                thread::sleep(Duration::from_millis(25));
+            }
+        }
+
+        fn detach(&mut self) {
+            write(&self.child.input, DETACH_KEY).expect("enter attach control mode");
+            wait_for_bytes(
+                &self.child.rx,
+                &mut self.host_bound,
+                b"detach",
+                Duration::from_secs(5),
+            )
+            .expect("attach control mode displayed detach action");
+            write(&self.child.input, b"d").expect("confirm detach");
+            wait_for_bytes(
+                &self.child.rx,
+                &mut self.host_bound,
+                b"HOST_AFTER_ATTACH",
+                Duration::from_secs(10),
+            )
+            .expect("host wrapper exited after detach");
+            let status = self.child.process.wait().expect("wait host wrapper");
+            assert!(
+                status.success(),
+                "host wrapper failed: {status}; transcript:\n{}",
+                escaped(&self.host_bound)
+            );
+        }
+    }
+
+    fn spawn_fake_host_answerback(
+        rx: mpsc::Receiver<Vec<u8>>,
+        input: OwnedFd,
+        answers: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let mut seen = Vec::new();
+            while let Ok(chunk) = rx.recv_timeout(Duration::from_millis(500)) {
+                seen.extend_from_slice(&chunk);
+                for (query, answer) in &answers {
+                    if contains_subslice(&seen, query) {
+                        let _ = write(&input, answer);
+                        return;
+                    }
+                }
+            }
+        })
+    }
+
+    fn set_raw(fd: &OwnedFd) {
+        let mut termios = tcgetattr(fd).expect("tcgetattr");
+        cfmakeraw(&mut termios);
+        tcsetattr(fd, SetArg::TCSANOW, &termios).expect("tcsetattr raw");
     }
 }
 
