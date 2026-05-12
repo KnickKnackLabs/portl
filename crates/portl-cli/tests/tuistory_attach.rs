@@ -2248,6 +2248,44 @@ exit 0
             })
     }
 
+    #[test]
+    fn post_reload_dedup_assertion_rejects_unqueued_overlapping_liveoutput() {
+        let events = vec![
+            PaintEvent {
+                timestamp_nanos: 1_000,
+                kind: "ReloadStarted".to_owned(),
+                fields: Vec::new(),
+            },
+            PaintEvent {
+                timestamp_nanos: 2_000,
+                kind: "ReloadDone".to_owned(),
+                fields: Vec::new(),
+            },
+            PaintEvent {
+                timestamp_nanos: 3_000,
+                kind: "ViewportSnapshot".to_owned(),
+                fields: vec![("region".to_owned(), "0,0,24,100".to_owned())],
+            },
+            PaintEvent {
+                timestamp_nanos: 200_003_000,
+                kind: "LiveOutput".to_owned(),
+                fields: vec![
+                    ("queued".to_owned(), "false".to_owned()),
+                    ("overlaps_viewport".to_owned(), "true".to_owned()),
+                    ("region".to_owned(), "0,0,24,100".to_owned()),
+                ],
+            },
+        ];
+
+        assert!(
+            std::panic::catch_unwind(|| {
+                assert_single_post_reload_viewport_without_dedup_overlap(&events);
+            })
+            .is_err(),
+            "post-reload dedup assertion must reject unqueued LiveOutput that overlaps the viewport within 1s"
+        );
+    }
+
     fn assert_single_post_reload_viewport_without_dedup_overlap(events: &[PaintEvent]) {
         let started = events
             .iter()
@@ -2271,7 +2309,6 @@ exit 0
             .iter()
             .filter(|event| {
                 event.kind == "LiveOutput"
-                    && event.field("queued") == Some("true")
                     && event.overlaps_viewport()
                     && event.timestamp_nanos >= viewport_timestamp
                     && event.timestamp_nanos <= dedup_window_end

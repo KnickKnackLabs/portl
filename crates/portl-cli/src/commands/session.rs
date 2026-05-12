@@ -3582,6 +3582,7 @@ async fn run_remote_attach_v2_once(
     let mut opening_state = AttachV2OpeningState::default();
     let mut data_streams = AttachV2DataStreamStatus::default();
     let mut resync_pending = false;
+    let mut post_reload_dedup_until: Option<Instant> = None;
     let end = loop {
         tokio::select! {
             frame = read_attach_v2_frame(&mut control_recv) => {
@@ -3638,11 +3639,23 @@ async fn run_remote_attach_v2_once(
                                         if let Err(err) = write_tracked_output(display, AttachOutputStream::Stdout, &bytes, mode_tracker).await {
                                             break AttachEnd::Disconnected(err);
                                         }
+                                        let post_reload_viewport_rendered = reload_state
+                                            .lock()
+                                            .is_ok_and(|state| {
+                                                matches!(
+                                                    state.state(),
+                                                    AttachV2ReloadState::AwaitingViewport { .. }
+                                                )
+                                            });
                                         let queued_live = finish_reload_after_viewport(
                                             &reload_state,
                                             covers_live_seq,
                                             bytes,
                                         );
+                                        if post_reload_viewport_rendered {
+                                            post_reload_dedup_until =
+                                                Some(Instant::now() + Duration::from_secs(1));
+                                        }
                                         let mut queued_live_end = None;
                                         for live in queued_live {
                                             if live.start_seq > covered_live_seq {
@@ -3658,6 +3671,14 @@ async fn run_remote_attach_v2_once(
                                                 break;
                                             }
                                             covered_live_seq = live.end_seq;
+                                            let overlaps_viewport =
+                                                live_output_overlaps_viewport(&live.bytes);
+                                            if post_reload_dedup_until
+                                                .is_some_and(|deadline| Instant::now() <= deadline)
+                                                && overlaps_viewport
+                                            {
+                                                continue;
+                                            }
                                             trace!(
                                                 lane = "live",
                                                 start_seq = live.start_seq,
@@ -3665,7 +3686,6 @@ async fn run_remote_attach_v2_once(
                                                 bytes = live.bytes.len(),
                                                 "render queued attach v2 live output after reload"
                                             );
-                                            let overlaps_viewport = live.bytes.starts_with(b"\x1b[?1049h\x1b[2J\x1b[H");
                                             record_attach_paint_event_for_test(&format!(
                                                 "LiveOutput|barrier=false|queued=true|start_seq={}|end_seq={}|bytes={}|overlaps_viewport={overlaps_viewport}",
                                                 live.start_seq,
@@ -3787,6 +3807,16 @@ async fn run_remote_attach_v2_once(
                                     .unwrap_or(usize::MAX);
                                 let skipped = skip.min(bytes.len());
                                 let bytes = &bytes[skipped..];
+                                let overlaps_viewport = live_output_overlaps_viewport(bytes);
+                                if let Some(deadline) = post_reload_dedup_until {
+                                    if Instant::now() <= deadline && overlaps_viewport {
+                                        covered_live_seq = end_seq;
+                                        continue;
+                                    }
+                                    if Instant::now() > deadline {
+                                        post_reload_dedup_until = None;
+                                    }
+                                }
                                 trace!(
                                     lane = "live",
                                     start_seq,
@@ -3797,11 +3827,10 @@ async fn run_remote_attach_v2_once(
                                     "render attach v2 live output"
                                 );
                                 covered_live_seq = end_seq;
-                            let overlaps_viewport = bytes.starts_with(b"\x1b[?1049h\x1b[2J\x1b[H");
-                            record_attach_paint_event_for_test(&format!(
-                                "LiveOutput|barrier=false|queued=false|start_seq={start_seq}|end_seq={end_seq}|bytes={}|overlaps_viewport={overlaps_viewport}",
-                                bytes.len()
-                            ));
+                                record_attach_paint_event_for_test(&format!(
+                                    "LiveOutput|barrier=false|queued=false|start_seq={start_seq}|end_seq={end_seq}|bytes={}|overlaps_viewport={overlaps_viewport}",
+                                    bytes.len()
+                                ));
                                 if let Err(err) = write_tracked_output(display, AttachOutputStream::Stdout, bytes, mode_tracker).await {
                                     break AttachEnd::Disconnected(err);
                                 }
@@ -3924,6 +3953,10 @@ fn finish_reload_after_viewport(
             state.drain_queued_live(covers_live_seq)
         })
         .unwrap_or_default()
+}
+
+fn live_output_overlaps_viewport(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x1b[?1049h\x1b[2J\x1b[H")
 }
 
 #[derive(Debug, Default)]
