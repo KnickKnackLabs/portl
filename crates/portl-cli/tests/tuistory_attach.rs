@@ -770,6 +770,7 @@ mod two_host_fixture {
     const GHOSTTY_KITTY: &[u8] = b"\x1b[?0u";
     const GHOSTTY_CPR: &[u8] = b"\x1b[10;5R";
     const SAFE_STDIN_MARKER: &[u8] = b"SAFE_STDIN_MARKER\n";
+    const BOX_DRAWING_DONE: &[u8] = b"E2E_BOX_DONE";
 
     #[derive(Debug, Clone, Copy)]
     enum E2eProvider {
@@ -971,6 +972,104 @@ mod two_host_fixture {
         }
     }
 
+    #[test]
+    fn e2e_reload_utf8_box_drawing_grid_survives_reload() {
+        let expected = full_box_drawing_block();
+        let mut fixture =
+            TwoHostFixture::spawn_ghostty_script(&box_drawing_reload_script(&expected));
+        fixture.wait_for_host_marker_with_answerback(BOX_DRAWING_DONE, Duration::from_secs(10));
+
+        fixture.trigger_reload();
+        fixture.wait_for_host_occurrences_with_answerback(
+            BOX_DRAWING_DONE,
+            2,
+            Duration::from_secs(10),
+        );
+        drain_for(
+            &fixture.child.rx,
+            &mut fixture.host_bound,
+            Duration::from_millis(250),
+        );
+
+        let grid = TerminalGrid::parse(&fixture.host_bound);
+        let actual: Vec<char> = grid
+            .row_chars(0)
+            .into_iter()
+            .take(64)
+            .chain(grid.row_chars(1))
+            .take(expected.len())
+            .collect();
+        assert_eq!(
+            actual,
+            expected,
+            "post-reload grid did not preserve the full box-drawing block:\n{}",
+            grid.render_text()
+        );
+        let rendered = grid.render_text().into_bytes();
+        assert_no_utf8_damage(&rendered, "box-drawing post-reload grid");
+        assert_eq!(
+            count_subslice(&fixture.host_bound, BOX_DRAWING_DONE),
+            2,
+            "reload should produce exactly one post-reload box-drawing screen:\n{}",
+            escaped(&fixture.host_bound)
+        );
+        fixture.detach();
+    }
+
+    #[test]
+    fn e2e_reload_live_streaming_tui_converges_to_one_coherent_screen() {
+        let mut fixture = TwoHostFixture::spawn_ghostty_script(&live_streaming_reload_script());
+        fixture.wait_for_host_marker_with_answerback(b"LIVE_READY:003", Duration::from_secs(10));
+        let before_reload = fixture.host_bound.len();
+
+        fixture.trigger_reload();
+        fixture.wait_for_host_marker_with_answerback(b"LIVE_READY:010", Duration::from_secs(10));
+        drain_for(
+            &fixture.child.rx,
+            &mut fixture.host_bound,
+            Duration::from_millis(250),
+        );
+
+        let observations = live_frame_observations(&fixture.host_bound[before_reload..]);
+        assert!(
+            !observations.is_empty(),
+            "expected at least one post-reload live frame observation:\n{}",
+            escaped(&fixture.host_bound[before_reload..])
+        );
+        for observation in &observations {
+            assert!(
+                observation.coherent,
+                "post-reload live TUI frame was torn/interleaved: {observation:?}\n{}",
+                escaped(&fixture.host_bound[before_reload..])
+            );
+        }
+        let final_grid = TerminalGrid::parse(&fixture.host_bound);
+        let final_frame = final_grid
+            .line(0)
+            .strip_prefix("FRAME:")
+            .and_then(|line| line.get(..3))
+            .expect("final grid contains frame header")
+            .to_owned();
+        for prefix in ["ROWA:", "ROWB:", "LIVE_READY:"] {
+            let line = final_grid
+                .lines()
+                .into_iter()
+                .find(|line| line.starts_with(prefix))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "final grid missing {prefix} line:\n{}",
+                        final_grid.render_text()
+                    )
+                });
+            assert!(
+                line.contains(&final_frame),
+                "final grid line {line:?} did not match frame {final_frame}:\n{}",
+                final_grid.render_text()
+            );
+        }
+        fixture.detach();
+    }
+
     fn assert_symptom1_provider_wire_clean(provider: E2eProvider) {
         assert_provider_host_bound_queries_are_stripped(provider, SYMPTOM1_QUERIES);
         let mut fixture = TwoHostFixture::spawn_provider(provider, SYMPTOM1_QUERIES);
@@ -1109,6 +1208,15 @@ mod two_host_fixture {
     impl TwoHostFixture {
         fn spawn(guest_script: &str) -> Self {
             Self::spawn_raw_script(guest_script)
+        }
+
+        fn spawn_ghostty_script(guest_script: &str) -> Self {
+            Self::spawn_remote(
+                E2eProvider::Ghostty,
+                None,
+                Some(guest_script.to_owned()),
+                SpawnOptions::default(),
+            )
         }
 
         fn spawn_provider(provider: E2eProvider, guest_queries: &[u8]) -> Self {
@@ -1289,6 +1397,46 @@ exit 0
                 escaped(marker),
                 escaped(&self.host_bound)
             );
+        }
+
+        fn wait_for_host_occurrences_with_answerback(
+            &mut self,
+            marker: &[u8],
+            occurrences: usize,
+            timeout: Duration,
+        ) {
+            let deadline = Instant::now() + timeout;
+            let mut answered = [false; 4];
+            while Instant::now() < deadline {
+                if count_subslice(&self.host_bound, marker) >= occurrences {
+                    return;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match self
+                    .child
+                    .rx
+                    .recv_timeout(remaining.min(Duration::from_millis(100)))
+                {
+                    Ok(chunk) => {
+                        self.host_bound.extend_from_slice(&chunk);
+                        answer_queries_once(&self.host_bound, &self.child.input, &mut answered);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            panic!(
+                "timed out waiting for {occurrences} occurrences of host marker {}; host-bound:\n{}",
+                escaped(marker),
+                escaped(&self.host_bound)
+            );
+        }
+
+        fn trigger_reload(&mut self) {
+            write(&self.child.input, DETACH_KEY).expect("enter attach control mode for reload");
+            self.wait_for_host_marker_with_answerback(b"reload", Duration::from_secs(5));
+            write(&self.child.input, b"r").expect("request attach reload");
+            self.wait_for_host_marker_with_answerback(b"reload requested", Duration::from_secs(5));
         }
 
         fn inject_ghostty_answers(&self, answers: &[&[u8]]) {
@@ -1483,6 +1631,271 @@ exit 0
             "provider {} DoS timing was not plausibly linear: slopes={slopes:?}",
             provider.name()
         );
+    }
+
+    fn full_box_drawing_block() -> Vec<char> {
+        (0x2500..=0x257f)
+            .filter_map(char::from_u32)
+            .collect::<Vec<_>>()
+    }
+
+    fn box_drawing_reload_script(expected: &[char]) -> String {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b[?1049h\x1b[2J\x1b[H");
+        for (idx, ch) in expected.iter().enumerate() {
+            if idx == 64 {
+                payload.extend_from_slice(b"\r\n");
+            }
+            let mut buf = [0_u8; 4];
+            payload.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        }
+        payload.extend_from_slice(b"\r\nE2E_BOX_DONE\r\n");
+        format!(
+            "/bin/sh -c \"printf '{}'; sleep 30\"",
+            shell_escaped_printf(&payload)
+        )
+    }
+
+    fn live_streaming_reload_script() -> String {
+        "/bin/sh -c \"i=0; while [ \\\"\\$i\\\" -lt 30 ]; do printf '\\033[?1049h\\033[2J\\033[HFRAME:%03d\\r\\nROWA:%03d\\r\\nROWB:%03d\\r\\nLIVE_READY:%03d\\r\\n' \\\"\\$i\\\" \\\"\\$i\\\" \\\"\\$i\\\" \\\"\\$i\\\"; i=\\$((i + 1)); sleep 0.05; done; sleep 30\"".to_owned()
+    }
+
+    #[derive(Debug)]
+    struct LiveFrameObservation {
+        frame: String,
+        coherent: bool,
+    }
+
+    fn live_frame_observations(bytes: &[u8]) -> Vec<LiveFrameObservation> {
+        let mut observations = Vec::new();
+        let mut grid = TerminalGrid::new();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let before = grid.render_text();
+            offset = grid.apply_one(bytes, offset);
+            let after = grid.render_text();
+            if before != after {
+                let lines = grid.lines();
+                if let Some(frame) = lines
+                    .iter()
+                    .find_map(|line| line.strip_prefix("LIVE_READY:"))
+                    .and_then(|line| line.get(..3))
+                {
+                    let frame = frame.to_owned();
+                    let coherent =
+                        ["FRAME:", "ROWA:", "ROWB:", "LIVE_READY:"]
+                            .into_iter()
+                            .all(|prefix| {
+                                lines
+                                    .iter()
+                                    .any(|line| line.starts_with(prefix) && line.contains(&frame))
+                            });
+                    if observations
+                        .last()
+                        .is_none_or(|last: &LiveFrameObservation| last.frame != frame)
+                    {
+                        observations.push(LiveFrameObservation { frame, coherent });
+                    }
+                }
+            }
+        }
+        observations
+    }
+
+    #[derive(Clone, Debug)]
+    struct TerminalGrid {
+        cells: Vec<Vec<char>>,
+        row: usize,
+        col: usize,
+    }
+
+    impl TerminalGrid {
+        const ROWS: usize = 24;
+        const COLS: usize = 100;
+
+        fn new() -> Self {
+            Self {
+                cells: vec![vec![' '; Self::COLS]; Self::ROWS],
+                row: 0,
+                col: 0,
+            }
+        }
+
+        fn parse(bytes: &[u8]) -> Self {
+            let mut grid = Self::new();
+            let mut offset = 0;
+            while offset < bytes.len() {
+                offset = grid.apply_one(bytes, offset);
+            }
+            grid
+        }
+
+        fn apply_one(&mut self, bytes: &[u8], offset: usize) -> usize {
+            match bytes[offset] {
+                b'\x1b' => self.apply_escape(bytes, offset),
+                b'\r' => {
+                    self.col = 0;
+                    offset + 1
+                }
+                b'\n' => {
+                    self.row = (self.row + 1).min(Self::ROWS - 1);
+                    offset + 1
+                }
+                b'\t' => {
+                    self.col = (self.col + 8).min(Self::COLS - 1);
+                    offset + 1
+                }
+                byte if byte.is_ascii_control() => offset + 1,
+                _ => {
+                    let text = std::str::from_utf8(&bytes[offset..]).unwrap_or("\u{fffd}");
+                    let ch = text.chars().next().unwrap_or('\u{fffd}');
+                    self.put(ch);
+                    offset + ch.len_utf8().min(bytes.len() - offset)
+                }
+            }
+        }
+
+        fn apply_escape(&mut self, bytes: &[u8], offset: usize) -> usize {
+            if offset + 1 >= bytes.len() {
+                return offset + 1;
+            }
+            match bytes[offset + 1] {
+                b'[' => self.apply_csi(bytes, offset),
+                b']' | b'P' => skip_until_terminator(bytes, offset + 2),
+                _ => (offset + 2).min(bytes.len()),
+            }
+        }
+
+        fn apply_csi(&mut self, bytes: &[u8], offset: usize) -> usize {
+            let params_start = offset + 2;
+            let Some(final_rel) = bytes[params_start..]
+                .iter()
+                .position(|byte| (0x40..=0x7e).contains(byte))
+            else {
+                return bytes.len();
+            };
+            let final_idx = params_start + final_rel;
+            let params = &bytes[params_start..final_idx];
+            match bytes[final_idx] {
+                b'H' | b'f' => {
+                    let (row, col) = parse_cursor_position(params);
+                    self.row = row.saturating_sub(1).min(Self::ROWS - 1);
+                    self.col = col.saturating_sub(1).min(Self::COLS - 1);
+                }
+                b'J' if params == b"2" || params == b"3" => self.clear(),
+                b'K' => {
+                    for col in self.col..Self::COLS {
+                        self.cells[self.row][col] = ' ';
+                    }
+                }
+                b'h' if params == b"?1049" => {
+                    self.clear();
+                    self.row = 0;
+                    self.col = 0;
+                }
+                b'A' => self.row = self.row.saturating_sub(csi_amount(params)),
+                b'B' => self.row = (self.row + csi_amount(params)).min(Self::ROWS - 1),
+                b'C' => self.col = (self.col + csi_amount(params)).min(Self::COLS - 1),
+                b'D' => self.col = self.col.saturating_sub(csi_amount(params)),
+                _ => {}
+            }
+            final_idx + 1
+        }
+
+        fn put(&mut self, ch: char) {
+            if self.row < Self::ROWS && self.col < Self::COLS {
+                self.cells[self.row][self.col] = ch;
+            }
+            self.col += 1;
+            if self.col >= Self::COLS {
+                self.col = 0;
+                self.row = (self.row + 1).min(Self::ROWS - 1);
+            }
+        }
+
+        fn clear(&mut self) {
+            for row in &mut self.cells {
+                row.fill(' ');
+            }
+        }
+
+        fn row_chars(&self, row: usize) -> Vec<char> {
+            self.cells[row].clone()
+        }
+
+        fn line(&self, row: usize) -> String {
+            self.cells[row]
+                .iter()
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        }
+
+        fn lines(&self) -> Vec<String> {
+            (0..Self::ROWS).map(|row| self.line(row)).collect()
+        }
+
+        fn render_text(&self) -> String {
+            self.lines().join("\n")
+        }
+    }
+
+    fn skip_until_terminator(bytes: &[u8], mut offset: usize) -> usize {
+        while offset < bytes.len() {
+            if bytes[offset] == 0x07 {
+                return offset + 1;
+            }
+            if bytes[offset] == b'\x1b' && bytes.get(offset + 1) == Some(&b'\\') {
+                return offset + 2;
+            }
+            offset += 1;
+        }
+        bytes.len()
+    }
+
+    fn parse_cursor_position(params: &[u8]) -> (usize, usize) {
+        let text = std::str::from_utf8(params).unwrap_or_default();
+        let mut parts = text.split(';');
+        let row = parts
+            .next()
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1);
+        let col = parts
+            .next()
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1);
+        (row, col)
+    }
+
+    fn csi_amount(params: &[u8]) -> usize {
+        std::str::from_utf8(params)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1)
+    }
+
+    fn assert_no_utf8_damage(bytes: &[u8], context: &str) {
+        assert!(
+            !contains_subslice(bytes, "\u{fffd}".as_bytes()),
+            "{context} contains U+FFFD replacement glyph bytes:\n{}",
+            escaped(bytes)
+        );
+        for (idx, byte) in bytes.iter().enumerate() {
+            if *byte == 0xe2 {
+                assert!(
+                    bytes
+                        .get(idx + 1)
+                        .is_some_and(|next| (0x80..=0xbf).contains(next))
+                        && bytes
+                            .get(idx + 2)
+                            .is_some_and(|next| (0x80..=0xbf).contains(next)),
+                    "{context} contains an unpaired E2 UTF-8 lead byte at offset {idx}:\n{}",
+                    escaped(bytes)
+                );
+            }
+        }
     }
 
     fn contains_response_shape(bytes: &[u8]) -> bool {
