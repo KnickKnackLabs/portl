@@ -4537,7 +4537,7 @@ impl HostOutputSanitizer {
                 }
 
                 if (0x40..=0x7e).contains(&byte) {
-                    if !host_output_is_stripped_response(&self.buffer) {
+                    if !host_output_is_stripped_response_or_query(&self.buffer) {
                         output.extend_from_slice(&self.buffer);
                     }
                     self.buffer.clear();
@@ -4548,7 +4548,7 @@ impl HostOutputSanitizer {
     }
 }
 
-fn host_output_is_stripped_response(csi: &[u8]) -> bool {
+fn host_output_is_stripped_response_or_query(csi: &[u8]) -> bool {
     let Some((&final_byte, body_with_intro)) = csi.split_last() else {
         return false;
     };
@@ -4556,12 +4556,29 @@ fn host_output_is_stripped_response(csi: &[u8]) -> bool {
         return false;
     };
 
+    if host_output_is_stripped_query(params, final_byte) {
+        return true;
+    }
+
     match (params.first().copied(), final_byte) {
         (Some(b'?'), b'u') => host_output_params_match(&params[1..], b";:", true),
         (Some(b'?' | b'>'), b'c') | (Some(b'?'), b'R') => {
             host_output_params_match(&params[1..], b";", true)
         }
         (_, b'R') => host_output_params_match(params, b";", true),
+        _ => false,
+    }
+}
+
+fn host_output_is_stripped_query(params: &[u8], final_byte: u8) -> bool {
+    match (params, final_byte) {
+        (b"" | b">", b'c') | (b"6", b'n') | (b"?" | b"<", b'u') => true,
+        ([b'>' | b'=', rest @ ..], b'u') => {
+            !rest.is_empty()
+                && rest
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || *byte == b';')
+        }
         _ => false,
     }
 }
@@ -7602,6 +7619,41 @@ mod tests {
     }
 
     #[test]
+    fn host_output_sanitizer_drops_da_query_shapes() {
+        assert_sanitizes_to(b"pre\x1b[cpost", b"prepost");
+        assert_sanitizes_to(b"before\x1b[>cafter", b"beforeafter");
+    }
+
+    #[test]
+    fn host_output_sanitizer_drops_dsr_cpr_query_shape() {
+        assert_sanitizes_to(b"x\x1b[6ny", b"xy");
+    }
+
+    #[test]
+    fn host_output_sanitizer_drops_kitty_query_shapes() {
+        for query in [
+            b"\x1b[?u".as_slice(),
+            b"\x1b[>1u",
+            b"\x1b[>15u",
+            b"\x1b[=15u",
+            b"\x1b[=0u",
+            b"\x1b[<u",
+        ] {
+            let mut input = b"pre".to_vec();
+            input.extend_from_slice(query);
+            input.extend_from_slice(b"post");
+            let output = sanitize_host_output_chunks(&[&input]);
+            assert_eq!(
+                output,
+                b"prepost",
+                "query leaked: {:?}",
+                String::from_utf8_lossy(query)
+            );
+            assert!(!contains_bytes(&output, query));
+        }
+    }
+
+    #[test]
     fn host_output_sanitizer_is_chunk_boundary_safe_inside_responses() {
         for response in [
             b"\x1b[?62;52;c".as_slice(),
@@ -7637,7 +7689,6 @@ mod tests {
             b"title\x1b]0;Portl title\x07done",
             b"title-st\x1b]0;Portl title\x1b\\done",
             b"paste\x1b[?2004h\x1b[?2004ldone",
-            b"kitty-push\x1b[>1udone",
             b"modify-other-keys\x1b[>4;0mdone",
         ];
         for input in inputs {
@@ -7649,6 +7700,71 @@ mod tests {
                 String::from_utf8_lossy(input)
             );
         }
+    }
+
+    #[test]
+    fn host_output_sanitizer_preserves_unrelated_csi_osc_while_stripping_queries() {
+        let input = b"pre\x1b[31mred\x1b[c\x1b[10;20Hpos\x1b[>c\x1b[?1049halt\x1b[6n\x1b]0;Portl title\x07title\x1b[?u\x1b[?2004hpaste\x1b[>15u\x1b[?2004lpost";
+        let expected = b"pre\x1b[31mred\x1b[10;20Hpos\x1b[?1049halt\x1b]0;Portl title\x07title\x1b[?2004hpaste\x1b[?2004lpost";
+        assert_sanitizes_to(input, expected);
+    }
+
+    #[test]
+    fn host_output_sanitizer_query_branch_is_chunk_boundary_safe() {
+        for query in [
+            b"\x1b[c".as_slice(),
+            b"\x1b[>c",
+            b"\x1b[6n",
+            b"\x1b[?u",
+            b"\x1b[>15u",
+            b"\x1b[=15u",
+            b"\x1b[<u",
+        ] {
+            let mut input = b"pre".to_vec();
+            let query_start = input.len();
+            input.extend_from_slice(query);
+            let query_end = input.len();
+            input.extend_from_slice(b"post");
+
+            for split in query_start..=query_end {
+                let output = sanitize_host_output_chunks(&[&input[..split], &input[split..]]);
+                assert_eq!(
+                    output,
+                    b"prepost",
+                    "query {:?} leaked with split {split}",
+                    String::from_utf8_lossy(query)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn host_output_sanitizer_preserves_partial_non_query_csi_after_split() {
+        let output = sanitize_host_output_chunks(&[b"pre\x1b[", b"31mred\x1b[10;20Hpost"]);
+        assert_eq!(output, b"pre\x1b[31mred\x1b[10;20Hpost");
+    }
+
+    #[test]
+    fn host_output_sanitizer_keeps_buffer_bounded_under_dense_queries() {
+        let mut sanitizer = HostOutputSanitizer::new();
+        let queries = [
+            b"\x1b[c".as_slice(),
+            b"\x1b[>c",
+            b"\x1b[6n",
+            b"\x1b[?u",
+            b"\x1b[>15u",
+            b"\x1b[=15u",
+            b"\x1b[<u",
+        ];
+        let initial_capacity = sanitizer.buffer.capacity();
+        let mut output = Vec::new();
+        for index in 0..16_384 {
+            output.extend_from_slice(&sanitizer.feed(queries[index % queries.len()]));
+            assert!(sanitizer.buffer.len() <= HOST_OUTPUT_SANITIZER_BUFFER_CAPACITY);
+            assert_eq!(sanitizer.buffer.capacity(), initial_capacity);
+        }
+        output.extend_from_slice(&sanitizer.finish());
+        assert!(output.is_empty());
     }
 
     #[test]
