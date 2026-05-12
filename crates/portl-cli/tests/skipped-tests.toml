@@ -1,3 +1,8 @@
+# Platform-aware skipped-test manifest.
+# Entries without `platform` apply to every OS. Platform-specific entries use
+# `platform = "macos"` or `platform = "linux"` and are enforced only on that
+# target, while remaining visible here as the cross-platform allow-list.
+
 [[skipped_tests]]
 package = "docker-portl"
 binary = "live"
@@ -25,6 +30,22 @@ binary = "agent_misc"
 kind = "test"
 name = "discovery_local::local_discovery_resolves_endpoint_id_over_mdns"
 justification = "mDNS localhost discovery is environment-dependent and flaky in CI."
+
+[[skipped_tests]]
+package = "portl-agent"
+binary = "agent_misc"
+kind = "test"
+name = "rlimits::fork_bomb_killed_by_nproc"
+platform = "linux"
+justification = "Linux-only resource-limit stress test is unsafe for shared CI hosts."
+
+[[skipped_tests]]
+package = "portl-agent"
+binary = "shell_e2e"
+kind = "test"
+name = "exec_user_switch_drops_supplementary_groups"
+platform = "linux"
+justification = "Requires privileged user-switch setup not available in Ubuntu CI."
 
 [[skipped_tests]]
 package = "portl-cli"

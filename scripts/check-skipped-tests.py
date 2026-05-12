@@ -9,10 +9,20 @@ import sys
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from sysconfig import get_platform
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_PATH = WORKSPACE_ROOT / "crates/portl-cli/tests/skipped-tests.toml"
+
+
+def current_platform() -> str:
+    platform = get_platform().lower()
+    if sys.platform == "darwin":
+        return "macos"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    return platform
 
 
 @dataclass(frozen=True, order=True)
@@ -106,7 +116,16 @@ def skipped_tests_from_manifest() -> set[SkippedTest]:
     entries = manifest.get("skipped_tests")
     if not isinstance(entries, list):
         raise ValueError("manifest must contain [[skipped_tests]] entries")
-    return {SkippedTest.from_manifest(entry) for entry in entries}
+    platform = current_platform()
+    tests = set()
+    for entry in entries:
+        entry_platform = entry.get("platform", "all")
+        if not isinstance(entry_platform, str) or not entry_platform:
+            raise ValueError(f"{entry.get('name', '<unknown>')}: platform must be a string")
+        if entry_platform not in ("all", platform):
+            continue
+        tests.add(SkippedTest.from_manifest(entry))
+    return tests
 
 
 def report_difference(title: str, tests: set[SkippedTest]) -> None:

@@ -762,9 +762,12 @@ mod two_host_fixture {
     const DA1_QUERY: &[u8] = b"\x1b[c";
     const DA2_QUERY: &[u8] = b"\x1b[>c";
     const KITTY_QUERY: &[u8] = b"\x1b[?u";
+    const KITTY_PUSH_QUERY: &[u8] = b"\x1b[>1u";
+    const KITTY_SET_QUERY: &[u8] = b"\x1b[=2u";
+    const KITTY_POP_QUERY: &[u8] = b"\x1b[<u";
     const CPR_QUERY: &[u8] = b"\x1b[6n";
-    const SYMPTOM1_QUERIES: &[u8] = b"\x1b[c\x1b[>c\x1b[?u\x1b[6n";
-    const DROID_STARTUP_QUERIES: &[u8] = b"\x1b[c\x1b[>c\x1b[?u";
+    const SYMPTOM1_QUERIES: &[u8] = b"\x1b[c\x1b[>c\x1b[?u\x1b[>1u\x1b[=2u\x1b[<u\x1b[6n";
+    const DROID_STARTUP_QUERIES: &[u8] = b"\x1b[c\x1b[>c\x1b[?u\x1b[6n";
     const GHOSTTY_DA1: &[u8] = b"\x1b[?62;52;c";
     const GHOSTTY_DA2: &[u8] = b"\x1b[>1;100;0c";
     const GHOSTTY_KITTY: &[u8] = b"\x1b[?0u";
@@ -944,13 +947,13 @@ mod two_host_fixture {
 
     #[test]
     fn e2e_defense_in_depth_multi_attach_detach_stays_wire_clean() {
-        let mut first = TwoHostFixture::spawn_provider(E2eProvider::Raw, DROID_STARTUP_QUERIES);
-        let mut second = TwoHostFixture::spawn_provider(E2eProvider::Raw, DROID_STARTUP_QUERIES);
-
+        let shared = SharedTwoHostSession::spawn(E2eProvider::Zmx, DROID_STARTUP_QUERIES);
+        let mut first = shared.attach_client("first");
         first.wait_for_host_marker_with_answerback(b"E2E_READY", Duration::from_secs(10));
+        let mut second = shared.attach_client("second");
         second.wait_for_host_marker_with_answerback(b"E2E_READY", Duration::from_secs(10));
-        first.inject_ghostty_answers(&[GHOSTTY_DA1, GHOSTTY_DA2, GHOSTTY_KITTY]);
-        second.inject_ghostty_answers(&[GHOSTTY_DA1, GHOSTTY_DA2, GHOSTTY_KITTY]);
+        first.inject_ghostty_answers(&[GHOSTTY_DA1, GHOSTTY_DA2, GHOSTTY_KITTY, GHOSTTY_CPR]);
+        second.inject_ghostty_answers(&[GHOSTTY_DA1, GHOSTTY_DA2, GHOSTTY_KITTY, GHOSTTY_CPR]);
 
         let first_wire = first.wait_for_wire_bytes(SAFE_STDIN_MARKER, Duration::from_secs(10));
         let second_wire = second.wait_for_wire_bytes(SAFE_STDIN_MARKER, Duration::from_secs(10));
@@ -967,9 +970,7 @@ mod two_host_fixture {
 
     #[test]
     fn e2e_dos_query_burst_is_bounded_linear_and_wire_clean() {
-        for provider in E2eProvider::ALL {
-            assert_dos_query_burst(provider);
-        }
+        assert_dos_query_burst(E2eProvider::Zmx);
     }
 
     #[test]
@@ -1020,9 +1021,24 @@ mod two_host_fixture {
     fn e2e_reload_live_streaming_tui_converges_to_one_coherent_screen() {
         let mut fixture = TwoHostFixture::spawn_ghostty_script(&live_streaming_reload_script());
         fixture.wait_for_host_marker_with_answerback(b"LIVE_READY:003", Duration::from_secs(10));
+        let pre_reload_grid = TerminalGrid::parse(&fixture.host_bound);
+        let pre_reload_frame = pre_reload_grid
+            .line(0)
+            .strip_prefix("FRAME:")
+            .and_then(|line| line.get(..3))
+            .expect("pre-reload grid contains frame header")
+            .to_owned();
         let before_reload = fixture.host_bound.len();
 
         fixture.trigger_reload();
+        let reload_command_done = fixture.host_bound.len();
+        let reload_command_paints =
+            live_full_screen_paints(&fixture.host_bound[before_reload..reload_command_done]);
+        assert!(
+            reload_command_paints.is_empty(),
+            "LiveOutput frame painted during reload command window after pre-reload frame {pre_reload_frame}: {reload_command_paints:?}\n{}",
+            escaped(&fixture.host_bound[before_reload..reload_command_done])
+        );
         fixture.wait_for_host_marker_with_answerback(b"LIVE_READY:010", Duration::from_secs(10));
         drain_for(
             &fixture.child.rx,
@@ -1030,6 +1046,18 @@ mod two_host_fixture {
             Duration::from_millis(250),
         );
 
+        let post_reload_paints =
+            live_full_screen_paints(&fixture.host_bound[reload_command_done..]);
+        assert!(
+            !post_reload_paints.is_empty(),
+            "expected paint-tracking tap to observe a post-reload full-screen paint:\n{}",
+            escaped(&fixture.host_bound[reload_command_done..])
+        );
+        assert!(
+            post_reload_paints.iter().all(|paint| paint.coherent),
+            "paint-tracking tap observed torn post-reload paint(s): {post_reload_paints:?}\n{}",
+            escaped(&fixture.host_bound[reload_command_done..])
+        );
         let observations = live_frame_observations(&fixture.host_bound[before_reload..]);
         assert!(
             !observations.is_empty(),
@@ -1067,11 +1095,17 @@ mod two_host_fixture {
                 final_grid.render_text()
             );
         }
+        assert_eq!(
+            post_reload_paints.last().map(|paint| paint.frame.as_str()),
+            Some(final_frame.as_str()),
+            "post-reload grid was not byte-identical to the most recent tracked live paint: paints={post_reload_paints:?}\n{}",
+            final_grid.render_text()
+        );
         fixture.detach();
     }
 
     #[test]
-    fn cross_da_da2_kitty_queries_produce_zero_wire_response_bytes_for_all_providers() {
+    fn cross_area_da_da2_kitty_queries_produce_zero_wire_response_bytes_for_all_providers() {
         for provider in E2eProvider::ALL {
             let mut fixture = TwoHostFixture::spawn_provider(provider, DROID_STARTUP_QUERIES);
             fixture.wait_for_host_marker_with_answerback(b"E2E_READY", Duration::from_secs(10));
@@ -1084,7 +1118,7 @@ mod two_host_fixture {
     }
 
     #[test]
-    fn cross_realistic_ghostty_62_52_answerback_never_leaks_to_wire() {
+    fn cross_area_realistic_ghostty_62_52_answerback_never_leaks_to_wire() {
         let mut fixture =
             TwoHostFixture::spawn_provider(E2eProvider::Ghostty, DROID_STARTUP_QUERIES);
         fixture.wait_for_host_marker_with_answerback(b"E2E_READY", Duration::from_secs(10));
@@ -1096,19 +1130,29 @@ mod two_host_fixture {
     }
 
     #[test]
-    fn cross_sanitizer_and_responder_compose_across_startup_split_boundaries() {
+    fn cross_area_sanitizer_and_responder_compose_across_startup_split_boundaries() {
         let chunks = startup_split_matrix_chunks();
-        let mut fixture = TwoHostFixture::spawn_provider_chunks(E2eProvider::Ghostty, &chunks);
-        fixture.wait_for_host_marker_with_answerback(b"E2E_READY", Duration::from_secs(10));
-        fixture.inject_ghostty_answers(&[GHOSTTY_DA1, GHOSTTY_DA2, GHOSTTY_KITTY]);
+        let mut fixture = TwoHostFixture::spawn_provider_chunks(E2eProvider::Zmx, &chunks);
+        drain_for(
+            &fixture.child.rx,
+            &mut fixture.host_bound,
+            Duration::from_secs(2),
+        );
+        fixture.inject_ghostty_answers(&[GHOSTTY_DA1, GHOSTTY_DA2, GHOSTTY_KITTY, GHOSTTY_CPR]);
         let wire = fixture.wait_for_wire_bytes(SAFE_STDIN_MARKER, Duration::from_secs(10));
 
-        assert_no_response_bytes(&wire, "ghostty split matrix");
+        assert_no_response_bytes(&wire, "zmx split matrix");
         fixture.detach();
     }
 
     #[test]
-    fn cross_dsr_cpr_response_payloads_never_reach_wire_tap() {
+    #[should_panic(expected = "bare ;52;c")]
+    fn cross_area_assert_no_response_bytes_rejects_bare_ghostty_payload_tail() {
+        assert_no_response_bytes(b"safe ;52;c unsafe", "bare-tail-regression");
+    }
+
+    #[test]
+    fn cross_area_dsr_cpr_response_payloads_never_reach_wire_tap() {
         for provider in E2eProvider::ALL {
             let mut fixture = TwoHostFixture::spawn_provider(provider, CPR_QUERY);
             fixture.wait_for_host_marker_with_answerback(b"E2E_READY", Duration::from_secs(10));
@@ -1122,7 +1166,7 @@ mod two_host_fixture {
     }
 
     #[test]
-    fn cross_droid_cli_shaped_attach_lifecycle_stays_wire_clean_through_detach() {
+    fn cross_area_droid_cli_shaped_attach_lifecycle_stays_wire_clean_through_detach() {
         let mut fixture = TwoHostFixture::spawn_provider_chunks(
             E2eProvider::Ghostty,
             &[
@@ -1162,6 +1206,14 @@ mod two_host_fixture {
             },
         );
         fixture.wait_for_host_marker_with_answerback(b"E2E_READY", Duration::from_secs(10));
+        let (server_disabled_wire, _) =
+            portl_agent::ghostty_provider_query_strip_capture_for_test(SYMPTOM1_QUERIES)
+                .expect("server-disabled ghostty query-strip positive control");
+        assert!(
+            contains_subslice(&server_disabled_wire, DA1_QUERY),
+            "M1-disabled positive control did not observe DA1 on server wire capture:\n{}",
+            escaped(&server_disabled_wire)
+        );
         fixture.inject_ghostty_answers(&[GHOSTTY_DA1, GHOSTTY_DA2, GHOSTTY_KITTY, GHOSTTY_CPR]);
         let wire = fixture.wait_for_wire_bytes(SAFE_STDIN_MARKER, Duration::from_secs(10));
         assert_no_response_bytes(&wire, "m1-disabled-m2-active");
@@ -1199,6 +1251,204 @@ mod two_host_fixture {
         _agent: RemoteReconnectAgent,
         _provider_temp: tempfile::TempDir,
         _ghostty_roots: Option<GhosttyRootGuard>,
+    }
+
+    struct SharedTwoHostSession {
+        portl: std::path::PathBuf,
+        home: tempfile::TempDir,
+        session: String,
+        provider: E2eProvider,
+        _agent: RemoteReconnectAgent,
+        _provider_temp: tempfile::TempDir,
+    }
+
+    impl SharedTwoHostSession {
+        fn spawn(provider: E2eProvider, guest_queries: &[u8]) -> Self {
+            assert!(matches!(provider, E2eProvider::Zmx));
+            let portl = assert_cmd::cargo::cargo_bin("portl");
+            let home = initialized_portl_home(&portl);
+            let provider_temp = tempdir().expect("temp shared provider");
+            let provider_path = provider_temp.path().join("zmx");
+            write_fake_zmx_shared_provider(&provider_path, guest_queries)
+                .expect("write shared fake zmx provider");
+            let agent = start_remote_reconnect_agent_with_temp(
+                &portl,
+                home.path(),
+                Some(provider_path),
+                provider_temp,
+            );
+            let session = unique_session("two-host-shared");
+            let provider_temp = tempdir().expect("temp shared holder");
+            Self {
+                portl,
+                home,
+                session,
+                provider,
+                _agent: agent,
+                _provider_temp: provider_temp,
+            }
+        }
+
+        fn attach_client(&self, label: &str) -> SharedTwoHostClient {
+            self.attach_client_with_command(label, None)
+        }
+
+        fn attach_client_with_command(
+            &self,
+            label: &str,
+            command: Option<String>,
+        ) -> SharedTwoHostClient {
+            let wire_tap = self
+                .home
+                .path()
+                .join(format!("wire-bound-input-{label}.tap"));
+            let host_script = r#"
+set +e
+if [ -n "${PORTL_ATTACH_COMMAND:-}" ]; then
+  eval "\"$PORTL_BIN\" attach \"$PORTL_SESSION\" --target \"$PORTL_TARGET_LABEL\" --provider \"$PORTL_PROVIDER\" -- $PORTL_ATTACH_COMMAND"
+else
+  "$PORTL_BIN" attach "$PORTL_SESSION" --target "$PORTL_TARGET_LABEL" --provider "$PORTL_PROVIDER"
+fi
+status=$?
+printf 'HOST_AFTER_ATTACH status=%s\n' "$status"
+exit 0
+"#;
+            let attach_command = command.unwrap_or_default();
+            let child = spawn_host_command(
+                "/bin/bash",
+                &["-lc", host_script],
+                &[
+                    ("PORTL_BIN", self.portl.to_str().expect("portl path utf8")),
+                    (
+                        "PORTL_HOME",
+                        self.home.path().to_str().expect("home path utf8"),
+                    ),
+                    ("PORTL_SESSION", &self.session),
+                    ("PORTL_TARGET_LABEL", REMOTE_TICKET_LABEL),
+                    ("PORTL_PROVIDER", self.provider.attach_provider()),
+                    ("PORTL_ATTACH_COMMAND", &attach_command),
+                    (
+                        "PORTL_TEST_ATTACH_STDIN_TAP",
+                        wire_tap.to_str().expect("tap path utf8"),
+                    ),
+                    ("TERM", "xterm-kitty"),
+                    ("RUST_LOG", "off"),
+                ],
+            )
+            .expect("spawn shared two-host attach wrapper");
+            SharedTwoHostClient {
+                child,
+                host_bound: Vec::new(),
+                wire_tap,
+            }
+        }
+    }
+
+    struct SharedTwoHostClient {
+        child: HostCommand,
+        host_bound: Vec<u8>,
+        wire_tap: std::path::PathBuf,
+    }
+
+    impl SharedTwoHostClient {
+        fn wait_for_host_marker_with_answerback(&mut self, marker: &[u8], timeout: Duration) {
+            let deadline = Instant::now() + timeout;
+            let mut answered = [false; 4];
+            while Instant::now() < deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match self
+                    .child
+                    .rx
+                    .recv_timeout(remaining.min(Duration::from_millis(100)))
+                {
+                    Ok(chunk) => {
+                        self.host_bound.extend_from_slice(&chunk);
+                        answer_queries_once(&self.host_bound, &self.child.input, &mut answered);
+                        if contains_subslice(&self.host_bound, marker) {
+                            return;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            panic!(
+                "timed out waiting for shared host marker {}; host-bound:\n{}",
+                escaped(marker),
+                escaped(&self.host_bound)
+            );
+        }
+
+        fn inject_ghostty_answers(&self, answers: &[&[u8]]) {
+            for answer in answers {
+                write(&self.child.input, answer).expect("inject fake Ghostty answer-back");
+            }
+            write(&self.child.input, SAFE_STDIN_MARKER).expect("inject safe stdin marker");
+        }
+
+        fn wait_for_wire_bytes(&self, needle: &[u8], timeout: Duration) -> Vec<u8> {
+            self.wait_for_wire_occurrences(needle, 1, timeout)
+        }
+
+        fn wait_for_wire_occurrences(
+            &self,
+            needle: &[u8],
+            occurrences: usize,
+            timeout: Duration,
+        ) -> Vec<u8> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                let bytes = fs::read(&self.wire_tap).unwrap_or_default();
+                if count_subslice(&bytes, needle) >= occurrences {
+                    return bytes;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for shared wire tap {}; tap:\n{}",
+                    escaped(needle),
+                    escaped(&bytes)
+                );
+                thread::sleep(Duration::from_millis(25));
+            }
+        }
+
+        fn detach(&mut self) {
+            drain_for(
+                &self.child.rx,
+                &mut self.host_bound,
+                Duration::from_millis(250),
+            );
+            if let Some(status) = self.child.process.try_wait().expect("poll shared wrapper") {
+                assert!(
+                    status.success(),
+                    "shared host wrapper failed: {status}; transcript:\n{}",
+                    escaped(&self.host_bound)
+                );
+                return;
+            }
+            write(&self.child.input, DETACH_KEY).expect("enter attach control mode");
+            wait_for_bytes(
+                &self.child.rx,
+                &mut self.host_bound,
+                b"detach",
+                Duration::from_secs(5),
+            )
+            .expect("shared attach control mode displayed detach action");
+            write(&self.child.input, b"d").expect("confirm shared detach");
+            wait_for_bytes(
+                &self.child.rx,
+                &mut self.host_bound,
+                b"HOST_AFTER_ATTACH",
+                Duration::from_secs(10),
+            )
+            .expect("shared host wrapper exited after detach");
+            let status = self.child.process.wait().expect("wait shared wrapper");
+            assert!(
+                status.success(),
+                "shared host wrapper failed: {status}; transcript:\n{}",
+                escaped(&self.host_bound)
+            );
+        }
     }
 
     struct GhosttyRootGuard {
@@ -1642,7 +1892,15 @@ exit 0
     }
 
     fn assert_no_query_bytes(bytes: &[u8], provider: &str) {
-        for query in [DA1_QUERY, DA2_QUERY, KITTY_QUERY, CPR_QUERY] {
+        for query in [
+            DA1_QUERY,
+            DA2_QUERY,
+            KITTY_QUERY,
+            KITTY_PUSH_QUERY,
+            KITTY_SET_QUERY,
+            KITTY_POP_QUERY,
+            CPR_QUERY,
+        ] {
             assert!(
                 !contains_subslice(bytes, query),
                 "provider {provider} leaked host-bound query {} in:\n{}",
@@ -1656,6 +1914,11 @@ exit 0
         assert!(
             !contains_response_shape(bytes),
             "provider {provider} leaked response shape on wire-bound tap:\n{}",
+            escaped(bytes)
+        );
+        assert!(
+            !contains_subslice(bytes, b";52;c"),
+            "provider {provider} leaked bare ;52;c payload tail on wire-bound tap:\n{}",
             escaped(bytes)
         );
         for forbidden in [
@@ -1709,14 +1972,21 @@ exit 0
     }
 
     fn assert_dos_query_burst(provider: E2eProvider) {
-        let mut slopes = Vec::new();
+        let mut samples = Vec::new();
         for size in [1024_usize, 100 * 1024, 10 * 1024 * 1024] {
             let mut burst = Vec::with_capacity(size + DA1_QUERY.len());
             while burst.len() < size {
                 burst.extend_from_slice(DA1_QUERY);
             }
             burst.truncate(size);
+
             let started = Instant::now();
+            let mut fixture = spawn_zmx_dos_fixture(size);
+            fixture.wait_for_host_marker_with_answerback(b"E2E_READY", Duration::from_secs(30));
+            let elapsed = started.elapsed();
+            assert_no_query_bytes(&fixture.host_bound, provider.name());
+            fixture.detach();
+
             let mut stripper = portl_core::QueryStripper::new();
             let mut high_water = 0;
             let mut output = Vec::new();
@@ -1725,8 +1995,6 @@ exit 0
                 high_water = high_water.max(stripper.buffered_len());
             }
             output.extend(stripper.finish());
-            let elapsed = started.elapsed();
-
             assert!(
                 output.is_empty(),
                 "provider {} leaked query bytes during DoS burst:\n{}",
@@ -1739,29 +2007,63 @@ exit 0
                 provider.name(),
                 portl_core::QueryStripper::MAX_BUFFERED
             );
-            let burst_len = u32::try_from(burst.len()).expect("DoS fixture size fits in u32");
-            slopes.push(elapsed.as_secs_f64().max(0.000_001) / f64::from(burst_len));
+            samples.push((burst.len(), elapsed));
         }
 
-        let min_slope = slopes.iter().copied().fold(f64::INFINITY, f64::min);
-        let max_slope = slopes.iter().copied().fold(0.0_f64, f64::max);
+        let (_, baseline) = samples[0];
+        let (mid_len, mid_elapsed) = samples[1];
+        let (large_len, large_elapsed) = samples[2];
+        let mid_bytes = u32::try_from(mid_len - samples[0].0).expect("mid DoS size fits in u32");
+        let large_bytes =
+            u32::try_from(large_len - samples[0].0).expect("large DoS size fits in u32");
+        let mid_slope = mid_elapsed.saturating_sub(baseline).as_secs_f64() / f64::from(mid_bytes);
+        let large_slope =
+            large_elapsed.saturating_sub(baseline).as_secs_f64() / f64::from(large_bytes);
+        let ratio = if mid_slope > large_slope {
+            mid_slope / large_slope.max(0.000_000_001)
+        } else {
+            large_slope / mid_slope.max(0.000_000_001)
+        };
         assert!(
-            max_slope / min_slope <= 200.0,
-            "provider {} DoS timing was not plausibly linear: slopes={slopes:?}",
+            ratio <= 3.0,
+            "provider {} DoS timing was not linear within 3x after startup baseline: samples={samples:?}, ratio={ratio}",
             provider.name()
         );
     }
 
     fn startup_split_matrix_chunks() -> Vec<Vec<u8>> {
         let mut chunks = Vec::new();
-        for split in 1..=8 {
-            chunks.push(format!("SPLIT{split}:").into_bytes());
-            chunks.push(DROID_STARTUP_QUERIES[..split].to_vec());
-            chunks.push(DROID_STARTUP_QUERIES[split..].to_vec());
-            chunks.push(b"\r\n".to_vec());
+        for (shape, query) in [
+            ("DA1", DA1_QUERY),
+            ("DA2", DA2_QUERY),
+            ("KITTY", KITTY_QUERY),
+            ("KITTY_PUSH", KITTY_PUSH_QUERY),
+            ("KITTY_SET", KITTY_SET_QUERY),
+            ("KITTY_POP", KITTY_POP_QUERY),
+            ("CPR", CPR_QUERY),
+        ] {
+            for split in 1..query.len() {
+                chunks.push(format!("SPLIT:{shape}:{split}:").into_bytes());
+                chunks.push(query[..split].to_vec());
+                chunks.push(query[split..].to_vec());
+                chunks.push(b"\r\n".to_vec());
+            }
         }
         chunks.push(b"E2E_READY\r\n".to_vec());
         chunks
+    }
+
+    fn spawn_zmx_dos_fixture(size: usize) -> TwoHostFixture {
+        let temp = tempdir().expect("temp zmx DoS provider fixture");
+        let provider_path = temp.path().join("zmx");
+        write_fake_zmx_dos_provider(&provider_path, size).expect("write fake zmx DoS provider");
+        TwoHostFixture::spawn_remote_with_temp(
+            E2eProvider::Zmx,
+            Some(provider_path),
+            None,
+            temp,
+            SpawnOptions::default(),
+        )
     }
 
     fn full_box_drawing_block() -> Vec<char> {
@@ -1795,6 +2097,40 @@ exit 0
     struct LiveFrameObservation {
         frame: String,
         coherent: bool,
+    }
+
+    #[derive(Debug)]
+    struct LiveFullScreenPaint {
+        frame: String,
+        coherent: bool,
+    }
+
+    fn live_full_screen_paints(bytes: &[u8]) -> Vec<LiveFullScreenPaint> {
+        let marker = b"\x1b[?1049h\x1b[2J\x1b[HFRAME:";
+        let mut paints = Vec::new();
+        let mut search = 0;
+        while let Some(rel) = find_subslice(&bytes[search..], marker) {
+            let start = search + rel + marker.len();
+            let Some(frame_bytes) = bytes.get(start..start + 3) else {
+                break;
+            };
+            let frame = String::from_utf8_lossy(frame_bytes).into_owned();
+            let end = find_subslice(&bytes[start..], b"\r\nLIVE_READY:")
+                .map_or(bytes.len(), |end_rel| {
+                    start + end_rel + b"\r\nLIVE_READY:".len() + 3
+                });
+            let paint = &bytes[search + rel..end.min(bytes.len())];
+            let coherent = [b"FRAME:" as &[u8], b"ROWA:", b"ROWB:", b"LIVE_READY:"]
+                .into_iter()
+                .all(|prefix| {
+                    let mut expected = Vec::from(prefix);
+                    expected.extend_from_slice(frame.as_bytes());
+                    contains_subslice(paint, &expected)
+                });
+            paints.push(LiveFullScreenPaint { frame, coherent });
+            search = end.min(bytes.len()).max(start);
+        }
+        paints
     }
 
     fn live_frame_observations(bytes: &[u8]) -> Vec<LiveFrameObservation> {
@@ -2161,6 +2497,31 @@ esac
         Ok(())
     }
 
+    fn write_fake_zmx_shared_provider(path: &Path, guest_queries: &[u8]) -> io::Result<()> {
+        fs::write(
+            path,
+            format!(
+                r#"#!/bin/sh
+case "$1" in
+  version) echo "zmx 0.0.e2e" ;;
+  list) printf 'dev\n' ;;
+  attach)
+    printf '{}E2E_READY\r\n'
+    sleep 30
+    ;;
+  kill) echo "killed:$2" ;;
+  *) echo "unknown:$1" >&2; exit 64 ;;
+esac
+"#,
+                shell_escaped_printf(guest_queries)
+            ),
+        )?;
+        let mut perms = fs::metadata(path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms)?;
+        Ok(())
+    }
+
     fn write_fake_zmx_e2e_provider_chunks(path: &Path, chunks: &[Vec<u8>]) -> io::Result<()> {
         fs::write(
             path,
@@ -2179,6 +2540,38 @@ case "$1" in
 esac
 "#,
                 chunked_printf_shell(chunks, false)
+            ),
+        )?;
+        let mut perms = fs::metadata(path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms)?;
+        Ok(())
+    }
+
+    fn write_fake_zmx_dos_provider(path: &Path, size: usize) -> io::Result<()> {
+        fs::write(
+            path,
+            format!(
+                r#"#!/bin/sh
+case "$1" in
+  version) echo "zmx 0.0.e2e" ;;
+  list) printf 'dev\n' ;;
+  attach)
+    python3 - <<'PY'
+import sys
+size = {size}
+query = b'\x1b[c'
+sys.stdout.buffer.write((query * ((size + len(query) - 1) // len(query)))[:size])
+sys.stdout.buffer.write(b'E2E_READY\r\n')
+sys.stdout.buffer.flush()
+PY
+    stty -echo -icanon min 0 time 100 2>/dev/null || true
+    dd of=/dev/null bs=1024 count=1 2>/dev/null || true
+    ;;
+  kill) echo "killed:$2" ;;
+  *) echo "unknown:$1" >&2; exit 64 ;;
+esac
+"#
             ),
         )?;
         let mut perms = fs::metadata(path)?.permissions();
