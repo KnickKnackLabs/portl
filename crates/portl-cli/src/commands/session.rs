@@ -3631,6 +3631,10 @@ async fn run_remote_attach_v2_once(
                                             bytes = bytes.len(),
                                             "render attach v2 viewport snapshot"
                                         );
+                                        record_attach_paint_event_for_test(&format!(
+                                            "ViewportSnapshot|generation={generation}|covers_live_seq={covers_live_seq}|bytes={}",
+                                            bytes.len()
+                                        ));
                                         if let Err(err) = write_tracked_output(display, AttachOutputStream::Stdout, &bytes, mode_tracker).await {
                                             break AttachEnd::Disconnected(err);
                                         }
@@ -3661,6 +3665,13 @@ async fn run_remote_attach_v2_once(
                                                 bytes = live.bytes.len(),
                                                 "render queued attach v2 live output after reload"
                                             );
+                                            let overlaps_viewport = live.bytes.starts_with(b"\x1b[?1049h\x1b[2J\x1b[H");
+                                            record_attach_paint_event_for_test(&format!(
+                                                "LiveOutput|barrier=false|queued=true|start_seq={}|end_seq={}|bytes={}|overlaps_viewport={overlaps_viewport}",
+                                                live.start_seq,
+                                                live.end_seq,
+                                                live.bytes.len()
+                                            ));
                                             if let Err(err) = write_tracked_output(display, AttachOutputStream::Stdout, &live.bytes, mode_tracker).await {
                                                 queued_live_end =
                                                     Some(AttachEnd::Disconnected(err));
@@ -3786,6 +3797,11 @@ async fn run_remote_attach_v2_once(
                                     "render attach v2 live output"
                                 );
                                 covered_live_seq = end_seq;
+                            let overlaps_viewport = bytes.starts_with(b"\x1b[?1049h\x1b[2J\x1b[H");
+                            record_attach_paint_event_for_test(&format!(
+                                "LiveOutput|barrier=false|queued=false|start_seq={start_seq}|end_seq={end_seq}|bytes={}|overlaps_viewport={overlaps_viewport}",
+                                bytes.len()
+                            ));
                                 if let Err(err) = write_tracked_output(display, AttachOutputStream::Stdout, bytes, mode_tracker).await {
                                     break AttachEnd::Disconnected(err);
                                 }
@@ -3880,6 +3896,7 @@ async fn handle_attach_v2_reload_chunk_frame(
 fn start_active_reload(reload_state: &Arc<StdMutex<ReloadCoordinator>>, reload_id: u64) {
     if let Ok(mut state) = reload_state.lock() {
         state.start(reload_id);
+        record_attach_paint_event_for_test(&format!("ReloadStarted|reload_id={reload_id}"));
     }
 }
 
@@ -4329,6 +4346,7 @@ async fn handle_attach_v2_control_frame(
             Ok(None)
         }
         AttachV2ServerFrame::ReloadDone { reload_id, .. } => {
+            record_attach_paint_event_for_test(&format!("ReloadDone|reload_id={reload_id}"));
             if mark_reload_done(reload_state, reload_id) {
                 write_tracked_output(
                     display,
@@ -4881,6 +4899,9 @@ async fn write_tracked_output(
     tracker: &SharedTerminalModeTracker,
 ) -> Result<()> {
     let defensive_reset = track_host_bound_bytes(tracker, bytes)?;
+    if stream == AttachOutputStream::Stdout {
+        record_attach_host_raw_output_tap(bytes);
+    }
     let sanitized = sanitize_host_bound_bytes(tracker, stream, bytes)?;
     if !sanitized.is_empty() {
         display.write_output(stream, &sanitized).await?;
@@ -5105,7 +5126,7 @@ impl AttachSignalWatcher {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttachOutputStream {
     Stdout,
     Stderr,
@@ -6516,6 +6537,47 @@ fn record_attach_stdin_tap(bytes: &[u8]) {
 
 #[cfg(not(feature = "test-attach-taps"))]
 fn record_attach_stdin_tap(_bytes: &[u8]) {}
+
+#[cfg(feature = "test-attach-taps")]
+fn record_attach_host_raw_output_tap(bytes: &[u8]) {
+    use std::io::Write as _;
+
+    let Some(path) = std::env::var_os("PORTL_TEST_ATTACH_HOST_RAW_OUTPUT_TAP") else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = file.write_all(bytes);
+    }
+}
+
+#[cfg(not(feature = "test-attach-taps"))]
+fn record_attach_host_raw_output_tap(_bytes: &[u8]) {}
+
+#[cfg(feature = "test-attach-taps")]
+fn record_attach_paint_event_for_test(event: &str) {
+    use std::io::Write as _;
+
+    let Some(path) = std::env::var_os("PORTL_TEST_ATTACH_PAINT_EVENT_TAP") else {
+        return;
+    };
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{timestamp}|{event}");
+    }
+}
+
+#[cfg(not(feature = "test-attach-taps"))]
+fn record_attach_paint_event_for_test(_event: &str) {}
 
 impl AttachInputSink {
     fn has_active_reload(&self) -> bool {

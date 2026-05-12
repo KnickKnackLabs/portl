@@ -19,6 +19,7 @@ workspace = true
 # own dev-dependencies and via downstream `[dev-dependencies]
 # portl-core = { features = ["test-util"] }`.
 test-util = []
+test-attach-taps = []
 
 [dependencies]
 iroh          = { workspace = true }

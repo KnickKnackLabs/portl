@@ -18,7 +18,7 @@ panic-inject-attach = []
 test-reconnect-injection = []
 force-disable-server-query-strip = ["ghostty-vt", "test-attach-taps", "portl-agent/force-disable-server-query-strip"]
 force-disable-client-query-strip = ["ghostty-vt", "test-attach-taps"]
-test-attach-taps = []
+test-attach-taps = ["portl-core/test-attach-taps"]
 
 [[bin]]
 name = "portl"

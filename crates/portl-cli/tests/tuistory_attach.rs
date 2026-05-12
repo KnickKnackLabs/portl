@@ -917,7 +917,6 @@ mod two_host_fixture {
     #[test]
     fn e2e_symptom1_droid_startup_shape_is_clean_on_host_and_wire_for_all_providers() {
         for provider in E2eProvider::ALL {
-            assert_provider_host_bound_queries_are_stripped(provider, DROID_STARTUP_QUERIES);
             let mut fixture = TwoHostFixture::spawn_provider(provider, DROID_STARTUP_QUERIES);
             fixture.wait_for_host_marker_with_answerback(b"E2E_READY", Duration::from_secs(10));
             fixture.inject_ghostty_answers(&[GHOSTTY_DA1, GHOSTTY_DA2, GHOSTTY_KITTY]);
@@ -970,7 +969,9 @@ mod two_host_fixture {
 
     #[test]
     fn e2e_dos_query_burst_is_bounded_linear_and_wire_clean() {
-        assert_dos_query_burst(E2eProvider::Zmx);
+        for provider in [E2eProvider::Zmx, E2eProvider::Raw] {
+            assert_dos_query_burst(provider);
+        }
     }
 
     #[test]
@@ -1018,7 +1019,7 @@ mod two_host_fixture {
     }
 
     #[test]
-    fn e2e_reload_live_streaming_tui_converges_to_one_coherent_screen() {
+    fn e2e_reload_during_live_stream() {
         let mut fixture = TwoHostFixture::spawn_ghostty_script(&live_streaming_reload_script());
         fixture.wait_for_host_marker_with_answerback(b"LIVE_READY:003", Duration::from_secs(10));
         let pre_reload_grid = TerminalGrid::parse(&fixture.host_bound);
@@ -1045,6 +1046,9 @@ mod two_host_fixture {
             &mut fixture.host_bound,
             Duration::from_millis(250),
         );
+        let paint_events = read_paint_events(&fixture.paint_event_tap);
+        assert_true_reload_window_has_no_live_paints(&paint_events);
+        assert_single_post_reload_viewport_without_dedup_overlap(&paint_events);
 
         let post_reload_paints =
             live_full_screen_paints(&fixture.host_bound[reload_command_done..]);
@@ -1186,19 +1190,19 @@ mod two_host_fixture {
     }
 
     fn assert_symptom1_provider_wire_clean(provider: E2eProvider) {
-        assert_provider_host_bound_queries_are_stripped(provider, SYMPTOM1_QUERIES);
         let mut fixture = TwoHostFixture::spawn_provider(provider, SYMPTOM1_QUERIES);
         fixture.wait_for_host_marker_with_answerback(b"E2E_READY", Duration::from_secs(10));
         fixture.inject_ghostty_answers(&[GHOSTTY_DA1, GHOSTTY_DA2, GHOSTTY_KITTY, GHOSTTY_CPR]);
         let wire = fixture.wait_for_wire_bytes(SAFE_STDIN_MARKER, Duration::from_secs(10));
 
+        assert_no_query_bytes(&fixture.host_bound, provider.name());
         assert_no_response_bytes(&wire, provider.name());
         fixture.detach();
     }
 
     fn assert_m1_disabled_m2_catches_leak() {
         let mut fixture = TwoHostFixture::spawn_provider_with_options(
-            E2eProvider::Ghostty,
+            E2eProvider::Raw,
             SYMPTOM1_QUERIES,
             SpawnOptions {
                 disable_server_query_strip: true,
@@ -1206,15 +1210,32 @@ mod two_host_fixture {
             },
         );
         fixture.wait_for_host_marker_with_answerback(b"E2E_READY", Duration::from_secs(10));
-        let (server_disabled_wire, _) =
-            portl_agent::ghostty_provider_query_strip_capture_for_test(SYMPTOM1_QUERIES)
-                .expect("server-disabled ghostty query-strip positive control");
-        assert!(
-            contains_subslice(&server_disabled_wire, DA1_QUERY),
-            "M1-disabled positive control did not observe DA1 on server wire capture:\n{}",
-            escaped(&server_disabled_wire)
-        );
-        fixture.inject_ghostty_answers(&[GHOSTTY_DA1, GHOSTTY_DA2, GHOSTTY_KITTY, GHOSTTY_CPR]);
+        let host_raw = fs::read(&fixture.host_raw_output_tap).unwrap_or_default();
+        for query in [
+            DA1_QUERY,
+            DA2_QUERY,
+            CPR_QUERY,
+            KITTY_QUERY,
+            KITTY_PUSH_QUERY,
+            KITTY_SET_QUERY,
+            KITTY_POP_QUERY,
+        ] {
+            assert!(
+                contains_subslice(&host_raw, query),
+                "M1-disabled positive control did not observe host-bound query {} in raw real attach output:\n{}",
+                escaped(query),
+                escaped(&host_raw)
+            );
+        }
+        fixture.inject_ghostty_answers(&[
+            GHOSTTY_DA1,
+            GHOSTTY_DA2,
+            GHOSTTY_CPR,
+            GHOSTTY_KITTY,
+            GHOSTTY_KITTY,
+            GHOSTTY_KITTY,
+            GHOSTTY_KITTY,
+        ]);
         let wire = fixture.wait_for_wire_bytes(SAFE_STDIN_MARKER, Duration::from_secs(10));
         assert_no_response_bytes(&wire, "m1-disabled-m2-active");
         fixture.detach();
@@ -1247,6 +1268,8 @@ mod two_host_fixture {
         child: HostCommand,
         host_bound: Vec<u8>,
         wire_tap: std::path::PathBuf,
+        host_raw_output_tap: std::path::PathBuf,
+        paint_event_tap: std::path::PathBuf,
         _home: tempfile::TempDir,
         _agent: RemoteReconnectAgent,
         _provider_temp: tempfile::TempDir,
@@ -1643,17 +1666,21 @@ exit 0
             options: SpawnOptions,
         ) -> Self {
             let portl = assert_cmd::cargo::cargo_bin("portl");
-            let ghostty_roots = matches!(provider, E2eProvider::Ghostty).then(|| {
-                GhosttyRootGuard::new_with_server_strip_disabled(
-                    &portl,
-                    options.disable_server_query_strip,
-                )
-            });
+            let ghostty_roots = (matches!(provider, E2eProvider::Ghostty)
+                || options.disable_server_query_strip)
+                .then(|| {
+                    GhosttyRootGuard::new_with_server_strip_disabled(
+                        &portl,
+                        options.disable_server_query_strip,
+                    )
+                });
             let home = initialized_portl_home(&portl);
             let agent =
                 start_remote_reconnect_agent_with_provider_path(&portl, home.path(), provider_path);
             let session = unique_session("two-host-fixture");
             let wire_tap = home.path().join("wire-bound-input.tap");
+            let host_raw_output_tap = home.path().join("host-raw-output.tap");
+            let paint_event_tap = home.path().join("paint-events.tap");
             let host_script = r#"
 set +e
 if [ -n "${PORTL_ATTACH_COMMAND:-}" ]; then
@@ -1687,6 +1714,16 @@ exit 0
                         wire_tap.to_str().expect("tap path utf8"),
                     ),
                     (
+                        "PORTL_TEST_ATTACH_HOST_RAW_OUTPUT_TAP",
+                        host_raw_output_tap
+                            .to_str()
+                            .expect("host raw tap path utf8"),
+                    ),
+                    (
+                        "PORTL_TEST_ATTACH_PAINT_EVENT_TAP",
+                        paint_event_tap.to_str().expect("paint tap path utf8"),
+                    ),
+                    (
                         "PORTL_TEST_FORCE_DISABLE_CLIENT_QUERY_STRIP",
                         disable_client_query_strip,
                     ),
@@ -1699,6 +1736,8 @@ exit 0
                 child,
                 host_bound: Vec::new(),
                 wire_tap,
+                host_raw_output_tap,
+                paint_event_tap,
                 _home: home,
                 _agent: agent,
                 _provider_temp: provider_temp,
@@ -1950,75 +1989,43 @@ exit 0
         );
     }
 
-    fn assert_provider_host_bound_queries_are_stripped(provider: E2eProvider, queries: &[u8]) {
-        if matches!(provider, E2eProvider::Ghostty) {
-            let (wire, guest_input) =
-                portl_agent::ghostty_provider_query_strip_capture_for_test(queries)
-                    .expect("ghostty query strip capture");
-            assert_no_query_bytes(&wire, provider.name());
-            assert!(
-                contains_subslice(&guest_input, GHOSTTY_DA1)
-                    || contains_subslice(&guest_input, b"\x1b[?62;1;6;22c"),
-                "ghostty guest PTY input missing DA1 answer:\n{}",
-                escaped(&guest_input)
-            );
-            return;
-        }
-
-        let mut stripper = portl_core::QueryStripper::new();
-        let mut output = stripper.feed(queries);
-        output.extend(stripper.finish());
-        assert_no_query_bytes(&output, provider.name());
-    }
-
     fn assert_dos_query_burst(provider: E2eProvider) {
+        #[cfg(feature = "test-attach-taps")]
+        portl_core::QueryStripper::reset_max_buffered_watermark_for_test();
+        let sizes = [1024_usize, 100 * 1024, 10 * 1024 * 1024];
         let mut samples = Vec::new();
-        for size in [1024_usize, 100 * 1024, 10 * 1024 * 1024] {
-            let mut burst = Vec::with_capacity(size + DA1_QUERY.len());
-            while burst.len() < size {
-                burst.extend_from_slice(DA1_QUERY);
-            }
-            burst.truncate(size);
-
-            let started = Instant::now();
-            let mut fixture = spawn_zmx_dos_fixture(size);
-            fixture.wait_for_host_marker_with_answerback(b"E2E_READY", Duration::from_secs(30));
-            let elapsed = started.elapsed();
+        let started = Instant::now();
+        let mut fixture = spawn_provider_dos_fixture(provider, &sizes);
+        let mut previous = started;
+        for size in sizes {
+            let marker = dos_marker(size);
+            fixture.wait_for_host_marker_with_answerback(&marker, Duration::from_secs(30));
+            let now = Instant::now();
             assert_no_query_bytes(&fixture.host_bound, provider.name());
-            fixture.detach();
-
-            let mut stripper = portl_core::QueryStripper::new();
-            let mut high_water = 0;
-            let mut output = Vec::new();
-            for chunk in burst.chunks(4096) {
-                output.extend(stripper.feed(chunk));
-                high_water = high_water.max(stripper.buffered_len());
-            }
-            output.extend(stripper.finish());
-            assert!(
-                output.is_empty(),
-                "provider {} leaked query bytes during DoS burst:\n{}",
-                provider.name(),
-                escaped(&output)
-            );
+            samples.push((size, now.saturating_duration_since(previous)));
+            previous = now;
+        }
+        fixture.inject_safe_stdin_marker();
+        let wire = fixture.wait_for_wire_bytes(SAFE_STDIN_MARKER, Duration::from_secs(10));
+        assert_no_query_bytes(&wire, provider.name());
+        #[cfg(feature = "test-attach-taps")]
+        {
+            let high_water = portl_core::QueryStripper::max_buffered_watermark_for_test();
             assert!(
                 high_water <= portl_core::QueryStripper::MAX_BUFFERED,
-                "provider {} high-water {high_water} exceeded bound {}",
+                "provider {} actual QueryStripper high-water {high_water} exceeded bound {}",
                 provider.name(),
                 portl_core::QueryStripper::MAX_BUFFERED
             );
-            samples.push((burst.len(), elapsed));
         }
+        fixture.detach();
 
-        let (_, baseline) = samples[0];
         let (mid_len, mid_elapsed) = samples[1];
         let (large_len, large_elapsed) = samples[2];
-        let mid_bytes = u32::try_from(mid_len - samples[0].0).expect("mid DoS size fits in u32");
-        let large_bytes =
-            u32::try_from(large_len - samples[0].0).expect("large DoS size fits in u32");
-        let mid_slope = mid_elapsed.saturating_sub(baseline).as_secs_f64() / f64::from(mid_bytes);
-        let large_slope =
-            large_elapsed.saturating_sub(baseline).as_secs_f64() / f64::from(large_bytes);
+        let mid_bytes = u32::try_from(mid_len).expect("mid DoS size fits in u32");
+        let large_bytes = u32::try_from(large_len).expect("large DoS size fits in u32");
+        let mid_slope = mid_elapsed.as_secs_f64() / f64::from(mid_bytes);
+        let large_slope = large_elapsed.as_secs_f64() / f64::from(large_bytes);
         let ratio = if mid_slope > large_slope {
             mid_slope / large_slope.max(0.000_000_001)
         } else {
@@ -2026,7 +2033,7 @@ exit 0
         };
         assert!(
             ratio <= 3.0,
-            "provider {} DoS timing was not linear within 3x after startup baseline: samples={samples:?}, ratio={ratio}",
+            "provider {} DoS timing was not linear within 3x: samples={samples:?}, ratio={ratio}",
             provider.name()
         );
     }
@@ -2053,16 +2060,67 @@ exit 0
         chunks
     }
 
-    fn spawn_zmx_dos_fixture(size: usize) -> TwoHostFixture {
-        let temp = tempdir().expect("temp zmx DoS provider fixture");
-        let provider_path = temp.path().join("zmx");
-        write_fake_zmx_dos_provider(&provider_path, size).expect("write fake zmx DoS provider");
-        TwoHostFixture::spawn_remote_with_temp(
-            E2eProvider::Zmx,
-            Some(provider_path),
-            None,
-            temp,
-            SpawnOptions::default(),
+    fn spawn_provider_dos_fixture(provider: E2eProvider, sizes: &[usize]) -> TwoHostFixture {
+        match provider {
+            E2eProvider::Ghostty | E2eProvider::Raw => TwoHostFixture::spawn_remote(
+                provider,
+                None,
+                Some(dos_burst_shell_command(sizes)),
+                SpawnOptions::default(),
+            ),
+            E2eProvider::Zmx => {
+                let temp = tempdir().expect("temp zmx DoS provider fixture");
+                let provider_path = temp.path().join("zmx");
+                write_fake_zmx_dos_provider(&provider_path, sizes)
+                    .expect("write fake zmx DoS provider");
+                TwoHostFixture::spawn_remote_with_temp(
+                    provider,
+                    Some(provider_path),
+                    None,
+                    temp,
+                    SpawnOptions::default(),
+                )
+            }
+            E2eProvider::Tmux => {
+                let temp = tempdir().expect("temp tmux DoS provider fixture");
+                let provider_path = temp.path().join("tmux");
+                write_fake_tmux_dos_provider(&provider_path, sizes)
+                    .expect("write fake tmux DoS provider");
+                TwoHostFixture::spawn_remote_with_temp(
+                    provider,
+                    Some(provider_path),
+                    None,
+                    temp,
+                    SpawnOptions::default(),
+                )
+            }
+        }
+    }
+
+    fn dos_marker(size: usize) -> Vec<u8> {
+        format!("E2E_DOS_READY_{size}").into_bytes()
+    }
+
+    fn dos_burst_python(prefix: &[u8], sizes: &[usize]) -> String {
+        let sizes = sizes
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut escaped_prefix = String::new();
+        for byte in prefix {
+            std::fmt::Write::write_fmt(&mut escaped_prefix, format_args!("\\x{byte:02x}"))
+                .expect("write escaped prefix");
+        }
+        format!(
+            "python3 -c 'import sys;sizes=[{sizes}];q=b\"\\x1b[c\";sys.stdout.buffer.write(b\"{escaped_prefix}\");[(sys.stdout.buffer.write(q*((s+len(q)-1)//len(q))),sys.stdout.buffer.write(f\"E2E_DOS_READY_{{s}}\\r\\n\".encode()),sys.stdout.buffer.flush()) for s in sizes]'"
+        )
+    }
+
+    fn dos_burst_shell_command(sizes: &[usize]) -> String {
+        format!(
+            "/bin/sh -c {:?}",
+            format!("{}; sleep 30", dos_burst_python(b"", sizes))
         )
     }
 
@@ -2103,6 +2161,126 @@ exit 0
     struct LiveFullScreenPaint {
         frame: String,
         coherent: bool,
+    }
+
+    #[derive(Debug)]
+    struct PaintEvent {
+        timestamp_nanos: u128,
+        kind: String,
+        fields: Vec<(String, String)>,
+    }
+
+    impl PaintEvent {
+        fn field(&self, key: &str) -> Option<&str> {
+            self.fields
+                .iter()
+                .find_map(|(field_key, value)| (field_key == key).then_some(value.as_str()))
+        }
+
+        fn overlaps_viewport(&self) -> bool {
+            self.field("overlaps_viewport") == Some("true")
+        }
+    }
+
+    fn read_paint_events(path: &Path) -> Vec<PaintEvent> {
+        let contents = fs::read_to_string(path).unwrap_or_default();
+        contents
+            .lines()
+            .map(|line| {
+                let mut parts = line.split('|');
+                let timestamp_nanos = parts
+                    .next()
+                    .and_then(|part| part.parse::<u128>().ok())
+                    .unwrap_or_else(|| panic!("invalid paint-event timestamp in line {line:?}"));
+                let kind = parts
+                    .next()
+                    .unwrap_or_else(|| panic!("missing paint-event kind in line {line:?}"))
+                    .to_owned();
+                let fields = parts
+                    .filter_map(|part| {
+                        let (key, value) = part.split_once('=')?;
+                        Some((key.to_owned(), value.to_owned()))
+                    })
+                    .collect();
+                PaintEvent {
+                    timestamp_nanos,
+                    kind,
+                    fields,
+                }
+            })
+            .collect()
+    }
+
+    fn assert_true_reload_window_has_no_live_paints(events: &[PaintEvent]) {
+        let started = events
+            .iter()
+            .find(|event| event.kind == "ReloadStarted")
+            .unwrap_or_else(|| panic!("missing ReloadStarted paint event: {events:?}"));
+        let done = reload_done_or_first_post_start_viewport(events, started.timestamp_nanos);
+        let interleaved_live: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.kind == "LiveOutput"
+                    && event.timestamp_nanos >= started.timestamp_nanos
+                    && event.timestamp_nanos <= done.timestamp_nanos
+            })
+            .collect();
+        assert!(
+            interleaved_live.is_empty(),
+            "LiveOutput painted during true ReloadStarted→ReloadDone window: {interleaved_live:?}; all events={events:?}"
+        );
+    }
+
+    fn reload_done_or_first_post_start_viewport(
+        events: &[PaintEvent],
+        started_nanos: u128,
+    ) -> &PaintEvent {
+        events
+            .iter()
+            .find(|event| event.kind == "ReloadDone")
+            .or_else(|| {
+                events.iter().find(|event| {
+                    event.kind == "ViewportSnapshot" && event.timestamp_nanos >= started_nanos
+                })
+            })
+            .unwrap_or_else(|| {
+                panic!("missing ReloadDone/ViewportSnapshot paint event: {events:?}")
+            })
+    }
+
+    fn assert_single_post_reload_viewport_without_dedup_overlap(events: &[PaintEvent]) {
+        let started = events
+            .iter()
+            .find(|event| event.kind == "ReloadStarted")
+            .unwrap_or_else(|| panic!("missing ReloadStarted paint event: {events:?}"));
+        let done = reload_done_or_first_post_start_viewport(events, started.timestamp_nanos);
+        let post_reload_viewports: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.kind == "ViewportSnapshot" && event.timestamp_nanos >= done.timestamp_nanos
+            })
+            .collect();
+        assert_eq!(
+            post_reload_viewports.len(),
+            1,
+            "expected exactly one ViewportSnapshot after ReloadDone; post-reload viewports={post_reload_viewports:?}; all events={events:?}"
+        );
+        let viewport_timestamp = post_reload_viewports[0].timestamp_nanos;
+        let dedup_window_end = viewport_timestamp + 1_000_000_000;
+        let overlapping_live: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.kind == "LiveOutput"
+                    && event.field("queued") == Some("true")
+                    && event.overlaps_viewport()
+                    && event.timestamp_nanos >= viewport_timestamp
+                    && event.timestamp_nanos <= dedup_window_end
+            })
+            .collect();
+        assert!(
+            overlapping_live.is_empty(),
+            "LiveOutput overlapping the viewport painted within the 1s post-reload dedup window: {overlapping_live:?}; all events={events:?}"
+        );
     }
 
     fn live_full_screen_paints(bytes: &[u8]) -> Vec<LiveFullScreenPaint> {
@@ -2548,7 +2726,7 @@ esac
         Ok(())
     }
 
-    fn write_fake_zmx_dos_provider(path: &Path, size: usize) -> io::Result<()> {
+    fn write_fake_zmx_dos_provider(path: &Path, sizes: &[usize]) -> io::Result<()> {
         fs::write(
             path,
             format!(
@@ -2557,19 +2735,41 @@ case "$1" in
   version) echo "zmx 0.0.e2e" ;;
   list) printf 'dev\n' ;;
   attach)
-    python3 - <<'PY'
-import sys
-size = {size}
-query = b'\x1b[c'
-sys.stdout.buffer.write((query * ((size + len(query) - 1) // len(query)))[:size])
-sys.stdout.buffer.write(b'E2E_READY\r\n')
-sys.stdout.buffer.flush()
-PY
+    {}
     stty -echo -icanon min 0 time 100 2>/dev/null || true
     dd of=/dev/null bs=1024 count=1 2>/dev/null || true
     ;;
   kill) echo "killed:$2" ;;
   *) echo "unknown:$1" >&2; exit 64 ;;
+esac
+"#,
+                dos_burst_python(b"", sizes)
+            ),
+        )?;
+        let mut perms = fs::metadata(path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms)?;
+        Ok(())
+    }
+
+    fn write_fake_tmux_dos_provider(path: &Path, sizes: &[usize]) -> io::Result<()> {
+        let python = dos_burst_python(b"\x1bP1000p%output %1 ", sizes);
+        fs::write(
+            path,
+            format!(
+                r#"#!/bin/sh
+case "$1" in
+  -V) echo "tmux 3.6" ;;
+  list-sessions) printf 'dev\n' ;;
+  display-message) exit 1 ;;
+  list-panes) exit 1 ;;
+  kill-session) echo "killed:$3" ;;
+  -CC)
+    {python}
+    stty -echo -icanon min 0 time 100 2>/dev/null || true
+    dd of=/dev/null bs=1024 count=1 2>/dev/null || true
+    ;;
+  *) echo "not tmux e2e fixture" >&2; exit 64 ;;
 esac
 "#
             ),

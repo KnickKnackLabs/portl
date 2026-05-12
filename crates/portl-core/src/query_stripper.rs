@@ -1,5 +1,11 @@
 const ESC: u8 = 0x1b;
 
+#[cfg(feature = "test-attach-taps")]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(feature = "test-attach-taps")]
+static MAX_BUFFERED_WATERMARK: AtomicUsize = AtomicUsize::new(0);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode {
     Ground,
@@ -38,6 +44,7 @@ impl QueryStripper {
         let mut out = Vec::with_capacity(bytes.len());
         for &byte in bytes {
             self.feed_byte(byte, &mut out);
+            self.record_buffered_watermark();
         }
         out
     }
@@ -52,6 +59,35 @@ impl QueryStripper {
     pub fn buffered_len(&self) -> usize {
         self.pending_len
     }
+
+    #[cfg(feature = "test-attach-taps")]
+    pub fn reset_max_buffered_watermark_for_test() {
+        MAX_BUFFERED_WATERMARK.store(0, Ordering::SeqCst);
+    }
+
+    #[cfg(feature = "test-attach-taps")]
+    pub fn max_buffered_watermark_for_test() -> usize {
+        MAX_BUFFERED_WATERMARK.load(Ordering::SeqCst)
+    }
+
+    #[cfg(feature = "test-attach-taps")]
+    fn record_buffered_watermark(&self) {
+        let mut current = MAX_BUFFERED_WATERMARK.load(Ordering::Relaxed);
+        while self.pending_len > current {
+            match MAX_BUFFERED_WATERMARK.compare_exchange_weak(
+                current,
+                self.pending_len,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    #[cfg(not(feature = "test-attach-taps"))]
+    fn record_buffered_watermark(&self) {}
 
     fn feed_byte(&mut self, byte: u8, out: &mut Vec<u8>) {
         match self.mode {
