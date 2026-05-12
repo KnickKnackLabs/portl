@@ -925,6 +925,52 @@ mod two_host_fixture {
         }
     }
 
+    #[test]
+    fn e2e_defense_in_depth_layers_are_independently_clean() {
+        assert_m1_disabled_m2_catches_leak();
+        assert_m2_disabled_m1_prevents_answerback();
+    }
+
+    #[test]
+    fn e2e_m1_disabled_m2_catches_leak() {
+        assert_m1_disabled_m2_catches_leak();
+    }
+
+    #[test]
+    fn e2e_m2_disabled_m1_prevents_answerback() {
+        assert_m2_disabled_m1_prevents_answerback();
+    }
+
+    #[test]
+    fn e2e_defense_in_depth_multi_attach_detach_stays_wire_clean() {
+        let mut first = TwoHostFixture::spawn_provider(E2eProvider::Raw, DROID_STARTUP_QUERIES);
+        let mut second = TwoHostFixture::spawn_provider(E2eProvider::Raw, DROID_STARTUP_QUERIES);
+
+        first.wait_for_host_marker_with_answerback(b"E2E_READY", Duration::from_secs(10));
+        second.wait_for_host_marker_with_answerback(b"E2E_READY", Duration::from_secs(10));
+        first.inject_ghostty_answers(&[GHOSTTY_DA1, GHOSTTY_DA2, GHOSTTY_KITTY]);
+        second.inject_ghostty_answers(&[GHOSTTY_DA1, GHOSTTY_DA2, GHOSTTY_KITTY]);
+
+        let first_wire = first.wait_for_wire_bytes(SAFE_STDIN_MARKER, Duration::from_secs(10));
+        let second_wire = second.wait_for_wire_bytes(SAFE_STDIN_MARKER, Duration::from_secs(10));
+        assert_no_response_bytes(&first_wire, "multi-attach-first-before-detach");
+        assert_no_response_bytes(&second_wire, "multi-attach-second-before-detach");
+
+        second.detach();
+        first.inject_ghostty_answers(&[GHOSTTY_DA1, GHOSTTY_KITTY, GHOSTTY_CPR]);
+        let first_wire_after_detach =
+            first.wait_for_wire_occurrences(SAFE_STDIN_MARKER, 2, Duration::from_secs(10));
+        assert_no_response_bytes(&first_wire_after_detach, "multi-attach-first-after-detach");
+        first.detach();
+    }
+
+    #[test]
+    fn e2e_dos_query_burst_is_bounded_linear_and_wire_clean() {
+        for provider in E2eProvider::ALL {
+            assert_dos_query_burst(provider);
+        }
+    }
+
     fn assert_symptom1_provider_wire_clean(provider: E2eProvider) {
         assert_provider_host_bound_queries_are_stripped(provider, SYMPTOM1_QUERIES);
         let mut fixture = TwoHostFixture::spawn_provider(provider, SYMPTOM1_QUERIES);
@@ -934,6 +980,45 @@ mod two_host_fixture {
 
         assert_no_response_bytes(&wire, provider.name());
         fixture.detach();
+    }
+
+    fn assert_m1_disabled_m2_catches_leak() {
+        let mut fixture = TwoHostFixture::spawn_provider_with_options(
+            E2eProvider::Ghostty,
+            SYMPTOM1_QUERIES,
+            SpawnOptions {
+                disable_server_query_strip: true,
+                disable_client_query_strip: false,
+            },
+        );
+        fixture.wait_for_host_marker_with_answerback(b"E2E_READY", Duration::from_secs(10));
+        fixture.inject_ghostty_answers(&[GHOSTTY_DA1, GHOSTTY_DA2, GHOSTTY_KITTY, GHOSTTY_CPR]);
+        let wire = fixture.wait_for_wire_bytes(SAFE_STDIN_MARKER, Duration::from_secs(10));
+        assert_no_response_bytes(&wire, "m1-disabled-m2-active");
+        fixture.detach();
+    }
+
+    fn assert_m2_disabled_m1_prevents_answerback() {
+        let mut fixture = TwoHostFixture::spawn_provider_with_options(
+            E2eProvider::Ghostty,
+            SYMPTOM1_QUERIES,
+            SpawnOptions {
+                disable_server_query_strip: false,
+                disable_client_query_strip: true,
+            },
+        );
+        fixture.wait_for_host_marker_with_answerback(b"E2E_READY", Duration::from_secs(10));
+        assert_no_query_bytes(&fixture.host_bound, "m2-disabled-m1-active-host-bound");
+        fixture.inject_safe_stdin_marker();
+        let wire = fixture.wait_for_wire_bytes(SAFE_STDIN_MARKER, Duration::from_secs(10));
+        assert_no_response_bytes(&wire, "m2-disabled-m1-active-wire");
+        fixture.detach();
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct SpawnOptions {
+        disable_server_query_strip: bool,
+        disable_client_query_strip: bool,
     }
 
     struct TwoHostFixture {
@@ -951,12 +1036,13 @@ mod two_host_fixture {
         previous_runtime: Option<OsString>,
         previous_state: Option<OsString>,
         previous_helper: Option<OsString>,
+        previous_disable_server: Option<OsString>,
         _temp: tempfile::TempDir,
     }
 
     impl GhosttyRootGuard {
         #[allow(unsafe_code)]
-        fn new(helper_exe: &Path) -> Self {
+        fn new_with_server_strip_disabled(helper_exe: &Path, disable_server_strip: bool) -> Self {
             let lock = GHOSTTY_ROOT_ENV_LOCK
                 .lock()
                 .expect("ghostty env lock poisoned");
@@ -971,16 +1057,24 @@ mod two_host_fixture {
             let previous_runtime = std::env::var_os("PORTL_GHOSTTY_RUNTIME_DIR");
             let previous_state = std::env::var_os("PORTL_GHOSTTY_STATE_DIR");
             let previous_helper = std::env::var_os("PORTL_GHOSTTY_HELPER_EXE");
+            let previous_disable_server =
+                std::env::var_os("PORTL_TEST_FORCE_DISABLE_SERVER_QUERY_STRIP");
             unsafe {
                 std::env::set_var("PORTL_GHOSTTY_RUNTIME_DIR", &runtime);
                 std::env::set_var("PORTL_GHOSTTY_STATE_DIR", &state);
                 std::env::set_var("PORTL_GHOSTTY_HELPER_EXE", helper_exe);
+                if disable_server_strip {
+                    std::env::set_var("PORTL_TEST_FORCE_DISABLE_SERVER_QUERY_STRIP", "1");
+                } else {
+                    std::env::remove_var("PORTL_TEST_FORCE_DISABLE_SERVER_QUERY_STRIP");
+                }
             }
             Self {
                 _lock: lock,
                 previous_runtime,
                 previous_state,
                 previous_helper,
+                previous_disable_server,
                 _temp: temp,
             }
         }
@@ -1002,6 +1096,12 @@ mod two_host_fixture {
                     Some(value) => std::env::set_var("PORTL_GHOSTTY_HELPER_EXE", value),
                     None => std::env::remove_var("PORTL_GHOSTTY_HELPER_EXE"),
                 }
+                match &self.previous_disable_server {
+                    Some(value) => {
+                        std::env::set_var("PORTL_TEST_FORCE_DISABLE_SERVER_QUERY_STRIP", value);
+                    }
+                    None => std::env::remove_var("PORTL_TEST_FORCE_DISABLE_SERVER_QUERY_STRIP"),
+                }
             }
         }
     }
@@ -1012,6 +1112,14 @@ mod two_host_fixture {
         }
 
         fn spawn_provider(provider: E2eProvider, guest_queries: &[u8]) -> Self {
+            Self::spawn_provider_with_options(provider, guest_queries, SpawnOptions::default())
+        }
+
+        fn spawn_provider_with_options(
+            provider: E2eProvider,
+            guest_queries: &[u8],
+            options: SpawnOptions,
+        ) -> Self {
             match provider {
                 E2eProvider::Ghostty | E2eProvider::Raw => Self::spawn_remote(
                     provider,
@@ -1020,20 +1128,21 @@ mod two_host_fixture {
                         "/bin/sh -c \"printf '{}E2E_READY\\r\\n'; sleep 30\"",
                         shell_escaped_printf(guest_queries)
                     )),
+                    options,
                 ),
                 E2eProvider::Zmx => {
                     let temp = tempdir().expect("temp zmx provider fixture");
                     let provider_path = temp.path().join("zmx");
                     write_fake_zmx_e2e_provider(&provider_path, guest_queries)
                         .expect("write fake zmx e2e provider");
-                    Self::spawn_remote_with_temp(provider, Some(provider_path), None, temp)
+                    Self::spawn_remote_with_temp(provider, Some(provider_path), None, temp, options)
                 }
                 E2eProvider::Tmux => {
                     let temp = tempdir().expect("temp tmux provider fixture");
                     let provider_path = temp.path().join("tmux");
                     write_fake_tmux_e2e_provider(&provider_path, guest_queries)
                         .expect("write fake tmux e2e provider");
-                    Self::spawn_remote_with_temp(provider, Some(provider_path), None, temp)
+                    Self::spawn_remote_with_temp(provider, Some(provider_path), None, temp, options)
                 }
             }
         }
@@ -1043,6 +1152,7 @@ mod two_host_fixture {
                 E2eProvider::Raw,
                 None,
                 Some(format!("/bin/sh -c {guest_script:?}")),
+                SpawnOptions::default(),
             )
         }
 
@@ -1050,9 +1160,10 @@ mod two_host_fixture {
             provider: E2eProvider,
             provider_path: Option<std::path::PathBuf>,
             command: Option<String>,
+            options: SpawnOptions,
         ) -> Self {
             let temp = tempdir().expect("temp provider fixture");
-            Self::spawn_remote_with_temp(provider, provider_path, command, temp)
+            Self::spawn_remote_with_temp(provider, provider_path, command, temp, options)
         }
 
         fn spawn_remote_with_temp(
@@ -1060,10 +1171,15 @@ mod two_host_fixture {
             provider_path: Option<std::path::PathBuf>,
             command: Option<String>,
             provider_temp: tempfile::TempDir,
+            options: SpawnOptions,
         ) -> Self {
             let portl = assert_cmd::cargo::cargo_bin("portl");
-            let ghostty_roots =
-                matches!(provider, E2eProvider::Ghostty).then(|| GhosttyRootGuard::new(&portl));
+            let ghostty_roots = matches!(provider, E2eProvider::Ghostty).then(|| {
+                GhosttyRootGuard::new_with_server_strip_disabled(
+                    &portl,
+                    options.disable_server_query_strip,
+                )
+            });
             let home = initialized_portl_home(&portl);
             let agent =
                 start_remote_reconnect_agent_with_provider_path(&portl, home.path(), provider_path);
@@ -1082,6 +1198,11 @@ printf 'HOST_AFTER_ATTACH status=%s\n' "$status"
 exit 0
 "#;
             let attach_command = command.unwrap_or_default();
+            let disable_client_query_strip = if options.disable_client_query_strip {
+                "1"
+            } else {
+                ""
+            };
             let child = spawn_host_command(
                 "/bin/bash",
                 &["-lc", host_script],
@@ -1095,6 +1216,10 @@ exit 0
                     (
                         "PORTL_TEST_ATTACH_STDIN_TAP",
                         wire_tap.to_str().expect("tap path utf8"),
+                    ),
+                    (
+                        "PORTL_TEST_FORCE_DISABLE_CLIENT_QUERY_STRIP",
+                        disable_client_query_strip,
                     ),
                     ("TERM", "xterm-kitty"),
                     ("RUST_LOG", "off"),
@@ -1113,10 +1238,19 @@ exit 0
         }
 
         fn wait_for_wire_bytes(&self, needle: &[u8], timeout: Duration) -> Vec<u8> {
+            self.wait_for_wire_occurrences(needle, 1, timeout)
+        }
+
+        fn wait_for_wire_occurrences(
+            &self,
+            needle: &[u8],
+            occurrences: usize,
+            timeout: Duration,
+        ) -> Vec<u8> {
             let deadline = Instant::now() + timeout;
             loop {
                 let bytes = fs::read(&self.wire_tap).unwrap_or_default();
-                if contains_subslice(&bytes, needle) {
+                if count_subslice(&bytes, needle) >= occurrences {
                     return bytes;
                 }
                 assert!(
@@ -1161,6 +1295,10 @@ exit 0
             for answer in answers {
                 write(&self.child.input, answer).expect("inject fake Ghostty answer-back");
             }
+            self.inject_safe_stdin_marker();
+        }
+
+        fn inject_safe_stdin_marker(&self) {
             write(&self.child.input, SAFE_STDIN_MARKER).expect("inject safe stdin marker");
         }
 
@@ -1301,6 +1439,50 @@ exit 0
         let mut output = stripper.feed(queries);
         output.extend(stripper.finish());
         assert_no_query_bytes(&output, provider.name());
+    }
+
+    fn assert_dos_query_burst(provider: E2eProvider) {
+        let mut slopes = Vec::new();
+        for size in [1024_usize, 100 * 1024, 10 * 1024 * 1024] {
+            let mut burst = Vec::with_capacity(size + DA1_QUERY.len());
+            while burst.len() < size {
+                burst.extend_from_slice(DA1_QUERY);
+            }
+            burst.truncate(size);
+            let started = Instant::now();
+            let mut stripper = portl_core::QueryStripper::new();
+            let mut high_water = 0;
+            let mut output = Vec::new();
+            for chunk in burst.chunks(4096) {
+                output.extend(stripper.feed(chunk));
+                high_water = high_water.max(stripper.buffered_len());
+            }
+            output.extend(stripper.finish());
+            let elapsed = started.elapsed();
+
+            assert!(
+                output.is_empty(),
+                "provider {} leaked query bytes during DoS burst:\n{}",
+                provider.name(),
+                escaped(&output)
+            );
+            assert!(
+                high_water <= portl_core::QueryStripper::MAX_BUFFERED,
+                "provider {} high-water {high_water} exceeded bound {}",
+                provider.name(),
+                portl_core::QueryStripper::MAX_BUFFERED
+            );
+            let burst_len = u32::try_from(burst.len()).expect("DoS fixture size fits in u32");
+            slopes.push(elapsed.as_secs_f64().max(0.000_001) / f64::from(burst_len));
+        }
+
+        let min_slope = slopes.iter().copied().fold(f64::INFINITY, f64::min);
+        let max_slope = slopes.iter().copied().fold(0.0_f64, f64::max);
+        assert!(
+            max_slope / min_slope <= 200.0,
+            "provider {} DoS timing was not plausibly linear: slopes={slopes:?}",
+            provider.name()
+        );
     }
 
     fn contains_response_shape(bytes: &[u8]) -> bool {
@@ -1715,7 +1897,9 @@ fn spawn_host_command(
     let slave_fd = slave.as_raw_fd();
 
     let mut command = Command::new(program);
-    command.args(args).envs(env.iter().copied());
+    command
+        .args(args)
+        .envs(env.iter().copied().filter(|(_, value)| !value.is_empty()));
     command.env("COLUMNS", "100").env("LINES", "24");
     unsafe {
         command.pre_exec(move || {
@@ -1958,6 +2142,16 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
         && haystack
             .windows(needle.len())
             .any(|window| window == needle)
+}
+
+fn count_subslice(haystack: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    haystack
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
 }
 
 fn is_server_stripped_kitty_stack_cleanup(cleanup: &[u8], slice: &[u8]) -> bool {

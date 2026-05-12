@@ -16,8 +16,8 @@ ghostty-vt = ["dep:libghostty-vt", "libghostty-vt/link-static", "portl-agent/gho
 ghostty-vt-static = ["ghostty-vt", "portl-agent/ghostty-vt-static"]
 panic-inject-attach = []
 test-reconnect-injection = []
-force-disable-server-query-strip = ["portl-agent/force-disable-server-query-strip"]
-force-disable-client-query-strip = []
+force-disable-server-query-strip = ["ghostty-vt", "test-attach-taps", "portl-agent/force-disable-server-query-strip"]
+force-disable-client-query-strip = ["ghostty-vt", "test-attach-taps"]
 test-attach-taps = []
 
 [[bin]]
