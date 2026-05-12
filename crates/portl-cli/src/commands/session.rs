@@ -35,8 +35,8 @@ use portl_core::terminal_mode_tracker::TerminalModeTracker;
 use portl_core::terminal_mode_tracker::{AltScreenMode, TerminalModeState};
 use portl_core::ticket::schema::{Capabilities, EnvPolicy, ShellCaps};
 use portl_core::wire::session::{
-    ATTACH_V2_MAX_DECODED_PAYLOAD, AttachV2ClientFrame, AttachV2Config, AttachV2ServerFrame,
-    SessionControlAction, SessionControlFrame,
+    ATTACH_V2_MAX_DECODED_PAYLOAD, AttachV2ClientFrame, AttachV2Config, AttachV2Payload,
+    AttachV2Progress, AttachV2ServerFrame, SessionControlAction, SessionControlFrame,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
@@ -3726,26 +3726,16 @@ async fn run_remote_attach_v2_once(
                         }
                     }
                     Ok(Some(AttachV2ServerFrame::ReloadChunk { attach_id: frame_attach_id, reload_id, progress, payload, .. })) if frame_attach_id == attach_id => {
-                        if active_reload_accepts_chunk(&reload_state, reload_id) {
-                            let text = if let Some(total) = progress.total_bytes {
-                                format!(
-                                    "▌ Portl › reloading {} / {} bytes · Esc cancel",
-                                    progress.loaded_bytes,
-                                    total
-                                )
-                            } else {
-                                format!("▌ Portl › reloading {} bytes · Esc cancel", progress.loaded_bytes)
-                            };
-                            let _ = display.set_bar(text).await;
-                            match payload.decode(ATTACH_V2_MAX_DECODED_PAYLOAD) {
-                                Ok(bytes) => {
-                                    trace!(lane = "history", frame = "reload_chunk", reload_id, bytes = bytes.len(), complete = progress.complete, "render attach v2 reload chunk");
-                                    if let Err(err) = write_tracked_output(display, AttachOutputStream::Stdout, &bytes, mode_tracker).await {
-                                        break AttachEnd::Disconnected(err);
-                                    }
-                                }
-                                Err(err) => break AttachEnd::Disconnected(err),
-                            }
+                        if let Err(err) = handle_attach_v2_reload_chunk_frame(
+                            display,
+                            &reload_state,
+                            reload_id,
+                            progress,
+                            payload,
+                        )
+                        .await
+                        {
+                            break AttachEnd::Disconnected(err);
                         }
                     }
                     Ok(Some(_)) => {}
@@ -3851,6 +3841,40 @@ fn active_reload_accepts_chunk(
     reload_state
         .lock()
         .is_ok_and(|state| state.accepts_chunk(reload_id))
+}
+
+async fn handle_attach_v2_reload_chunk_frame(
+    display: &AttachDisplay,
+    reload_state: &Arc<StdMutex<ReloadCoordinator>>,
+    reload_id: u64,
+    progress: AttachV2Progress,
+    payload: AttachV2Payload,
+) -> Result<()> {
+    if !active_reload_accepts_chunk(reload_state, reload_id) {
+        return Ok(());
+    }
+    let text = if let Some(total) = progress.total_bytes {
+        format!(
+            "▌ Portl › reloading {} / {} bytes · Esc cancel",
+            progress.loaded_bytes, total
+        )
+    } else {
+        format!(
+            "▌ Portl › reloading {} bytes · Esc cancel",
+            progress.loaded_bytes
+        )
+    };
+    let _ = display.set_bar(text).await;
+    let bytes = payload.decode(ATTACH_V2_MAX_DECODED_PAYLOAD)?;
+    trace!(
+        lane = "history",
+        frame = "reload_chunk",
+        reload_id,
+        bytes = bytes.len(),
+        complete = progress.complete,
+        "suppress attach v2 reload chunk until viewport snapshot"
+    );
+    Ok(())
 }
 
 fn start_active_reload(reload_state: &Arc<StdMutex<ReloadCoordinator>>, reload_id: u64) {
@@ -7404,6 +7428,53 @@ mod tests {
         assert!(state.mouse_modes[3]);
         assert!(!state.decawm);
         assert!(state.scroll_region_non_default);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reload_edge_suppresses_tail_history_before_post_reload_viewport() {
+        let display = AttachDisplay::new(80, 24);
+        display.inner.lock().await.gate.set_holding(true);
+        let reload_state = Arc::new(StdMutex::new(ReloadCoordinator::default()));
+        let tracker = new_terminal_mode_tracker();
+
+        start_active_reload(&reload_state, 21);
+        handle_attach_v2_reload_chunk_frame(
+            &display,
+            &reload_state,
+            21,
+            AttachV2Progress {
+                loaded_bytes: 17,
+                total_bytes: Some(17),
+                retained_history_truncated: false,
+                complete: true,
+            },
+            AttachV2Payload::raw(b"TAIL_FULL_SCREEN".to_vec()),
+        )
+        .await
+        .unwrap();
+        assert!(mark_reload_done(&reload_state, 21));
+        write_tracked_output(
+            &display,
+            AttachOutputStream::Stdout,
+            b"VIEWPORT_SCREEN",
+            &tracker,
+        )
+        .await
+        .unwrap();
+        let queued = finish_reload_after_viewport(&reload_state, 17, b"VIEWPORT_SCREEN".to_vec());
+        assert!(queued.is_empty());
+
+        let output = display.inner.lock().await.gate.take_stdout();
+        assert!(!contains_bytes(&output, b"TAIL_FULL_SCREEN"));
+        assert_eq!(
+            output
+                .windows(b"VIEWPORT_SCREEN".len())
+                .filter(|window| *window == b"VIEWPORT_SCREEN")
+                .count(),
+            1,
+            "host-bound output should contain exactly one post-reload viewport: {output:?}"
+        );
     }
 
     #[test]

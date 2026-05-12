@@ -25,7 +25,7 @@ use libghostty_vt::style::{RgbColor, Underline};
 use libghostty_vt::{
     RenderState, Terminal, TerminalOptions,
     terminal::{
-        ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType,
+        ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode,
         PrimaryDeviceAttributes, SecondaryDeviceAttributes, TertiaryDeviceAttributes,
     },
 };
@@ -1453,7 +1453,7 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
                             }
                         }
                         let (reload_start_abs, reload_len, reload_truncated) =
-                            bounded_reload_window(history_start_abs, history.len());
+                            bounded_reload_window(history_start_abs, &history);
                         tracing::trace!(
                             reload_id,
                             reload_start_abs,
@@ -2045,7 +2045,12 @@ fn render_viewport_snapshot(terminal: &Terminal<'_, '_>) -> Result<Vec<u8>> {
             break;
         }
     }
-    out.extend_from_slice(b"\x1b[0m\x1b[?7h");
+    out.extend_from_slice(b"\x1b[0m");
+    if terminal.mode(Mode::WRAPAROUND).unwrap_or(true) {
+        out.extend_from_slice(b"\x1b[?7h");
+    } else {
+        out.extend_from_slice(b"\x1b[?7l");
+    }
     if let Some(cursor) = snapshot.cursor_viewport().context("read ghostty cursor")? {
         out.extend_from_slice(
             format!(
@@ -2125,10 +2130,19 @@ fn append_bounded(history: &mut VecDeque<u8>, bytes: &[u8]) -> usize {
 }
 
 #[cfg(unix)]
-fn bounded_reload_window(history_start_abs: u64, retained_len: usize) -> (u64, usize, bool) {
+fn bounded_reload_window(history_start_abs: u64, history: &VecDeque<u8>) -> (u64, usize, bool) {
+    let retained_len = history.len();
     let reload_len = retained_len.min(GHOSTTY_ATTACH_V2_RELOAD_MAX_BYTES);
-    let skipped_retained = retained_len.saturating_sub(reload_len);
+    let mut skipped_retained = retained_len.saturating_sub(reload_len);
+    while skipped_retained < retained_len
+        && history
+            .get(skipped_retained)
+            .is_some_and(|byte| (*byte & 0b1100_0000) == 0b1000_0000)
+    {
+        skipped_retained = skipped_retained.saturating_add(1);
+    }
     let reload_start_abs = history_start_abs.saturating_add(skipped_retained as u64);
+    let reload_len = retained_len.saturating_sub(skipped_retained);
     let truncated = history_start_abs > 0 || skipped_retained > 0;
     (reload_start_abs, reload_len, truncated)
 }
@@ -4186,6 +4200,32 @@ mod tests {
     }
 
     #[test]
+    fn render_viewport_snapshot_preserves_decawm_off() -> Result<()> {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 8,
+            rows: 1,
+            max_scrollback: 4096,
+        })?;
+        terminal.vt_write(b"\x1b[?7lno-wrap");
+
+        let snapshot = render_viewport_snapshot(&terminal)?;
+
+        assert!(
+            snapshot
+                .windows(b"\x1b[?7l".len())
+                .any(|w| w == b"\x1b[?7l"),
+            "snapshot should preserve DECAWM off: {snapshot:?}"
+        );
+        assert!(
+            !snapshot
+                .windows(b"\x1b[?7h".len())
+                .any(|w| w == b"\x1b[?7h"),
+            "snapshot must not unconditionally enable DECAWM: {snapshot:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn attach_v2_viewport_snapshot_resets_style_before_clearing_rows() -> Result<()> {
         let mut terminal = Terminal::new(TerminalOptions {
             cols: 3,
@@ -4286,6 +4326,29 @@ mod tests {
     }
 
     #[test]
+    fn bounded_reload_window_snaps_capped_start_to_utf8_boundary() {
+        let mut bytes = Vec::with_capacity(GHOSTTY_ATTACH_V2_RELOAD_MAX_BYTES + 1);
+        bytes.extend_from_slice("─".as_bytes());
+        bytes.resize(GHOSTTY_ATTACH_V2_RELOAD_MAX_BYTES + 1, b'x');
+        let history = VecDeque::from(bytes);
+
+        let (start_abs, retained_len, truncated) = bounded_reload_window(0, &history);
+        let rel_start = usize::try_from(start_abs).unwrap();
+        let first_chunk = vec_deque_chunk(&history, rel_start, retained_len.min(16));
+
+        assert_eq!(start_abs, 3);
+        assert_eq!(retained_len, GHOSTTY_ATTACH_V2_RELOAD_MAX_BYTES - 2);
+        assert!(truncated);
+        assert!(
+            first_chunk
+                .first()
+                .is_some_and(|byte| (*byte & 0b1100_0000) != 0b1000_0000),
+            "first reload chunk started with UTF-8 continuation byte: {first_chunk:?}"
+        );
+        assert!(!first_chunk.windows("�".len()).any(|w| w == "�".as_bytes()));
+    }
+
+    #[test]
     fn sanitize_terminal_replay_sgr_only_regression_baseline() {
         assert_eq!(
             sanitize_terminal_replay(b"\x1b[31mred\x1b[0m plain \x1b[1;4mbold\x1b[0m"),
@@ -4309,6 +4372,33 @@ mod tests {
         assert_eq!(sanitizer.feed(b"before\x1b]52;c;", false), b"before");
         assert_eq!(sanitizer.feed(b"secret", false), b"");
         assert_eq!(sanitizer.feed(b"\x07after", true), b"after");
+    }
+
+    #[test]
+    fn replay_sanitizer_carries_escape_context_across_reload_chunks() {
+        let whole = sanitize_terminal_replay(
+            b"pre\x1b[31mred\x1b[0m\x1b[?1049hmid\x1b]52;c;secret\x07tail\x1bPprivate\x1b\\post",
+        );
+        let mut sanitizer = TerminalReplaySanitizer::new();
+        let mut split = Vec::new();
+        for (chunk, final_chunk) in [
+            (b"pre\x1b[".as_slice(), false),
+            (b"31mred\x1b[0m\x1b[?".as_slice(), false),
+            (b"1049hmid\x1b]52;c;".as_slice(), false),
+            (b"secret\x07tail\x1bPpri".as_slice(), false),
+            (b"vate\x1b\\post".as_slice(), true),
+        ] {
+            split.extend_from_slice(&sanitizer.feed(chunk, final_chunk));
+        }
+
+        assert_eq!(split, whole);
+        for leaked in [b"1049h".as_slice(), b"secret", b"private"] {
+            assert!(
+                !split.windows(leaked.len()).any(|window| window == leaked),
+                "split replay leaked envelope bytes {leaked:?}: {split:?}"
+            );
+        }
+        assert_eq!(split, b"pre\x1b[31mred\x1b[0mmidtailpost");
     }
 
     #[test]
@@ -4642,7 +4732,8 @@ mod tests {
 
     #[test]
     fn attach_v2_reload_window_keeps_small_untruncated_history() {
-        let (start_abs, retained_len, truncated) = bounded_reload_window(0, 42);
+        let history = VecDeque::from(vec![b'x'; 42]);
+        let (start_abs, retained_len, truncated) = bounded_reload_window(0, &history);
 
         assert_eq!(start_abs, 0);
         assert_eq!(retained_len, 42);
@@ -4654,8 +4745,9 @@ mod tests {
         let overflow = 1234;
         let history_start_abs = 10_000;
         let retained = GHOSTTY_ATTACH_V2_RELOAD_MAX_BYTES + overflow;
+        let history = VecDeque::from(vec![b'x'; retained]);
         let (start_abs, retained_len, truncated) =
-            bounded_reload_window(history_start_abs, retained);
+            bounded_reload_window(history_start_abs, &history);
 
         assert_eq!(start_abs, history_start_abs + overflow as u64);
         assert_eq!(retained_len, GHOSTTY_ATTACH_V2_RELOAD_MAX_BYTES);
