@@ -1270,19 +1270,7 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 fn is_server_stripped_kitty_stack_cleanup(cleanup: &[u8], slice: &[u8]) -> bool {
-    matches!(
-        cleanup,
-        b"\x1b[<u"
-            | b"\x1b[=0u"
-            | b"\x1b[>4;0m"
-            | b"\x1b[?2004l"
-            | b"\x1b[?1000l"
-            | b"\x1b[?1002l"
-            | b"\x1b[?1003l"
-            | b"\x1b[?1006l"
-            | b"\x1b[?7h"
-            | b"\x1b[r"
-    ) && !contains_subslice(slice, b"\x1b[>1u")
+    matches!(cleanup, b"\x1b[<u" | b"\x1b[=0u") && !contains_subslice(slice, b"\x1b[>1u")
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {

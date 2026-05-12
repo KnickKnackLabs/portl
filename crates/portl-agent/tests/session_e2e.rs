@@ -18,6 +18,10 @@ use portl_core::ticket::mint::mint_root;
 use portl_core::ticket::schema::{Capabilities, EnvPolicy, PortlTicket, ShellCaps};
 use tokio::io::AsyncReadExt;
 
+const QUERY_EMISSION_PRINTF: &str =
+    "printf 'pre\\033[c\\033[>c\\033[6n\\033[?u\\033[>1u\\033[=15u\\033[<upost'";
+const QUERY_STRIPPED_EXPECTED: &[u8] = b"prepost";
+
 #[tokio::test]
 async fn session_zmx_provider_maps_core_ops_over_session_protocol() -> Result<()> {
     let temp = tempfile::tempdir()?;
@@ -270,6 +274,88 @@ async fn session_zmx_control_attach_strips_terminal_queries_without_answers() ->
     assert_eq!(attach.wait_exit().await?, 0);
 
     shutdown(connection, client, server, agent).await
+}
+
+#[tokio::test]
+async fn session_provider_parity_real_paths_strip_queries_to_identical_wire_capture() -> Result<()>
+{
+    let temp = tempfile::tempdir()?;
+    let mut captures = Vec::new();
+
+    let fake_zmx_legacy = temp.path().join("zmx-legacy");
+    let zmx_legacy_stdin = temp.path().join("zmx-legacy.stdin");
+    write_fake_zmx_query_strip_legacy(&fake_zmx_legacy, &zmx_legacy_stdin)?;
+    captures.push((
+        "zmx-legacy",
+        run_query_strip_capture(Some("zmx"), Some(fake_zmx_legacy), None).await?,
+    ));
+
+    let fake_zmx_control = temp.path().join("zmx-control");
+    let zmx_control_stdin = temp.path().join("zmx-control.stdin");
+    write_fake_zmx_query_strip_control(&fake_zmx_control, &zmx_control_stdin)?;
+    captures.push((
+        "zmx-control",
+        run_query_strip_capture(Some("zmx"), Some(fake_zmx_control), None).await?,
+    ));
+
+    let fake_tmux = temp.path().join("tmux");
+    let tmux_stdin = temp.path().join("tmux.stdin");
+    write_fake_tmux_parity_control(&fake_tmux, &tmux_stdin)?;
+    captures.push((
+        "tmux-control",
+        run_query_strip_capture(Some("tmux"), Some(fake_tmux), None).await?,
+    ));
+
+    let raw_stdin = temp.path().join("raw.stdin");
+    captures.push((
+        "raw",
+        run_query_strip_capture(
+            Some("raw"),
+            None,
+            Some(vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+            format!(
+                "{QUERY_EMISSION_PRINTF}; stty -echo -icanon min 0 time 2 2>/dev/null || true; dd of={} bs=1024 count=1 2>/dev/null || true",
+                raw_stdin.display()
+            ),
+            ]),
+        )
+        .await?,
+    ));
+
+    assert!(
+        captures.len() >= 4,
+        "provider parity should exercise zmx legacy, zmx-control, tmux-control, and raw shell actual paths"
+    );
+    for (provider, capture) in &captures {
+        assert_eq!(
+            capture, QUERY_STRIPPED_EXPECTED,
+            "provider {provider} should strip to the known wire capture"
+        );
+        assert_no_query_bytes(capture);
+    }
+    for window in captures.windows(2) {
+        assert_eq!(
+            window[0].1, window[1].1,
+            "wire captures should match byte-for-byte for {} and {}",
+            window[0].0, window[1].0
+        );
+    }
+
+    for (provider, path) in [
+        ("zmx-legacy", zmx_legacy_stdin),
+        ("zmx-control", zmx_control_stdin),
+        ("tmux-control", tmux_stdin),
+        ("raw", raw_stdin),
+    ] {
+        let stdin_bytes = fs::read(path)?;
+        assert_no_response_bytes(&stdin_bytes);
+        assert_no_query_bytes(&stdin_bytes);
+        let _ = provider;
+    }
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -559,6 +645,8 @@ async fn session_tmux_control_attach_strips_terminal_queries_without_answers() -
 
 #[tokio::test]
 async fn session_raw_shell_attach_strips_terminal_queries_without_answers() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let stdin_log = temp.path().join("raw.stdin");
     let (client, server) = pair().await?;
     let operator = Identity::new();
     let agent = start_agent(server.clone(), &operator, None).await?;
@@ -573,7 +661,10 @@ async fn session_raw_shell_attach_strips_terminal_queries_without_answers() -> R
         Some(vec![
             "/bin/sh".to_owned(),
             "-c".to_owned(),
-            "printf 'pre\\033[c\\033[>c\\033[6n\\033[?u\\033[>1u\\033[=15u\\033[<upost'".to_owned(),
+            format!(
+                "{QUERY_EMISSION_PRINTF}; stty -echo -icanon min 0 time 2 2>/dev/null || true; dd of={} bs=1024 count=1 2>/dev/null || true",
+                stdin_log.display()
+            ),
         ]),
         None,
         None,
@@ -591,6 +682,13 @@ async fn session_raw_shell_attach_strips_terminal_queries_without_answers() -> R
     assert_eq!(attached, b"prepost");
     assert_no_query_bytes(&attached);
     assert_no_response_bytes(&attached);
+    let stdin_bytes = fs::read(stdin_log)?;
+    assert_no_response_bytes(&stdin_bytes);
+    assert!(
+        stdin_bytes.is_empty(),
+        "raw provider wrote guest PTY input bytes: {}",
+        escaped(&stdin_bytes)
+    );
     assert_eq!(attach.wait_exit().await?, 0);
 
     shutdown(connection, client, server, agent).await
@@ -660,6 +758,41 @@ async fn start_agent(
         ..AgentConfig::default()
     })
     .await
+}
+
+async fn run_query_strip_capture(
+    provider: Option<&str>,
+    provider_path: Option<std::path::PathBuf>,
+    argv: Option<Vec<String>>,
+) -> Result<Vec<u8>> {
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator, provider_path).await?;
+    let ticket = root_ticket(&operator, server.addr(), shell_caps(true));
+
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let mut attach = open_session_attach(
+        &connection,
+        &session,
+        provider.map(str::to_owned),
+        "dev".to_owned(),
+        argv,
+        None,
+        None,
+        PtyCfg {
+            term: "xterm-256color".to_owned(),
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await?;
+    attach.close_stdin()?;
+    let mut attached = Vec::new();
+    AsyncReadExt::read_to_end(&mut attach.stdout, &mut attached).await?;
+    assert_eq!(attach.wait_exit().await?, 0);
+
+    shutdown(connection, client, server, agent).await?;
+    Ok(attached)
 }
 
 fn root_ticket(
@@ -844,16 +977,45 @@ case "$1" in
   -CC)
     stty -echo 2>/dev/null || true
     printf '\033P1000p%%output %%1 pre\\033[c\\033[>c\\033[6n\\033[?u\\033[>1u\\033[=15u\\033[<upostmalformed:\\033[Xhello\\033[?Xhello\\033[?;;uhello\\033Zdone\r\n'
-    while IFS= read -r line; do
-      printf 'stdin:%s\n' "$line" >> "{}"
-      [ "$line" = "detach-client" ] && exit 0
-    done
+    stty -echo -icanon min 0 time 2 2>/dev/null || true
+    dd of="{}" bs=1024 count=1 2>/dev/null || true
     ;;
   *) echo "not tmux query fixture" >&2; exit 64 ;;
 esac
 "#,
             log.display(),
             log.display()
+        ),
+    )?;
+    let mut perms = fs::metadata(path)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+fn write_fake_tmux_parity_control(
+    path: &std::path::Path,
+    stdin_log: &std::path::Path,
+) -> Result<()> {
+    fs::write(
+        path,
+        format!(
+            r#"#!/bin/sh
+case "$1" in
+  -V) echo "tmux 3.6" ;;
+  list-sessions) printf 'dev\n' ;;
+  display-message) exit 1 ;;
+  list-panes) exit 1 ;;
+  -CC)
+    stty -echo 2>/dev/null || true
+    printf '\033P1000p%%output %%1 pre\\033[c\\033[>c\\033[6n\\033[?u\\033[>1u\\033[=15u\\033[<upost\r\n'
+    stty -echo -icanon min 0 time 2 2>/dev/null || true
+    dd of="{}" bs=1024 count=1 2>/dev/null || true
+    ;;
+  *) echo "not tmux parity fixture" >&2; exit 64 ;;
+esac
+"#,
+            stdin_log.display()
         ),
     )?;
     let mut perms = fs::metadata(path)?.permissions();
@@ -935,8 +1097,9 @@ case "$1" in
   version) echo "zmx 0.0.fake" ;;
   list) printf 'dev\n' ;;
   attach)
-    : > "{}"
     printf 'pre\033[c\033[>c\033[6n\033[?u\033[>1u\033[=15u\033[<upost'
+    stty -echo -icanon min 0 time 2 2>/dev/null || true
+    dd of="{}" bs=1024 count=1 2>/dev/null || true
     ;;
   *) echo "unknown:$1" >&2; exit 64 ;;
 esac

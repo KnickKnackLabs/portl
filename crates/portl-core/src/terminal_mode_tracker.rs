@@ -327,9 +327,14 @@ impl TerminalModeTracker {
         if enable {
             self.modes.alt_screen = Some(mode);
         } else if self.modes.alt_screen == Some(mode) || self.modes.alt_screen.is_some() {
-            let kitty_was_active = self.is_kitty_active();
+            let any_dirty = self.is_kitty_active()
+                || self.modes.modify_other_keys != 0
+                || self.modes.bracketed_paste
+                || self.modes.mouse_modes.iter().any(|enabled| *enabled)
+                || !self.modes.decawm
+                || self.modes.scroll_region_non_default;
             self.modes.alt_screen = None;
-            if kitty_was_active {
+            if any_dirty {
                 self.pending_alt_screen_kitty_reset = true;
             }
         }
@@ -675,6 +680,38 @@ mod tests {
         );
         assert!(tracker.decawm());
         assert!(!tracker.scroll_region_non_default());
+    }
+
+    #[test]
+    fn terminal_mode_tracker_alt_screen_leave_reset_survives_stripped_kitty_push() {
+        let mut tracker = TerminalModeTracker::new();
+
+        tracker.feed(b"\x1b[?1049h\x1b[>4;2m\x1b[?1006h\x1b[?2004h\x1b[?7l\x1b[5;20r\x1b[?1049l");
+
+        let reset = tracker.take_alt_screen_leave_kitty_reset();
+        assert!(
+            !reset
+                .windows(KITTY_POP.len())
+                .any(|window| window == KITTY_POP),
+            "stripped Kitty push must not synthesize a Kitty pop: {reset:?}"
+        );
+        for cleanup in [
+            MODIFY_OTHER_KEYS_CLEAR,
+            BRACKETED_PASTE_DISABLE,
+            b"\x1b[?1006l",
+            DECAWM_ENABLE,
+            SCROLL_REGION_RESET,
+        ] {
+            assert!(
+                reset.windows(cleanup.len()).any(|window| window == cleanup),
+                "missing cleanup {cleanup:?} from reset {reset:?}"
+            );
+        }
+        assert!(!tracker.is_bracketed_paste_enabled());
+        assert!(!tracker.is_mouse_mode_enabled(1006));
+        assert!(tracker.decawm());
+        assert!(!tracker.scroll_region_non_default());
+        assert_eq!(tracker.cleanup_plan(), EMPTY);
     }
 
     #[test]
