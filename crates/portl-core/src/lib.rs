@@ -17,6 +17,7 @@ pub mod pair_code;
 pub mod pair_store;
 pub mod paths;
 pub mod peer_store;
+pub mod query_response_filter;
 pub mod query_stripper;
 pub mod rendezvous;
 pub mod runtime;
@@ -28,6 +29,7 @@ pub mod ticket_store;
 pub mod tls;
 pub mod wire;
 
+pub use query_response_filter::{QueryResponseFilter, StdinResponseFilter};
 pub use query_stripper::QueryStripper;
 
 #[cfg(any(test, feature = "test-util"))]
