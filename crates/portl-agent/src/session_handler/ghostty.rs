@@ -351,9 +351,13 @@ pub(crate) struct GhosttyProvider {
 #[cfg(unix)]
 impl GhosttyProvider {
     pub(crate) fn new() -> Self {
+        let helper_exe = std::env::var_os("PORTL_GHOSTTY_HELPER_EXE").map_or_else(
+            || std::env::current_exe().unwrap_or_else(|_| PathBuf::from("portl")),
+            PathBuf::from,
+        );
         Self {
             registry: GhosttyRegistry::new(),
-            helper_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("portl")),
+            helper_exe,
         }
     }
 

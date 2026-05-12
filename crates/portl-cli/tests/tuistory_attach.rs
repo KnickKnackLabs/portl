@@ -1,5 +1,6 @@
 #![cfg(all(unix, feature = "ghostty-vt"))]
 
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -7,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command};
-use std::sync::mpsc;
+use std::sync::{Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -756,6 +757,8 @@ impl Drop for RemoteReconnectAgent {
 mod two_host_fixture {
     use super::*;
 
+    static GHOSTTY_ROOT_ENV_LOCK: Mutex<()> = Mutex::new(());
+
     const DA1_QUERY: &[u8] = b"\x1b[c";
     const DA2_QUERY: &[u8] = b"\x1b[>c";
     const KITTY_QUERY: &[u8] = b"\x1b[?u";
@@ -790,7 +793,8 @@ mod two_host_fixture {
 
         fn attach_provider(self) -> &'static str {
             match self {
-                Self::Ghostty | Self::Raw => "raw",
+                Self::Ghostty => "ghostty",
+                Self::Raw => "raw",
                 Self::Zmx => "zmx",
                 Self::Tmux => "tmux",
             }
@@ -939,6 +943,67 @@ mod two_host_fixture {
         _home: tempfile::TempDir,
         _agent: RemoteReconnectAgent,
         _provider_temp: tempfile::TempDir,
+        _ghostty_roots: Option<GhosttyRootGuard>,
+    }
+
+    struct GhosttyRootGuard {
+        _lock: MutexGuard<'static, ()>,
+        previous_runtime: Option<OsString>,
+        previous_state: Option<OsString>,
+        previous_helper: Option<OsString>,
+        _temp: tempfile::TempDir,
+    }
+
+    impl GhosttyRootGuard {
+        #[allow(unsafe_code)]
+        fn new(helper_exe: &Path) -> Self {
+            let lock = GHOSTTY_ROOT_ENV_LOCK
+                .lock()
+                .expect("ghostty env lock poisoned");
+            let temp = tempfile::Builder::new()
+                .prefix("pgt-")
+                .tempdir_in("/tmp")
+                .expect("temp ghostty roots");
+            let runtime = temp.path().join("r");
+            let state = temp.path().join("s");
+            fs::create_dir_all(&runtime).expect("create isolated ghostty runtime root");
+            fs::create_dir_all(&state).expect("create isolated ghostty state root");
+            let previous_runtime = std::env::var_os("PORTL_GHOSTTY_RUNTIME_DIR");
+            let previous_state = std::env::var_os("PORTL_GHOSTTY_STATE_DIR");
+            let previous_helper = std::env::var_os("PORTL_GHOSTTY_HELPER_EXE");
+            unsafe {
+                std::env::set_var("PORTL_GHOSTTY_RUNTIME_DIR", &runtime);
+                std::env::set_var("PORTL_GHOSTTY_STATE_DIR", &state);
+                std::env::set_var("PORTL_GHOSTTY_HELPER_EXE", helper_exe);
+            }
+            Self {
+                _lock: lock,
+                previous_runtime,
+                previous_state,
+                previous_helper,
+                _temp: temp,
+            }
+        }
+    }
+
+    impl Drop for GhosttyRootGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous_runtime {
+                    Some(value) => std::env::set_var("PORTL_GHOSTTY_RUNTIME_DIR", value),
+                    None => std::env::remove_var("PORTL_GHOSTTY_RUNTIME_DIR"),
+                }
+                match &self.previous_state {
+                    Some(value) => std::env::set_var("PORTL_GHOSTTY_STATE_DIR", value),
+                    None => std::env::remove_var("PORTL_GHOSTTY_STATE_DIR"),
+                }
+                match &self.previous_helper {
+                    Some(value) => std::env::set_var("PORTL_GHOSTTY_HELPER_EXE", value),
+                    None => std::env::remove_var("PORTL_GHOSTTY_HELPER_EXE"),
+                }
+            }
+        }
     }
 
     impl TwoHostFixture {
@@ -997,6 +1062,8 @@ mod two_host_fixture {
             provider_temp: tempfile::TempDir,
         ) -> Self {
             let portl = assert_cmd::cargo::cargo_bin("portl");
+            let ghostty_roots =
+                matches!(provider, E2eProvider::Ghostty).then(|| GhosttyRootGuard::new(&portl));
             let home = initialized_portl_home(&portl);
             let agent =
                 start_remote_reconnect_agent_with_provider_path(&portl, home.path(), provider_path);
@@ -1041,6 +1108,7 @@ exit 0
                 _home: home,
                 _agent: agent,
                 _provider_temp: provider_temp,
+                _ghostty_roots: ghostty_roots,
             }
         }
 
