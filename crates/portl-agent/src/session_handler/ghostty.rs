@@ -1819,8 +1819,6 @@ fn trailing_incomplete_replay_escape_start(bytes: &[u8]) -> Option<usize> {
                 if byte == 0x1b {
                     state = State::Escape { start: index };
                     index += 1;
-                } else if byte >= 0x80 {
-                    state = State::Ground;
                 } else {
                     if (0x40..=0x7e).contains(&byte) {
                         state = State::Ground;
@@ -4399,6 +4397,44 @@ mod tests {
             );
         }
         assert_eq!(split, b"pre\x1b[31mred\x1b[0mmidtailpost");
+    }
+
+    #[test]
+    fn sanitize_terminal_replay_csi_split_on_c1_byte_preserves_envelope_state() {
+        let whole = sanitize_terminal_replay(b"pre\x1b[31;\x94mred");
+        let mut sanitizer = TerminalReplaySanitizer::new();
+        let mut split = sanitizer.feed(b"pre\x1b[31;\x94", false);
+        split.extend_from_slice(&sanitizer.feed(b"mred", true));
+
+        assert_eq!(split, whole);
+        assert!(
+            !split
+                .windows("�".len())
+                .any(|window| window == "�".as_bytes())
+        );
+        assert_ne!(split, b"premred");
+    }
+
+    #[test]
+    fn sanitize_terminal_replay_osc_split_on_c1_byte_preserves_envelope_state() {
+        let whole = sanitize_terminal_replay(b"pre\x1b]52;c;\x94\x1b\\post");
+        let mut sanitizer = TerminalReplaySanitizer::new();
+        let mut split = sanitizer.feed(b"pre\x1b]52;c;\x94", false);
+        split.extend_from_slice(&sanitizer.feed(b"\x1b\\post", true));
+
+        assert_eq!(split, whole);
+        assert_eq!(split, b"prepost");
+    }
+
+    #[test]
+    fn sanitize_terminal_replay_dcs_split_on_c1_byte_preserves_envelope_state() {
+        let whole = sanitize_terminal_replay(b"pre\x1bPpayload\x94\x1b\\post");
+        let mut sanitizer = TerminalReplaySanitizer::new();
+        let mut split = sanitizer.feed(b"pre\x1bPpayload\x94", false);
+        split.extend_from_slice(&sanitizer.feed(b"\x1b\\post", true));
+
+        assert_eq!(split, whole);
+        assert_eq!(split, b"prepost");
     }
 
     #[test]
