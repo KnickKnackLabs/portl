@@ -1168,6 +1168,10 @@ impl GhosttyReloadJob {
             return false;
         }
         let raw_bytes = vec_deque_chunk(history, rel_start, chunk_len);
+        if raw_bytes.is_empty() {
+            self.offset = self.offset.saturating_add(chunk_len as u64);
+            return false;
+        }
         let loaded = self.offset.saturating_add(raw_bytes.len() as u64);
         let complete = self.start_abs.saturating_add(loaded) >= self.end_abs;
         let bytes = bracket_reload_replay_chunk(
@@ -1731,6 +1735,8 @@ fn vec_deque_chunk(history: &VecDeque<u8>, rel_start: usize, chunk_len: usize) -
         let back_end = back_start.saturating_add(chunk_len).min(back.len());
         out.extend_from_slice(&back[back_start..back_end]);
     }
+    let snap_len = utf8_boundary_snap_len(&out);
+    out.truncate(snap_len);
     out
 }
 
@@ -1767,34 +1773,11 @@ fn sanitize_terminal_replay(bytes: &[u8]) -> Vec<u8> {
                 _ => {}
             }
         }
-        if byte == 0x9b {
-            index = sanitize_c1_csi(bytes, index);
-            continue;
-        }
-        if matches!(byte, 0x90 | 0x9d | 0x9e | 0x9f) {
-            index += 1;
-            while index < bytes.len() {
-                if bytes[index] == 0x07 {
-                    index += 1;
-                    break;
-                }
-                if bytes[index] == 0x1b && index + 1 < bytes.len() && bytes[index + 1] == b'\\' {
-                    index += 2;
-                    break;
-                }
-                index += 1;
-            }
-            continue;
-        }
         if byte == 0x1b {
             index = sanitize_plain_escape(bytes, index);
             continue;
         }
         if byte < 0x20 && !matches!(byte, b'\n' | b'\r' | b'\t') {
-            index += 1;
-            continue;
-        }
-        if (0x80..=0x9f).contains(&byte) {
             index += 1;
             continue;
         }
@@ -1812,6 +1795,13 @@ fn sanitize_escape_csi(bytes: &[u8], start: usize, out: &mut Vec<u8>) -> usize {
         .is_some_and(|byte| matches!(*byte, b'?' | b'>' | b'!' | b' '));
     while index < bytes.len() {
         let byte = bytes[index];
+        if (0x80..=0x9f).contains(&byte) {
+            index = index.saturating_add(1);
+            continue;
+        }
+        if byte >= 0x80 {
+            return index;
+        }
         if (0x40..=0x7e).contains(&byte) {
             let end = index.saturating_add(1);
             if byte == b'm' && !private {
@@ -1825,16 +1815,27 @@ fn sanitize_escape_csi(bytes: &[u8], start: usize, out: &mut Vec<u8>) -> usize {
 }
 
 #[cfg(unix)]
-fn sanitize_c1_csi(bytes: &[u8], start: usize) -> usize {
-    let mut index = start.saturating_add(1);
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if (0x40..=0x7e).contains(&byte) {
-            return index.saturating_add(1);
-        }
-        index = index.saturating_add(1);
+fn utf8_boundary_snap_len(bytes: &[u8]) -> usize {
+    let len = bytes.len();
+    if len == 0 {
+        return 0;
     }
-    bytes.len()
+    let mut start = len.saturating_sub(1);
+    while start > 0 && (0x80..=0xbf).contains(&bytes[start]) {
+        start -= 1;
+    }
+    let expected = match bytes[start] {
+        0x00..=0x7f => 1,
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => return len,
+    };
+    if start.saturating_add(expected) <= len {
+        len
+    } else {
+        start
+    }
 }
 
 #[cfg(unix)]
@@ -4089,6 +4090,80 @@ mod tests {
             sanitize_terminal_replay(b"a\x1bcb\x1b7c\x1b8d\x1b(Be\x1b=f\x1b>g"),
             b"abcdefg"
         );
+    }
+
+    #[test]
+    fn sanitize_terminal_replay_preserves_utf8_continuations_outside_escape_context() {
+        let box_drawing = "─│┌┐└┘├┤┬┴┼ ╔╗╚╝═║ ╭╮╰╯ ▐▌▀▄ █▓▒░";
+        assert_eq!(
+            sanitize_terminal_replay(box_drawing.as_bytes()),
+            box_drawing.as_bytes()
+        );
+        assert_eq!(
+            sanitize_terminal_replay("left │ right".as_bytes()),
+            "left │ right".as_bytes()
+        );
+    }
+
+    #[test]
+    fn sanitize_terminal_replay_preserves_c1_bytes_in_csi_escape_context() {
+        assert_eq!(sanitize_terminal_replay(b"pre\x94post"), b"pre\x94post");
+        assert_eq!(
+            sanitize_terminal_replay(b"pre\x1b[31;\x94mred\x1b[0m"),
+            b"pre\x1b[31;\x94mred\x1b[0m"
+        );
+        assert_eq!(
+            sanitize_terminal_replay(b"pre\x1b]0;\x94title\x07post"),
+            b"prepost"
+        );
+        assert_eq!(
+            sanitize_terminal_replay(b"pre\x1bPpayload\x94\x1b\\post"),
+            b"prepost"
+        );
+    }
+
+    #[test]
+    fn sanitize_terminal_replay_does_not_consume_utf8_after_malformed_csi_prefix() {
+        assert_eq!(
+            sanitize_terminal_replay("pre\x1b[│post".as_bytes()),
+            "pre│post".as_bytes()
+        );
+    }
+
+    #[test]
+    fn sanitize_terminal_replay_vec_deque_chunk_snaps_end_to_utf8_codepoint_boundary() {
+        let bytes = "ab─🭁cd".as_bytes();
+        let history = VecDeque::from(bytes.to_vec());
+
+        assert_eq!(vec_deque_chunk(&history, 0, 3), b"ab");
+        assert_eq!(vec_deque_chunk(&history, 0, 4), b"ab");
+        assert_eq!(vec_deque_chunk(&history, 0, 5), "ab─".as_bytes());
+        assert_eq!(vec_deque_chunk(&history, 0, 6), "ab─".as_bytes());
+        assert_eq!(vec_deque_chunk(&history, 0, 8), "ab─".as_bytes());
+        assert_eq!(vec_deque_chunk(&history, 0, 9), "ab─🭁".as_bytes());
+        assert_eq!(vec_deque_chunk(&history, 0, 10), "ab─🭁c".as_bytes());
+    }
+
+    #[test]
+    fn sanitize_terminal_replay_sgr_only_regression_baseline() {
+        assert_eq!(
+            sanitize_terminal_replay(b"\x1b[31mred\x1b[0m plain \x1b[1;4mbold\x1b[0m"),
+            b"\x1b[31mred\x1b[0m plain \x1b[1;4mbold\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn sanitize_terminal_replay_linear_smoke_large_utf8_payloads() {
+        for size in [1024_usize, 64 * 1024, 1024 * 1024, 8 * 1024 * 1024] {
+            let mut payload = Vec::with_capacity(size + 16);
+            while payload.len() < size {
+                payload.extend_from_slice("text │ ─ \x1b[31mred\x1b[0m ".as_bytes());
+            }
+            payload.truncate(size);
+            let sanitized = sanitize_terminal_replay(&payload);
+            assert!(!sanitized.windows("�".len()).any(|w| w == "�".as_bytes()));
+            assert!(sanitized.len() >= size / 2);
+        }
     }
 
     #[tokio::test]
