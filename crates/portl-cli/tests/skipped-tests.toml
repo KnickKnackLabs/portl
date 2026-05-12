@@ -1,0 +1,118 @@
+[[skipped_tests]]
+package = "docker-portl"
+binary = "live"
+kind = "test"
+name = "agent_graceful_shutdown_on_sigterm"
+justification = "Requires a live Docker daemon and disposable test image."
+
+[[skipped_tests]]
+package = "docker-portl"
+binary = "live"
+kind = "test"
+name = "list_reports_actual_network"
+justification = "Requires a live Docker daemon and mutable Docker network state."
+
+[[skipped_tests]]
+package = "docker-portl"
+binary = "live"
+kind = "test"
+name = "provision_cycle_smoke_test"
+justification = "Requires a live Docker daemon and disposable test image."
+
+[[skipped_tests]]
+package = "portl-agent"
+binary = "agent_misc"
+kind = "test"
+name = "discovery_local::local_discovery_resolves_endpoint_id_over_mdns"
+justification = "mDNS localhost discovery is environment-dependent and flaky in CI."
+
+[[skipped_tests]]
+package = "portl-cli"
+binary = "agent_run"
+kind = "test"
+name = "agent_run_loads_env_config_and_accepts_configured_root"
+justification = "Slow release smoke covered by the full release verification task."
+
+[[skipped_tests]]
+package = "portl-cli"
+binary = "endpoint_close_cli"
+kind = "test"
+name = "cli_closes_endpoint_after_dial_timeout"
+justification = "Slow release smoke covered by the full release verification task."
+
+[[skipped_tests]]
+package = "portl-cli"
+binary = "m3_cli"
+kind = "test"
+name = "exec_command_connects_and_returns_output"
+justification = "Slow CLI end-to-end smoke covered by full release verification."
+
+[[skipped_tests]]
+package = "portl-cli"
+binary = "m3_cli"
+kind = "test"
+name = "exec_exits_promptly_when_child_exits_with_stdin_idle"
+justification = "Slow CLI end-to-end smoke covered by full release verification."
+
+[[skipped_tests]]
+package = "portl-cli"
+binary = "m3_cli"
+kind = "test"
+name = "shell_command_connects_and_dispatches_noninteractive_session"
+justification = "Slow CLI end-to-end smoke covered by full release verification."
+
+[[skipped_tests]]
+package = "portl-cli"
+binary = "m3_cli"
+kind = "test"
+name = "tcp_command_connects_and_forwards_bytes"
+justification = "Slow CLI end-to-end smoke covered by full release verification."
+
+[[skipped_tests]]
+package = "portl-cli"
+binary = "status_cli"
+kind = "test"
+name = "status_command_reports_bare_endpoint_peer"
+justification = "Slow CLI end-to-end smoke covered by full release verification."
+
+[[skipped_tests]]
+package = "portl-cli"
+binary = "status_cli"
+kind = "test"
+name = "status_command_reports_cached_ticket_peer"
+justification = "Slow CLI end-to-end smoke covered by full release verification."
+
+[[skipped_tests]]
+package = "portl-cli"
+binary = "status_cli"
+kind = "test"
+name = "status_refuses_delegated_tickets"
+justification = "Slow CLI end-to-end smoke covered by full release verification."
+
+[[skipped_tests]]
+package = "portl-cli"
+binary = "udp_cli"
+kind = "test"
+name = "udp_command_connects_and_forwards_datagrams"
+justification = "Slow UDP end-to-end smoke covered by full release verification."
+
+[[skipped_tests]]
+package = "portl-cli"
+binary = "udp_cli"
+kind = "test"
+name = "udp_forward_handle_reconnects_and_preserves_session"
+justification = "Slow UDP reconnect smoke covered by full release verification."
+
+[[skipped_tests]]
+package = "portl-core"
+binary = "portl_core"
+kind = "lib"
+name = "rendezvous::ws::tests::public_relay_offer_accept_smoke"
+justification = "Requires public Magic Wormhole relay availability."
+
+[[skipped_tests]]
+package = "slicer-portl"
+binary = "live"
+kind = "test"
+name = "live_slicer_smoke"
+justification = "Requires a running local slicer-mac daemon and live API token."

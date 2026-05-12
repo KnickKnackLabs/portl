@@ -2499,3 +2499,36 @@ fn integrations_into_command(action: IntegrationsTopLevel) -> Command {
         IntegrationsTopLevel::Gateway { upstream_url } => Command::Gateway { upstream_url },
     }
 }
+
+#[cfg(test)]
+mod skipped_test_manifest {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    #[test]
+    fn skipped_test_manifest_matches_nextest_inventory() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("portl-cli lives under crates/portl-cli")
+            .to_path_buf();
+        let script = workspace_root.join("scripts/check-skipped-tests.py");
+        let output = Command::new("python3")
+            .arg(&script)
+            .current_dir(&workspace_root)
+            .env(
+                "CARGO_TARGET_DIR",
+                workspace_root.join("target/skipped-test-manifest"),
+            )
+            .output()
+            .expect("failed to run skipped-test manifest checker");
+
+        assert!(
+            output.status.success(),
+            "skipped-test manifest checker failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}

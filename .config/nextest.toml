@@ -75,5 +75,13 @@ slow-timeout = { period = "30s", terminate-after = 3 }
 filter = 'test(=alias_store::tests::many_writers_converge_to_full_set)'
 slow-timeout = { period = "30s", terminate-after = 2 }
 
+[[profile.default.overrides]]
+filter = 'test(skipped_test_manifest)'
+slow-timeout = { period = "120s", terminate-after = 2 }
+
+[[profile.ci.overrides]]
+filter = 'test(skipped_test_manifest)'
+slow-timeout = { period = "120s", terminate-after = 2 }
+
 [profile.ci.junit]
 path = "junit.xml"
