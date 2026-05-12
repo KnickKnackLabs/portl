@@ -1070,6 +1070,77 @@ mod two_host_fixture {
         fixture.detach();
     }
 
+    #[test]
+    fn cross_da_da2_kitty_queries_produce_zero_wire_response_bytes_for_all_providers() {
+        for provider in E2eProvider::ALL {
+            let mut fixture = TwoHostFixture::spawn_provider(provider, DROID_STARTUP_QUERIES);
+            fixture.wait_for_host_marker_with_answerback(b"E2E_READY", Duration::from_secs(10));
+            fixture.inject_ghostty_answers(&[GHOSTTY_DA1, GHOSTTY_DA2, GHOSTTY_KITTY]);
+            let wire = fixture.wait_for_wire_bytes(SAFE_STDIN_MARKER, Duration::from_secs(10));
+
+            assert_no_response_bytes(&wire, provider.name());
+            fixture.detach();
+        }
+    }
+
+    #[test]
+    fn cross_realistic_ghostty_62_52_answerback_never_leaks_to_wire() {
+        let mut fixture =
+            TwoHostFixture::spawn_provider(E2eProvider::Ghostty, DROID_STARTUP_QUERIES);
+        fixture.wait_for_host_marker_with_answerback(b"E2E_READY", Duration::from_secs(10));
+        fixture.inject_ghostty_answers(&[GHOSTTY_DA1, GHOSTTY_DA2, GHOSTTY_KITTY]);
+        let wire = fixture.wait_for_wire_bytes(SAFE_STDIN_MARKER, Duration::from_secs(10));
+
+        assert_no_response_bytes(&wire, "cross-realistic-ghostty-answerback");
+        fixture.detach();
+    }
+
+    #[test]
+    fn cross_sanitizer_and_responder_compose_across_startup_split_boundaries() {
+        let chunks = startup_split_matrix_chunks();
+        let mut fixture = TwoHostFixture::spawn_provider_chunks(E2eProvider::Ghostty, &chunks);
+        fixture.wait_for_host_marker_with_answerback(b"E2E_READY", Duration::from_secs(10));
+        fixture.inject_ghostty_answers(&[GHOSTTY_DA1, GHOSTTY_DA2, GHOSTTY_KITTY]);
+        let wire = fixture.wait_for_wire_bytes(SAFE_STDIN_MARKER, Duration::from_secs(10));
+
+        assert_no_response_bytes(&wire, "ghostty split matrix");
+        fixture.detach();
+    }
+
+    #[test]
+    fn cross_dsr_cpr_response_payloads_never_reach_wire_tap() {
+        for provider in E2eProvider::ALL {
+            let mut fixture = TwoHostFixture::spawn_provider(provider, CPR_QUERY);
+            fixture.wait_for_host_marker_with_answerback(b"E2E_READY", Duration::from_secs(10));
+            fixture.inject_ghostty_answers(&[GHOSTTY_CPR]);
+            let wire = fixture.wait_for_wire_bytes(SAFE_STDIN_MARKER, Duration::from_secs(10));
+
+            assert_no_cpr_response_payloads(&wire, provider.name());
+            assert_no_response_bytes(&wire, provider.name());
+            fixture.detach();
+        }
+    }
+
+    #[test]
+    fn cross_droid_cli_shaped_attach_lifecycle_stays_wire_clean_through_detach() {
+        let mut fixture = TwoHostFixture::spawn_provider_chunks(
+            E2eProvider::Ghostty,
+            &[
+                b"\x1b[?1049h\x1b[2J\x1b[HDroid CLI\r\n> ".to_vec(),
+                DROID_STARTUP_QUERIES.to_vec(),
+                b"\r\nE2E_READY\r\n".to_vec(),
+            ],
+        );
+        fixture.wait_for_host_marker_with_answerback(b"E2E_READY", Duration::from_secs(10));
+        fixture.inject_ghostty_answers(&[GHOSTTY_DA1, GHOSTTY_DA2, GHOSTTY_KITTY, GHOSTTY_CPR]);
+        let wire = fixture.wait_for_wire_bytes(SAFE_STDIN_MARKER, Duration::from_secs(10));
+        assert_no_response_bytes(&wire, "ghostty droid lifecycle");
+
+        fixture.detach();
+        let final_wire = fs::read(&fixture.wire_tap).unwrap_or_default();
+        assert_no_response_bytes(&final_wire, "ghostty droid lifecycle");
+    }
+
     fn assert_symptom1_provider_wire_clean(provider: E2eProvider) {
         assert_provider_host_bound_queries_are_stripped(provider, SYMPTOM1_QUERIES);
         let mut fixture = TwoHostFixture::spawn_provider(provider, SYMPTOM1_QUERIES);
@@ -1221,6 +1292,46 @@ mod two_host_fixture {
 
         fn spawn_provider(provider: E2eProvider, guest_queries: &[u8]) -> Self {
             Self::spawn_provider_with_options(provider, guest_queries, SpawnOptions::default())
+        }
+
+        fn spawn_provider_chunks(provider: E2eProvider, chunks: &[Vec<u8>]) -> Self {
+            match provider {
+                E2eProvider::Ghostty | E2eProvider::Raw => Self::spawn_remote(
+                    provider,
+                    None,
+                    Some(format!(
+                        "/bin/sh -c \"{}\"",
+                        chunked_printf_shell(chunks, true)
+                    )),
+                    SpawnOptions::default(),
+                ),
+                E2eProvider::Zmx => {
+                    let temp = tempdir().expect("temp zmx provider fixture");
+                    let provider_path = temp.path().join("zmx");
+                    write_fake_zmx_e2e_provider_chunks(&provider_path, chunks)
+                        .expect("write fake zmx e2e provider");
+                    Self::spawn_remote_with_temp(
+                        provider,
+                        Some(provider_path),
+                        None,
+                        temp,
+                        SpawnOptions::default(),
+                    )
+                }
+                E2eProvider::Tmux => {
+                    let temp = tempdir().expect("temp tmux provider fixture");
+                    let provider_path = temp.path().join("tmux");
+                    write_fake_tmux_e2e_provider_chunks(&provider_path, chunks)
+                        .expect("write fake tmux e2e provider");
+                    Self::spawn_remote_with_temp(
+                        provider,
+                        Some(provider_path),
+                        None,
+                        temp,
+                        SpawnOptions::default(),
+                    )
+                }
+            }
         }
 
         fn spawn_provider_with_options(
@@ -1568,6 +1679,14 @@ exit 0
         }
     }
 
+    fn assert_no_cpr_response_payloads(bytes: &[u8], provider: &str) {
+        assert!(
+            !contains_cpr_payload_tail(bytes),
+            "provider {provider} leaked CPR payload tail on wire-bound tap:\n{}",
+            escaped(bytes)
+        );
+    }
+
     fn assert_provider_host_bound_queries_are_stripped(provider: E2eProvider, queries: &[u8]) {
         if matches!(provider, E2eProvider::Ghostty) {
             let (wire, guest_input) =
@@ -1631,6 +1750,18 @@ exit 0
             "provider {} DoS timing was not plausibly linear: slopes={slopes:?}",
             provider.name()
         );
+    }
+
+    fn startup_split_matrix_chunks() -> Vec<Vec<u8>> {
+        let mut chunks = Vec::new();
+        for split in 1..=8 {
+            chunks.push(format!("SPLIT{split}:").into_bytes());
+            chunks.push(DROID_STARTUP_QUERIES[..split].to_vec());
+            chunks.push(DROID_STARTUP_QUERIES[split..].to_vec());
+            chunks.push(b"\r\n".to_vec());
+        }
+        chunks.push(b"E2E_READY\r\n".to_vec());
+        chunks
     }
 
     fn full_box_drawing_block() -> Vec<char> {
@@ -1935,6 +2066,34 @@ exit 0
         false
     }
 
+    fn contains_cpr_payload_tail(bytes: &[u8]) -> bool {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            if !bytes[offset].is_ascii_digit() {
+                offset += 1;
+                continue;
+            }
+            let start = offset;
+            while offset < bytes.len() && bytes[offset].is_ascii_digit() {
+                offset += 1;
+            }
+            if bytes.get(offset) != Some(&b';') {
+                offset = start + 1;
+                continue;
+            }
+            offset += 1;
+            let col_start = offset;
+            while offset < bytes.len() && bytes[offset].is_ascii_digit() {
+                offset += 1;
+            }
+            if offset > col_start && bytes.get(offset) == Some(&b'R') {
+                return true;
+            }
+            offset = start + 1;
+        }
+        false
+    }
+
     fn semicolon_digits(bytes: &[u8]) -> bool {
         !bytes.is_empty()
             && bytes
@@ -1958,6 +2117,24 @@ exit 0
         escaped
     }
 
+    fn chunked_printf_shell(chunks: &[Vec<u8>], keep_open: bool) -> String {
+        let mut script = String::new();
+        for (idx, chunk) in chunks.iter().enumerate() {
+            std::fmt::Write::write_fmt(
+                &mut script,
+                format_args!("printf '{}'; ", shell_escaped_printf(chunk)),
+            )
+            .expect("write chunk script");
+            if idx + 1 < chunks.len() {
+                script.push_str("sleep 0.02; ");
+            }
+        }
+        if keep_open {
+            script.push_str("sleep 30");
+        }
+        script
+    }
+
     fn write_fake_zmx_e2e_provider(path: &Path, guest_queries: &[u8]) -> io::Result<()> {
         fs::write(
             path,
@@ -1976,6 +2153,32 @@ case "$1" in
 esac
 "#,
                 shell_escaped_printf(guest_queries)
+            ),
+        )?;
+        let mut perms = fs::metadata(path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms)?;
+        Ok(())
+    }
+
+    fn write_fake_zmx_e2e_provider_chunks(path: &Path, chunks: &[Vec<u8>]) -> io::Result<()> {
+        fs::write(
+            path,
+            format!(
+                r#"#!/bin/sh
+case "$1" in
+  version) echo "zmx 0.0.e2e" ;;
+  list) printf 'dev\n' ;;
+  attach)
+    {}
+    stty -echo -icanon min 0 time 100 2>/dev/null || true
+    dd of=/dev/null bs=1024 count=1 2>/dev/null || true
+    ;;
+  kill) echo "killed:$2" ;;
+  *) echo "unknown:$1" >&2; exit 64 ;;
+esac
+"#,
+                chunked_printf_shell(chunks, false)
             ),
         )?;
         let mut perms = fs::metadata(path)?.permissions();
@@ -2005,6 +2208,48 @@ case "$1" in
 esac
 "#,
                 shell_escaped_printf(guest_queries)
+            ),
+        )?;
+        let mut perms = fs::metadata(path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms)?;
+        Ok(())
+    }
+
+    fn write_fake_tmux_e2e_provider_chunks(path: &Path, chunks: &[Vec<u8>]) -> io::Result<()> {
+        let mut output = String::new();
+        for (idx, chunk) in chunks.iter().enumerate() {
+            std::fmt::Write::write_fmt(
+                &mut output,
+                format_args!(
+                    "    printf '\\033P1000p%%output %%1 {}\\r\\n'\n",
+                    shell_escaped_printf(chunk)
+                ),
+            )
+            .expect("write tmux chunk script");
+            if idx + 1 < chunks.len() {
+                output.push_str("    sleep 0.02\n");
+            }
+        }
+        fs::write(
+            path,
+            format!(
+                r#"#!/bin/sh
+case "$1" in
+  -V) echo "tmux 3.6" ;;
+  list-sessions) printf 'dev\n' ;;
+  display-message) exit 1 ;;
+  list-panes) exit 1 ;;
+  kill-session) echo "killed:$3" ;;
+  -CC)
+    stty -echo 2>/dev/null || true
+{output}
+    stty -echo -icanon min 0 time 100 2>/dev/null || true
+    dd of=/dev/null bs=1024 count=1 2>/dev/null || true
+    ;;
+  *) echo "not tmux e2e fixture" >&2; exit 64 ;;
+esac
+"#
             ),
         )?;
         let mut perms = fs::metadata(path)?.permissions();
