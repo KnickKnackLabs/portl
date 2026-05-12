@@ -20,6 +20,19 @@ terminal sessions via `portl/session/v1`, provider discovery,
 zmx-control support, tmux `-CC` compatibility, `PORTL-S-*` short codes
 for importing shared session access through `portl accept`, and stable
 host-suffixed labels for paired machines and saved access.
+
+OSC and escape-sequence leaks across attach, reload, and
+multi-attach scenarios are mitigated by four defense layers: a
+server-side `QueryStripper` wired into every persistent-session
+provider (zmx, tmux, ghostty, raw), the client `HostOutputSanitizer`
+with a query-response extension, the client `StdinResponseFilter` that
+drops echoed terminal-query replies on the input path, and a reload
+pipeline with a stateful sanitizer, UTF-8 boundary snapping, and
+DECAWM preservation across the reload window. The two-host PTY fixture
+under `crates/portl-cli/tests/tuistory_attach.rs` is the canonical
+end-to-end surface for these defenses and exercises per-provider
+attach, reload, multi-attach, DoS fallback, and cross-area replacement
+paths.
 The current CLI vocabulary is:
 
 ```text
