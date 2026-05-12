@@ -757,7 +757,45 @@ mod two_host_fixture {
     use super::*;
 
     const DA1_QUERY: &[u8] = b"\x1b[c";
+    const DA2_QUERY: &[u8] = b"\x1b[>c";
+    const KITTY_QUERY: &[u8] = b"\x1b[?u";
+    const CPR_QUERY: &[u8] = b"\x1b[6n";
+    const SYMPTOM1_QUERIES: &[u8] = b"\x1b[c\x1b[>c\x1b[?u\x1b[6n";
+    const DROID_STARTUP_QUERIES: &[u8] = b"\x1b[c\x1b[>c\x1b[?u";
     const GHOSTTY_DA1: &[u8] = b"\x1b[?62;52;c";
+    const GHOSTTY_DA2: &[u8] = b"\x1b[>1;100;0c";
+    const GHOSTTY_KITTY: &[u8] = b"\x1b[?0u";
+    const GHOSTTY_CPR: &[u8] = b"\x1b[10;5R";
+    const SAFE_STDIN_MARKER: &[u8] = b"SAFE_STDIN_MARKER\n";
+
+    #[derive(Debug, Clone, Copy)]
+    enum E2eProvider {
+        Ghostty,
+        Zmx,
+        Tmux,
+        Raw,
+    }
+
+    impl E2eProvider {
+        const ALL: [Self; 4] = [Self::Ghostty, Self::Zmx, Self::Tmux, Self::Raw];
+
+        fn name(self) -> &'static str {
+            match self {
+                Self::Ghostty => "ghostty",
+                Self::Zmx => "zmx",
+                Self::Tmux => "tmux",
+                Self::Raw => "raw",
+            }
+        }
+
+        fn attach_provider(self) -> &'static str {
+            match self {
+                Self::Ghostty | Self::Raw => "raw",
+                Self::Zmx => "zmx",
+                Self::Tmux => "tmux",
+            }
+        }
+    }
 
     #[test]
     fn fake_host_side_pty_answers_da1_like_ghostty() {
@@ -848,29 +886,135 @@ mod two_host_fixture {
         fixture.detach();
     }
 
+    #[test]
+    fn e2e_symptom1_ghostty_provider_strips_host_answerbacks_from_wire() {
+        assert_symptom1_provider_wire_clean(E2eProvider::Ghostty);
+    }
+
+    #[test]
+    fn e2e_symptom1_zmx_provider_strips_host_answerbacks_from_wire() {
+        assert_symptom1_provider_wire_clean(E2eProvider::Zmx);
+    }
+
+    #[test]
+    fn e2e_symptom1_tmux_provider_strips_host_answerbacks_from_wire() {
+        assert_symptom1_provider_wire_clean(E2eProvider::Tmux);
+    }
+
+    #[test]
+    fn e2e_symptom1_raw_provider_strips_host_answerbacks_from_wire() {
+        assert_symptom1_provider_wire_clean(E2eProvider::Raw);
+    }
+
+    #[test]
+    fn e2e_symptom1_droid_startup_shape_is_clean_on_host_and_wire_for_all_providers() {
+        for provider in E2eProvider::ALL {
+            assert_provider_host_bound_queries_are_stripped(provider, DROID_STARTUP_QUERIES);
+            let mut fixture = TwoHostFixture::spawn_provider(provider, DROID_STARTUP_QUERIES);
+            fixture.wait_for_host_marker_with_answerback(b"E2E_READY", Duration::from_secs(10));
+            fixture.inject_ghostty_answers(&[GHOSTTY_DA1, GHOSTTY_DA2, GHOSTTY_KITTY]);
+            let wire = fixture.wait_for_wire_bytes(SAFE_STDIN_MARKER, Duration::from_secs(10));
+
+            assert_no_query_bytes(&fixture.host_bound, provider.name());
+            assert_no_response_bytes(&wire, provider.name());
+            fixture.detach();
+        }
+    }
+
+    fn assert_symptom1_provider_wire_clean(provider: E2eProvider) {
+        assert_provider_host_bound_queries_are_stripped(provider, SYMPTOM1_QUERIES);
+        let mut fixture = TwoHostFixture::spawn_provider(provider, SYMPTOM1_QUERIES);
+        fixture.wait_for_host_marker_with_answerback(b"E2E_READY", Duration::from_secs(10));
+        fixture.inject_ghostty_answers(&[GHOSTTY_DA1, GHOSTTY_DA2, GHOSTTY_KITTY, GHOSTTY_CPR]);
+        let wire = fixture.wait_for_wire_bytes(SAFE_STDIN_MARKER, Duration::from_secs(10));
+
+        assert_no_response_bytes(&wire, provider.name());
+        fixture.detach();
+    }
+
     struct TwoHostFixture {
         child: HostCommand,
         host_bound: Vec<u8>,
         wire_tap: std::path::PathBuf,
         _home: tempfile::TempDir,
         _agent: RemoteReconnectAgent,
+        _provider_temp: tempfile::TempDir,
     }
 
     impl TwoHostFixture {
         fn spawn(guest_script: &str) -> Self {
+            Self::spawn_raw_script(guest_script)
+        }
+
+        fn spawn_provider(provider: E2eProvider, guest_queries: &[u8]) -> Self {
+            match provider {
+                E2eProvider::Ghostty | E2eProvider::Raw => Self::spawn_remote(
+                    provider,
+                    None,
+                    Some(format!(
+                        "/bin/sh -c \"printf '{}E2E_READY\\r\\n'; sleep 30\"",
+                        shell_escaped_printf(guest_queries)
+                    )),
+                ),
+                E2eProvider::Zmx => {
+                    let temp = tempdir().expect("temp zmx provider fixture");
+                    let provider_path = temp.path().join("zmx");
+                    write_fake_zmx_e2e_provider(&provider_path, guest_queries)
+                        .expect("write fake zmx e2e provider");
+                    Self::spawn_remote_with_temp(provider, Some(provider_path), None, temp)
+                }
+                E2eProvider::Tmux => {
+                    let temp = tempdir().expect("temp tmux provider fixture");
+                    let provider_path = temp.path().join("tmux");
+                    write_fake_tmux_e2e_provider(&provider_path, guest_queries)
+                        .expect("write fake tmux e2e provider");
+                    Self::spawn_remote_with_temp(provider, Some(provider_path), None, temp)
+                }
+            }
+        }
+
+        fn spawn_raw_script(guest_script: &str) -> Self {
+            Self::spawn_remote(
+                E2eProvider::Raw,
+                None,
+                Some(format!("/bin/sh -c {guest_script:?}")),
+            )
+        }
+
+        fn spawn_remote(
+            provider: E2eProvider,
+            provider_path: Option<std::path::PathBuf>,
+            command: Option<String>,
+        ) -> Self {
+            let temp = tempdir().expect("temp provider fixture");
+            Self::spawn_remote_with_temp(provider, provider_path, command, temp)
+        }
+
+        fn spawn_remote_with_temp(
+            provider: E2eProvider,
+            provider_path: Option<std::path::PathBuf>,
+            command: Option<String>,
+            provider_temp: tempfile::TempDir,
+        ) -> Self {
             let portl = assert_cmd::cargo::cargo_bin("portl");
             let home = initialized_portl_home(&portl);
-            let agent = start_remote_reconnect_agent(&portl, home.path());
+            let agent =
+                start_remote_reconnect_agent_with_provider_path(&portl, home.path(), provider_path);
             let session = unique_session("two-host-fixture");
             let wire_tap = home.path().join("wire-bound-input.tap");
             let host_script = r#"
 set +e
-"$PORTL_BIN" attach "$PORTL_SESSION" --target "$PORTL_TARGET_LABEL" --provider raw -- /bin/sh -c "$GUEST_SCRIPT"
+if [ -n "${PORTL_ATTACH_COMMAND:-}" ]; then
+  eval "\"$PORTL_BIN\" attach \"$PORTL_SESSION\" --target \"$PORTL_TARGET_LABEL\" --provider \"$PORTL_PROVIDER\" -- $PORTL_ATTACH_COMMAND"
+else
+  "$PORTL_BIN" attach "$PORTL_SESSION" --target "$PORTL_TARGET_LABEL" --provider "$PORTL_PROVIDER"
+fi
 status=$?
 printf 'HOST_AFTER_ATTACH status=%s\n' "$status"
-"$PORTL_BIN" kill "$PORTL_SESSION" --target "$PORTL_TARGET_LABEL" --provider raw >/dev/null 2>&1 || true
+"$PORTL_BIN" kill "$PORTL_SESSION" --target "$PORTL_TARGET_LABEL" --provider "$PORTL_PROVIDER" >/dev/null 2>&1 || true
 exit 0
 "#;
+            let attach_command = command.unwrap_or_default();
             let child = spawn_host_command(
                 "/bin/bash",
                 &["-lc", host_script],
@@ -879,7 +1023,8 @@ exit 0
                     ("PORTL_HOME", home.path().to_str().expect("home path utf8")),
                     ("PORTL_SESSION", &session),
                     ("PORTL_TARGET_LABEL", REMOTE_TICKET_LABEL),
-                    ("GUEST_SCRIPT", guest_script),
+                    ("PORTL_PROVIDER", provider.attach_provider()),
+                    ("PORTL_ATTACH_COMMAND", &attach_command),
                     (
                         "PORTL_TEST_ATTACH_STDIN_TAP",
                         wire_tap.to_str().expect("tap path utf8"),
@@ -895,6 +1040,7 @@ exit 0
                 wire_tap,
                 _home: home,
                 _agent: agent,
+                _provider_temp: provider_temp,
             }
         }
 
@@ -915,7 +1061,60 @@ exit 0
             }
         }
 
+        fn wait_for_host_marker_with_answerback(&mut self, marker: &[u8], timeout: Duration) {
+            let deadline = Instant::now() + timeout;
+            let mut answered = [false; 4];
+            while Instant::now() < deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match self
+                    .child
+                    .rx
+                    .recv_timeout(remaining.min(Duration::from_millis(100)))
+                {
+                    Ok(chunk) => {
+                        self.host_bound.extend_from_slice(&chunk);
+                        answer_queries_once(&self.host_bound, &self.child.input, &mut answered);
+                        if contains_subslice(&self.host_bound, marker) {
+                            return;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            panic!(
+                "timed out waiting for host marker {} with provider answer-back; host-bound:\n{}",
+                escaped(marker),
+                escaped(&self.host_bound)
+            );
+        }
+
+        fn inject_ghostty_answers(&self, answers: &[&[u8]]) {
+            for answer in answers {
+                write(&self.child.input, answer).expect("inject fake Ghostty answer-back");
+            }
+            write(&self.child.input, SAFE_STDIN_MARKER).expect("inject safe stdin marker");
+        }
+
         fn detach(&mut self) {
+            drain_for(&self.child.rx, &mut self.host_bound, Duration::from_secs(2));
+            if contains_subslice(&self.host_bound, b"HOST_AFTER_ATTACH") {
+                let status = self.child.process.wait().expect("wait host wrapper");
+                assert!(
+                    status.success(),
+                    "host wrapper failed: {status}; transcript:\n{}",
+                    escaped(&self.host_bound)
+                );
+                return;
+            }
+            if let Some(status) = self.child.process.try_wait().expect("poll host wrapper") {
+                assert!(
+                    status.success(),
+                    "host wrapper failed: {status}; transcript:\n{}",
+                    escaped(&self.host_bound)
+                );
+                return;
+            }
             write(&self.child.input, DETACH_KEY).expect("enter attach control mode");
             wait_for_bytes(
                 &self.child.rx,
@@ -960,6 +1159,197 @@ exit 0
         })
     }
 
+    fn answer_queries_once(seen: &[u8], input: &OwnedFd, answered: &mut [bool; 4]) {
+        for (idx, (query, answer)) in [
+            (DA1_QUERY, GHOSTTY_DA1),
+            (DA2_QUERY, GHOSTTY_DA2),
+            (KITTY_QUERY, GHOSTTY_KITTY),
+            (CPR_QUERY, GHOSTTY_CPR),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if !answered[idx] && contains_subslice(seen, query) {
+                write(input, answer).expect("write fake Ghostty answer-back");
+                answered[idx] = true;
+            }
+        }
+    }
+
+    fn assert_no_query_bytes(bytes: &[u8], provider: &str) {
+        for query in [DA1_QUERY, DA2_QUERY, KITTY_QUERY, CPR_QUERY] {
+            assert!(
+                !contains_subslice(bytes, query),
+                "provider {provider} leaked host-bound query {} in:\n{}",
+                escaped(query),
+                escaped(bytes)
+            );
+        }
+    }
+
+    fn assert_no_response_bytes(bytes: &[u8], provider: &str) {
+        assert!(
+            !contains_response_shape(bytes),
+            "provider {provider} leaked response shape on wire-bound tap:\n{}",
+            escaped(bytes)
+        );
+        for forbidden in [
+            b"0u62;52;c".as_slice(),
+            b"62;52;c",
+            b"?62;52;c",
+            b">1;100;0c",
+            b"?0u",
+            b"10;5R",
+            b"\x1b[?62;52;c",
+            b"\x1b[>1;100;0c",
+            b"\x1b[?0u",
+            b"\x1b[10;5R",
+        ] {
+            assert!(
+                !contains_subslice(bytes, forbidden),
+                "provider {provider} leaked forbidden payload {} on wire-bound tap:\n{}",
+                escaped(forbidden),
+                escaped(bytes)
+            );
+        }
+    }
+
+    fn assert_provider_host_bound_queries_are_stripped(provider: E2eProvider, queries: &[u8]) {
+        if matches!(provider, E2eProvider::Ghostty) {
+            let (wire, guest_input) =
+                portl_agent::ghostty_provider_query_strip_capture_for_test(queries)
+                    .expect("ghostty query strip capture");
+            assert_no_query_bytes(&wire, provider.name());
+            assert!(
+                contains_subslice(&guest_input, GHOSTTY_DA1)
+                    || contains_subslice(&guest_input, b"\x1b[?62;1;6;22c"),
+                "ghostty guest PTY input missing DA1 answer:\n{}",
+                escaped(&guest_input)
+            );
+            return;
+        }
+
+        let mut stripper = portl_core::QueryStripper::new();
+        let mut output = stripper.feed(queries);
+        output.extend(stripper.finish());
+        assert_no_query_bytes(&output, provider.name());
+    }
+
+    fn contains_response_shape(bytes: &[u8]) -> bool {
+        let mut offset = 0;
+        while offset + 2 < bytes.len() {
+            if bytes[offset] != 0x1b || bytes[offset + 1] != b'[' {
+                offset += 1;
+                continue;
+            }
+            let body_start = offset + 2;
+            let Some(final_rel) = bytes[body_start..]
+                .iter()
+                .position(|byte| (0x40..=0x7e).contains(byte))
+            else {
+                return false;
+            };
+            let final_byte = bytes[body_start + final_rel];
+            let body = &bytes[body_start..body_start + final_rel];
+            let response = match final_byte {
+                b'c' => body
+                    .strip_prefix(b"?")
+                    .or_else(|| body.strip_prefix(b">"))
+                    .is_some_and(semicolon_digits),
+                b'u' => body.strip_prefix(b"?").is_some_and(colon_semicolon_digits),
+                b'R' => body
+                    .strip_prefix(b"?")
+                    .unwrap_or(body)
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || *byte == b';'),
+                _ => false,
+            };
+            if response {
+                return true;
+            }
+            offset = body_start + final_rel + 1;
+        }
+        false
+    }
+
+    fn semicolon_digits(bytes: &[u8]) -> bool {
+        !bytes.is_empty()
+            && bytes
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || *byte == b';')
+    }
+
+    fn colon_semicolon_digits(bytes: &[u8]) -> bool {
+        !bytes.is_empty()
+            && bytes
+                .iter()
+                .all(|byte| *byte == b':' || *byte == b';' || byte.is_ascii_digit())
+    }
+
+    fn shell_escaped_printf(bytes: &[u8]) -> String {
+        let mut escaped = String::with_capacity(bytes.len() * 4);
+        for byte in bytes {
+            std::fmt::Write::write_fmt(&mut escaped, format_args!("\\{byte:03o}"))
+                .expect("write to String");
+        }
+        escaped
+    }
+
+    fn write_fake_zmx_e2e_provider(path: &Path, guest_queries: &[u8]) -> io::Result<()> {
+        fs::write(
+            path,
+            format!(
+                r#"#!/bin/sh
+case "$1" in
+  version) echo "zmx 0.0.e2e" ;;
+  list) printf 'dev\n' ;;
+  attach)
+    printf '{}E2E_READY\r\n'
+    stty -echo -icanon min 0 time 100 2>/dev/null || true
+    dd of=/dev/null bs=1024 count=1 2>/dev/null || true
+    ;;
+  kill) echo "killed:$2" ;;
+  *) echo "unknown:$1" >&2; exit 64 ;;
+esac
+"#,
+                shell_escaped_printf(guest_queries)
+            ),
+        )?;
+        let mut perms = fs::metadata(path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms)?;
+        Ok(())
+    }
+
+    fn write_fake_tmux_e2e_provider(path: &Path, guest_queries: &[u8]) -> io::Result<()> {
+        fs::write(
+            path,
+            format!(
+                r#"#!/bin/sh
+case "$1" in
+  -V) echo "tmux 3.6" ;;
+  list-sessions) printf 'dev\n' ;;
+  display-message) exit 1 ;;
+  list-panes) exit 1 ;;
+  kill-session) echo "killed:$3" ;;
+  -CC)
+    stty -echo 2>/dev/null || true
+    printf '\033P1000p%%output %%1 {}E2E_READY\\015\\012\r\n'
+    stty -echo -icanon min 0 time 100 2>/dev/null || true
+    dd of=/dev/null bs=1024 count=1 2>/dev/null || true
+    ;;
+  *) echo "not tmux e2e fixture" >&2; exit 64 ;;
+esac
+"#,
+                shell_escaped_printf(guest_queries)
+            ),
+        )?;
+        let mut perms = fs::metadata(path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms)?;
+        Ok(())
+    }
+
     fn set_raw(fd: &OwnedFd) {
         let mut termios = tcgetattr(fd).expect("tcgetattr");
         cfmakeraw(&mut termios);
@@ -971,6 +1361,24 @@ fn start_remote_reconnect_agent(portl: &Path, home: &Path) -> RemoteReconnectAge
     let temp = tempdir().expect("temp remote agent fixture");
     let provider_path = temp.path().join("zmx");
     write_remote_reconnect_zmx(&provider_path).expect("write fake remote zmx provider");
+    start_remote_reconnect_agent_with_temp(portl, home, Some(provider_path), temp)
+}
+
+fn start_remote_reconnect_agent_with_provider_path(
+    portl: &Path,
+    home: &Path,
+    provider_path: Option<std::path::PathBuf>,
+) -> RemoteReconnectAgent {
+    let temp = tempdir().expect("temp remote agent fixture");
+    start_remote_reconnect_agent_with_temp(portl, home, provider_path, temp)
+}
+
+fn start_remote_reconnect_agent_with_temp(
+    portl: &Path,
+    home: &Path,
+    provider_path: Option<std::path::PathBuf>,
+    temp: tempfile::TempDir,
+) -> RemoteReconnectAgent {
     let agent_home = temp.path().join("agent-home");
     let (ready_tx, ready_rx) = mpsc::channel();
     let (stop_tx, stop_rx) = mpsc::channel();
@@ -1006,7 +1414,7 @@ fn start_remote_reconnect_agent(portl: &Path, home: &Path) -> RemoteReconnectAge
 }
 
 async fn start_remote_reconnect_agent_async(
-    provider_path: std::path::PathBuf,
+    provider_path: Option<std::path::PathBuf>,
     agent_home: std::path::PathBuf,
     stop_rx: mpsc::Receiver<()>,
     ready_tx: mpsc::Sender<Result<String, String>>,
@@ -1020,7 +1428,7 @@ async fn start_remote_reconnect_agent_async(
         peers_path: Some(paths.peers_path()),
         revocations_path: Some(paths.revocations_path()),
         endpoint: Some(server.clone()),
-        session_provider_path: Some(provider_path),
+        session_provider_path: provider_path,
         ..AgentConfig::default()
     })
     .await?;
