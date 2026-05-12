@@ -1702,20 +1702,7 @@ fn trim_partial_replay_prefix(mut bytes: Vec<u8>) -> Vec<u8> {
 }
 
 #[cfg(unix)]
-fn bracket_reload_replay_chunk(
-    mut bytes: Vec<u8>,
-    first_chunk: bool,
-    final_chunk: bool,
-) -> Vec<u8> {
-    if first_chunk {
-        let mut framed = Vec::with_capacity(bytes.len().saturating_add(8));
-        framed.extend_from_slice(b"\x1b[0m");
-        framed.append(&mut bytes);
-        bytes = framed;
-    }
-    if final_chunk {
-        bytes.extend_from_slice(b"\x1b[0m");
-    }
+fn bracket_reload_replay_chunk(bytes: Vec<u8>, _first_chunk: bool, _final_chunk: bool) -> Vec<u8> {
     bytes
 }
 
@@ -3765,6 +3752,22 @@ mod tests {
     }
 
     #[test]
+    fn reload_replay_chunk_bracketing_does_not_inject_sgr_resets() {
+        assert_eq!(
+            bracket_reload_replay_chunk(b"abc".to_vec(), true, false),
+            b"abc"
+        );
+        assert_eq!(
+            bracket_reload_replay_chunk(b"def".to_vec(), false, true),
+            b"def"
+        );
+        assert_eq!(
+            bracket_reload_replay_chunk(b"ghi".to_vec(), true, true),
+            b"ghi"
+        );
+    }
+
+    #[test]
     fn da1_da2_and_kitty_flag_query_replies_are_queued_to_guest_pty_input_not_broadcast_to_host()
     -> Result<()> {
         let mut terminal = GhosttyTerminalIo::new(TerminalOptions {
@@ -4441,7 +4444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reload_job_brackets_replay_with_sgr_reset() -> Result<()> {
+    async fn reload_job_leaves_sgr_framing_to_client_reload_coordinator() -> Result<()> {
         let history = VecDeque::from(b"\x1b[2mdimmed".to_vec());
         let (tx, mut rx) = mpsc::channel(4);
         let mut job = GhosttyReloadJob::new(3, 0, history.len(), tx, 1, false);
@@ -4455,13 +4458,9 @@ mod tests {
             bail!("missing reload chunk");
         };
 
-        assert!(
-            bytes.starts_with(b"\x1b[0m"),
-            "reload replay must start from a known SGR state: {bytes:?}"
-        );
-        assert!(
-            bytes.ends_with(b"\x1b[0m"),
-            "reload replay must not leak SGR state into the viewport/live stream: {bytes:?}"
+        assert_eq!(
+            bytes, b"\x1b[2mdimmed",
+            "reload chunks must not inject per-chunk SGR resets: {bytes:?}"
         );
         Ok(())
     }

@@ -3550,7 +3550,7 @@ async fn run_remote_attach_v2_once(
         mut live,
         mut history,
     } = session;
-    let reload_state = Arc::new(StdMutex::new(AttachV2ReloadState::default()));
+    let reload_state = Arc::new(StdMutex::new(ReloadCoordinator::default()));
     let (initial_cols, initial_rows) = display.size().await;
     let resize_state = Arc::new(StdMutex::new(AttachV2ResizeState {
         resize_id: 0,
@@ -3591,6 +3591,7 @@ async fn run_remote_attach_v2_once(
                         display,
                         &reload_state,
                         &mut resync_pending,
+                        mode_tracker,
                     ).await {
                         Ok(Some(end)) => break end,
                         Ok(None) => {}
@@ -3611,16 +3612,15 @@ async fn run_remote_attach_v2_once(
                             cols,
                             rows,
                             current_resize_state(&resize_state),
-                            reload_state.lock().map_or(AttachV2ReloadState::Idle, |state| *state),
+                            reload_state.lock().map_or(AttachV2ReloadState::Idle, |state| state.state()),
                         ) {
                             AttachV2ViewportDecision::Render => {
-                                last_viewport_generation = generation;
-                                covered_live_seq = covered_live_seq.max(covers_live_seq);
-                                resync_pending = false;
-                                opening_state.mark_viewport_seen();
-                                clear_reload_after_viewport(&reload_state);
                                 match payload.decode(ATTACH_V2_MAX_DECODED_PAYLOAD) {
                                     Ok(bytes) => {
+                                        last_viewport_generation = generation;
+                                        covered_live_seq = covered_live_seq.max(covers_live_seq);
+                                        resync_pending = false;
+                                        opening_state.mark_viewport_seen();
                                         trace!(
                                             lane = "viewport",
                                             generation,
@@ -3634,6 +3634,42 @@ async fn run_remote_attach_v2_once(
                                         if let Err(err) = write_tracked_output(display, AttachOutputStream::Stdout, &bytes, mode_tracker).await {
                                             break AttachEnd::Disconnected(err);
                                         }
+                                        let queued_live = finish_reload_after_viewport(
+                                            &reload_state,
+                                            covers_live_seq,
+                                            bytes,
+                                        );
+                                        let mut queued_live_end = None;
+                                        for live in queued_live {
+                                            if live.start_seq > covered_live_seq {
+                                                let _ = display
+                                                    .set_bar("▌ Portl › resyncing after reload live sequence gap".to_owned())
+                                                    .await;
+                                                resync_pending = true;
+                                                if let Err(err) = coordinator.request_viewport("reload_live_seq_gap").await {
+                                                    queued_live_end =
+                                                        Some(AttachEnd::Disconnected(err));
+                                                    break;
+                                                }
+                                                break;
+                                            }
+                                            covered_live_seq = live.end_seq;
+                                            trace!(
+                                                lane = "live",
+                                                start_seq = live.start_seq,
+                                                end_seq = live.end_seq,
+                                                bytes = live.bytes.len(),
+                                                "render queued attach v2 live output after reload"
+                                            );
+                                            if let Err(err) = write_tracked_output(display, AttachOutputStream::Stdout, &live.bytes, mode_tracker).await {
+                                                queued_live_end =
+                                                    Some(AttachEnd::Disconnected(err));
+                                                break;
+                                            }
+                                        }
+                                        if let Some(end) = queued_live_end {
+                                            break end;
+                                        }
                                         let _ = display.clear_bar().await;
                                     }
                                     Err(err) => break AttachEnd::Disconnected(err),
@@ -3645,7 +3681,7 @@ async fn run_remote_attach_v2_once(
                                     resize_id,
                                     cols,
                                     rows,
-                                    reload_state = ?reload_state.lock().map(|state| *state).ok(),
+                                    reload_state = ?reload_state.lock().map(|state| state.state()).ok(),
                                     "ignored attach v2 viewport snapshot while reload is loading"
                                 );
                             }
@@ -3722,7 +3758,18 @@ async fn run_remote_attach_v2_once(
             }
             frame = read_attach_v2_frame(&mut live), if data_streams.live_open() => {
                 match frame {
-                    Ok(Some(AttachV2ServerFrame::LiveOutput { attach_id: frame_attach_id, start_seq, end_seq, payload, .. })) if frame_attach_id == attach_id && active_reload_id(&reload_state).is_none() && !resync_pending && end_seq > covered_live_seq => {
+                    Ok(Some(AttachV2ServerFrame::LiveOutput { attach_id: frame_attach_id, start_seq, end_seq, payload, .. })) if frame_attach_id == attach_id && !resync_pending && end_seq > covered_live_seq => {
+                        if active_reload_id(&reload_state).is_some() {
+                            match payload.decode(ATTACH_V2_MAX_DECODED_PAYLOAD) {
+                                Ok(bytes) => {
+                                    if let Ok(mut coordinator) = reload_state.lock() {
+                                        let _ = coordinator.handle_live_output(start_seq, end_seq, bytes);
+                                    }
+                                }
+                                Err(err) => break AttachEnd::Disconnected(err),
+                            }
+                            continue;
+                        }
                         if start_seq > covered_live_seq {
                             let _ = display
                                 .set_bar("▌ Portl › resyncing after live sequence gap".to_owned())
@@ -3785,20 +3832,20 @@ async fn read_attach_v2_frame(recv: &mut BufferedRecv) -> Result<Option<AttachV2
         .await
 }
 
-fn active_reload_id(reload_state: &Arc<StdMutex<AttachV2ReloadState>>) -> Option<u64> {
+fn active_reload_id(reload_state: &Arc<StdMutex<ReloadCoordinator>>) -> Option<u64> {
     reload_state
         .lock()
         .map_or(None, |state| state.active_reload_id())
 }
 
-fn cancellable_reload_id(reload_state: &Arc<StdMutex<AttachV2ReloadState>>) -> Option<u64> {
+fn cancellable_reload_id(reload_state: &Arc<StdMutex<ReloadCoordinator>>) -> Option<u64> {
     reload_state
         .lock()
         .map_or(None, |state| state.cancellable_reload_id())
 }
 
 fn active_reload_accepts_chunk(
-    reload_state: &Arc<StdMutex<AttachV2ReloadState>>,
+    reload_state: &Arc<StdMutex<ReloadCoordinator>>,
     reload_id: u64,
 ) -> bool {
     reload_state
@@ -3806,31 +3853,36 @@ fn active_reload_accepts_chunk(
         .is_ok_and(|state| state.accepts_chunk(reload_id))
 }
 
-fn start_active_reload(reload_state: &Arc<StdMutex<AttachV2ReloadState>>, reload_id: u64) {
+fn start_active_reload(reload_state: &Arc<StdMutex<ReloadCoordinator>>, reload_id: u64) {
     if let Ok(mut state) = reload_state.lock() {
         state.start(reload_id);
     }
 }
 
-fn mark_reload_done(reload_state: &Arc<StdMutex<AttachV2ReloadState>>, reload_id: u64) -> bool {
+fn mark_reload_done(reload_state: &Arc<StdMutex<ReloadCoordinator>>, reload_id: u64) -> bool {
     reload_state
         .lock()
         .is_ok_and(|mut state| state.mark_done(reload_id))
 }
 
-fn mark_reload_cancelled(
-    reload_state: &Arc<StdMutex<AttachV2ReloadState>>,
-    reload_id: u64,
-) -> bool {
+fn mark_reload_cancelled(reload_state: &Arc<StdMutex<ReloadCoordinator>>, reload_id: u64) -> bool {
     reload_state
         .lock()
         .is_ok_and(|mut state| state.mark_cancelled(reload_id))
 }
 
-fn clear_reload_after_viewport(reload_state: &Arc<StdMutex<AttachV2ReloadState>>) -> bool {
+fn finish_reload_after_viewport(
+    reload_state: &Arc<StdMutex<ReloadCoordinator>>,
+    covers_live_seq: u64,
+    bytes: Vec<u8>,
+) -> Vec<QueuedLiveOutput> {
     reload_state
         .lock()
-        .is_ok_and(|mut state| state.clear_after_viewport())
+        .map(|mut state| {
+            state.record_post_reload_viewport(covers_live_seq, bytes);
+            state.drain_queued_live(covers_live_seq)
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Default)]
@@ -3849,6 +3901,139 @@ impl AttachV2OpeningState {
 
     fn mark_viewport_barrier_seen(&mut self) {
         self.viewport_seen = true;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueuedLiveOutput {
+    start_seq: u64,
+    end_seq: u64,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PostReloadViewport {
+    covers_live_seq: u64,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReloadLiveDecision {
+    Render,
+    Queued,
+}
+
+#[derive(Debug, Default)]
+struct ReloadCoordinator {
+    state: AttachV2ReloadState,
+    queued_live: VecDeque<QueuedLiveOutput>,
+    post_reload_viewport: Option<PostReloadViewport>,
+}
+
+impl ReloadCoordinator {
+    fn state(&self) -> AttachV2ReloadState {
+        self.state
+    }
+
+    fn start(&mut self, reload_id: u64) {
+        if self.active_reload_id() == Some(reload_id) {
+            return;
+        }
+        self.state.start(reload_id);
+        self.queued_live.clear();
+        self.post_reload_viewport = None;
+    }
+
+    fn active_reload_id(&self) -> Option<u64> {
+        self.state.active_reload_id()
+    }
+
+    fn cancellable_reload_id(&self) -> Option<u64> {
+        self.state.cancellable_reload_id()
+    }
+
+    fn accepts_chunk(&self, reload_id: u64) -> bool {
+        self.state.accepts_chunk(reload_id)
+    }
+
+    fn mark_done(&mut self, reload_id: u64) -> bool {
+        self.state.mark_done(reload_id)
+    }
+
+    fn mark_cancelled(&mut self, reload_id: u64) -> bool {
+        self.queued_live.clear();
+        self.state.mark_cancelled(reload_id)
+    }
+
+    fn is_reloading(&self) -> bool {
+        self.active_reload_id().is_some()
+    }
+
+    fn handle_live_output(
+        &mut self,
+        start_seq: u64,
+        end_seq: u64,
+        bytes: Vec<u8>,
+    ) -> ReloadLiveDecision {
+        if !self.is_reloading() {
+            return ReloadLiveDecision::Render;
+        }
+        self.queued_live.push_back(QueuedLiveOutput {
+            start_seq,
+            end_seq,
+            bytes,
+        });
+        ReloadLiveDecision::Queued
+    }
+
+    fn record_post_reload_viewport(&mut self, covers_live_seq: u64, bytes: Vec<u8>) {
+        if matches!(self.state, AttachV2ReloadState::AwaitingViewport { .. }) {
+            self.post_reload_viewport = Some(PostReloadViewport {
+                covers_live_seq,
+                bytes,
+            });
+        }
+    }
+
+    fn drain_queued_live(&mut self, covered_live_seq: u64) -> Vec<QueuedLiveOutput> {
+        let mut covered = self
+            .post_reload_viewport
+            .as_ref()
+            .map_or(covered_live_seq, |viewport| {
+                let _ = viewport.bytes.len();
+                covered_live_seq.max(viewport.covers_live_seq)
+            });
+        let mut drained = Vec::new();
+        while let Some(mut live) = self.queued_live.pop_front() {
+            if live.end_seq <= covered {
+                continue;
+            }
+            if live.start_seq < covered {
+                let skip = usize::try_from(covered.saturating_sub(live.start_seq))
+                    .unwrap_or(usize::MAX)
+                    .min(live.bytes.len());
+                live.bytes = live.bytes[skip..].to_vec();
+                live.start_seq = covered;
+            }
+            covered = live.end_seq;
+            if !live.bytes.is_empty() {
+                drained.push(live);
+            }
+        }
+        let _ = self.state.clear_after_viewport();
+        drained
+    }
+
+    #[cfg(test)]
+    fn queued_live_len(&self) -> usize {
+        self.queued_live.len()
+    }
+
+    #[cfg(test)]
+    fn post_reload_viewport_len(&self) -> Option<usize> {
+        self.post_reload_viewport
+            .as_ref()
+            .map(|viewport| viewport.bytes.len())
     }
 }
 
@@ -4094,8 +4279,9 @@ fn attach_v2_frame_matches(frame: &AttachV2ServerFrame, attach_id: [u8; 16]) -> 
 async fn handle_attach_v2_control_frame(
     frame: AttachV2ServerFrame,
     display: &AttachDisplay,
-    reload_state: &Arc<StdMutex<AttachV2ReloadState>>,
+    reload_state: &Arc<StdMutex<ReloadCoordinator>>,
     resync_pending: &mut bool,
+    mode_tracker: &SharedTerminalModeTracker,
 ) -> Result<Option<AttachEnd>> {
     match frame {
         AttachV2ServerFrame::ReloadStarted {
@@ -4104,6 +4290,13 @@ async fn handle_attach_v2_control_frame(
             ..
         } => {
             start_active_reload(reload_state, reload_id);
+            write_tracked_output(
+                display,
+                AttachOutputStream::Stdout,
+                b"\x1b[0m",
+                mode_tracker,
+            )
+            .await?;
             let text = total_bytes.map_or_else(
                 || "▌ Portl › reloading · Esc cancel".to_owned(),
                 |total| format!("▌ Portl › reloading 0 / {total} bytes · Esc cancel"),
@@ -4113,6 +4306,13 @@ async fn handle_attach_v2_control_frame(
         }
         AttachV2ServerFrame::ReloadDone { reload_id, .. } => {
             if mark_reload_done(reload_state, reload_id) {
+                write_tracked_output(
+                    display,
+                    AttachOutputStream::Stdout,
+                    b"\x1b[0m",
+                    mode_tracker,
+                )
+                .await?;
                 display
                     .set_bar("▌ Portl › reload complete · refreshing viewport".to_owned())
                     .await?;
@@ -6508,7 +6708,7 @@ enum AttachInputSinkKind {
         next_resize_id: u64,
         next_reload_id: u64,
         resize_state: Arc<StdMutex<AttachV2ResizeState>>,
-        reload_state: Arc<StdMutex<AttachV2ReloadState>>,
+        reload_state: Arc<StdMutex<ReloadCoordinator>>,
     },
     Zmx {
         stdin: ChildStdin,
@@ -7025,6 +7225,109 @@ mod tests {
         assert!(!state.allows_viewport_render());
         assert!(state.mark_cancelled(8));
         assert!(state.allows_viewport_render());
+    }
+
+    #[test]
+    fn reload_coordinator_queues_live_until_post_reload_viewport_and_dedups() {
+        let mut coordinator = ReloadCoordinator::default();
+
+        coordinator.start(42);
+        assert!(coordinator.is_reloading());
+        assert_eq!(
+            coordinator.handle_live_output(3, 8, b"loNEW".to_vec()),
+            ReloadLiveDecision::Queued
+        );
+        coordinator.start(42);
+        assert_eq!(coordinator.queued_live_len(), 1);
+
+        assert!(coordinator.mark_done(42));
+        coordinator.record_post_reload_viewport(5, b"hello".to_vec());
+
+        let drained = coordinator.drain_queued_live(5);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].bytes, b"NEW");
+        assert_eq!(drained[0].end_seq, 8);
+        assert!(!coordinator.is_reloading());
+        assert_eq!(coordinator.queued_live_len(), 0);
+        assert_eq!(coordinator.post_reload_viewport_len(), Some(5));
+    }
+
+    #[test]
+    fn reload_coordinator_suppresses_catching_up_live_covered_by_viewport() {
+        let mut coordinator = ReloadCoordinator::default();
+
+        coordinator.start(7);
+        assert_eq!(
+            coordinator.handle_live_output(0, 5, b"hello".to_vec()),
+            ReloadLiveDecision::Queued
+        );
+        assert!(coordinator.mark_done(7));
+        coordinator.record_post_reload_viewport(5, b"hello".to_vec());
+
+        let drained = coordinator.drain_queued_live(5);
+        assert!(drained.is_empty());
+        assert!(!coordinator.is_reloading());
+    }
+
+    #[test]
+    fn reload_coordinator_empty_history_completes_after_viewport() {
+        let mut coordinator = ReloadCoordinator::default();
+
+        coordinator.start(11);
+        assert!(coordinator.mark_done(11));
+        coordinator.record_post_reload_viewport(0, Vec::new());
+        assert!(coordinator.drain_queued_live(0).is_empty());
+
+        assert!(!coordinator.is_reloading());
+        assert_eq!(
+            coordinator.handle_live_output(0, 4, b"live".to_vec()),
+            ReloadLiveDecision::Render
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attach_v2_reload_control_frames_emit_one_sgr_reset_each() {
+        let display = AttachDisplay::new(80, 24);
+        display.inner.lock().await.gate.set_holding(true);
+        let reload_state = Arc::new(StdMutex::new(ReloadCoordinator::default()));
+        let tracker = new_terminal_mode_tracker();
+        let mut resync_pending = false;
+        let attach_id = [7_u8; 16];
+
+        handle_attach_v2_control_frame(
+            AttachV2ServerFrame::ReloadStarted {
+                attach_id,
+                reload_id: 1,
+                total_bytes: Some(10),
+            },
+            &display,
+            &reload_state,
+            &mut resync_pending,
+            &tracker,
+        )
+        .await
+        .unwrap();
+        handle_attach_v2_control_frame(
+            AttachV2ServerFrame::ReloadDone {
+                attach_id,
+                reload_id: 1,
+                final_generation: 2,
+            },
+            &display,
+            &reload_state,
+            &mut resync_pending,
+            &tracker,
+        )
+        .await
+        .unwrap();
+
+        let output = display.inner.lock().await.gate.take_stdout();
+        let reset_count = output
+            .windows(b"\x1b[0m".len())
+            .filter(|window| *window == b"\x1b[0m")
+            .count();
+        assert_eq!(reset_count, 2, "stdout output: {output:?}");
     }
 
     #[test]
