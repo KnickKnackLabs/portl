@@ -558,6 +558,45 @@ async fn session_tmux_control_attach_strips_terminal_queries_without_answers() -
 }
 
 #[tokio::test]
+async fn session_raw_shell_attach_strips_terminal_queries_without_answers() -> Result<()> {
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator, None).await?;
+    let ticket = root_ticket(&operator, server.addr(), shell_caps(true));
+
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let mut attach = open_session_attach(
+        &connection,
+        &session,
+        Some("raw".to_owned()),
+        "raw".to_owned(),
+        Some(vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "printf 'pre\\033[c\\033[>c\\033[6n\\033[?u\\033[>1u\\033[=15u\\033[<upost'".to_owned(),
+        ]),
+        None,
+        None,
+        PtyCfg {
+            term: "xterm-256color".to_owned(),
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await?;
+    attach.close_stdin()?;
+    let mut attached = Vec::new();
+    AsyncReadExt::read_to_end(&mut attach.stdout, &mut attached).await?;
+
+    assert_eq!(attached, b"prepost");
+    assert_no_query_bytes(&attached);
+    assert_no_response_bytes(&attached);
+    assert_eq!(attach.wait_exit().await?, 0);
+
+    shutdown(connection, client, server, agent).await
+}
+
+#[tokio::test]
 async fn session_provider_command_failure_returns_session_ack() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let fake_zmx = temp.path().join("zmx");

@@ -483,6 +483,80 @@ async fn serve_attach(
         .await;
     }
 
+    if selected == SelectedProvider::Raw {
+        if raw_shell_missing_explicit_argv(&req) {
+            let reason = SessionReason::MissingArgv;
+            record_session_attach_rejection("raw", &reason);
+            write_ack(&mut send, reject(reason)).await?;
+            let _ = send.finish();
+            return Ok(());
+        }
+        let shell_req = portl_proto::shell_v1::ShellReq {
+            preamble: portl_proto::wire::StreamPreamble {
+                peer_token: session.peer_token,
+                alpn: String::from_utf8_lossy(portl_proto::shell_v1::ALPN_SHELL_V1).into_owned(),
+            },
+            mode: portl_proto::shell_v1::ShellMode::Shell,
+            argv: req.argv,
+            env_patch: Vec::new(),
+            cwd: workload_context.cwd,
+            pty: req.pty,
+            user: req.user,
+        };
+        let session_id = rand::random::<[u8; 16]>();
+        let audit_session_id = hex::encode(session_id);
+        let process = match spawn_raw_shell_process(
+            &session,
+            &shell_req,
+            requested_user.as_ref(),
+            &audit_session_id,
+        ) {
+            Ok(process) => process,
+            Err(err) => {
+                let reason = SessionReason::SpawnFailed(err);
+                record_session_attach_rejection("raw", &reason);
+                write_ack(&mut send, reject(reason)).await?;
+                let _ = send.finish();
+                return Ok(());
+            }
+        };
+        process.set_started_at(Instant::now());
+        state
+            .shell_registry
+            .insert(session_id, Arc::clone(&process));
+        let _guard = SessionRegistryGuard {
+            state: Arc::clone(&state),
+            session_id,
+        };
+        write_ack(
+            &mut send,
+            SessionAck {
+                ok: true,
+                reason: None,
+                session_id: Some(session_id),
+                provider: Some("raw".to_owned()),
+                providers: None,
+                sessions: None,
+                session_entries: None,
+                session_groups: None,
+                run: None,
+                output: None,
+            },
+        )
+        .await?;
+        let mut control_buffer = [0_u8; 1024];
+        loop {
+            let read = recv
+                .read(&mut control_buffer)
+                .await
+                .context("read session control")?;
+            if read == 0 {
+                let _ = send.finish();
+                return Ok(());
+            }
+        }
+    }
+
     if req.user.is_none() && zmx.control_available().await? {
         let name = name.to_owned();
         return serve_control_attach(
@@ -631,6 +705,22 @@ async fn serve_ghostty_attach(
             return Ok(());
         }
     }
+}
+
+fn raw_shell_missing_explicit_argv(req: &SessionReq) -> bool {
+    req.provider.as_deref() == Some("raw") && req.argv.as_ref().is_some_and(Vec::is_empty)
+}
+
+fn spawn_raw_shell_process(
+    session: &Session,
+    req: &portl_proto::shell_v1::ShellReq,
+    requested_user: Option<&RequestedUser>,
+    audit_session_id: &str,
+) -> std::result::Result<Arc<ShellProcess>, String> {
+    let process = spawn_process(session, req, requested_user, audit_session_id)
+        .map_err(|err| format!("{:?}", err.wire))?;
+    process.enable_stdout_query_stripping();
+    Ok(process)
 }
 
 #[cfg(feature = "ghostty-vt")]
@@ -1439,6 +1529,7 @@ enum SelectedProvider {
     Ghostty,
     Zmx,
     Tmux,
+    Raw,
 }
 
 impl SelectedProvider {
@@ -1448,6 +1539,7 @@ impl SelectedProvider {
             Self::Ghostty => "ghostty",
             Self::Zmx => "zmx",
             Self::Tmux => "tmux",
+            Self::Raw => "raw",
         }
     }
 
@@ -1461,6 +1553,7 @@ impl SelectedProvider {
             Self::Ghostty => GhosttyProvider::new().list_detailed().await,
             Self::Zmx => zmx.list_detailed().await,
             Self::Tmux => tmux.list_detailed().await,
+            Self::Raw => bail!("raw provider does not support list"),
         }
     }
 
@@ -1478,6 +1571,7 @@ impl SelectedProvider {
             Self::Ghostty => GhosttyProvider::new().run(session, cwd, argv, None).await,
             Self::Zmx => zmx.run(session, argv).await,
             Self::Tmux => bail!("tmux provider does not support run"),
+            Self::Raw => bail!("raw provider does not support run"),
         }
     }
 
@@ -1492,6 +1586,7 @@ impl SelectedProvider {
             Self::Ghostty => GhosttyProvider::new().history(session).await,
             Self::Zmx => zmx.history(session).await,
             Self::Tmux => tmux.history(session).await,
+            Self::Raw => bail!("raw provider does not support history"),
         }
     }
 
@@ -1506,6 +1601,7 @@ impl SelectedProvider {
             Self::Ghostty => GhosttyProvider::new().kill(session).await,
             Self::Zmx => zmx.kill(session).await,
             Self::Tmux => tmux.kill(session).await,
+            Self::Raw => bail!("raw provider does not support kill"),
         }
     }
 }
@@ -1529,6 +1625,15 @@ async fn aggregate_session_entries(
             SelectedProvider::Ghostty => GhosttyProvider::new().status(),
             SelectedProvider::Zmx => zmx.probe().await?,
             SelectedProvider::Tmux => tmux.probe().await?,
+            SelectedProvider::Raw => portl_proto::session_v1::ProviderStatus {
+                name: "raw".to_owned(),
+                available: true,
+                path: None,
+                notes: Some("one-shot PTY fallback".to_owned()),
+                capabilities: portl_proto::session_v1::ProviderCapabilities::raw(),
+                tier: Some("raw".to_owned()),
+                features: Vec::new(),
+            },
         };
         if !status.available {
             continue;
@@ -1619,6 +1724,7 @@ async fn select_provider(
                     ensure_available(tmux.probe().await, "tmux", SelectedProvider::Tmux)
                 }
             }
+            "raw" if op == SessionOp::Attach => Ok(SelectedProvider::Raw),
             "raw" => Err(SessionReason::CapabilityUnsupported {
                 provider: provider.to_owned(),
                 capability: op_name(op).to_owned(),
@@ -1897,6 +2003,98 @@ mod tests {
             .map_err(|reason| anyhow::anyhow!("unexpected rejection: {reason:?}"))?;
 
         assert_eq!(selected.name(), "zmx");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_shell_provider_is_selectable_for_attach_only() -> Result<()> {
+        let zmx = provider::ZmxProvider::new(None);
+        let tmux = provider::TmuxProvider::new(None);
+
+        let selected = select_provider(&zmx, &tmux, Some("raw"), SessionOp::Attach)
+            .await
+            .map_err(|reason| anyhow::anyhow!("unexpected rejection: {reason:?}"))?;
+
+        assert_eq!(selected.name(), "raw");
+        assert!(matches!(
+            select_provider(&zmx, &tmux, Some("raw"), SessionOp::Run).await,
+            Err(SessionReason::CapabilityUnsupported { .. })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_shell_process_enables_stdout_query_stripping() -> Result<()> {
+        let session = Session {
+            peer_token: [0; 16],
+            caps: portl_core::ticket::schema::Capabilities {
+                presence: 0,
+                shell: None,
+                tcp: None,
+                udp: None,
+                fs: None,
+                vpn: None,
+                meta: None,
+            },
+            ticket_id: [1; 16],
+            ticket_chain_ids: Vec::new(),
+            caller_endpoint_id: [2; 32],
+            bearer: None,
+        };
+        let req = portl_proto::shell_v1::ShellReq {
+            preamble: portl_proto::wire::StreamPreamble {
+                peer_token: session.peer_token,
+                alpn: String::from_utf8_lossy(portl_proto::shell_v1::ALPN_SHELL_V1).into_owned(),
+            },
+            mode: portl_proto::shell_v1::ShellMode::Shell,
+            argv: Some(vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "printf done".to_owned(),
+            ]),
+            env_patch: Vec::new(),
+            cwd: None,
+            pty: Some(portl_proto::shell_v1::PtyCfg {
+                term: "xterm-256color".to_owned(),
+                cols: 80,
+                rows: 24,
+            }),
+            user: None,
+        };
+
+        let process = spawn_raw_shell_process(&session, &req, None, "raw-strip-test")
+            .map_err(|err| anyhow::anyhow!("unexpected spawn error: {err}"))?;
+
+        assert!(process.strip_stdout_queries());
+        let _ = process.stdin_tx.send(StdinMessage::Close).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_shell_rejects_empty_explicit_argv_before_spawn() -> Result<()> {
+        let req = SessionReq {
+            preamble: portl_proto::wire::StreamPreamble {
+                peer_token: [0; 16],
+                alpn: String::from_utf8_lossy(ALPN_SESSION_V1).into_owned(),
+            },
+            op: SessionOp::Attach,
+            provider: Some("raw".to_owned()),
+            session_name: Some("raw".to_owned()),
+            user: None,
+            cwd: None,
+            argv: Some(Vec::new()),
+            pty: Some(portl_proto::shell_v1::PtyCfg {
+                term: "xterm-256color".to_owned(),
+                cols: 80,
+                rows: 24,
+            }),
+            attach_v2: None,
+        };
+
+        assert!(raw_shell_missing_explicit_argv(&req));
+        let mut default_shell_req = req;
+        default_shell_req.argv = None;
+        assert!(!raw_shell_missing_explicit_argv(&default_shell_req));
         Ok(())
     }
 

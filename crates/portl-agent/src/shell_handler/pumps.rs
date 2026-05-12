@@ -186,6 +186,35 @@ pub(crate) async fn pump_exit(mut send: SendStream, process: &ShellProcess) -> R
 mod tests {
     use super::output_chunk_for_wire;
 
+    const ALL_QUERY_FORMS_CHUNK: &[u8] =
+        b"pre\x1b[c\x1b[>c\x1b[6n\x1b[?u\x1b[>1u\x1b[=15u\x1b[<umiddle\x1b[c\x1b[?upost";
+    const EXPECTED_STRIPPED_CHUNK: &[u8] = b"premiddlepost";
+
+    #[derive(Debug, Clone, Copy)]
+    enum TestProvider {
+        Ghostty,
+        Zmx,
+        Tmux,
+        RawShell,
+    }
+
+    impl TestProvider {
+        const ALL: [Self; 4] = [Self::Ghostty, Self::Zmx, Self::Tmux, Self::RawShell];
+        const NON_GHOSTTY: [Self; 3] = [Self::Zmx, Self::Tmux, Self::RawShell];
+    }
+
+    fn stripped_wire_capture(chunks: &[&[u8]]) -> Vec<u8> {
+        let mut stripper = Some(portl_core::QueryStripper::new());
+        let mut output = Vec::new();
+        for chunk in chunks {
+            output.extend(output_chunk_for_wire(&mut stripper, chunk.to_vec()));
+        }
+        if let Some(stripper) = stripper.as_mut() {
+            output.extend(stripper.finish());
+        }
+        output
+    }
+
     #[test]
     fn zmx_stdout_query_stripper_removes_queries_and_keeps_surrounding_bytes() {
         let mut stripper = Some(portl_core::QueryStripper::new());
@@ -222,5 +251,86 @@ mod tests {
                 .windows(b"hello".len())
                 .any(|window| window == b"hello")
         );
+    }
+
+    #[test]
+    fn raw_shell_stdout_query_stripper_removes_all_queries_in_single_chunk() {
+        let output = stripped_wire_capture(&[ALL_QUERY_FORMS_CHUNK]);
+
+        assert_eq!(output, EXPECTED_STRIPPED_CHUNK);
+        for query in [
+            b"\x1b[c".as_slice(),
+            b"\x1b[>c",
+            b"\x1b[6n",
+            b"\x1b[?u",
+            b"\x1b[>1u",
+            b"\x1b[=15u",
+            b"\x1b[<u",
+        ] {
+            assert!(!output.windows(query.len()).any(|window| window == query));
+        }
+    }
+
+    #[test]
+    fn raw_shell_stdout_query_stripper_survives_large_query_burst() {
+        let mut burst = Vec::from(&b"pre"[..]);
+        for _ in 0..120 {
+            burst.extend_from_slice(b"\x1b[c\x1b[>c\x1b[6n\x1b[?u\x1b[>1u\x1b[=15u\x1b[<u");
+        }
+        burst.extend_from_slice(b"post");
+
+        let output = stripped_wire_capture(&[&burst]);
+
+        assert_eq!(output, b"prepost");
+    }
+
+    #[test]
+    fn provider_parity_strips_all_queries_from_single_chunk_for_every_provider() {
+        for provider in TestProvider::ALL {
+            let output = stripped_wire_capture(&[ALL_QUERY_FORMS_CHUNK]);
+
+            assert_eq!(
+                output, EXPECTED_STRIPPED_CHUNK,
+                "provider {provider:?} should strip all query forms"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_parity_non_ghostty_large_bursts_silent_consume_without_panic() {
+        let mut burst = Vec::from(&b"before"[..]);
+        for _ in 0..120 {
+            burst.extend_from_slice(b"\x1b[c\x1b[>c\x1b[6n\x1b[?u\x1b[>1u\x1b[=15u\x1b[<u");
+        }
+        burst.extend_from_slice(b"after");
+
+        for provider in TestProvider::NON_GHOSTTY {
+            let output = stripped_wire_capture(&[&burst]);
+
+            assert_eq!(
+                output, b"beforeafter",
+                "provider {provider:?} should silently consume query bursts"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_parity_wire_capture_is_byte_equal_across_providers() {
+        let chunks = [
+            b"pre\x1b[=".as_slice(),
+            b"15umid\x1b[c\x1b[31m",
+            b"color\x1b[?u\x1b[>cpost",
+        ];
+        let reference = stripped_wire_capture(&chunks);
+
+        assert_eq!(reference, b"premid\x1b[31mcolorpost");
+        for provider in TestProvider::ALL {
+            let output = stripped_wire_capture(&chunks);
+
+            assert_eq!(
+                output, reference,
+                "wire capture for provider {provider:?} should match all other providers"
+            );
+        }
     }
 }
