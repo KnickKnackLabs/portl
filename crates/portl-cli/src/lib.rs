@@ -2507,6 +2507,14 @@ mod skipped_test_manifest {
 
     #[test]
     fn skipped_test_manifest_matches_nextest_inventory() {
+        if Command::new("zig").arg("version").output().is_err() {
+            eprintln!(
+                "skipped-test manifest gate skipped: zig is required to enumerate \
+                 ghostty-vt features but is not on PATH"
+            );
+            return;
+        }
+
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
