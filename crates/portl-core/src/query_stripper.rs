@@ -87,6 +87,7 @@ impl QueryStripper {
     }
 
     #[cfg(not(feature = "test-attach-taps"))]
+    #[allow(clippy::unused_self)]
     fn record_buffered_watermark(&self) {}
 
     fn feed_byte(&mut self, byte: u8, out: &mut Vec<u8>) {

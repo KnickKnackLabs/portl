@@ -5,6 +5,83 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.9.0 — 2026-05-12
+
+### Fixed
+
+- Eliminated the residual `0u62;52;c` (and similar DA1/DA2/Kitty/CPR
+  response) leak that v0.8.13 still permitted in some real-world Portl
+  deployments. The fix adds four independent defense layers so the leak
+  cannot recur even if any single layer is bypassed:
+  - **Server-side query strip** in every persistent-attach provider
+    (Ghostty, zmx, tmux, raw shell). The agent-side `QueryStripper` consumes
+    DA1, DA2, DSR-CPR, and Kitty primary/push/set/pop queries from the
+    host-bound output stream before they reach the wire, while preserving
+    OSC/DCS envelopes byte-for-byte and disambiguating DECSET/DECRST
+    sequences that share the `\x1b[?` introducer.
+  - **Client-side host-output sanitizer extension.** Portl's existing
+    `HostOutputSanitizer` now also recognizes query shapes (not just stripped
+    responses) on the host-bound output, providing standalone defense-in-depth
+    if the server-side layer is bypassed.
+  - **Client-side stdin response filter.** A new `StdinResponseFilter` is
+    wired between local stdin and `send_stdin` on every attach path (remote
+    v1, remote v2, local Ghostty, local zmx, local tmux). It strips
+    response-shaped bytes the host terminal might inject in answer to
+    queries, while preserving real keystrokes (printable ASCII, control
+    bytes including Ctrl+\, arrow/function keys, Alt-key combos, multi-byte
+    UTF-8 / IME input) and bracketed-paste contents byte-for-byte.
+  - **Reload pipeline refactor.** The reload coordinator now owns a single
+    replay barrier, queues `LiveOutput` frames during the reload window, and
+    ensures the post-reload `ViewportSnapshot` supersedes any tail history
+    paint. The `ReloadCoordinator` carries replay-sanitizer state across
+    chunks so split CSI / OSC / DCS envelopes (including those whose
+    boundary lands on a C1 byte) reassemble correctly. Per-reload SGR
+    framing replaces the old per-chunk `\x1b[0m` injection.
+- Reload replay no longer corrupts UTF-8 box-drawing characters or other
+  multi-byte codepoints. The replay sanitizer strips bytes in the
+  `0x80..=0x9F` range only inside an active escape envelope; outside any
+  escape context, all high-bit bytes pass through untouched. Reload chunks
+  also snap to UTF-8 codepoint boundaries, so multi-byte sequences are
+  never split across chunks. The bounded reload-history window snaps its
+  capped start to the next valid UTF-8 lead byte.
+- `Ctrl+\ r` reload now produces exactly one coherent post-reload screen.
+  The previous behaviour painted ReloadChunk tail history first and then
+  the post-reload viewport, leaving a duplicated full-screen paint visible
+  to the user. The coordinator now suppresses tail-history paints that
+  overlap the final viewport region within a 1-second dedup window,
+  regardless of whether the live frames came in via the queued or
+  unqueued path.
+- Post-reload viewport rendering now preserves the pre-reload DECAWM
+  (autowrap) state instead of unconditionally re-enabling it. Sessions
+  that had autowrap disabled before reload now stay disabled afterwards.
+- Alt-screen-leave defensive reset now fires whenever ANY tracked terminal
+  mode is dirty (modify-other-keys, bracketed paste, mouse 1000/1002/1003/
+  1006, DECAWM, scroll region) — not only when Kitty was active. This
+  restores the host terminal cleanup chain that was masked once the
+  server-side query strip removed Kitty push observability from the
+  host-bound stream. Per-category gating ensures `\x1b[=0u` and `\x1b[>4;0m`
+  are emitted only when their corresponding modes were actually active.
+
+### Changed
+
+- End-to-end coverage for OSC/escape leaks now uses a two-host PTY fixture
+  in `crates/portl-cli/tests/tuistory_attach.rs`. The fixture creates a
+  second `nix::pty::openpty` pair on the wrapper side and answers DA1/DA2/
+  Kitty/CPR queries the way real Ghostty does, exposing concurrent taps for
+  the host-bound output stream and the wire-bound input stream from
+  client→agent (the exact production leak path). New cargo features
+  `force-disable-server-query-strip` and `force-disable-client-query-strip`
+  let defense-in-depth tests verify each layer in isolation.
+- The provider-parity test suite now drives identical guest-emission
+  scripts through every actual provider attach path (Ghostty agent
+  provider plus zmx-legacy, zmx-control, tmux-control, raw shell
+  `ShellProcess`) and compares wire-bound captures byte-for-byte, instead
+  of routing all providers through a single standalone helper.
+- Added `crates/portl-cli/tests/skipped-tests.toml` and
+  `scripts/check-skipped-tests.py`, with platform-aware entries for both
+  macOS and Linux. CI fails on any new `#[ignore]` test that is not
+  documented in the manifest.
+
 ## 0.8.13 — 2026-05-10
 
 ### Fixed
