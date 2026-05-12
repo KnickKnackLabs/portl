@@ -20,6 +20,7 @@ use tokio::io::AsyncReadExt;
 
 const QUERY_EMISSION_PRINTF: &str =
     "printf 'pre\\033[c\\033[>c\\033[6n\\033[?u\\033[>1u\\033[=15u\\033[<upost'";
+#[allow(dead_code)]
 const QUERY_EMISSION_BYTES: &[u8] = b"pre\x1b[c\x1b[>c\x1b[6n\x1b[?u\x1b[>1u\x1b[=15u\x1b[<upost";
 const QUERY_STRIPPED_EXPECTED: &[u8] = b"prepost";
 
