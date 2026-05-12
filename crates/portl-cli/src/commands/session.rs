@@ -18,6 +18,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use iroh::endpoint::{Connection, SendStream};
 use iroh_base::TransportAddr;
+use portl_core::StdinResponseFilter;
 use portl_core::attach_control::{
     RenderBarOptions, fit_visible, is_ctrl_backslash_sequence, render_bar,
 };
@@ -5286,6 +5287,7 @@ async fn attach_input_coordinator_loop(
     let mut pending_size = initial_pending_attach_size(initial_size);
     let mut paste = PasteState::new(PasteConfig::default());
     let mut bracketed = BracketedPasteScanner::default();
+    let mut stdin_response_filter = StdinResponseFilter::new();
     let mut read_buf = [0_u8; 8192];
 
     loop {
@@ -5333,9 +5335,28 @@ async fn attach_input_coordinator_loop(
                     &mut stdin_src,
                     &mut paste,
                     &mut bracketed,
+                    &mut stdin_response_filter,
                 ).await?;
             }
             () = tokio::time::sleep(Duration::from_millis(500)) => {
+                let flushed = flush_attach_stdin_filter_timeout(&mut stdin_response_filter);
+                if !flushed.is_empty() {
+                    match mode {
+                        AttachInputMode::Connected => {
+                            if let Some(active_sink) = sink.as_mut()
+                                && let Err(err) = active_sink.send_stdin(&flushed).await.context("flush stdin response filter")
+                            {
+                                sink_failed(&event_tx, err).await;
+                                sink.take();
+                                mode = AttachInputMode::Disconnected { visible: false };
+                            }
+                        }
+                        AttachInputMode::Disconnected { visible: false } => {
+                            let _ = buffer.push(&flushed);
+                        }
+                        AttachInputMode::Disconnected { visible: true } => {}
+                    }
+                }
                 if let Ok(now) = size()
                     && now != last_size
                 {
@@ -5438,6 +5459,7 @@ async fn handle_attach_input_bytes(
     stdin_src: &mut tokio::io::Stdin,
     paste: &mut PasteState,
     bracketed: &mut BracketedPasteScanner,
+    stdin_response_filter: &mut StdinResponseFilter,
 ) -> Result<()> {
     match *mode {
         AttachInputMode::Connected => {
@@ -5492,13 +5514,16 @@ async fn handle_attach_input_bytes(
                     outbound.extend_from_slice(&escape_tail[..read]);
                 }
             }
+            let outbound =
+                filter_attach_stdin_outbound(stdin_response_filter, active_sink, &outbound);
             paste.observe_queued(outbound.len());
             update_paste_bar(ui, paste).await?;
             let send_started = Instant::now();
-            if let Err(err) = active_sink
-                .send_stdin(&outbound)
-                .await
-                .context("copy local stdin")
+            if !outbound.is_empty()
+                && let Err(err) = active_sink
+                    .send_stdin(&outbound)
+                    .await
+                    .context("copy local stdin")
             {
                 debug!(%err, "stdin loop ended after provider stdin closed");
                 sink.take();
@@ -5525,7 +5550,11 @@ async fn handle_attach_input_bytes(
                     None => {}
                 }
             } else {
-                match buffer.push(chunk) {
+                let filtered = stdin_response_filter.feed(chunk);
+                if filtered.is_empty() {
+                    return Ok(());
+                }
+                match buffer.push(&filtered) {
                     ReconnectBufferPush::Accepted => {
                         if buffer.is_full() {
                             *mode = AttachInputMode::Disconnected { visible: true };
@@ -6220,6 +6249,22 @@ fn attach_v2_input_trace_class(bytes: &[u8]) -> &'static str {
     }
 }
 
+fn filter_attach_stdin_outbound(
+    filter: &mut StdinResponseFilter,
+    sink: &AttachInputSink,
+    bytes: &[u8],
+) -> Vec<u8> {
+    if bytes == b"\x1b" && sink.has_active_reload() {
+        bytes.to_vec()
+    } else {
+        filter.feed(bytes)
+    }
+}
+
+fn flush_attach_stdin_filter_timeout(filter: &mut StdinResponseFilter) -> Vec<u8> {
+    filter.flush_timeout()
+}
+
 impl AttachInputSink {
     fn has_active_reload(&self) -> bool {
         matches!(
@@ -6545,6 +6590,7 @@ where
     let mut last_size = size().unwrap_or((80, 24));
     let mut paste = PasteState::new(PasteConfig::default());
     let mut bracketed = BracketedPasteScanner::default();
+    let mut stdin_response_filter = StdinResponseFilter::new();
     loop {
         tokio::select! {
             read = stdin.read(&mut buf) => {
@@ -6587,18 +6633,29 @@ where
                     ui.display.clear_bar().await?;
                     continue;
                 }
-                paste.observe_queued(read);
+                let filtered =
+                    filter_attach_stdin_outbound(&mut stdin_response_filter, sink, chunk);
+                paste.observe_queued(filtered.len());
                 update_paste_bar(ui, &paste).await?;
                 let send_started = Instant::now();
-                if let Err(err) = sink.send_stdin(chunk).await.context("copy local stdin") {
+                if !filtered.is_empty()
+                    && let Err(err) = sink.send_stdin(&filtered).await.context("copy local stdin")
+                {
                     debug!(%err, "stdin loop ended after provider stdin closed");
                     return Ok(StdinTaskResult::Closed);
                 }
                 paste.set_backpressured(send_started.elapsed() >= Duration::from_millis(100));
-                paste.observe_sent(read);
+                paste.observe_sent(filtered.len());
                 update_paste_bar(ui, &paste).await?;
             }
             () = tokio::time::sleep(Duration::from_millis(500)) => {
+                let flushed = flush_attach_stdin_filter_timeout(&mut stdin_response_filter);
+                if !flushed.is_empty()
+                    && let Err(err) = sink.send_stdin(&flushed).await.context("flush stdin response filter")
+                {
+                    debug!(%err, "stdin loop ended after provider stdin closed");
+                    return Ok(StdinTaskResult::Closed);
+                }
                 if let Ok(now) = size()
                     && now != last_size
                 {
@@ -7442,6 +7499,129 @@ mod tests {
         assert_signal_watcher_signature(
             function_body(shell_source, "run"),
             "signal_watcher.next()",
+        );
+    }
+
+    #[test]
+    fn stdin_response_filter_wiring_covers_raw_mode_attach_paths() {
+        let source = include_str!("session.rs");
+
+        assert_stdin_response_filter_signature(
+            function_body(source, "stdin_loop"),
+            "local stdin_loop",
+        );
+        assert_coordinator_stdin_response_filter_signature(function_body(
+            source,
+            "attach_input_coordinator_loop",
+        ));
+
+        for (path, body, driver) in [
+            (
+                "remote v1",
+                function_body(source, "bridge_attach"),
+                "maybe_spawn_stdin_task(",
+            ),
+            (
+                "remote v2",
+                function_body(source, "bridge_attach_v2"),
+                "AttachInputCoordinator::spawn(",
+            ),
+            (
+                "local Ghostty",
+                function_body(source, "local_ghostty_attach"),
+                "maybe_spawn_stdin_task(",
+            ),
+            (
+                "local zmx",
+                function_body(source, "local_zmx_control_attach"),
+                "maybe_spawn_stdin_task(",
+            ),
+            (
+                "local tmux",
+                function_body(source, "local_tmux_control_attach"),
+                "maybe_spawn_stdin_task(",
+            ),
+        ] {
+            assert!(
+                body.contains(driver),
+                "{path} attach path must route stdin through the filtered input driver:\n{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn stdin_response_filter_cleans_production_leak_before_send_stdin_tap() {
+        let mut filter = StdinResponseFilter::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink = AttachInputSink {
+            kind: AttachInputSinkKind::TmuxPty { tx },
+        };
+        let mut sent = Vec::new();
+
+        for chunk in [
+            b"type".as_slice(),
+            b"\x1b[?0u\x1b[?",
+            b"62;52;c\x1b[>1;100;0c",
+            b"\x1b[10;5R",
+            b"d",
+        ] {
+            sent.extend_from_slice(&filter_attach_stdin_outbound(&mut filter, &sink, chunk));
+        }
+        sent.extend_from_slice(&flush_attach_stdin_filter_timeout(&mut filter));
+
+        assert_eq!(sent, b"typed");
+        for forbidden in [
+            b"0u".as_slice(),
+            b"62;52;c",
+            b"\x1b[?62;52;c",
+            b"\x1b[>1;100;0c",
+            b"\x1b[10;5R",
+        ] {
+            assert!(!contains_bytes(&sent, forbidden));
+        }
+    }
+
+    #[test]
+    fn stdin_response_filter_preserves_detach_hotkey_bytes_if_seen() {
+        let mut filter = StdinResponseFilter::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink = AttachInputSink {
+            kind: AttachInputSinkKind::TmuxPty { tx },
+        };
+
+        assert_eq!(
+            filter_attach_stdin_outbound(&mut filter, &sink, b"\x1cr"),
+            b"\x1cr"
+        );
+    }
+
+    fn assert_stdin_response_filter_signature(body: &str, label: &str) {
+        assert!(
+            body.contains("StdinResponseFilter::new()"),
+            "{label} must instantiate a per-stream stdin response filter:\n{body}"
+        );
+        assert!(
+            body.contains("filter_attach_stdin_outbound("),
+            "{label} must filter bytes immediately before send_stdin:\n{body}"
+        );
+        assert!(
+            body.contains("flush_attach_stdin_filter_timeout("),
+            "{label} must flush lone Esc after the disambiguation timeout:\n{body}"
+        );
+    }
+
+    fn assert_coordinator_stdin_response_filter_signature(body: &str) {
+        assert!(
+            body.contains("StdinResponseFilter::new()"),
+            "remote attach input coordinator must instantiate a per-stream stdin response filter:\n{body}"
+        );
+        assert!(
+            body.contains("&mut stdin_response_filter"),
+            "remote attach input coordinator must pass filter state into the byte handler:\n{body}"
+        );
+        assert!(
+            body.contains("flush_attach_stdin_filter_timeout("),
+            "remote attach input coordinator must flush lone Esc after the disambiguation timeout:\n{body}"
         );
     }
 
