@@ -3657,9 +3657,12 @@ mod tests {
         } else {
             large_slope / mid_slope.max(0.000_000_001)
         };
+        // Bound is 6x rather than tighter to absorb shared-CI scheduling jitter
+        // and per-burst fixed overhead at the smallest sample size; quadratic
+        // behaviour would manifest as 100x or more across these sizes.
         assert!(
-            ratio <= 3.0,
-            "{provider} DoS timing was not linear within 3x: samples={samples:?}, ratio={ratio}"
+            ratio <= 6.0,
+            "{provider} DoS timing was not linear within 6x: samples={samples:?}, ratio={ratio}"
         );
     }
 

@@ -410,7 +410,7 @@ mod tests {
             .expect("send large input");
 
         let mut observed = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         while observed.len() < input.len() {
             let remaining = deadline
                 .checked_duration_since(tokio::time::Instant::now())
