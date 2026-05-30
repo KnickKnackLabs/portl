@@ -5,6 +5,34 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.10.0 — 2026-05-30
+
+### Added
+
+- Added a protocol-aware Herdr session provider. `portl attach <target>/herdr`
+  and `portl attach <target>/herdr/<session>` now launch the local Herdr CLI,
+  bootstrap the remote side with `herdr remote-client-bridge`, and carry Herdr's
+  binary client protocol over Portl while leaving Herdr's own rendering,
+  configuration, and keybindings in charge.
+- Added Herdr provider discovery/listing, `PORTL_HERDR_PATH` overrides, Herdr
+  wire-frame classification, priority lanes for control/input/resize/render
+  traffic, and end-to-end protocol coverage.
+
+### Changed
+
+- `PORTL_TARGET=<target> portl attach herdr` and `<target>/herdr` now resolve to
+  the remote Herdr default session; `<target>/herdr/<name>` attaches a named
+  Herdr session.
+
+### Fixed
+
+- Hardened Herdr attach startup and teardown by enforcing Hello/Welcome frame
+  ordering, using private temporary socket permissions, propagating Herdr
+  reattach/keybinding environment, and cleaning up the remote bridge process
+  when the local attach exits.
+- Removed inherited `HERDR_SOCKET_PATH` from the spawned local `herdr client` so
+  Herdr honors Portl's temporary `HERDR_CLIENT_SOCKET_PATH` during attach.
+
 ## 0.9.0 — 2026-05-12
 
 ### Fixed
