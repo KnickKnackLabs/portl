@@ -71,6 +71,9 @@ pub(crate) async fn serve_herdr_attach(
         state: Arc::clone(&state),
         session_id,
     };
+    let _termination_guard = HerdrAttachTerminationGuard {
+        attach: Arc::clone(&attach),
+    };
     super::write_ack(
         &mut send,
         SessionAck {
@@ -237,8 +240,8 @@ fn spawn_herdr_attach(
     }))
 }
 
-impl Drop for HerdrAttach {
-    fn drop(&mut self) {
+impl HerdrAttach {
+    fn terminate_bridge(&self) {
         if self.exit_rx.borrow().is_some() {
             return;
         }
@@ -252,6 +255,22 @@ impl Drop for HerdrAttach {
                 nix::sys::signal::Signal::SIGTERM,
             );
         }
+    }
+}
+
+impl Drop for HerdrAttach {
+    fn drop(&mut self) {
+        self.terminate_bridge();
+    }
+}
+
+struct HerdrAttachTerminationGuard {
+    attach: Arc<HerdrAttach>,
+}
+
+impl Drop for HerdrAttachTerminationGuard {
+    fn drop(&mut self) {
+        self.attach.terminate_bridge();
     }
 }
 

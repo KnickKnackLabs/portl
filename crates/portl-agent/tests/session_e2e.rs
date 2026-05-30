@@ -220,6 +220,61 @@ async fn session_herdr_provider_bridges_protocol_lanes() -> Result<()> {
 }
 
 #[tokio::test]
+async fn session_herdr_bridge_exits_when_attach_control_closes() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let fake_herdr = temp.path().join("herdr");
+    let log = temp.path().join("herdr.log");
+    let welcome = RawHerdrFrame::encode_server(&ServerMessage::Welcome {
+        version: HERDR_PROTOCOL_VERSION,
+        encoding: RenderEncoding::SemanticFrame,
+        error: None,
+    })?;
+    write_fake_herdr(&fake_herdr, &log, &hex::encode(welcome.framed_bytes()))?;
+
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator, Some(fake_herdr)).await?;
+    let ticket = root_ticket(&operator, server.addr(), shell_caps(true));
+
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let mut attach = open_session_attach_herdr_checked(
+        &connection,
+        &session,
+        "default".to_owned(),
+        None,
+        None,
+        PtyCfg {
+            term: "xterm-256color".to_owned(),
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await?;
+
+    let hello = RawHerdrFrame::encode_client(&ClientMessage::Hello {
+        version: HERDR_PROTOCOL_VERSION,
+        cols: 80,
+        rows: 24,
+        cell_width_px: 0,
+        cell_height_px: 0,
+        requested_encoding: RenderEncoding::SemanticFrame,
+        keybindings: ClientKeybindings::Server,
+    })?;
+    attach
+        .client_control
+        .write_all(hello.framed_bytes())
+        .await?;
+    let _ =
+        read_test_herdr_frame(&mut attach.server_control, FrameDirection::ServerToClient).await?;
+
+    let _ = attach.control_send.finish();
+    wait_for_log_contains(&log, "signal:term").await?;
+    wait_for_log_contains(&log, "exit:remote-client-bridge").await?;
+
+    shutdown(connection, client, server, agent).await
+}
+
+#[tokio::test]
 async fn session_attach_prefers_zmx_control_when_probe_succeeds() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let fake_zmx = temp.path().join("zmx");
@@ -995,6 +1050,7 @@ fn write_fake_herdr(
 ) -> Result<()> {
     let script = r#"#!/usr/bin/env python3
 import os
+import signal
 import struct
 import sys
 
@@ -1005,6 +1061,12 @@ def log(line):
     with open(LOG, "a", encoding="utf-8") as handle:
         handle.write(line + "\n")
         handle.flush()
+
+def handle_term(signum, frame):
+    log("signal:term")
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, handle_term)
 
 def read_frame():
     length = sys.stdin.buffer.read(4)
@@ -1032,11 +1094,14 @@ if args == ["session", "list", "--json"]:
     print('{"sessions":[{"name":"default"}]}')
     raise SystemExit(0)
 if args == ["remote-client-bridge"]:
-    if read_frame() is not None:
-        sys.stdout.buffer.write(WELCOME)
-        sys.stdout.buffer.flush()
-        while read_frame() is not None:
-            pass
+    try:
+        if read_frame() is not None:
+            sys.stdout.buffer.write(WELCOME)
+            sys.stdout.buffer.flush()
+            while read_frame() is not None:
+                pass
+    finally:
+        log("exit:remote-client-bridge")
     raise SystemExit(0)
 print("unknown herdr args: " + " ".join(args), file=sys.stderr)
 raise SystemExit(64)
