@@ -78,6 +78,8 @@ pub struct Capabilities {
     pub vpn: Option<VpnCaps>,
     /// Bit 5.
     pub meta: Option<MetaCaps>,
+    /// Bit 6.
+    pub unix: Option<UnixCaps>,
 }
 
 /// Port-range rule for `tcp` / `udp` caps.
@@ -133,6 +135,99 @@ pub struct VpnCaps {
 pub struct MetaCaps {
     pub ping: bool,
     pub info: bool,
+}
+
+/// Unix-domain socket forwarding capability bundle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnixCaps {
+    pub connect: Vec<UnixPathRule>,
+    pub listen: Vec<UnixPathRule>,
+}
+
+/// Unix-domain socket path rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnixPathRule {
+    pub path: String,
+}
+
+impl UnixPathRule {
+    #[must_use]
+    pub fn is_valid_rule(&self, allow_broad_wildcard: bool) -> bool {
+        validate_unix_path_rule(&self.path, allow_broad_wildcard).is_ok()
+    }
+
+    #[must_use]
+    pub fn matches_path(&self, path: &str) -> bool {
+        if !unix_socket_path_is_safe(path) {
+            return false;
+        }
+        if self.path == "*" {
+            return true;
+        }
+        if let Some(prefix) = self.path.strip_suffix('*') {
+            return is_narrow_unix_glob(prefix) && path.starts_with(prefix);
+        }
+        self.path == path
+    }
+
+    #[must_use]
+    pub fn covers(&self, child: &Self) -> bool {
+        if !self.is_valid_rule(true) || !child.is_valid_rule(true) {
+            return false;
+        }
+        if self.path == "*" || self.path == child.path {
+            return true;
+        }
+        let Some(parent_prefix) = self.path.strip_suffix('*') else {
+            return false;
+        };
+        if let Some(child_prefix) = child.path.strip_suffix('*') {
+            is_narrow_unix_glob(parent_prefix) && child_prefix.starts_with(parent_prefix)
+        } else {
+            self.matches_path(&child.path)
+        }
+    }
+}
+
+pub fn validate_unix_path_rule(spec: &str, allow_broad_wildcard: bool) -> Result<(), &'static str> {
+    if spec.is_empty() {
+        return Err("unix path rule must not be empty");
+    }
+    if spec == "*" {
+        return if allow_broad_wildcard {
+            Ok(())
+        } else {
+            Err("broad unix wildcard is only available through the dev/all shortcut")
+        };
+    }
+    if let Some(prefix) = spec.strip_suffix('*') {
+        if unix_socket_path_is_safe(prefix) && is_narrow_unix_glob(prefix) {
+            Ok(())
+        } else {
+            Err("unix path glob must have a narrow absolute prefix")
+        }
+    } else if unix_socket_path_is_safe(spec) {
+        Ok(())
+    } else {
+        Err("unix path rule must be absolute and must not contain . or .. components")
+    }
+}
+
+#[must_use]
+pub fn unix_socket_path_is_safe(path: &str) -> bool {
+    use std::path::{Component, Path};
+
+    if path.is_empty() || path.as_bytes().contains(&0) || !path.starts_with('/') {
+        return false;
+    }
+    Path::new(path)
+        .components()
+        .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
+}
+
+#[must_use]
+pub fn is_narrow_unix_glob(prefix: &str) -> bool {
+    prefix.starts_with('/') && prefix.len() >= 6 && prefix != "/tmp/" && prefix != "/var/"
 }
 
 /// Delegation-chain linkage.

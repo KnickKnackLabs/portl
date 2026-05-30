@@ -56,6 +56,7 @@ fn make_caps(
         fs: None,
         vpn: None,
         meta: None,
+        unix: None,
     }
 }
 
@@ -90,6 +91,7 @@ fn narrow_caps(parent: &Capabilities, tighten: bool) -> Capabilities {
         fs: None,
         vpn: None,
         meta: None,
+        unix: None,
     }
 }
 

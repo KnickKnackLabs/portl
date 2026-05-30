@@ -40,6 +40,7 @@ pub mod tcp_handler;
 pub mod ticket_handler;
 pub mod udp_handler;
 pub mod udp_registry;
+pub mod unix_handler;
 
 pub use config::{AgentConfig, AgentMode, DiscoveryConfig, RateLimitConfig};
 
@@ -228,7 +229,7 @@ pub use revocations::{RevocationRecord, RevocationSet};
 /// Listener mode serves every wire-level ALPN. Gateway mode is
 /// strictly a master-ticket-backed HTTP forwarder (see
 /// `src/gateway.rs`), so only `meta/v1` and `tcp/v1` streams are
-/// dispatched; `shell/v1`, `session/v1`, and `udp/v1` are closed at dispatch time.
+/// dispatched; `shell/v1`, `session/v1`, `udp/v1`, and `unix/v1` are closed at dispatch time.
 pub(crate) fn alpn_allowed_in_mode(mode: &AgentMode, alpn: &str) -> Result<(), &'static str> {
     match mode {
         AgentMode::Listener => Ok(()),
@@ -264,6 +265,7 @@ mod mode_dispatch_tests {
             String::from_utf8_lossy(portl_proto::session_v1::ALPN_SESSION_V1),
             String::from_utf8_lossy(portl_proto::tcp_v1::ALPN_TCP_V1),
             String::from_utf8_lossy(portl_proto::udp_v1::ALPN_UDP_V1),
+            String::from_utf8_lossy(portl_proto::unix_v1::ALPN_UNIX_V1),
         ] {
             alpn_allowed_in_mode(&AgentMode::Listener, alpn.as_ref())
                 .unwrap_or_else(|err| panic!("listener rejected {alpn}: {err}"));
@@ -285,7 +287,7 @@ mod mode_dispatch_tests {
     }
 
     #[test]
-    fn gateway_rejects_shell_and_udp() {
+    fn gateway_rejects_shell_session_udp_and_unix() {
         let err = alpn_allowed_in_mode(
             &gateway(),
             String::from_utf8_lossy(portl_proto::shell_v1::ALPN_SHELL_V1).as_ref(),
@@ -303,6 +305,12 @@ mod mode_dispatch_tests {
             String::from_utf8_lossy(portl_proto::udp_v1::ALPN_UDP_V1).as_ref(),
         )
         .expect_err("udp/v1 must be rejected in gateway mode");
+        assert!(err.contains("gateway mode only serves"));
+        let err = alpn_allowed_in_mode(
+            &gateway(),
+            String::from_utf8_lossy(portl_proto::unix_v1::ALPN_UNIX_V1).as_ref(),
+        )
+        .expect_err("unix/v1 must be rejected in gateway mode");
         assert!(err.contains("gateway mode only serves"));
     }
 }

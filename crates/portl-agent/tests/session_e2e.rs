@@ -1040,6 +1040,7 @@ fn shell_caps(allow: bool) -> Capabilities {
         fs: None,
         vpn: None,
         meta: None,
+        unix: None,
     }
 }
 

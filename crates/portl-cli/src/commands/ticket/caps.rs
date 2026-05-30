@@ -101,6 +101,18 @@ fn entries() -> Vec<CapEntry<'static>> {
             examples: vec!["portl ticket issue 'udp:*:5353' --ttl 1h"],
         },
         CapEntry {
+            name: "unix:connect",
+            summary: "Connect to target-side Unix-domain socket paths.",
+            argument_grammar: Some("unix:connect:<path>"),
+            examples: vec!["portl ticket issue 'unix:connect:/run/agent.sock' --ttl 10m"],
+        },
+        CapEntry {
+            name: "unix:listen",
+            summary: "Bind target-side Unix-domain socket paths and reverse-forward connections.",
+            argument_grammar: Some("unix:listen:<path>"),
+            examples: vec!["portl ticket issue 'unix:listen:/tmp/portl-*' --ttl 10m"],
+        },
+        CapEntry {
             name: "dev",
             summary: "Development preset; alias for all capabilities in v0.4.0.",
             argument_grammar: None,

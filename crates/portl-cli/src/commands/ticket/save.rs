@@ -184,6 +184,7 @@ mod tests {
             fs: None,
             vpn: None,
             meta: None,
+            unix: None,
         }
     }
 
@@ -199,6 +200,7 @@ mod tests {
                 ping: true,
                 info: true,
             }),
+            unix: None,
         }
     }
 }

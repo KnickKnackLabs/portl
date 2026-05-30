@@ -240,6 +240,7 @@ fn shell_caps_exec_only() -> Capabilities {
         fs: None,
         vpn: None,
         meta: None,
+        unix: None,
     }
 }
 
@@ -258,5 +259,6 @@ fn shell_caps_pty_only() -> Capabilities {
         fs: None,
         vpn: None,
         meta: None,
+        unix: None,
     }
 }

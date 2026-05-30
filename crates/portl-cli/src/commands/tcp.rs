@@ -87,6 +87,7 @@ fn tcp_caps() -> Capabilities {
         fs: None,
         vpn: None,
         meta: None,
+        unix: None,
     }
 }
 

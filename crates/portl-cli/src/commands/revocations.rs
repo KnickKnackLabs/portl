@@ -206,6 +206,7 @@ fn publish_meta_caps() -> Capabilities {
             ping: true,
             info: true,
         }),
+        unix: None,
     }
 }
 

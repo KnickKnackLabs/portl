@@ -14,6 +14,7 @@ pub mod shell_v1;
 pub mod tcp_v1;
 pub mod ticket_v1;
 pub mod udp_v1;
+pub mod unix_v1;
 pub mod wire;
 
 pub use portl_core::ticket::schema::Capabilities as Caps;

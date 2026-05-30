@@ -157,6 +157,13 @@ pub enum Command {
         peer: String,
         local: Vec<String>,
     },
+    Socket {
+        peer: String,
+        local: String,
+        connect: Option<String>,
+        listen: Option<String>,
+        cleanup: bool,
+    },
     // v0.3.0: peer / ticket / whoami replace top-level mint + revoke.
     PeerLs {
         json: bool,
@@ -848,6 +855,19 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
         ),
         Command::Tcp { peer, local } => commands::tcp::run(&peer, &local),
         Command::Udp { peer, local } => commands::udp::run(&peer, &local),
+        Command::Socket {
+            peer,
+            local,
+            connect,
+            listen,
+            cleanup,
+        } => commands::socket::run(
+            &peer,
+            &local,
+            connect.as_deref(),
+            listen.as_deref(),
+            cleanup,
+        ),
         Command::PeerLs { json, active } => commands::peer::ls::run(json, active),
         Command::PeerRm { label } => commands::peer::unlink::run(&label),
         Command::PeerAddUnsafeRaw {
@@ -1144,6 +1164,7 @@ Connect:
   ssh          SSH-like native Portl shell/exec command
   tcp          Set up one or more local TCP forwards
   udp          Set up one or more local UDP forwards
+  socket       Set up Unix-domain socket forwards
 
 Permissions:
   ticket       Manage bounded permission tickets
@@ -1583,6 +1604,34 @@ enum ConnectTopLevel {
         /// Local forward spec: `[LOCAL_HOST:]LOCAL_PORT:REMOTE_HOST:REMOTE_PORT`.
         #[arg(short = 'L', required = true)]
         local: Vec<String>,
+        #[arg(help = TARGET_HELP, value_name = "TARGET")]
+        peer: String,
+    },
+    /// Set up Unix-domain socket forwards.
+    #[command(display_order = 195)]
+    Socket {
+        /// Local Unix socket path. In --connect mode this is the local listener; in --listen mode this is the local target socket.
+        #[arg(long, value_name = "PATH")]
+        local: String,
+        /// Remote Unix socket path to connect to for each local connection.
+        #[arg(
+            long,
+            value_name = "REMOTE_PATH",
+            conflicts_with = "listen",
+            required_unless_present = "listen"
+        )]
+        connect: Option<String>,
+        /// Remote Unix socket path the agent should listen on and reverse-forward back to --local.
+        #[arg(
+            long,
+            value_name = "REMOTE_PATH",
+            conflicts_with = "connect",
+            required_unless_present = "connect"
+        )]
+        listen: Option<String>,
+        /// Remove an existing socket path before binding and remove it on exit.
+        #[arg(long)]
+        cleanup: bool,
         #[arg(help = TARGET_HELP, value_name = "TARGET")]
         peer: String,
     },
@@ -2444,6 +2493,19 @@ fn connect_into_command(action: ConnectTopLevel, log_verbose: u8) -> Command {
         }
         ConnectTopLevel::Tcp { local, peer } => Command::Tcp { peer, local },
         ConnectTopLevel::Udp { local, peer } => Command::Udp { peer, local },
+        ConnectTopLevel::Socket {
+            peer,
+            local,
+            connect,
+            listen,
+            cleanup,
+        } => Command::Socket {
+            peer,
+            local,
+            connect,
+            listen,
+            cleanup,
+        },
     }
 }
 

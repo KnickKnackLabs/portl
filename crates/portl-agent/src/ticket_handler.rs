@@ -15,6 +15,7 @@ use crate::shell_handler;
 use crate::stream_io::read_postcard_prefix;
 use crate::tcp_handler;
 use crate::udp_handler::{self, UdpConnectionContext};
+use crate::unix_handler;
 
 const MAX_OFFER_BYTES: usize = 64 * 1024;
 const MAX_META_STREAMS: u32 = 64;
@@ -237,6 +238,21 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
                                     recv,
                                     preamble,
                                     udp_context,
+                                )
+                                .await
+                            }
+                        }
+                        value
+                            if value
+                                == String::from_utf8_lossy(portl_proto::unix_v1::ALPN_UNIX_V1) =>
+                        {
+                            if let Err(error) = crate::alpn_allowed_in_mode(&state.mode, value) {
+                                connection.close(0x1004u32.into(), error.as_bytes());
+                                Ok(())
+                            } else {
+                                state.metrics.unix_streams_opened.inc();
+                                unix_handler::serve_stream(
+                                    connection, session, state, send, recv, preamble,
                                 )
                                 .await
                             }

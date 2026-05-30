@@ -260,6 +260,7 @@ fn shell_and_meta_caps() -> Capabilities {
             ping: true,
             info: true,
         }),
+        unix: None,
     }
 }
 

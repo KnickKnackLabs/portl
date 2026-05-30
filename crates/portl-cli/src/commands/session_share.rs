@@ -366,6 +366,7 @@ pub(crate) fn share_caps() -> Capabilities {
         fs: None,
         vpn: None,
         meta: None,
+        unix: None,
     }
 }
 

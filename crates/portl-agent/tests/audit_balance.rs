@@ -182,5 +182,6 @@ fn shell_caps_exec_only() -> Capabilities {
         fs: None,
         vpn: None,
         meta: None,
+        unix: None,
     }
 }

@@ -104,6 +104,7 @@ pub struct Metrics {
     pub shell_sessions_opened: Counter,
     pub tcp_streams_opened: Counter,
     pub udp_sessions_opened: Counter,
+    pub unix_streams_opened: Counter,
     pub active_connections: Gauge,
     pub active_udp_sessions: Gauge,
     /// Relay endpoint authorization counters. Incremented by the
@@ -150,6 +151,13 @@ impl Default for Metrics {
             "udp_sessions_opened",
             "Number of udp/v1 sessions created",
             udp_sessions_opened.clone(),
+        );
+
+        let unix_streams_opened = Counter::default();
+        registry.register(
+            "unix_streams_opened",
+            "Number of unix/v1 streams forwarded",
+            unix_streams_opened.clone(),
         );
 
         let active_connections = Gauge::default();
@@ -213,6 +221,7 @@ impl Default for Metrics {
             shell_sessions_opened,
             tcp_streams_opened,
             udp_sessions_opened,
+            unix_streams_opened,
             active_connections,
             active_udp_sessions,
             relay_accepts_total,

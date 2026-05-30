@@ -388,6 +388,7 @@ fn shell_caps_with_env_policy_and_modes(
         fs: None,
         vpn: None,
         meta: None,
+        unix: None,
     }
 }
 

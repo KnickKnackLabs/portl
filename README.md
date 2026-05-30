@@ -250,7 +250,7 @@ Top-level help is grouped by task:
 Setup        init, doctor, install, config, whoami
 Trust        peer, invite
 Pairing      accept
-Connect      status, shell, session, exec, ssh, tcp, udp
+Connect      status, shell, session, exec, ssh, tcp, udp, socket
 Permissions  ticket
 Integrations docker, slicer, gateway
 Utility      completions, man, help

@@ -38,6 +38,7 @@ fn canonical_body() -> PortlBody {
             fs: None,
             vpn: None,
             meta: None,
+            unix: None,
         },
         target: *addr.id.as_bytes(),
         alpns_extra: vec![],

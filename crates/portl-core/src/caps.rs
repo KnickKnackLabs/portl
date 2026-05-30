@@ -8,7 +8,7 @@
 //! rules, including bearer-token inheritance, in `ticket::verify`.
 
 use crate::ticket::schema::{
-    Capabilities, EnvPolicy, FsCaps, MetaCaps, PortRule, ShellCaps, VpnCaps,
+    Capabilities, EnvPolicy, FsCaps, MetaCaps, PortRule, ShellCaps, UnixCaps, VpnCaps,
 };
 
 /// Return true iff `child` is a monotone narrowing of `parent`.
@@ -32,6 +32,7 @@ pub fn is_narrowing(parent: &Capabilities, child: &Capabilities) -> bool {
         && option_narrows(parent.fs.as_ref(), child.fs.as_ref(), fs_narrows)
         && option_narrows(parent.vpn.as_ref(), child.vpn.as_ref(), vpn_narrows)
         && option_narrows(parent.meta.as_ref(), child.meta.as_ref(), meta_narrows)
+        && option_narrows(parent.unix.as_ref(), child.unix.as_ref(), unix_narrows)
 }
 
 fn option_narrows<T: ?Sized>(
@@ -133,4 +134,66 @@ fn vpn_narrows(parent: &VpnCaps, child: &VpnCaps) -> bool {
 
 fn meta_narrows(parent: &MetaCaps, child: &MetaCaps) -> bool {
     bool_narrows(parent.ping, child.ping) && bool_narrows(parent.info, child.info)
+}
+
+fn unix_narrows(parent: &UnixCaps, child: &UnixCaps) -> bool {
+    unix_rules_narrow(&parent.connect, &child.connect)
+        && unix_rules_narrow(&parent.listen, &child.listen)
+}
+
+fn unix_rules_narrow(
+    parent: &[crate::ticket::schema::UnixPathRule],
+    child: &[crate::ticket::schema::UnixPathRule],
+) -> bool {
+    child.iter().all(|child_rule| {
+        parent
+            .iter()
+            .any(|parent_rule| parent_rule.covers(child_rule))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_narrowing;
+    use crate::ticket::schema::{Capabilities, UnixCaps, UnixPathRule};
+
+    #[test]
+    fn unix_connect_child_must_stay_within_parent_rules() {
+        let parent = unix_caps(vec!["/tmp/portl-*"], vec![]);
+        let allowed = unix_caps(vec!["/tmp/portl-agent.sock"], vec![]);
+        let widened = unix_caps(vec!["/tmp/other.sock"], vec![]);
+
+        assert!(is_narrowing(&parent, &allowed));
+        assert!(!is_narrowing(&parent, &widened));
+    }
+
+    #[test]
+    fn unix_listen_child_cannot_add_connect_capability() {
+        let parent = unix_caps(vec![], vec!["/tmp/portl-*"]);
+        let child = unix_caps(vec!["/tmp/portl-agent.sock"], vec!["/tmp/portl-agent.sock"]);
+
+        assert!(!is_narrowing(&parent, &child));
+    }
+
+    fn unix_caps(connect: Vec<&str>, listen: Vec<&str>) -> Capabilities {
+        Capabilities {
+            presence: 0b0100_0000,
+            shell: None,
+            tcp: None,
+            udp: None,
+            fs: None,
+            vpn: None,
+            meta: None,
+            unix: Some(UnixCaps {
+                connect: connect.into_iter().map(rule).collect(),
+                listen: listen.into_iter().map(rule).collect(),
+            }),
+        }
+    }
+
+    fn rule(path: &str) -> UnixPathRule {
+        UnixPathRule {
+            path: path.to_owned(),
+        }
+    }
 }

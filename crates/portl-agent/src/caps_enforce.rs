@@ -2,6 +2,7 @@ use portl_core::ticket::schema::{Capabilities, ShellCaps};
 use portl_proto::shell_v1::{ShellMode, ShellReason, ShellReq};
 use portl_proto::tcp_v1::TcpReq;
 use portl_proto::udp_v1::UdpBind;
+use portl_proto::unix_v1::UnixReq;
 
 pub fn shell_permits(caps: &Capabilities, req: &ShellReq) -> Result<(), ShellReason> {
     let Some(shell_caps) = caps.shell.as_ref() else {
@@ -60,6 +61,23 @@ pub fn tcp_permits(caps: &Capabilities, req: &TcpReq) -> Result<(), &'static str
         .ok_or("destination not permitted by ticket")
 }
 
+pub fn unix_permits(caps: &Capabilities, req: &UnixReq) -> Result<(), &'static str> {
+    let Some(unix_caps) = caps.unix.as_ref() else {
+        return Err("unix forwarding not allowed");
+    };
+
+    let (rules, path) = match &req.op {
+        portl_proto::unix_v1::UnixOp::Connect { path } => (&unix_caps.connect, path),
+        portl_proto::unix_v1::UnixOp::Listen { path, .. } => (&unix_caps.listen, path),
+    };
+
+    rules
+        .iter()
+        .any(|rule| rule.matches_path(path))
+        .then_some(())
+        .ok_or("unix path not permitted by ticket")
+}
+
 pub fn udp_permits(caps: &Capabilities, bind: &UdpBind) -> Result<(), &'static str> {
     let Some(rules) = caps.udp.as_ref() else {
         return Err("udp forwarding not allowed");
@@ -95,14 +113,17 @@ pub fn shell_caps(caps: &Capabilities) -> Option<&ShellCaps> {
 
 #[cfg(test)]
 mod tests {
-    use portl_core::ticket::schema::{Capabilities, EnvPolicy, PortRule, ShellCaps};
+    use portl_core::ticket::schema::{
+        Capabilities, EnvPolicy, PortRule, ShellCaps, UnixCaps, UnixPathRule,
+    };
     use portl_proto::shell_v1::{EnvValue, PtyCfg};
     use portl_proto::wire::StreamPreamble;
 
-    use super::{shell_permits, tcp_permits, udp_permits};
+    use super::{shell_permits, tcp_permits, udp_permits, unix_permits};
     use portl_proto::shell_v1::{ShellMode, ShellReason, ShellReq};
     use portl_proto::tcp_v1::TcpReq;
     use portl_proto::udp_v1::UdpBind;
+    use portl_proto::unix_v1::{UnixOp, UnixReq};
 
     #[test]
     fn shell_permits_pty_session_when_caps_allow_it() {
@@ -134,6 +155,7 @@ mod tests {
             fs: None,
             vpn: None,
             meta: None,
+            unix: None,
         };
         let req = shell_req(ShellMode::Shell, None);
 
@@ -292,6 +314,85 @@ mod tests {
     }
 
     #[test]
+    fn unix_permits_exact_connect_path() {
+        let caps = unix_caps(
+            vec![UnixPathRule {
+                path: "/run/user/1000/agent.sock".to_owned(),
+            }],
+            vec![],
+        );
+        let req = UnixReq {
+            preamble: preamble("portl/unix/v1"),
+            op: UnixOp::Connect {
+                path: "/run/user/1000/agent.sock".to_owned(),
+            },
+        };
+
+        assert_eq!(unix_permits(&caps, &req), Ok(()));
+    }
+
+    #[test]
+    fn unix_rejects_connect_path_outside_caps() {
+        let caps = unix_caps(
+            vec![UnixPathRule {
+                path: "/run/user/1000/agent.sock".to_owned(),
+            }],
+            vec![],
+        );
+        let req = UnixReq {
+            preamble: preamble("portl/unix/v1"),
+            op: UnixOp::Connect {
+                path: "/tmp/other.sock".to_owned(),
+            },
+        };
+
+        assert_eq!(
+            unix_permits(&caps, &req),
+            Err("unix path not permitted by ticket")
+        );
+    }
+
+    #[test]
+    fn unix_rejects_parent_dir_escape_under_glob() {
+        let caps = unix_caps(
+            vec![UnixPathRule {
+                path: "/tmp/portl-*".to_owned(),
+            }],
+            vec![],
+        );
+        let req = UnixReq {
+            preamble: preamble("portl/unix/v1"),
+            op: UnixOp::Connect {
+                path: "/tmp/portl-foo/../other.sock".to_owned(),
+            },
+        };
+
+        assert_eq!(
+            unix_permits(&caps, &req),
+            Err("unix path not permitted by ticket")
+        );
+    }
+
+    #[test]
+    fn unix_permits_narrow_listen_glob() {
+        let caps = unix_caps(
+            vec![],
+            vec![UnixPathRule {
+                path: "/tmp/portl-*".to_owned(),
+            }],
+        );
+        let req = UnixReq {
+            preamble: preamble("portl/unix/v1"),
+            op: UnixOp::Listen {
+                path: "/tmp/portl-agent.sock".to_owned(),
+                cleanup: true,
+            },
+        };
+
+        assert_eq!(unix_permits(&caps, &req), Ok(()));
+    }
+
+    #[test]
     fn udp_permits_exact_host_and_port_range() {
         let caps = udp_caps(vec![PortRule {
             host_glob: "127.0.0.1".to_owned(),
@@ -346,6 +447,7 @@ mod tests {
             fs: None,
             vpn: None,
             meta: None,
+            unix: None,
         }
     }
 
@@ -358,6 +460,7 @@ mod tests {
             fs: None,
             vpn: None,
             meta: None,
+            unix: None,
         }
     }
 
@@ -370,6 +473,20 @@ mod tests {
             fs: None,
             vpn: None,
             meta: None,
+            unix: None,
+        }
+    }
+
+    fn unix_caps(connect: Vec<UnixPathRule>, listen: Vec<UnixPathRule>) -> Capabilities {
+        Capabilities {
+            presence: 0b0100_0000,
+            shell: None,
+            tcp: None,
+            udp: None,
+            fs: None,
+            vpn: None,
+            meta: None,
+            unix: Some(UnixCaps { connect, listen }),
         }
     }
 

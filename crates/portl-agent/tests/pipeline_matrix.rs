@@ -304,6 +304,7 @@ fn meta_caps(ping: bool, info: bool) -> Capabilities {
         fs: None,
         vpn: None,
         meta: Some(MetaCaps { ping, info }),
+        unix: None,
     }
 }
 
@@ -454,5 +455,6 @@ fn tcp_caps_to_upstream() -> Capabilities {
         fs: None,
         vpn: None,
         meta: None,
+        unix: None,
     }
 }

@@ -27,6 +27,7 @@ fn shell_caps() -> Capabilities {
         fs: None,
         vpn: None,
         meta: None,
+        unix: None,
     }
 }
 
@@ -49,6 +50,7 @@ fn shell_and_tcp_caps() -> Capabilities {
         fs: None,
         vpn: None,
         meta: None,
+        unix: None,
     }
 }
 

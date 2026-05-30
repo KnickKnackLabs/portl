@@ -23,8 +23,8 @@ fn help_output(args: &[&str]) -> String {
 fn cli_help_lists_expected_top_level_commands() {
     let help = help_output(&["--help"]);
     for command in [
-        "init", "doctor", "status", "shell", "exec", "ssh", "tcp", "udp", "peer", "invite",
-        "accept", "ticket", "whoami", "config", "install", "docker", "slicer", "gateway",
+        "init", "doctor", "status", "shell", "exec", "ssh", "tcp", "udp", "socket", "peer",
+        "invite", "accept", "ticket", "whoami", "config", "install", "docker", "slicer", "gateway",
     ] {
         assert!(
             help.contains(command),
@@ -127,7 +127,7 @@ fn top_level_help_uses_logical_command_groups() {
             "  session",
         ],
         &[
-            "Connect:", "  status", "  shell", "  exec", "  ssh", "  tcp", "  udp",
+            "Connect:", "  status", "  shell", "  exec", "  ssh", "  tcp", "  udp", "  socket",
         ],
         &["Permissions:", "  ticket"],
         &["Integrations:", "  docker", "  slicer", "  gateway"],
@@ -287,6 +287,7 @@ Commands:
   exec     Run a remote command without a PTY
   tcp      Set up one or more local TCP forwards
   udp      Set up one or more local UDP forwards
+  socket   Set up Unix-domain socket forwards
   peer     Manage peer trust (the filesystem-backed `peers.json` store)
   ticket   Manage saved tickets (outbound credentials)
   whoami   Print the local identity's `endpoint_id` and peer-store label
@@ -417,6 +418,27 @@ Options:
   -v, --verbose...    Increase logging; in doctor, also show passing checks
       --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and `PORTL_LOG`
   -h, --help          Print help
+"#,
+        ),
+        (
+            &["socket", "--help"][..],
+            r#"Set up Unix-domain socket forwards
+
+Usage: portl socket [OPTIONS] --local <PATH> <TARGET>
+
+Arguments:
+  <TARGET>  Target by label, ticket string, alias, endpoint id, or elided endpoint id
+
+Options:
+      --local <PATH>           Local Unix socket path. In --connect mode this is the local listener; in
+                               --listen mode this is the local target socket
+      --connect <REMOTE_PATH>  Remote Unix socket path to connect to for each local connection
+      --listen <REMOTE_PATH>   Remote Unix socket path the agent should listen on and reverse-forward back
+                               to --local
+      --cleanup                Remove an existing socket path before binding and remove it on exit
+  -v, --verbose...             Increase logging; in doctor, also show passing checks
+      --log <FILTER>           RUST_LOG-style tracing filter. Overrides -v and `PORTL_LOG`
+  -h, --help                   Print help
 "#,
         ),
         (

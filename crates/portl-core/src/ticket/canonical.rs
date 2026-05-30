@@ -23,7 +23,10 @@
 //!      bytes).
 
 use crate::error::{PortlError, Result};
-use crate::ticket::schema::{Capabilities, EnvPolicy, PortRule, PortlBody, PortlTicket, ShellCaps};
+use crate::ticket::schema::{
+    Capabilities, EnvPolicy, PortRule, PortlBody, PortlTicket, ShellCaps, UnixPathRule,
+    validate_unix_path_rule,
+};
 
 /// One year in seconds (365 × 86 400).
 const MAX_TTL_SECONDS: u64 = 365 * 86_400;
@@ -63,6 +66,10 @@ pub fn canonical_check(body: &PortlBody) -> Result<()> {
     }
     if let Some(shell) = &body.caps.shell {
         check_shell_caps_sorted(shell)?;
+    }
+    if let Some(unix) = &body.caps.unix {
+        check_sorted_unique_unix_path_rules(&unix.connect, "unix.connect")?;
+        check_sorted_unique_unix_path_rules(&unix.listen, "unix.listen")?;
     }
     // alpns_extra: rule 3 (sort+dedup) and the v0.1 "MUST be empty"
     // invariant from §2.
@@ -144,7 +151,8 @@ fn check_presence_bitmap(caps: &Capabilities) -> Result<()> {
         | (u8::from(caps.udp.is_some()) << 2)
         | (u8::from(caps.fs.is_some()) << 3)
         | (u8::from(caps.vpn.is_some()) << 4)
-        | (u8::from(caps.meta.is_some()) << 5);
+        | (u8::from(caps.meta.is_some()) << 5)
+        | (u8::from(caps.unix.is_some()) << 6);
     if caps.presence != expected {
         return Err(PortlError::Canonical(
             "presence bitmap does not match Some-set",
@@ -175,6 +183,38 @@ fn portrule_ord(a: &PortRule, b: &PortRule) -> std::cmp::Ordering {
         .cmp(&b.host_glob)
         .then(a.port_min.cmp(&b.port_min))
         .then(a.port_max.cmp(&b.port_max))
+}
+
+fn check_sorted_unique_unix_path_rules(rules: &[UnixPathRule], tag: &'static str) -> Result<()> {
+    for rule in rules {
+        if validate_unix_path_rule(&rule.path, true).is_err() {
+            return Err(PortlError::Canonical(match tag {
+                "unix.connect" => "invalid unix.connect path rule",
+                "unix.listen" => "invalid unix.listen path rule",
+                _ => "invalid unix path rule",
+            }));
+        }
+    }
+    for w in rules.windows(2) {
+        match w[0].path.cmp(&w[1].path) {
+            std::cmp::Ordering::Less => {}
+            std::cmp::Ordering::Equal => {
+                return Err(PortlError::Canonical(match tag {
+                    "unix.connect" => "duplicate unix.connect path rule",
+                    "unix.listen" => "duplicate unix.listen path rule",
+                    _ => "duplicate unix path rule",
+                }));
+            }
+            std::cmp::Ordering::Greater => {
+                return Err(PortlError::Canonical(match tag {
+                    "unix.connect" => "unix.connect path rules not sorted",
+                    "unix.listen" => "unix.listen path rules not sorted",
+                    _ => "unix path rules not sorted",
+                }));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Rule 3 for `Vec<String>` with a tag so errors say which field.

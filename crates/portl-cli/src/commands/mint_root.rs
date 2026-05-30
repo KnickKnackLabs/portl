@@ -6,7 +6,10 @@ use iroh_base::{EndpointAddr, EndpointId};
 use iroh_tickets::Ticket;
 use portl_core::id::{Identity, store};
 use portl_core::ticket::mint::{mint_delegated, mint_root};
-use portl_core::ticket::schema::{Capabilities, EnvPolicy, MetaCaps, PortRule, ShellCaps};
+use portl_core::ticket::schema::{
+    Capabilities, EnvPolicy, MetaCaps, PortRule, ShellCaps, UnixCaps, UnixPathRule,
+    validate_unix_path_rule,
+};
 use qrcode::QrCode;
 use qrcode::render::unicode;
 
@@ -80,6 +83,8 @@ pub(crate) fn parse_caps(spec: &str) -> Result<Capabilities> {
     let mut shell = None;
     let mut tcp = Vec::new();
     let mut udp = Vec::new();
+    let mut unix_connect = Vec::new();
+    let mut unix_listen = Vec::new();
     let mut meta = None::<MetaCaps>;
 
     for entry in spec.split(',').filter(|entry| !entry.is_empty()) {
@@ -107,10 +112,17 @@ pub(crate) fn parse_caps(spec: &str) -> Result<Capabilities> {
             }
             _ if entry.starts_with("tcp:") => tcp.push(parse_port_rule(&entry[4..])?),
             _ if entry.starts_with("udp:") => udp.push(parse_port_rule(&entry[4..])?),
+            _ if entry.starts_with("unix:connect:") => {
+                unix_connect.push(parse_unix_path_rule(&entry[13..])?);
+            }
+            _ if entry.starts_with("unix:listen:") => {
+                unix_listen.push(parse_unix_path_rule(&entry[12..])?);
+            }
             _ => bail!(
                 "unsupported cap '{entry}'\n\
                  valid caps: shell, exec, session, dev, meta:ping, meta:info, \
-                 tcp:<host>:<port>[-<port>], udp:<host>:<port>[-<port>], all\n\
+                 tcp:<host>:<port>[-<port>], udp:<host>:<port>[-<port>], \
+                 unix:connect:<path>, unix:listen:<path>, all\n\
                  run `portl ticket caps` for the full reference"
             ),
         }
@@ -118,13 +130,20 @@ pub(crate) fn parse_caps(spec: &str) -> Result<Capabilities> {
 
     sort_and_validate_rules(&mut tcp)?;
     sort_and_validate_rules(&mut udp)?;
+    sort_and_validate_unix_rules(&mut unix_connect, "unix:connect")?;
+    sort_and_validate_unix_rules(&mut unix_listen, "unix:listen")?;
 
     let tcp = (!tcp.is_empty()).then_some(tcp);
     let udp = (!udp.is_empty()).then_some(udp);
+    let unix = (!unix_connect.is_empty() || !unix_listen.is_empty()).then_some(UnixCaps {
+        connect: unix_connect,
+        listen: unix_listen,
+    });
     let presence = u8::from(shell.is_some())
         | (u8::from(tcp.is_some()) << 1)
         | (u8::from(udp.is_some()) << 2)
-        | (u8::from(meta.is_some()) << 5);
+        | (u8::from(meta.is_some()) << 5)
+        | (u8::from(unix.is_some()) << 6);
 
     if presence == 0 {
         bail!("at least one capability is required");
@@ -138,6 +157,7 @@ pub(crate) fn parse_caps(spec: &str) -> Result<Capabilities> {
         fs: None,
         vpn: None,
         meta,
+        unix,
     })
 }
 
@@ -163,7 +183,7 @@ ticket. Use `all` as a wildcard only for dev / self-trust.
       SessionCaps are deferred.
 
   dev
-      Alias for `all`: shell + exec + session plus TCP/UDP/meta conveniences.
+      Alias for `all`: shell + exec + session plus TCP/UDP/Unix/meta conveniences.
 
   meta:ping
       Respond to liveness pings. Pairs well with uptime monitoring;
@@ -185,9 +205,19 @@ ticket. Use `all` as a wildcard only for dev / self-trust.
       UDP port forward. Same semantics as tcp:… but for UDP.
       Grants `portl udp <target> -L <local>:<host>:<port>`.
 
+  unix:connect:<path>
+      Permit connecting to a target-side Unix-domain socket path.
+      Grants `portl socket --local <path> --connect <path> <target>`.
+
+  unix:listen:<path>
+      Permit binding a target-side Unix-domain socket path and reverse-forwarding
+      connections back to a local Unix socket.
+      Grants `portl socket --local <path> --listen <path> <target>`.
+
   all
       Wildcard — grants every cap above with `*:1-65535` for
-      tcp/udp. Intended for self-trust / dev, not production.
+      tcp/udp and `*` Unix paths. Intended for self-trust / dev,
+      not production.
 
 Examples:
 
@@ -196,6 +226,7 @@ Examples:
   portl ticket issue exec --ttl 10m
   portl ticket issue 'shell,tcp:*:8080' --ttl 1h
   portl ticket issue 'tcp:127.0.0.1:6000-6100' --ttl 30m
+  portl ticket issue 'unix:listen:/tmp/portl-*' --ttl 10m
   portl ticket issue 'meta:ping,meta:info' --ttl 30d
   portl ticket issue all --ttl 1h       # dev only
 "
@@ -205,14 +236,14 @@ Examples:
 /// Abbreviated reference for error messages (keeps the failure
 /// output narrow).
 pub(crate) fn caps_reference_short() -> String {
-    "valid caps: shell | exec | session | dev | meta:ping | meta:info | tcp:<host>:<range> | udp:<host>:<range> | all\n\
+    "valid caps: shell | exec | session | dev | meta:ping | meta:info | tcp:<host>:<range> | udp:<host>:<range> | unix:connect:<path> | unix:listen:<path> | all\n\
      full reference: portl ticket caps"
         .to_owned()
 }
 
 fn all_caps() -> Capabilities {
     Capabilities {
-        presence: 0b0010_0111,
+        presence: 0b0110_0111,
         shell: Some(default_shell_caps()),
         tcp: Some(vec![PortRule {
             host_glob: "*".to_owned(),
@@ -229,6 +260,14 @@ fn all_caps() -> Capabilities {
         meta: Some(MetaCaps {
             ping: true,
             info: true,
+        }),
+        unix: Some(UnixCaps {
+            connect: vec![UnixPathRule {
+                path: "*".to_owned(),
+            }],
+            listen: vec![UnixPathRule {
+                path: "*".to_owned(),
+            }],
         }),
     }
 }
@@ -271,6 +310,24 @@ fn parse_port_rule(spec: &str) -> Result<PortRule> {
         port_min,
         port_max,
     })
+}
+
+fn parse_unix_path_rule(spec: &str) -> Result<UnixPathRule> {
+    validate_unix_path_rule(spec, false).map_err(anyhow::Error::msg)?;
+    Ok(UnixPathRule {
+        path: spec.to_owned(),
+    })
+}
+
+fn sort_and_validate_unix_rules(rules: &mut [UnixPathRule], name: &str) -> Result<()> {
+    rules.sort_by(|left, right| left.path.cmp(&right.path));
+    for window in rules.windows(2) {
+        let [left, right] = window else { continue };
+        if left.path == right.path {
+            bail!("duplicate {name} rule");
+        }
+    }
+    Ok(())
 }
 
 fn sort_and_validate_rules(rules: &mut [PortRule]) -> Result<()> {
@@ -334,4 +391,24 @@ pub(crate) fn parse_endpoint_bytes(spec: &str) -> Result<[u8; 32]> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("endpoint id must be exactly 32 bytes"))?;
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_caps;
+
+    #[test]
+    fn parse_caps_accepts_unix_connect_and_listen_rules() {
+        let caps = parse_caps("unix:connect:/run/agent.sock,unix:listen:/tmp/portl-*").unwrap();
+        assert_eq!(caps.presence, 0b0100_0000);
+        let unix = caps.unix.expect("unix caps");
+        assert_eq!(unix.connect[0].path, "/run/agent.sock");
+        assert_eq!(unix.listen[0].path, "/tmp/portl-*");
+    }
+
+    #[test]
+    fn parse_caps_rejects_broad_unix_wildcard() {
+        let err = parse_caps("unix:connect:*").expect_err("broad unix wildcard should fail");
+        assert!(err.to_string().contains("broad unix wildcard"));
+    }
 }

@@ -247,6 +247,7 @@ fn udp_caps(port: u16) -> Capabilities {
         fs: None,
         vpn: None,
         meta: None,
+        unix: None,
     }
 }
 

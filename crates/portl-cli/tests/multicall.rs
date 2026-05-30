@@ -221,6 +221,52 @@ fn shell_exec_tcp_and_udp_subcommands_parse() {
 }
 
 #[test]
+fn socket_subcommands_parse() {
+    let connect = parse(argv(&[
+        "portl",
+        "socket",
+        "--local",
+        "/tmp/local.sock",
+        "--connect",
+        "/run/remote.sock",
+        "peer-ticket",
+    ]))
+    .expect("socket connect parse should succeed");
+    assert_eq!(
+        connect,
+        Command::Socket {
+            peer: "peer-ticket".to_owned(),
+            local: "/tmp/local.sock".to_owned(),
+            connect: Some("/run/remote.sock".to_owned()),
+            listen: None,
+            cleanup: false,
+        }
+    );
+
+    let listen = parse(argv(&[
+        "portl",
+        "socket",
+        "--local",
+        "/run/local-agent.sock",
+        "--listen",
+        "/tmp/portl-agent.sock",
+        "--cleanup",
+        "peer-ticket",
+    ]))
+    .expect("socket listen parse should succeed");
+    assert_eq!(
+        listen,
+        Command::Socket {
+            peer: "peer-ticket".to_owned(),
+            local: "/run/local-agent.sock".to_owned(),
+            connect: None,
+            listen: Some("/tmp/portl-agent.sock".to_owned()),
+            cleanup: true,
+        }
+    );
+}
+
+#[test]
 fn portl_ssh_subcommands_parse() {
     let ssh_shell = parse(argv(&["portl", "ssh", "vn3"])).expect("ssh shell parse");
     assert_eq!(

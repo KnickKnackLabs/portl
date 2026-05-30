@@ -238,6 +238,7 @@ fn tcp_caps(port_min: u16, port_max: u16) -> Capabilities {
         fs: None,
         vpn: None,
         meta: None,
+        unix: None,
     }
 }
 

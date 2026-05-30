@@ -4,6 +4,7 @@ pub mod session;
 pub mod shell;
 pub mod tcp;
 pub mod udp;
+pub mod unix;
 
 use crate::ticket::schema::Capabilities;
 use serde::{Deserialize, Serialize};

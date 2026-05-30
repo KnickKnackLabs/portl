@@ -79,6 +79,7 @@ pub struct Capabilities {
     fs:        Option<FsCaps>,     // bit 3; deferred to v0.2
     vpn:       Option<VpnCaps>,    // bit 4
     meta:      Option<MetaCaps>,   // bit 5
+    unix:      Option<UnixCaps>,   // bit 6
 }
 //   Wire encoding is `presence: u8` followed by present bodies in
 //   bit order. Postcard field elision is required: bits not set in
@@ -119,6 +120,16 @@ pub struct VpnCaps {
 pub struct MetaCaps {
     ping: bool,
     info: bool,
+}
+
+pub struct UnixCaps {
+    connect: Vec<UnixPathRule>,    // target-side socket connect paths
+    listen:  Vec<UnixPathRule>,    // target-side socket bind paths
+}
+
+pub struct UnixPathRule {
+    path: String,                  // absolute path or narrow suffix-* glob;
+                                   // `*` reserved for dev/self-trust
 }
 
 pub struct Delegation {

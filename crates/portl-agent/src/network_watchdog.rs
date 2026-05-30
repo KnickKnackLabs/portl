@@ -479,6 +479,7 @@ fn meta_caps() -> Capabilities {
             ping: true,
             info: false,
         }),
+        unix: None,
     }
 }
 
