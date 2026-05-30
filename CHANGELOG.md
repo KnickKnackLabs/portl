@@ -5,6 +5,14 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.10.1 — 2026-05-30
+
+### Fixed
+
+- Herdr attach now terminates the remote `herdr remote-client-bridge` as soon
+  as the primary attach control stream closes, preventing stale bridge
+  processes after local detach while leaving the remote Herdr server running.
+
 ## 0.10.0 — 2026-05-30
 
 ### Added
