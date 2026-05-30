@@ -2919,6 +2919,9 @@ fn spawn_local_herdr_client(socket_path: &std::path::Path, canonical_ref: &str) 
         canonical_ref,
         std::env::var_os("HERDR_REMOTE_KEYBINDINGS").is_some(),
     ));
+    for key in local_herdr_client_env_removals() {
+        command.env_remove(key);
+    }
     command
         .spawn()
         .with_context(|| format!("spawn local herdr client via {}", path.display()))
@@ -3141,6 +3144,10 @@ fn local_herdr_client_env(
         env.push(("HERDR_REMOTE_KEYBINDINGS".to_owned(), "local".to_owned()));
     }
     env
+}
+
+fn local_herdr_client_env_removals() -> &'static [&'static str] {
+    &["HERDR_SOCKET_PATH"]
 }
 
 fn shell_quote(value: &str) -> String {
@@ -9805,6 +9812,11 @@ mod tests {
             ]
         );
         assert!(!env.iter().any(|(key, _)| key == "HERDR_RENDER_ENCODING"));
+    }
+
+    #[test]
+    fn local_herdr_client_env_removes_api_socket_override() {
+        assert!(local_herdr_client_env_removals().contains(&"HERDR_SOCKET_PATH"));
     }
 
     #[test]
