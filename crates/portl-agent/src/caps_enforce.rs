@@ -386,6 +386,7 @@ mod tests {
             op: UnixOp::Listen {
                 path: "/tmp/portl-agent.sock".to_owned(),
                 cleanup: true,
+                ssh_agent: false,
             },
         };
 

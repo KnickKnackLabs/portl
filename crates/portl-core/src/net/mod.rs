@@ -14,12 +14,14 @@ pub use session_client::{
     open_session_list, open_session_list_detailed, open_session_list_detailed_checked,
     open_session_providers, open_session_run,
 };
-pub use shell_client::{ShellClient, open_exec, open_shell};
+pub use shell_client::{
+    ShellClient, open_exec, open_exec_with_env, open_shell, open_shell_with_env,
+};
 pub use tcp_client::{open_tcp, run_local_forward};
 pub use udp_client::{
     LocalUdpForwardHandle, UdpControl, open_udp, run_local_forward as run_local_udp_forward,
 };
 pub use unix_client::{
-    UnixListenControl, accept_unix_reverse_once, open_unix, open_unix_listen,
-    run_local_unix_forward, run_unix_reverse_forward,
+    UnixListenControl, UnixListenOptions, accept_unix_reverse_once, open_unix, open_unix_listen,
+    open_unix_listen_with_options, run_local_unix_forward, run_unix_reverse_forward,
 };

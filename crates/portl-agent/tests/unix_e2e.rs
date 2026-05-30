@@ -1,12 +1,16 @@
 #[allow(dead_code)]
 mod common;
 
+use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use portl_agent::{AgentConfig, DiscoveryConfig, run_task};
 use portl_core::id::Identity;
-use portl_core::net::{accept_unix_reverse_once, open_ticket_v1, open_unix, open_unix_listen};
+use portl_core::net::{
+    UnixListenOptions, accept_unix_reverse_once, open_ticket_v1, open_unix, open_unix_listen,
+    open_unix_listen_with_options, run_unix_reverse_forward,
+};
 use portl_core::test_util::pair;
 use portl_core::ticket::mint::mint_root;
 use portl_core::ticket::schema::{Capabilities, PortlTicket, UnixCaps, UnixPathRule};
@@ -81,6 +85,133 @@ async fn unix_listen_reverse_forward_echo() -> Result<()> {
     shutdown(connection, client, server, agent).await
 }
 
+#[tokio::test]
+async fn agent_forward_listen_creates_private_remote_dir_and_cleans_up() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let local_echo_path = temp.path().join("local-agent.sock");
+    let remote_dir =
+        std::path::PathBuf::from(format!("/tmp/portl-agent-{:016x}", rand::random::<u64>()));
+    let remote_agent_path = remote_dir.join("agent.sock");
+    let _ = std::fs::remove_dir_all(&remote_dir);
+    let echo_task = spawn_unix_echo(local_echo_path.clone())?;
+
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator).await?;
+    let ticket = root_ticket(
+        &operator,
+        server.addr(),
+        unix_caps(vec![], vec![path_rule(&remote_agent_path)]),
+    );
+
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let control = open_unix_listen_with_options(
+        &connection,
+        &session,
+        path_str(&remote_agent_path)?,
+        UnixListenOptions {
+            cleanup: true,
+            ssh_agent: true,
+        },
+    )
+    .await?;
+    let metadata = std::fs::symlink_metadata(&remote_dir)?;
+    assert!(metadata.file_type().is_dir());
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+
+    let reverse_task = tokio::spawn({
+        let connection = connection.clone();
+        let session = session.clone();
+        let remote_path = path_str(&remote_agent_path)?.to_owned();
+        let local_path = path_str(&local_echo_path)?.to_owned();
+        async move { accept_unix_reverse_once(&connection, &session, &remote_path, &local_path).await }
+    });
+
+    let mut remote = UnixStream::connect(&remote_agent_path).await?;
+    remote.write_all(b"agent request").await?;
+    remote.shutdown().await?;
+    let mut echoed = Vec::new();
+    remote.read_to_end(&mut echoed).await?;
+    assert_eq!(echoed, b"agent request");
+
+    reverse_task.await??;
+    control.close()?;
+    wait_until_removed(&remote_dir).await?;
+    assert!(!remote_agent_path.exists());
+    assert!(!remote_dir.exists());
+    echo_task.await??;
+    shutdown(connection, client, server, agent).await
+}
+
+#[tokio::test]
+async fn agent_forward_reverse_loop_survives_missing_local_agent() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let local_agent_path = temp.path().join("late-local-agent.sock");
+    let remote_dir =
+        std::path::PathBuf::from(format!("/tmp/portl-agent-{:016x}", rand::random::<u64>()));
+    let remote_agent_path = remote_dir.join("agent.sock");
+    let _ = std::fs::remove_dir_all(&remote_dir);
+
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator).await?;
+    let ticket = root_ticket(
+        &operator,
+        server.addr(),
+        unix_caps(vec![], vec![path_rule(&remote_agent_path)]),
+    );
+
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let control = open_unix_listen_with_options(
+        &connection,
+        &session,
+        path_str(&remote_agent_path)?,
+        UnixListenOptions {
+            cleanup: true,
+            ssh_agent: true,
+        },
+    )
+    .await?;
+    let reverse_task = tokio::spawn({
+        let connection = connection.clone();
+        let session = session.clone();
+        let remote_path = path_str(&remote_agent_path)?.to_owned();
+        let local_path = path_str(&local_agent_path)?.to_owned();
+        async move { run_unix_reverse_forward(connection, session, remote_path, local_path).await }
+    });
+
+    let mut failed_request = UnixStream::connect(&remote_agent_path).await?;
+    let _ = failed_request.write_all(b"agent before local exists").await;
+    failed_request.shutdown().await.ok();
+    let mut ignored = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        failed_request.read_to_end(&mut ignored),
+    )
+    .await
+    .context("failed request should close promptly")??;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !reverse_task.is_finished(),
+        "missing local agent socket must not terminate forwarding loop"
+    );
+
+    let echo_task = spawn_unix_echo(local_agent_path.clone())?;
+    let mut remote = UnixStream::connect(&remote_agent_path).await?;
+    remote.write_all(b"agent after local exists").await?;
+    remote.shutdown().await?;
+    let mut echoed = Vec::new();
+    remote.read_to_end(&mut echoed).await?;
+    assert_eq!(echoed, b"agent after local exists");
+
+    echo_task.await??;
+    control.close()?;
+    reverse_task.abort();
+    let _ = reverse_task.await;
+    wait_until_removed(&remote_dir).await?;
+    shutdown(connection, client, server, agent).await
+}
+
 fn spawn_unix_echo(path: std::path::PathBuf) -> Result<tokio::task::JoinHandle<Result<()>>> {
     let listener = UnixListener::bind(path)?;
     Ok(tokio::spawn(async move {
@@ -144,6 +275,16 @@ fn path_rule(path: &std::path::Path) -> UnixPathRule {
 
 fn path_str(path: &std::path::Path) -> Result<&str> {
     path.to_str().context("unix socket path must be utf-8")
+}
+
+async fn wait_until_removed(path: &std::path::Path) -> Result<()> {
+    for _ in 0..40 {
+        if !path.exists() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    anyhow::bail!("path was not removed: {}", path.display())
 }
 
 async fn shutdown(

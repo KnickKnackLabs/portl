@@ -19,7 +19,9 @@ use nix::unistd::{User, geteuid, getgroups};
 use portl_agent::{AgentConfig, DiscoveryConfig, run_task};
 use portl_core::id::Identity;
 use portl_core::net::shell_client::PtyCfg;
-use portl_core::net::{TicketHandshakeError, open_exec, open_shell, open_ticket_v1};
+use portl_core::net::{
+    TicketHandshakeError, open_exec, open_exec_with_env, open_shell, open_ticket_v1,
+};
 use portl_core::test_util::pair;
 use portl_core::ticket::mint::mint_root;
 use portl_core::ticket::schema::{Capabilities, EnvPolicy, PortlTicket, ShellCaps};
@@ -128,6 +130,45 @@ async fn shell_with_pty_resize_mid_session_applies_winsz() -> Result<()> {
     assert!(output.contains("__PORTL__"), "output was: {output:?}");
     assert!(output.contains("40 120"), "output was: {output:?}");
     assert_eq!(shell.wait_exit().await?, 0);
+
+    shutdown(connection, client, server, agent).await
+}
+
+#[tokio::test]
+async fn agent_forward_env_patch_injects_ssh_auth_sock() -> Result<()> {
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator).await?;
+    let ticket = root_ticket(&operator, server.addr(), shell_caps(true, true));
+
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let mut exec = open_exec_with_env(
+        &connection,
+        &session,
+        None,
+        None,
+        vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "printf '%s\\n' \"$SSH_AUTH_SOCK\"".to_owned(),
+        ],
+        vec![(
+            "SSH_AUTH_SOCK".to_owned(),
+            portl_core::wire::shell::EnvValue::Set(
+                "/tmp/portl-agent-0123456789abcdef/agent.sock".to_owned(),
+            ),
+        )],
+    )
+    .await?;
+    exec.stdin.finish()?;
+
+    let mut stdout = Vec::new();
+    AsyncReadExt::read_to_end(&mut exec.stdout, &mut stdout).await?;
+    assert_eq!(
+        String::from_utf8(stdout)?.trim(),
+        "/tmp/portl-agent-0123456789abcdef/agent.sock"
+    );
+    assert_eq!(exec.wait_exit().await?, 0);
 
     shutdown(connection, client, server, agent).await
 }

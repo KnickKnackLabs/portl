@@ -48,17 +48,42 @@ impl UnixListenControl {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnixListenOptions {
+    pub cleanup: bool,
+    pub ssh_agent: bool,
+}
+
 pub async fn open_unix_listen(
     connection: &Connection,
     session: &PeerSession,
     path: &str,
     cleanup: bool,
 ) -> Result<UnixListenControl> {
+    open_unix_listen_with_options(
+        connection,
+        session,
+        path,
+        UnixListenOptions {
+            cleanup,
+            ssh_agent: false,
+        },
+    )
+    .await
+}
+
+pub async fn open_unix_listen_with_options(
+    connection: &Connection,
+    session: &PeerSession,
+    path: &str,
+    options: UnixListenOptions,
+) -> Result<UnixListenControl> {
     let req = unix_req(
         session,
         UnixOp::Listen {
             path: path.to_owned(),
-            cleanup,
+            cleanup: options.cleanup,
+            ssh_agent: options.ssh_agent,
         },
     );
     let (mut send, recv) = connection
@@ -128,9 +153,12 @@ pub async fn run_unix_reverse_forward(
     local_path: String,
 ) -> Result<()> {
     loop {
-        let (local, send, recv) =
+        let Some((local, send, recv)) =
             accept_unix_reverse_connection(&connection, &session, &remote_path, &local_path)
-                .await?;
+                .await?
+        else {
+            continue;
+        };
         tokio::spawn(async move {
             if let Err(err) = copy_bidirectional_unix(local, send, recv).await {
                 tracing::debug!(%err, "reverse unix forwarding connection failed");
@@ -145,8 +173,11 @@ pub async fn accept_unix_reverse_once(
     remote_path: &str,
     local_path: &str,
 ) -> Result<()> {
-    let (local, send, recv) =
-        accept_unix_reverse_connection(connection, session, remote_path, local_path).await?;
+    let Some((local, send, recv)) =
+        accept_unix_reverse_connection(connection, session, remote_path, local_path).await?
+    else {
+        bail!("reverse unix request rejected: connect local unix target")
+    };
     copy_bidirectional_unix(local, send, recv).await
 }
 
@@ -155,7 +186,7 @@ async fn accept_unix_reverse_connection(
     session: &PeerSession,
     remote_path: &str,
     local_path: &str,
-) -> Result<(UnixStream, SendStream, BufferedRecv)> {
+) -> Result<Option<(UnixStream, SendStream, BufferedRecv)>> {
     let (mut send, recv) = connection
         .accept_bi()
         .await
@@ -207,12 +238,13 @@ async fn accept_unix_reverse_connection(
         Err(err) => {
             write_unix_ack(&mut send, false, Some(err.to_string())).await?;
             send.finish().context("finish failed reverse unix ack")?;
-            return Err(err).context("connect local unix target");
+            tracing::debug!(%err, local_path, "reverse unix local target unavailable");
+            return Ok(None);
         }
     };
 
     write_unix_ack(&mut send, true, None).await?;
-    Ok((local, send, recv))
+    Ok(Some((local, send, recv)))
 }
 
 fn unix_req(session: &PeerSession, op: UnixOp) -> UnixReq {

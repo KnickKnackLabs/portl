@@ -4,8 +4,8 @@ use iroh::endpoint::{Connection, RecvStream, SendStream};
 use crate::io::BufferedRecv;
 use crate::wire::StreamPreamble;
 use crate::wire::shell::{
-    ALPN_SHELL_V1, ExitFrame, ResizeFrame, ShellAck, ShellFirstFrame, ShellMode, ShellReqBody,
-    ShellStreamKind, ShellSubTail, SignalFrame,
+    ALPN_SHELL_V1, EnvValue, ExitFrame, ResizeFrame, ShellAck, ShellFirstFrame, ShellMode,
+    ShellReqBody, ShellStreamKind, ShellSubTail, SignalFrame,
 };
 
 use super::PeerSession;
@@ -78,10 +78,21 @@ pub async fn open_shell(
     cwd: Option<String>,
     pty: PtyCfg,
 ) -> Result<ShellClient> {
+    open_shell_with_env(connection, session, user, cwd, pty, Vec::new()).await
+}
+
+pub async fn open_shell_with_env(
+    connection: &Connection,
+    session: &PeerSession,
+    user: Option<String>,
+    cwd: Option<String>,
+    pty: PtyCfg,
+    env_patch: Vec<(String, EnvValue)>,
+) -> Result<ShellClient> {
     let req = ShellReqBody {
         mode: ShellMode::Shell,
         argv: None,
-        env_patch: Vec::new(),
+        env_patch,
         cwd,
         pty: Some(pty),
         user,
@@ -96,10 +107,21 @@ pub async fn open_exec(
     cwd: Option<String>,
     argv: Vec<String>,
 ) -> Result<ShellClient> {
+    open_exec_with_env(connection, session, user, cwd, argv, Vec::new()).await
+}
+
+pub async fn open_exec_with_env(
+    connection: &Connection,
+    session: &PeerSession,
+    user: Option<String>,
+    cwd: Option<String>,
+    argv: Vec<String>,
+    env_patch: Vec<(String, EnvValue)>,
+) -> Result<ShellClient> {
     let req = ShellReqBody {
         mode: ShellMode::Exec,
         argv: Some(argv),
-        env_patch: Vec::new(),
+        env_patch,
         cwd,
         pty: None,
         user,

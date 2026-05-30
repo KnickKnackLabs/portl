@@ -34,8 +34,14 @@ impl UnixReq {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UnixOp {
-    Connect { path: String },
-    Listen { path: String, cleanup: bool },
+    Connect {
+        path: String,
+    },
+    Listen {
+        path: String,
+        cleanup: bool,
+        ssh_agent: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +65,7 @@ mod tests {
             op: UnixOp::Listen {
                 path: "/tmp/portl-agent.sock".to_owned(),
                 cleanup: true,
+                ssh_agent: true,
             },
         };
 

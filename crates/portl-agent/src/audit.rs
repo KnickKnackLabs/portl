@@ -201,6 +201,16 @@ fn init_shell_exit_audit_file() -> Option<Mutex<File>> {
     Some(Mutex::new(file))
 }
 
+pub(crate) fn ssh_agent_forward_enabled(session: &Session, remote_socket_path: &str) {
+    tracing::event!(
+        Level::INFO,
+        event = "audit.ssh_agent_forward_enabled",
+        caller_endpoint_id = %hex::encode(session.caller_endpoint_id),
+        ticket_id = %hex::encode(session.ticket_id),
+        remote_socket_path,
+    );
+}
+
 pub(crate) fn tcp_connect(session: &Session, host: &str, port: u16) {
     tracing::event!(
         Level::INFO,

@@ -7,22 +7,26 @@ use crossterm::terminal::size;
 use iroh::endpoint::SendStream;
 use portl_core::io::BufferedRecv;
 use portl_core::net::shell_client::PtyCfg;
-use portl_core::net::{ShellClient, open_shell};
+use portl_core::net::{ShellClient, open_shell_with_env};
 use portl_core::ticket::schema::{Capabilities, EnvPolicy, ShellCaps};
+use portl_core::wire::shell::EnvValue;
 use tokio::io::{AsyncWriteExt, copy};
 use tracing::debug;
 
-use crate::commands::peer_resolve::{close_connected, connect_peer, connect_peer_quiet};
+use crate::commands::peer_resolve::{
+    ConnectedPeer, close_connected, connect_peer, connect_peer_quiet,
+};
 use crate::commands::session::{AttachSignalWatcher, RawModeExitVariant, RawModeGuard};
 
 pub fn run(peer: &str, cwd: Option<&str>, user: Option<&str>) -> Result<ExitCode> {
     run_with_options(peer, cwd, user, ShellRunOptions::default())
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ShellRunOptions {
     pub(crate) quiet_resolve: bool,
     pub(crate) close_stdin: bool,
+    pub(crate) env_patch: Vec<(String, EnvValue)>,
 }
 
 pub(crate) fn run_with_options(
@@ -38,101 +42,112 @@ pub(crate) fn run_with_options(
         } else {
             connect_peer(peer, shell_caps()).await?
         };
-        let (cols, rows) = size().unwrap_or((80, 24));
-        let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_owned());
-        let shell = open_shell(
-            &connected.connection,
-            &connected.session,
-            user.map(ToOwned::to_owned),
-            cwd.map(ToOwned::to_owned),
-            PtyCfg { term, cols, rows },
-        )
-        .await?;
-
-        let raw_guard = if std::io::stdin().is_terminal() {
-            Some(RawModeGuard::new()?)
-        } else {
-            None
-        };
-        let mut signal_watcher = AttachSignalWatcher::new()?;
-
-        let ShellClient {
-            control_send: _control_send,
-            control_recv: _control_recv,
-            stdin,
-            stdout: mut stdout_recv,
-            stderr: mut stderr_recv,
-            mut exit,
-            signal: _signal,
-            resize,
-        } = shell;
-
-        let stdin_task = if options.close_stdin {
-            close_remote_stdin(stdin);
-            None
-        } else {
-            maybe_spawn_stdin_task(stdin)?
-        };
-
-        let stdout_task = tokio::spawn(async move {
-            let mut stdout = tokio::io::stdout();
-            copy(&mut stdout_recv, &mut stdout)
-                .await
-                .context("copy remote stdout")?;
-            stdout.flush().await.context("flush local stdout")?;
-            Ok::<_, anyhow::Error>(())
-        });
-
-        let stderr_task = tokio::spawn(async move {
-            let mut stderr = tokio::io::stderr();
-            copy(&mut stderr_recv, &mut stderr)
-                .await
-                .context("copy remote stderr")?;
-            stderr.flush().await.context("flush local stderr")?;
-            Ok::<_, anyhow::Error>(())
-        });
-
-        let resize_task = resize.map(|mut resize| {
-            tokio::spawn(async move {
-                let mut last = (cols, rows);
-                loop {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    if let Ok(now) = size()
-                        && now != last
-                    {
-                        let frame = portl_proto::shell_v1::ResizeFrame {
-                            cols: now.0,
-                            rows: now.1,
-                        };
-                        resize
-                            .write_all(&postcard::to_stdvec(&frame).context("encode resize frame")?)
-                            .await
-                            .context("write resize frame")?;
-                        last = now;
-                    }
-                }
-                #[allow(unreachable_code)]
-                Ok::<_, anyhow::Error>(())
-            })
-        });
-
-        let completion = tokio::select! {
-            code = read_exit(&mut exit) => ShellCompletion::Exited(code?),
-            signal = signal_watcher.next() => ShellCompletion::Signal(signal),
-        };
-        if let Some(task) = resize_task {
-            task.abort();
-        }
-        if let Some(stdin_task) = stdin_task {
-            stdin_task.abort();
-            let _ = stdin_task.await;
-        }
-        let code = finish_shell_completion(completion, raw_guard, stdout_task, stderr_task).await?;
+        let result = run_on_connected(&connected, cwd, user, options).await;
         close_connected(connected, b"shell complete").await;
-        Ok(exit_code_from_i32(code))
+        result
     });
     runtime.shutdown_background();
     result
+}
+
+pub(crate) async fn run_on_connected(
+    connected: &ConnectedPeer,
+    cwd: Option<&str>,
+    user: Option<&str>,
+    options: ShellRunOptions,
+) -> Result<ExitCode> {
+    let (cols, rows) = size().unwrap_or((80, 24));
+    let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_owned());
+    let shell = open_shell_with_env(
+        &connected.connection,
+        &connected.session,
+        user.map(ToOwned::to_owned),
+        cwd.map(ToOwned::to_owned),
+        PtyCfg { term, cols, rows },
+        options.env_patch,
+    )
+    .await?;
+
+    let raw_guard = if std::io::stdin().is_terminal() {
+        Some(RawModeGuard::new()?)
+    } else {
+        None
+    };
+    let mut signal_watcher = AttachSignalWatcher::new()?;
+
+    let ShellClient {
+        control_send: _control_send,
+        control_recv: _control_recv,
+        stdin,
+        stdout: mut stdout_recv,
+        stderr: mut stderr_recv,
+        mut exit,
+        signal: _signal,
+        resize,
+    } = shell;
+
+    let stdin_task = if options.close_stdin {
+        close_remote_stdin(stdin);
+        None
+    } else {
+        maybe_spawn_stdin_task(stdin)?
+    };
+
+    let stdout_task = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        copy(&mut stdout_recv, &mut stdout)
+            .await
+            .context("copy remote stdout")?;
+        stdout.flush().await.context("flush local stdout")?;
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let stderr_task = tokio::spawn(async move {
+        let mut stderr = tokio::io::stderr();
+        copy(&mut stderr_recv, &mut stderr)
+            .await
+            .context("copy remote stderr")?;
+        stderr.flush().await.context("flush local stderr")?;
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let resize_task = resize.map(|mut resize| {
+        tokio::spawn(async move {
+            let mut last = (cols, rows);
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if let Ok(now) = size()
+                    && now != last
+                {
+                    let frame = portl_proto::shell_v1::ResizeFrame {
+                        cols: now.0,
+                        rows: now.1,
+                    };
+                    resize
+                        .write_all(&postcard::to_stdvec(&frame).context("encode resize frame")?)
+                        .await
+                        .context("write resize frame")?;
+                    last = now;
+                }
+            }
+            #[allow(unreachable_code)]
+            Ok::<_, anyhow::Error>(())
+        })
+    });
+
+    let completion = tokio::select! {
+        code = read_exit(&mut exit) => ShellCompletion::Exited(code?),
+        signal = signal_watcher.next() => ShellCompletion::Signal(signal),
+    };
+    if let Some(task) = resize_task {
+        task.abort();
+    }
+    if let Some(stdin_task) = stdin_task {
+        stdin_task.abort();
+        let _ = stdin_task.await;
+    }
+    let code = finish_shell_completion(completion, raw_guard, stdout_task, stderr_task).await?;
+    Ok(exit_code_from_i32(code))
 }
 
 fn shell_caps() -> Capabilities {
@@ -292,5 +307,6 @@ mod ssh_shell_options_tests {
         let options = ShellRunOptions::default();
         assert!(!options.quiet_resolve);
         assert!(!options.close_stdin);
+        assert!(options.env_patch.is_empty());
     }
 }

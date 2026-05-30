@@ -5,21 +5,25 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use iroh::endpoint::SendStream;
 use portl_core::io::BufferedRecv;
-use portl_core::net::{ShellClient, open_exec};
+use portl_core::net::{ShellClient, open_exec_with_env};
 use portl_core::ticket::schema::{Capabilities, EnvPolicy, ShellCaps};
+use portl_core::wire::shell::EnvValue;
 use tokio::io::{AsyncWriteExt, copy};
 use tracing::debug;
 
-use crate::commands::peer_resolve::{close_connected, connect_peer, connect_peer_quiet};
+use crate::commands::peer_resolve::{
+    ConnectedPeer, close_connected, connect_peer, connect_peer_quiet,
+};
 
 pub fn run(peer: &str, cwd: Option<&str>, user: Option<&str>, argv: &[String]) -> Result<ExitCode> {
     run_with_options(peer, cwd, user, argv, ExecRunOptions::default())
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ExecRunOptions {
     pub(crate) quiet_resolve: bool,
     pub(crate) close_stdin: bool,
+    pub(crate) env_patch: Vec<(String, EnvValue)>,
 }
 
 pub(crate) fn run_with_options(
@@ -36,63 +40,75 @@ pub(crate) fn run_with_options(
         } else {
             connect_peer(peer, exec_caps()).await?
         };
-        let exec = open_exec(
-            &connected.connection,
-            &connected.session,
-            user.map(ToOwned::to_owned),
-            cwd.map(ToOwned::to_owned),
-            argv.to_vec(),
-        )
-        .await?;
-
-        let ShellClient {
-            control_send: _control_send,
-            control_recv: _control_recv,
-            stdin,
-            stdout: mut stdout_recv,
-            stderr: mut stderr_recv,
-            mut exit,
-            signal: _,
-            resize: _,
-        } = exec;
-
-        let stdin_task = if options.close_stdin {
-            close_remote_stdin(stdin);
-            None
-        } else {
-            maybe_spawn_stdin_task(stdin)?
-        };
-
-        let stdout_task = tokio::spawn(async move {
-            let mut stdout = tokio::io::stdout();
-            copy(&mut stdout_recv, &mut stdout)
-                .await
-                .context("copy remote stdout")?;
-            stdout.flush().await.context("flush local stdout")?;
-            Ok::<_, anyhow::Error>(())
-        });
-
-        let stderr_task = tokio::spawn(async move {
-            let mut stderr = tokio::io::stderr();
-            copy(&mut stderr_recv, &mut stderr)
-                .await
-                .context("copy remote stderr")?;
-            stderr.flush().await.context("flush local stderr")?;
-            Ok::<_, anyhow::Error>(())
-        });
-
-        let code = read_exit(&mut exit).await?;
-        if let Some(stdin_task) = stdin_task {
-            stdin_task.abort();
-            let _ = stdin_task.await;
-        }
-        await_output_task(stdout_task, "stdout").await?;
-        await_output_task(stderr_task, "stderr").await?;
+        let result = run_on_connected(&connected, cwd, user, argv, options).await;
         close_connected(connected, b"exec complete").await;
-        Ok(exit_code_from_i32(code))
+        result
     });
     runtime.shutdown_background();
     result
+}
+
+pub(crate) async fn run_on_connected(
+    connected: &ConnectedPeer,
+    cwd: Option<&str>,
+    user: Option<&str>,
+    argv: &[String],
+    options: ExecRunOptions,
+) -> Result<ExitCode> {
+    let exec = open_exec_with_env(
+        &connected.connection,
+        &connected.session,
+        user.map(ToOwned::to_owned),
+        cwd.map(ToOwned::to_owned),
+        argv.to_vec(),
+        options.env_patch,
+    )
+    .await?;
+
+    let ShellClient {
+        control_send: _control_send,
+        control_recv: _control_recv,
+        stdin,
+        stdout: mut stdout_recv,
+        stderr: mut stderr_recv,
+        mut exit,
+        signal: _,
+        resize: _,
+    } = exec;
+
+    let stdin_task = if options.close_stdin {
+        close_remote_stdin(stdin);
+        None
+    } else {
+        maybe_spawn_stdin_task(stdin)?
+    };
+
+    let stdout_task = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        copy(&mut stdout_recv, &mut stdout)
+            .await
+            .context("copy remote stdout")?;
+        stdout.flush().await.context("flush local stdout")?;
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let stderr_task = tokio::spawn(async move {
+        let mut stderr = tokio::io::stderr();
+        copy(&mut stderr_recv, &mut stderr)
+            .await
+            .context("copy remote stderr")?;
+        stderr.flush().await.context("flush local stderr")?;
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let code = read_exit(&mut exit).await?;
+    if let Some(stdin_task) = stdin_task {
+        stdin_task.abort();
+        let _ = stdin_task.await;
+    }
+    await_output_task(stdout_task, "stdout").await?;
+    await_output_task(stderr_task, "stderr").await?;
+    Ok(exit_code_from_i32(code))
 }
 
 fn exec_caps() -> Capabilities {
@@ -219,5 +235,6 @@ mod ssh_exec_options_tests {
         let options = ExecRunOptions::default();
         assert!(!options.quiet_resolve);
         assert!(!options.close_stdin);
+        assert!(options.env_patch.is_empty());
     }
 }

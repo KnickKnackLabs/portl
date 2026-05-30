@@ -302,7 +302,7 @@ fn portl_ssh_subcommands_parse() {
         "portl-ssh",
         "-l",
         "thinh",
-        "-A",
+        "--forward-agent",
         "-o",
         "StrictHostKeyChecking=no",
         "vn3",

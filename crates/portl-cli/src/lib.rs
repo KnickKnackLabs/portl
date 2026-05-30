@@ -1551,8 +1551,8 @@ enum ConnectTopLevel {
         /// Login name. Also accepts USER@TARGET in the target position.
         #[arg(short = 'l', value_name = "USER")]
         login_name: Option<String>,
-        /// Request SSH-agent forwarding. Implemented in a later phase.
-        #[arg(short = 'A')]
+        /// Request SSH-agent forwarding to the remote Portl session.
+        #[arg(short = 'A', long = "forward-agent")]
         forward_agent: bool,
         /// Disable SSH-agent forwarding.
         #[arg(short = 'a')]

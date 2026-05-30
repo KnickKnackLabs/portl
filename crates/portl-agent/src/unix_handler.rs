@@ -1,4 +1,4 @@
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -43,9 +43,11 @@ pub(crate) async fn serve_stream(
 
     match req.op {
         portl_proto::unix_v1::UnixOp::Connect { path } => serve_connect(send, recv, path).await,
-        portl_proto::unix_v1::UnixOp::Listen { path, cleanup } => {
-            serve_listen(connection, session, send, recv, path, cleanup).await
-        }
+        portl_proto::unix_v1::UnixOp::Listen {
+            path,
+            cleanup,
+            ssh_agent,
+        } => serve_listen(connection, session, send, recv, path, cleanup, ssh_agent).await,
     }
 }
 
@@ -63,6 +65,7 @@ async fn serve_connect(mut send: SendStream, recv: BufferedRecv, path: String) -
     copy_bidirectional(unix, send, recv).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_listen(
     connection: Connection,
     session: Session,
@@ -70,8 +73,33 @@ async fn serve_listen(
     recv: BufferedRecv,
     path: String,
     cleanup: bool,
+    ssh_agent: bool,
 ) -> Result<()> {
     let path_buf = PathBuf::from(&path);
+    if ssh_agent && !cleanup {
+        write_ack(
+            &mut send,
+            false,
+            Some("ssh-agent forwarding listen requires cleanup".to_owned()),
+        )
+        .await?;
+        send.finish()
+            .context("finish failed ssh-agent cleanup-required ack")?;
+        return Ok(());
+    }
+    let parent_cleanup = if ssh_agent {
+        match create_private_agent_parent(&path_buf) {
+            Ok(cleanup) => Some(cleanup),
+            Err(err) => {
+                write_ack(&mut send, false, Some(err.to_string())).await?;
+                send.finish()
+                    .context("finish failed ssh-agent listen setup ack")?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
     if cleanup && let Err(err) = remove_existing_socket_for_bind(&path_buf) {
         write_ack(&mut send, false, Some(err.to_string())).await?;
         send.finish()
@@ -86,10 +114,14 @@ async fn serve_listen(
             return Ok(());
         }
     };
+    let _parent_cleanup = parent_cleanup;
     let _cleanup = UnixSocketCleanup {
         path: path_buf,
         cleanup,
     };
+    if ssh_agent {
+        crate::audit::ssh_agent_forward_enabled(&session, &path);
+    }
     write_ack(&mut send, true, None).await?;
 
     let mut control_task = tokio::spawn(wait_for_control_close(recv));
@@ -198,12 +230,66 @@ struct UnixSocketCleanup {
     cleanup: bool,
 }
 
+struct AgentParentCleanup {
+    path: PathBuf,
+}
+
 impl Drop for UnixSocketCleanup {
     fn drop(&mut self) {
         if self.cleanup {
             remove_socket_if_present(&self.path);
         }
     }
+}
+
+impl Drop for AgentParentCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.path);
+    }
+}
+
+fn create_private_agent_parent(path: &Path) -> Result<AgentParentCleanup> {
+    let parent = path
+        .parent()
+        .context("ssh-agent socket path must include a parent directory")?;
+    validate_agent_parent(parent)?;
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(parent)
+        .with_context(|| format!("create ssh-agent forwarding directory {}", parent.display()))?;
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod ssh-agent forwarding directory {}", parent.display()))?;
+    let metadata = std::fs::symlink_metadata(parent)
+        .with_context(|| format!("stat ssh-agent forwarding directory {}", parent.display()))?;
+    if !metadata.file_type().is_dir() {
+        bail!(
+            "ssh-agent forwarding parent is not a directory {}",
+            parent.display()
+        );
+    }
+    if metadata.permissions().mode() & 0o777 != 0o700 {
+        bail!(
+            "ssh-agent forwarding directory has unsafe permissions {}",
+            parent.display()
+        );
+    }
+    Ok(AgentParentCleanup {
+        path: parent.to_path_buf(),
+    })
+}
+
+fn validate_agent_parent(parent: &Path) -> Result<()> {
+    let Some(name) = parent.file_name().and_then(|name| name.to_str()) else {
+        bail!("ssh-agent forwarding parent must have a utf-8 name");
+    };
+    if parent.parent() != Some(Path::new("/tmp")) || !name.starts_with("portl-agent-") {
+        bail!("ssh-agent forwarding parent must be /tmp/portl-agent-*");
+    }
+    let suffix = &name["portl-agent-".len()..];
+    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("ssh-agent forwarding parent suffix must be hex");
+    }
+    Ok(())
 }
 
 fn remove_existing_socket_for_bind(path: &Path) -> Result<()> {
