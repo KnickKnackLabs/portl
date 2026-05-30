@@ -1042,7 +1042,7 @@ print("unknown herdr args: " + " ".join(args), file=sys.stderr)
 raise SystemExit(64)
 "#
     .replace("__LOG__", &format!("{:?}", log.display().to_string()))
-    .replace("__WELCOME__", &format!("{:?}", welcome_hex));
+    .replace("__WELCOME__", &format!("{welcome_hex:?}"));
     fs::write(path, script)?;
     let mut perms = fs::metadata(path)?.permissions();
     perms.set_mode(0o755);
