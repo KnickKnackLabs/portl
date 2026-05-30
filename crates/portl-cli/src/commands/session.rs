@@ -2043,7 +2043,7 @@ fn resolve_session_ref_with_stores(
         });
     }
 
-    let (host_from_ref, provider_from_ref, session_name) = split_session_ref(session_ref)?;
+    let (host_from_ref, mut provider_from_ref, mut session_name) = split_session_ref(session_ref)?;
     let target_from_ref = host_from_ref
         .map(|hint| resolve_target_hint_with_stores(hint, peers, tickets, aliases))
         .transpose()?;
@@ -2075,6 +2075,17 @@ fn resolve_session_ref_with_stores(
     };
     let target_hint = explicit_target.or(env_target);
 
+    if host_from_ref.is_none()
+        && provider_from_ref.is_none()
+        && target_hint.is_some()
+        && session_name
+            .as_deref()
+            .is_some_and(is_herdr_provider_shorthand)
+    {
+        provider_from_ref = Some("herdr".to_owned());
+        session_name = Some("default".to_owned());
+    }
+
     let session = session_name.unwrap_or_else(|| "default".to_owned());
     let target = if let Some(target_hint) = target_hint {
         session_share_ticket_label(tickets, &target_hint.label, &session)
@@ -2102,6 +2113,11 @@ fn split_session_ref(
     }
     match parts.as_slice() {
         [session] => Ok((None, None, Some((*session).to_owned()))),
+        [host, provider] if is_herdr_provider_shorthand(provider) => Ok((
+            Some(*host),
+            Some(normalize_session_provider(provider)?),
+            Some("default".to_owned()),
+        )),
         [host, session] => Ok((Some(*host), None, Some((*session).to_owned()))),
         [host, provider, session] => Ok((
             Some(*host),
@@ -2122,6 +2138,10 @@ fn normalize_session_provider(provider: &str) -> Result<String> {
     }
     let supported = format!("{}, raw", portl_agent::config::SESSION_PROVIDER_HELP_VALUES);
     anyhow::bail!("unsupported session provider '{normalized}' (supported: {supported})")
+}
+
+fn is_herdr_provider_shorthand(provider: &str) -> bool {
+    normalize_session_provider_alias(provider) == "herdr"
 }
 
 fn normalize_session_provider_alias(provider: &str) -> String {
@@ -9324,6 +9344,50 @@ mod tests {
         assert_eq!(resolved.target, "max-b265/dotfiles");
         assert_eq!(resolved.provider.as_deref(), Some("tmux"));
         assert_eq!(resolved.session, "dotfiles");
+    }
+
+    #[test]
+    fn target_herdr_ref_defaults_to_default_session() {
+        let fixture = seed_peer_and_share();
+        let resolved = resolve_session_ref_with_stores(
+            Some("max/herdr"),
+            None,
+            None,
+            &fixture.peers,
+            &fixture.tickets,
+            &fixture.aliases,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.target, "max-b265");
+        assert_eq!(resolved.provider.as_deref(), Some("herdr"));
+        assert_eq!(resolved.session, "default");
+    }
+
+    #[test]
+    fn env_target_herdr_ref_defaults_to_default_session() {
+        let fixture = seed_peer_and_share();
+        let resolved = resolve_session_ref_with_stores(
+            Some("herdr"),
+            None,
+            Some("max"),
+            &fixture.peers,
+            &fixture.tickets,
+            &fixture.aliases,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.target, "max-b265");
+        assert_eq!(resolved.provider.as_deref(), Some("herdr"));
+        assert_eq!(resolved.session, "default");
+    }
+
+    #[test]
+    fn one_part_herdr_without_target_remains_session_name() {
+        let (_host, provider, session) = split_session_ref(Some("herdr")).unwrap();
+
+        assert_eq!(provider, None);
+        assert_eq!(session.as_deref(), Some("herdr"));
     }
 
     #[test]
