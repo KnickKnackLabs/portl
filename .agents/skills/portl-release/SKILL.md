@@ -22,8 +22,46 @@ Portl releases combine deterministic mise tasks with agent judgment. Let scripts
 5. Run `mise run release:verify -- VERSION --local` before committing the release bump. This keeps local verification fast by checking metadata/fmt/diff, focused nextest suites for the core crates, and focused clippy. Use `--full` only when you intentionally want to reproduce CI plus ignored smoke tests locally.
 6. Commit with subject `Release vVERSION` and a body explaining the bump.
 7. Push `main`.
-8. Before tagging, verify the pushed release commit's comprehensive CI with `mise run release:watch -- VERSION --ci-only`; before the tag exists this requires local `HEAD` to match upstream, and it refuses a stale existing `vVERSION` tag unless `--allow-existing-tag` is explicit. Then run `mise run release:tag -- VERSION`.
-9. After tagging, watch/report CI and release publishing with `mise run release:watch -- VERSION`. Avoid raw `gh run watch` unless debugging interactively; it repeats large job tables and annotations.
+8. For releases touching session providers, remote helpers, spawned CLIs, networking, or target deployment, run the **Provider/Remote Process Gate** below before tagging.
+9. Before tagging, verify the pushed release commit's comprehensive CI with `mise run release:watch -- VERSION --ci-only`; before the tag exists this requires local `HEAD` to match upstream, and it refuses a stale existing `vVERSION` tag unless `--allow-existing-tag` is explicit. Then run `mise run release:tag -- VERSION`.
+10. After tagging, watch/report CI and release publishing with `mise run release:watch -- VERSION`. Avoid raw `gh run watch` unless debugging interactively; it repeats large job tables and annotations.
+
+## Provider/Remote Process Gate
+
+Use this gate when a release changes attach providers, long-lived helpers, remote bootstrap, deployed agents, TUI clients, or external CLI spawning. **REQUIRED SUB-SKILL:** Use `portl-live-e2e` for the live-target workflow.
+
+Minimum evidence before tagging:
+
+```bash
+cargo build -p portl-cli --bin portl
+./target/debug/portl --version
+./target/debug/portl status TARGET --timeout 8s
+ssh TARGET '~/.local/bin/portl-agent --version'
+./target/debug/portl session providers --target TARGET
+```
+
+Then run a live E2E on the exact user-facing command and verify:
+
+- exact shorthand/user command resolves correctly,
+- local and remote versions match the release candidate,
+- text input reaches the remote session (marker file or equivalent),
+- provider controls work (for Herdr: tab, workspace/space, detach),
+- no stale helper remains after detach (for Herdr: no `herdr remote-client-bridge`),
+- only expected long-lived services remain (for Herdr: remote `herdr server` may remain).
+
+If a GitHub release is already published and this gate finds a bug, cut the next patch release. Do not move a published tag.
+
+## Extra Local Gates
+
+Run these before pushing when they match the change:
+
+```bash
+# New dependency or changed dependency policy
+cargo deny --all-features check
+
+# Cross-crate or test-harness changes not covered by release:verify --local
+cargo clippy --workspace --all-targets -- -D warnings
+```
 
 ## Changelog Rules
 
@@ -63,3 +101,5 @@ Portl releases combine deterministic mise tasks with agent judgment. Let scripts
 - Forgetting the GitHub release workflow extracts the matching changelog section.
 - Using raw `gh run watch` by default; prefer `release:watch` to avoid repeated annotations and huge transcripts.
 - Moving a tag after the GitHub release has been published; cut a new patch release instead.
+- Trusting `release:verify --local` alone after adding dependencies or cross-crate provider code; run the Extra Local Gates when applicable.
+- Tagging provider/helper releases without a live process cleanup audit.

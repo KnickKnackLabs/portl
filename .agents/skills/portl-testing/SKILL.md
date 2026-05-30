@@ -60,6 +60,25 @@ These helpers use iroh `presets::Minimal`, disable relays, avoid default DNS/PKA
 
 Use production `Endpoint::bind()` only for tests whose purpose is to validate production endpoint defaults.
 
+## Herdr Provider Testing
+
+Use focused Herdr filters before broader suites:
+
+```bash
+cargo nextest run -p portl-core -p portl-agent -p portl-cli \
+  -E '(test(herdr_) + test(client_bridge_) + test(first_herdr_server_frame_must_be_welcome) + test(local_herdr_client_env_) + test(session_herdr_provider_bridges_protocol_lanes) + test(session_herdr_bridge_exits_when_attach_control_closes) + test(provider_capabilities_include_herdr))'
+```
+
+Herdr regressions should cover:
+
+- default session maps to unset remote `HERDR_SESSION`; named sessions set it,
+- local client env sets `HERDR_CLIENT_SOCKET_PATH`, `HERDR_REATTACH_COMMAND`, default keybindings, and removes `HERDR_SOCKET_PATH`,
+- first client frame must be `Hello`; first server frame must be `Welcome`,
+- bridge lanes preserve control/input/resize/bulk classification,
+- primary attach control close terminates `herdr remote-client-bridge` even if lane tasks still hold shared state.
+
+Do not use fake-provider E2E as a substitute for live target validation before releases; use `portl-live-e2e` for real machines such as `vn3`.
+
 ## Tmux / Session Provider Testing
 
 - Prefer focused unit tests for tmux control parsing and snapshot rendering.
@@ -76,6 +95,7 @@ Use production `Endpoint::bind()` only for tests whose purpose is to validate pr
 ## Common Mistakes
 
 - Running `cargo nextest run -p portl-agent some_name` without `kind(lib)` or `binary(...)`; this can still discover unrelated binaries.
+- Forgetting that Herdr cleanup bugs can hide if tests only drop the whole agent; explicitly close attach control and assert the fake bridge exits.
 - Using real iroh DNS/relay setup for tests that only need local peer-to-peer behavior.
 - Treating nextest timeout as a code failure before sampling/listing; verify whether it is stuck in setup, discovery, or the code under test.
 - Updating fake tmux output expectations without updating the fake command argument handling.
