@@ -29,6 +29,12 @@ pub enum InitiatorMode {
     Them,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SshConfigMode {
+    /// Generate a `ProxyCommand` config that tunnels to a real sshd on the Portl target.
+    SshdProxy,
+}
+
 impl From<InitiatorMode> for portl_core::pair_code::InitiatorMode {
     fn from(value: InitiatorMode) -> Self {
         match value {
@@ -148,6 +154,19 @@ pub enum Command {
         quiet: bool,
         verbose: u8,
         remote_command: Vec<String>,
+    },
+    SshProxy {
+        peer: String,
+        host: String,
+        port: u16,
+    },
+    SshConfig {
+        mode: SshConfigMode,
+        target: String,
+        host_alias: Option<String>,
+        remote_host: String,
+        remote_port: u16,
+        portl_bin: String,
     },
     Tcp {
         peer: String,
@@ -853,6 +872,22 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             verbose,
             &remote_command,
         ),
+        Command::SshProxy { peer, host, port } => commands::ssh_proxy::run(&peer, &host, port),
+        Command::SshConfig {
+            mode,
+            target,
+            host_alias,
+            remote_host,
+            remote_port,
+            portl_bin,
+        } => commands::ssh_proxy::print_config(
+            mode,
+            &target,
+            host_alias.as_deref(),
+            &remote_host,
+            remote_port,
+            &portl_bin,
+        ),
         Command::Tcp { peer, local } => commands::tcp::run(&peer, &local),
         Command::Udp { peer, local } => commands::udp::run(&peer, &local),
         Command::Socket {
@@ -1162,6 +1197,8 @@ Connect:
   shell        Open a one-shot remote PTY shell
   exec         Run a one-shot remote command without a persistent session
   ssh          SSH-like native Portl shell/exec command
+  ssh-proxy    Proxy stdio to a real sshd reachable from the Portl target
+  ssh-config   Emit OpenSSH config snippets for Portl SSH workflows
   tcp          Set up one or more local TCP forwards
   udp          Set up one or more local UDP forwards
   socket       Set up Unix-domain socket forwards
@@ -1588,6 +1625,39 @@ enum ConnectTopLevel {
             allow_hyphen_values = true
         )]
         remote_command: Vec<String>,
+    },
+    /// Proxy stdio to a real sshd reachable from the Portl target.
+    #[command(display_order = 176)]
+    SshProxy {
+        #[arg(help = TARGET_HELP, value_name = "TARGET")]
+        target: String,
+        /// Hostname or address to connect to from the target.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port to connect to from the target.
+        #[arg(long, default_value_t = 22)]
+        port: u16,
+    },
+    /// Emit OpenSSH config snippets for Portl SSH workflows.
+    #[command(display_order = 177)]
+    SshConfig {
+        /// Config generation mode.
+        #[arg(long, value_enum)]
+        mode: SshConfigMode,
+        #[arg(help = TARGET_HELP, value_name = "TARGET")]
+        target: String,
+        /// OpenSSH Host alias to emit. Defaults to TARGET.
+        #[arg(long = "host", value_name = "HOST_ALIAS")]
+        host_alias: Option<String>,
+        /// Hostname or address of the real sshd from the target.
+        #[arg(long = "remote-host", default_value = "127.0.0.1")]
+        remote_host: String,
+        /// Port of the real sshd from the target.
+        #[arg(long = "remote-port", default_value_t = 22)]
+        remote_port: u16,
+        /// Portl executable name/path to use in `ProxyCommand`.
+        #[arg(long = "portl", default_value = "portl")]
+        portl_bin: String,
     },
     /// Set up one or more local TCP forwards.
     #[command(display_order = 180)]
@@ -2491,6 +2561,26 @@ fn connect_into_command(action: ConnectTopLevel, log_verbose: u8) -> Command {
                 remote_command,
             }
         }
+        ConnectTopLevel::SshProxy { target, host, port } => Command::SshProxy {
+            peer: target,
+            host,
+            port,
+        },
+        ConnectTopLevel::SshConfig {
+            mode,
+            target,
+            host_alias,
+            remote_host,
+            remote_port,
+            portl_bin,
+        } => Command::SshConfig {
+            mode,
+            target,
+            host_alias,
+            remote_host,
+            remote_port,
+            portl_bin,
+        },
         ConnectTopLevel::Tcp { local, peer } => Command::Tcp { peer, local },
         ConnectTopLevel::Udp { local, peer } => Command::Udp { peer, local },
         ConnectTopLevel::Socket {

@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 
-use portl_cli::{Command, parse};
+use portl_cli::{Command, SshConfigMode, parse};
 
 fn argv(parts: &[&str]) -> Vec<OsString> {
     parts.iter().map(OsString::from).collect()
@@ -321,6 +321,84 @@ fn portl_ssh_subcommands_parse() {
             quiet: false,
             verbose: 0,
             remote_command: vec!["git-upload-pack".to_owned(), "repo.git".to_owned()],
+        }
+    );
+}
+
+#[test]
+fn portl_ssh_proxy_subcommands_parse() {
+    let default_proxy = parse(argv(&["portl", "ssh-proxy", "vn3"])).expect("ssh-proxy defaults");
+    assert_eq!(
+        default_proxy,
+        Command::SshProxy {
+            peer: "vn3".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 22,
+        }
+    );
+
+    let proxy = parse(argv(&[
+        "portl",
+        "ssh-proxy",
+        "vn3",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "2222",
+    ]))
+    .expect("ssh-proxy parse");
+    assert_eq!(
+        proxy,
+        Command::SshProxy {
+            peer: "vn3".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 2222,
+        }
+    );
+
+    let default_config = parse(argv(&[
+        "portl",
+        "ssh-config",
+        "--mode",
+        "sshd-proxy",
+        "vn3",
+    ]))
+    .expect("ssh-config defaults");
+    assert_eq!(
+        default_config,
+        Command::SshConfig {
+            mode: SshConfigMode::SshdProxy,
+            target: "vn3".to_owned(),
+            host_alias: None,
+            remote_host: "127.0.0.1".to_owned(),
+            remote_port: 22,
+            portl_bin: "portl".to_owned(),
+        }
+    );
+
+    let config = parse(argv(&[
+        "portl",
+        "ssh-config",
+        "--mode",
+        "sshd-proxy",
+        "vn3",
+        "--host",
+        "vn3-sshd",
+        "--remote-port",
+        "2222",
+        "--portl",
+        "/usr/local/bin/portl",
+    ]))
+    .expect("ssh-config parse");
+    assert_eq!(
+        config,
+        Command::SshConfig {
+            mode: SshConfigMode::SshdProxy,
+            target: "vn3".to_owned(),
+            host_alias: Some("vn3-sshd".to_owned()),
+            remote_host: "127.0.0.1".to_owned(),
+            remote_port: 2222,
+            portl_bin: "/usr/local/bin/portl".to_owned(),
         }
     );
 }

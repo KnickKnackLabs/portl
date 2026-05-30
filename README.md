@@ -232,6 +232,10 @@ portl session attach demo dev
 portl tcp demo -L 127.0.0.1:18080:127.0.0.1:80
 portl udp demo -L 60000:127.0.0.1:60000
 
+# OpenSSH ProxyCommand passthrough to a real sshd on the target.
+portl ssh-config --mode sshd-proxy demo --host demo-sshd
+ssh demo-sshd
+
 portl docker rm demo --force
 ```
 
@@ -250,7 +254,7 @@ Top-level help is grouped by task:
 Setup        init, doctor, install, config, whoami
 Trust        peer, invite
 Pairing      accept
-Connect      status, shell, session, exec, ssh, tcp, udp, socket
+Connect      status, shell, session, exec, ssh, ssh-proxy, ssh-config, tcp, udp, socket
 Permissions  ticket
 Integrations docker, slicer, gateway
 Utility      completions, man, help

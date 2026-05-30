@@ -18,6 +18,7 @@ pub mod shell;
 pub mod slicer;
 pub mod socket;
 pub mod ssh;
+pub mod ssh_proxy;
 pub mod status;
 pub mod tcp;
 pub mod ticket;
