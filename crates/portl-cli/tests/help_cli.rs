@@ -257,7 +257,8 @@ fn help_documents_session_environment_overrides() {
         let help = help_output(args);
         for needle in [
             "PORTL_SESSION_PROVIDER",
-            "default, ghostty, zmx, tmux",
+            "default, ghostty, herdr, zmx",
+            "tmux",
             "PORTL_SESSION_PROVIDER_PATH",
         ] {
             assert!(

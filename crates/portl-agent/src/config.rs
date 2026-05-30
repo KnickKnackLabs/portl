@@ -914,7 +914,7 @@ mod tests {
                     "unexpected error: {text}"
                 );
                 assert!(
-                    text.contains("supported: default, ghostty, zmx, tmux"),
+                    text.contains("supported: default, ghostty, herdr, zmx, tmux"),
                     "error should use shared provider list: {text}"
                 );
             },

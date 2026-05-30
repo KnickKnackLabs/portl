@@ -2056,10 +2056,11 @@ mod tests {
     async fn select_provider_prefers_ghostty_when_feature_enabled() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let missing = temp.path().join("missing-provider");
+        let herdr = provider::HerdrProvider::new(Some(missing.clone()));
         let zmx = provider::ZmxProvider::with_path(missing.clone());
         let tmux = provider::TmuxProvider::with_path(missing);
 
-        let selected = select_provider(&zmx, &tmux, None, SessionOp::Attach)
+        let selected = select_provider(&herdr, &zmx, &tmux, None, SessionOp::Attach)
             .await
             .map_err(|reason| anyhow::anyhow!("unexpected rejection: {reason:?}"))?;
 
@@ -2083,10 +2084,11 @@ mod tests {
             perms.set_mode(0o755);
             std::fs::set_permissions(&fake, perms)?;
         }
+        let herdr = provider::HerdrProvider::new(None);
         let zmx = provider::ZmxProvider::with_path(fake);
         let tmux = provider::TmuxProvider::new(None);
 
-        let selected = select_provider(&zmx, &tmux, Some("zmx"), SessionOp::Attach)
+        let selected = select_provider(&herdr, &zmx, &tmux, Some("zmx"), SessionOp::Attach)
             .await
             .map_err(|reason| anyhow::anyhow!("unexpected rejection: {reason:?}"))?;
 
@@ -2096,16 +2098,17 @@ mod tests {
 
     #[tokio::test]
     async fn raw_shell_provider_is_selectable_for_attach_only() -> Result<()> {
+        let herdr = provider::HerdrProvider::new(None);
         let zmx = provider::ZmxProvider::new(None);
         let tmux = provider::TmuxProvider::new(None);
 
-        let selected = select_provider(&zmx, &tmux, Some("raw"), SessionOp::Attach)
+        let selected = select_provider(&herdr, &zmx, &tmux, Some("raw"), SessionOp::Attach)
             .await
             .map_err(|reason| anyhow::anyhow!("unexpected rejection: {reason:?}"))?;
 
         assert_eq!(selected.name(), "raw");
         assert!(matches!(
-            select_provider(&zmx, &tmux, Some("raw"), SessionOp::Run).await,
+            select_provider(&herdr, &zmx, &tmux, Some("raw"), SessionOp::Run).await,
             Err(SessionReason::CapabilityUnsupported { .. })
         ));
         Ok(())
