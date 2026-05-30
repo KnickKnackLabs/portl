@@ -657,8 +657,8 @@ impl HerdrProvider {
             .ok_or_else(|| anyhow!("herdr is not installed on the target"))?;
         let mut command = self.command(&path);
         command.envs(workload_env.iter().cloned());
-        if session_name != "default" {
-            command.env("HERDR_SESSION", session_name);
+        if let Some((key, value)) = herdr_session_env(session_name) {
+            command.env(key, value);
         } else {
             command.env_remove("HERDR_SESSION");
         }
@@ -1045,6 +1045,10 @@ fn parse_zmx_session_json(stdout: &str) -> Result<Vec<SessionInfo>> {
         .collect())
 }
 
+fn herdr_session_env(session_name: &str) -> Option<(String, String)> {
+    (session_name != "default").then(|| ("HERDR_SESSION".to_owned(), session_name.to_owned()))
+}
+
 fn parse_herdr_session_json(stdout: &str) -> Result<Vec<SessionInfo>> {
     let value: serde_json::Value =
         serde_json::from_str(stdout).context("parse herdr session list --json")?;
@@ -1351,10 +1355,11 @@ fn default_user_info() -> Option<crate::status_schema::DefaultUserInfo> {
 }
 
 pub(crate) async fn provider_report(
+    herdr: &HerdrProvider,
     zmx: &ZmxProvider,
     tmux: &TmuxProvider,
 ) -> Result<ProviderReport> {
-    let herdr_status = HerdrProvider::new(None).probe().await?;
+    let herdr_status = herdr.probe().await?;
     let zmx_status = zmx.probe().await?;
     let tmux_status = tmux.probe().await?;
     let ghostty_status = ghostty_provider_status();
@@ -1754,6 +1759,19 @@ esac
         Ok(())
     }
 
+    #[test]
+    fn herdr_default_session_unsets_session_env() {
+        assert_eq!(herdr_session_env("default"), None);
+    }
+
+    #[test]
+    fn herdr_named_session_sets_session_env() {
+        assert_eq!(
+            herdr_session_env("ops"),
+            Some(("HERDR_SESSION".to_owned(), "ops".to_owned()))
+        );
+    }
+
     #[tokio::test]
     async fn herdr_provider_maps_session_list_json() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -1990,10 +2008,11 @@ esac
     async fn provider_report_prefers_builtin_ghostty_when_feature_enabled() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let missing = temp.path().join("missing-provider");
+        let herdr = HerdrProvider::new(Some(missing.clone()));
         let zmx = ZmxProvider::with_path(missing.clone());
         let tmux = TmuxProvider::with_path(missing);
 
-        let report = provider_report(&zmx, &tmux).await?;
+        let report = provider_report(&herdr, &zmx, &tmux).await?;
 
         assert_eq!(report.default_provider.as_deref(), Some("ghostty"));
         assert_eq!(
@@ -2030,9 +2049,10 @@ esac
         perms.set_mode(0o755);
         fs::set_permissions(&fake, perms)?;
 
+        let herdr = HerdrProvider::new(None);
         let zmx = ZmxProvider::with_path(fake.clone());
         let tmux = TmuxProvider::with_path(fake);
-        let report = provider_report(&zmx, &tmux).await?;
+        let report = provider_report(&herdr, &zmx, &tmux).await?;
 
         assert_eq!(report.default_provider.as_deref(), Some("tmux"));
         assert_eq!(

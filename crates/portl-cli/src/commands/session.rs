@@ -4,6 +4,8 @@ use std::future::Future;
 use std::io::{IsTerminal, Write as IoWrite};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{ExitCode, Stdio};
 use std::sync::{
@@ -22,7 +24,9 @@ use portl_core::StdinResponseFilter;
 use portl_core::attach_control::{
     RenderBarOptions, fit_visible, is_ctrl_backslash_sequence, render_bar,
 };
-use portl_core::herdr_wire::{FrameDirection, HerdrFrameError, MAX_FRAME_SIZE, RawHerdrFrame};
+use portl_core::herdr_wire::{
+    FrameDirection, HerdrFrameError, MAX_FRAME_SIZE, RawHerdrFrame, ServerMessage,
+};
 use portl_core::io::BufferedRecv;
 use portl_core::net::{
     HerdrSessionClient, SessionClient, SessionClientV2, SessionOpenError,
@@ -2812,7 +2816,8 @@ async fn bridge_attach_herdr(session: HerdrSessionClient, canonical_ref: String)
     let socket_path = socket_dir.path().join("herdr-client.sock");
     let listener = tokio::net::UnixListener::bind(&socket_path)
         .with_context(|| format!("bind herdr client socket {}", socket_path.display()))?;
-    let mut child = spawn_local_herdr_client(&socket_path)?;
+    set_private_socket_permissions(&socket_path)?;
+    let mut child = spawn_local_herdr_client(&socket_path, &canonical_ref)?;
     let accepted = tokio::time::timeout(Duration::from_secs(10), listener.accept()).await;
     let (socket, _) = match accepted {
         Ok(Ok(accepted)) => accepted,
@@ -2871,7 +2876,11 @@ impl HerdrSocketTempDir {
                 rand::random::<u64>()
             ));
             match std::fs::create_dir(&candidate) {
-                Ok(()) => return Ok(Self { path: candidate }),
+                Ok(()) => {
+                    std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o700))
+                        .with_context(|| format!("set permissions on {}", candidate.display()))?;
+                    return Ok(Self { path: candidate });
+                }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(err) => return Err(err).context("create herdr client socket directory"),
             }
@@ -2892,14 +2901,24 @@ impl Drop for HerdrSocketTempDir {
 }
 
 #[cfg(unix)]
-fn spawn_local_herdr_client(socket_path: &std::path::Path) -> Result<Child> {
+fn set_private_socket_permissions(socket_path: &std::path::Path) -> Result<()> {
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("set permissions on {}", socket_path.display()))
+}
+
+#[cfg(unix)]
+fn spawn_local_herdr_client(socket_path: &std::path::Path, canonical_ref: &str) -> Result<Child> {
     let path = local_herdr_path()?;
     let mut command = Command::new(&path);
     command.arg("client");
     command.stdin(Stdio::inherit());
     command.stdout(Stdio::inherit());
     command.stderr(Stdio::inherit());
-    command.envs(local_herdr_client_env(socket_path));
+    command.envs(local_herdr_client_env(
+        socket_path,
+        canonical_ref,
+        std::env::var_os("HERDR_REMOTE_KEYBINDINGS").is_some(),
+    ));
     command
         .spawn()
         .with_context(|| format!("spawn local herdr client via {}", path.display()))
@@ -2994,6 +3013,7 @@ where
     let first = read_next_herdr_frame(&mut control, FrameDirection::ServerToClient)
         .await?
         .context("remote herdr bridge closed before Welcome")?;
+    validate_first_herdr_server_frame(&first)?;
     write_herdr_local_frame(&mut writer, &first).await?;
 
     let mut control_open = true;
@@ -3027,6 +3047,14 @@ where
         .await
         .context("shutdown herdr client socket")?;
     Ok(())
+}
+
+fn validate_first_herdr_server_frame(frame: &RawHerdrFrame) -> Result<()> {
+    if matches!(frame.decode_server()?, ServerMessage::Welcome { .. }) {
+        Ok(())
+    } else {
+        anyhow::bail!("first Herdr server control frame must be Welcome")
+    }
 }
 
 async fn write_herdr_frame(send: &mut SendStream, frame: &RawHerdrFrame) -> Result<()> {
@@ -3094,11 +3122,34 @@ fn local_herdr_path_opt() -> Option<PathBuf> {
         .or_else(|| find_on_safe_path("herdr"))
 }
 
-fn local_herdr_client_env(socket_path: &std::path::Path) -> Vec<(String, String)> {
-    vec![(
-        "HERDR_CLIENT_SOCKET_PATH".to_owned(),
-        socket_path.display().to_string(),
-    )]
+fn local_herdr_client_env(
+    socket_path: &std::path::Path,
+    canonical_ref: &str,
+    remote_keybindings_present: bool,
+) -> Vec<(String, String)> {
+    let mut env = vec![
+        (
+            "HERDR_CLIENT_SOCKET_PATH".to_owned(),
+            socket_path.display().to_string(),
+        ),
+        (
+            "HERDR_REATTACH_COMMAND".to_owned(),
+            format!("portl attach {}", shell_quote(canonical_ref)),
+        ),
+    ];
+    if !remote_keybindings_present {
+        env.push(("HERDR_REMOTE_KEYBINDINGS".to_owned(), "local".to_owned()));
+    }
+    env
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b':' | b'@')
+    }) {
+        return value.to_owned();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 async fn bridge_attach_v2(
@@ -9720,17 +9771,74 @@ mod tests {
     }
 
     #[test]
-    fn local_herdr_client_env_only_overrides_socket_path() {
-        let env = local_herdr_client_env(std::path::Path::new("/tmp/portl-herdr.sock"));
+    fn first_herdr_server_frame_must_be_welcome() {
+        let notify = RawHerdrFrame::encode_server(&ServerMessage::Notify {
+            kind: portl_core::herdr_wire::NotifyKind::Toast,
+            message: "not yet".to_owned(),
+        })
+        .unwrap();
+
+        let err = validate_first_herdr_server_frame(&notify).unwrap_err();
+        assert!(err.to_string().contains("must be Welcome"));
+    }
+
+    #[test]
+    fn local_herdr_client_env_sets_socket_reattach_and_default_keybindings() {
+        let env = local_herdr_client_env(
+            std::path::Path::new("/tmp/portl-herdr.sock"),
+            "vn3/herdr/default",
+            false,
+        );
 
         assert_eq!(
             env,
-            vec![(
-                "HERDR_CLIENT_SOCKET_PATH".to_owned(),
-                "/tmp/portl-herdr.sock".to_owned(),
-            ),]
+            vec![
+                (
+                    "HERDR_CLIENT_SOCKET_PATH".to_owned(),
+                    "/tmp/portl-herdr.sock".to_owned(),
+                ),
+                (
+                    "HERDR_REATTACH_COMMAND".to_owned(),
+                    "portl attach vn3/herdr/default".to_owned(),
+                ),
+                ("HERDR_REMOTE_KEYBINDINGS".to_owned(), "local".to_owned()),
+            ]
         );
         assert!(!env.iter().any(|(key, _)| key == "HERDR_RENDER_ENCODING"));
+    }
+
+    #[test]
+    fn local_herdr_client_env_preserves_existing_keybinding_override() {
+        let env = local_herdr_client_env(
+            std::path::Path::new("/tmp/portl-herdr.sock"),
+            "vn3/herdr/default",
+            true,
+        );
+
+        assert!(!env.iter().any(|(key, _)| key == "HERDR_REMOTE_KEYBINDINGS"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn herdr_socket_paths_are_private() {
+        let dir = HerdrSocketTempDir::create().unwrap();
+        let socket_path = dir.path().join("herdr-client.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        set_private_socket_permissions(&socket_path).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&socket_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        drop(listener);
     }
 
     #[test]

@@ -3,11 +3,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use iroh::endpoint::SendStream;
 use portl_core::herdr_wire::{
-    ClientLane, FrameDirection, HerdrFrameError, MAX_FRAME_SIZE, RawHerdrFrame, ServerLane,
+    ClientLane, ClientMessage, FrameDirection, HerdrFrameError, MAX_FRAME_SIZE, RawHerdrFrame,
+    ServerLane,
 };
 use portl_core::wire::session::{SessionAck, SessionStreamKind, SessionSubTail};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::process::ChildStdin;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -19,6 +19,8 @@ const HERDR_LANE_BUFFER: usize = 64;
 const HERDR_RESIZE_BUFFER: usize = 1;
 
 pub(crate) struct HerdrAttach {
+    pid: u32,
+    exit_rx: watch::Receiver<Option<i32>>,
     client_control_tx: mpsc::Sender<RawHerdrFrame>,
     client_input_tx: mpsc::Sender<RawHerdrFrame>,
     client_resize: ResizeCoalescer,
@@ -173,7 +175,7 @@ async fn spawn_herdr_attach(
     let (server_control_tx, server_control_rx) = mpsc::channel(HERDR_LANE_BUFFER);
     let (server_render_tx, server_render_rx) = mpsc::channel(HERDR_LANE_BUFFER);
     let (server_bulk_tx, server_bulk_rx) = mpsc::channel(HERDR_LANE_BUFFER);
-    let (exit_tx, _exit_rx) = watch::channel(None);
+    let (exit_tx, exit_rx) = watch::channel(None);
 
     let mut tasks = Vec::new();
     tasks.push(tokio::spawn(async move {
@@ -222,6 +224,8 @@ async fn spawn_herdr_attach(
     }));
 
     Ok(Arc::new(HerdrAttach {
+        pid,
+        exit_rx,
         client_control_tx,
         client_input_tx,
         client_resize: ResizeCoalescer::new(client_resize_tx),
@@ -231,6 +235,24 @@ async fn spawn_herdr_attach(
         server_bulk_rx: AsyncMutex::new(Some(server_bulk_rx)),
         _tasks: tasks,
     }))
+}
+
+impl Drop for HerdrAttach {
+    fn drop(&mut self) {
+        if self.exit_rx.borrow().is_some() {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            let Ok(pid) = i32::try_from(self.pid) else {
+                return;
+            };
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+        }
+    }
 }
 
 async fn take_receiver(
@@ -277,24 +299,75 @@ async fn pump_herdr_server_frames(
     Ok(())
 }
 
-async fn pump_client_lanes_to_bridge(
-    mut stdin: ChildStdin,
+async fn pump_client_lanes_to_bridge<W>(
+    mut stdin: W,
     mut control_rx: mpsc::Receiver<RawHerdrFrame>,
     mut input_rx: mpsc::Receiver<RawHerdrFrame>,
     mut resize_rx: mpsc::Receiver<RawHerdrFrame>,
     mut bulk_rx: mpsc::Receiver<RawHerdrFrame>,
-) -> Result<()> {
-    loop {
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let hello = control_rx
+        .recv()
+        .await
+        .context("herdr client control stream closed before Hello")?;
+    if !matches!(hello.decode_client()?, ClientMessage::Hello { .. }) {
+        anyhow::bail!("first Herdr client control frame must be Hello");
+    }
+    stdin
+        .write_all(hello.framed_bytes())
+        .await
+        .context("write herdr Hello to bridge")?;
+    stdin.flush().await.context("flush herdr bridge stdin")?;
+
+    let mut control_open = true;
+    let mut input_open = true;
+    let mut resize_open = true;
+    let mut bulk_open = true;
+    while control_open || input_open || resize_open || bulk_open {
         let frame = tokio::select! {
             biased;
-            frame = control_rx.recv() => frame,
-            frame = input_rx.recv() => frame,
-            frame = resize_rx.recv() => frame,
-            frame = bulk_rx.recv() => frame,
-            else => None,
+            frame = control_rx.recv(), if control_open => {
+                match frame {
+                    Some(frame) => Some(frame),
+                    None => {
+                        control_open = false;
+                        None
+                    }
+                }
+            }
+            frame = input_rx.recv(), if input_open => {
+                match frame {
+                    Some(frame) => Some(frame),
+                    None => {
+                        input_open = false;
+                        None
+                    }
+                }
+            }
+            frame = resize_rx.recv(), if resize_open => {
+                match frame {
+                    Some(frame) => Some(frame),
+                    None => {
+                        resize_open = false;
+                        None
+                    }
+                }
+            }
+            frame = bulk_rx.recv(), if bulk_open => {
+                match frame {
+                    Some(frame) => Some(frame),
+                    None => {
+                        bulk_open = false;
+                        None
+                    }
+                }
+            }
         };
         let Some(frame) = frame else {
-            break;
+            continue;
         };
         stdin
             .write_all(frame.framed_bytes())
@@ -407,15 +480,6 @@ impl ResizeCoalescer {
     }
 }
 
-#[cfg(test)]
-fn bridge_env_for_session(session_name: &str) -> Vec<(String, String)> {
-    if session_name == "default" {
-        Vec::new()
-    } else {
-        vec![("HERDR_SESSION".to_owned(), session_name.to_owned())]
-    }
-}
-
 struct HerdrAttachRegistryGuard {
     state: Arc<AgentState>,
     session_id: [u8; 16],
@@ -430,20 +494,84 @@ impl Drop for HerdrAttachRegistryGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use portl_core::herdr_wire::{ClientMessage, RawHerdrFrame};
+    use portl_core::herdr_wire::{
+        ClientKeybindings, ClientMessage, HERDR_PROTOCOL_VERSION, RawHerdrFrame, RenderEncoding,
+    };
 
-    #[test]
-    fn default_session_does_not_set_herdr_session_env() {
-        let env = bridge_env_for_session("default");
-
-        assert!(!env.iter().any(|(key, _)| key == "HERDR_SESSION"));
+    fn hello_frame() -> RawHerdrFrame {
+        RawHerdrFrame::encode_client(&ClientMessage::Hello {
+            version: HERDR_PROTOCOL_VERSION,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            requested_encoding: RenderEncoding::SemanticFrame,
+            keybindings: ClientKeybindings::Server,
+        })
+        .unwrap()
     }
 
-    #[test]
-    fn named_session_sets_herdr_session_env() {
-        let env = bridge_env_for_session("ops");
+    #[tokio::test]
+    async fn client_bridge_waits_for_hello_before_input_frames() {
+        let (control_tx, control_rx) = mpsc::channel(4);
+        let (input_tx, input_rx) = mpsc::channel(4);
+        let (resize_tx, resize_rx) = mpsc::channel(4);
+        let (bulk_tx, bulk_rx) = mpsc::channel(4);
+        let (writer, mut reader) = tokio::io::duplex(4096);
+        let input = RawHerdrFrame::encode_client(&ClientMessage::Input {
+            data: b"typed-before-hello".to_vec(),
+        })
+        .unwrap();
+        input_tx.send(input.clone()).await.unwrap();
 
-        assert!(env.contains(&("HERDR_SESSION".to_owned(), "ops".to_owned())));
+        let pump = tokio::spawn(pump_client_lanes_to_bridge(
+            writer, control_rx, input_rx, resize_rx, bulk_rx,
+        ));
+        tokio::task::yield_now().await;
+        control_tx.send(hello_frame()).await.unwrap();
+        drop(control_tx);
+        drop(input_tx);
+        drop(resize_tx);
+        drop(bulk_tx);
+
+        let first = read_next_raw_frame(&mut reader, FrameDirection::ClientToServer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            first.decode_client().unwrap(),
+            ClientMessage::Hello { .. }
+        ));
+        let second = read_next_raw_frame(&mut reader, FrameDirection::ClientToServer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second, input);
+        pump.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_bridge_rejects_non_hello_first_control_frame() {
+        let (control_tx, control_rx) = mpsc::channel(4);
+        let (_input_tx, input_rx) = mpsc::channel(4);
+        let (_resize_tx, resize_rx) = mpsc::channel(4);
+        let (_bulk_tx, bulk_rx) = mpsc::channel(4);
+        control_tx
+            .send(RawHerdrFrame::encode_client(&ClientMessage::Detach).unwrap())
+            .await
+            .unwrap();
+        drop(control_tx);
+
+        let err = pump_client_lanes_to_bridge(
+            tokio::io::sink(),
+            control_rx,
+            input_rx,
+            resize_rx,
+            bulk_rx,
+        )
+        .await
+        .expect_err("non-Hello first frame should fail");
+        assert!(err.to_string().contains("first Herdr client control frame"));
     }
 
     #[tokio::test]

@@ -115,7 +115,7 @@ async fn serve_control_stream(
                 req.cwd.as_deref(),
                 req.argv.as_ref(),
             );
-            let providers = provider::provider_report(&zmx, &tmux).await?;
+            let providers = provider::provider_report(&herdr, &zmx, &tmux).await?;
             write_ack(
                 &mut send,
                 SessionAck {
@@ -1595,13 +1595,14 @@ impl SelectedProvider {
 
     async fn list_detailed(
         self,
+        herdr: &provider::HerdrProvider,
         zmx: &provider::ZmxProvider,
         tmux: &provider::TmuxProvider,
     ) -> Result<Vec<portl_proto::session_v1::SessionInfo>> {
         match self {
             #[cfg(feature = "ghostty-vt")]
             Self::Ghostty => GhosttyProvider::new().list_detailed().await,
-            Self::Herdr => provider::HerdrProvider::new(None).list_detailed().await,
+            Self::Herdr => herdr.list_detailed().await,
             Self::Zmx => zmx.list_detailed().await,
             Self::Tmux => tmux.list_detailed().await,
             Self::Raw => bail!("raw provider does not support list"),
@@ -1661,6 +1662,7 @@ impl SelectedProvider {
 }
 
 async fn aggregate_session_entries(
+    herdr: &provider::HerdrProvider,
     zmx: &provider::ZmxProvider,
     tmux: &provider::TmuxProvider,
 ) -> Result<Vec<SessionEntry>> {
@@ -1682,7 +1684,7 @@ async fn aggregate_session_entries(
         let status = match provider {
             #[cfg(feature = "ghostty-vt")]
             SelectedProvider::Ghostty => GhosttyProvider::new().status(),
-            SelectedProvider::Herdr => provider::HerdrProvider::new(None).probe().await?,
+            SelectedProvider::Herdr => herdr.probe().await?,
             SelectedProvider::Zmx => zmx.probe().await?,
             SelectedProvider::Tmux => tmux.probe().await?,
             SelectedProvider::Raw => portl_proto::session_v1::ProviderStatus {
@@ -1698,7 +1700,7 @@ async fn aggregate_session_entries(
         if !status.available {
             continue;
         }
-        for session in provider.list_detailed(zmx, tmux).await? {
+        for session in provider.list_detailed(herdr, zmx, tmux).await? {
             entries.push(SessionEntry {
                 provider: provider.name().to_owned(),
                 name: session.name,
@@ -1721,7 +1723,7 @@ async fn resolve_provider_for_session(
         return select_provider(herdr, zmx, tmux, requested, op).await;
     }
 
-    let entries = aggregate_session_entries(zmx, tmux)
+    let entries = aggregate_session_entries(herdr, zmx, tmux)
         .await
         .map_err(|err| SessionReason::SpawnFailed(err.to_string()))?;
     let tmux_lookup = provider::tmux_lookup_session(session_name);
@@ -1848,7 +1850,7 @@ async fn list_session_groups(
                 .available
         };
         let sessions = selected
-            .list_detailed(zmx, tmux)
+            .list_detailed(herdr, zmx, tmux)
             .await
             .map_err(|err| SessionReason::SpawnFailed(err.to_string()))?;
         return Ok(vec![SessionProviderSessions {
