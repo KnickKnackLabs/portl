@@ -9,6 +9,7 @@ pub mod bootstrap;
 pub mod caps;
 pub mod endpoint;
 pub mod error;
+pub mod herdr_wire;
 pub mod id;
 pub mod io;
 pub mod labels;

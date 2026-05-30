@@ -58,6 +58,7 @@ hkdf             = "0.12"
 serde            = { version = "1", features = ["derive"] }
 serde-big-array  = "0.5"
 postcard         = { version = "1", features = ["use-std"] }
+bincode          = { version = "2", features = ["serde"] }
 base32           = "0.5"
 base64           = "0.22"
 serde_json       = "1"
