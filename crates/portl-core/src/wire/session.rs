@@ -135,6 +135,24 @@ impl ProviderCapabilities {
             exact_argv_spawn: true,
         }
     }
+
+    #[must_use]
+    pub const fn herdr() -> Self {
+        Self {
+            persistent: true,
+            multi_attach: true,
+            create_on_attach: true,
+            attach_command: true,
+            run: false,
+            detached_run: false,
+            history: false,
+            tail: false,
+            kill: false,
+            terminal_state_restore: true,
+            external_direct_attach: true,
+            exact_argv_spawn: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,6 +254,13 @@ pub enum SessionStreamKind {
     AttachV2Viewport,
     AttachV2Live,
     AttachV2History,
+    HerdrClientControl,
+    HerdrClientInput,
+    HerdrClientResize,
+    HerdrClientBulk,
+    HerdrServerControl,
+    HerdrServerRender,
+    HerdrServerBulk,
 }
 
 pub const ATTACH_V2_DEFAULT_PRELUDE_MAX_WAIT_MS: u64 = 200;
@@ -523,6 +548,49 @@ mod tests {
                 exact_argv_spawn: true,
             }
         );
+    }
+
+    #[test]
+    fn herdr_capabilities_match_external_protocol_provider_contract() {
+        assert_eq!(
+            ProviderCapabilities::herdr(),
+            ProviderCapabilities {
+                persistent: true,
+                multi_attach: true,
+                create_on_attach: true,
+                attach_command: true,
+                run: false,
+                detached_run: false,
+                history: false,
+                tail: false,
+                kill: false,
+                terminal_state_restore: true,
+                external_direct_attach: true,
+                exact_argv_spawn: false,
+            }
+        );
+    }
+
+    #[test]
+    fn herdr_stream_kinds_roundtrip_via_postcard() {
+        let kinds = [
+            SessionStreamKind::HerdrClientControl,
+            SessionStreamKind::HerdrClientInput,
+            SessionStreamKind::HerdrClientResize,
+            SessionStreamKind::HerdrClientBulk,
+            SessionStreamKind::HerdrServerControl,
+            SessionStreamKind::HerdrServerRender,
+            SessionStreamKind::HerdrServerBulk,
+        ];
+        for kind in kinds {
+            let tail = SessionSubTail {
+                session_id: [9; 16],
+                kind,
+            };
+            let encoded = postcard::to_stdvec(&tail).expect("encode");
+            let decoded: SessionSubTail = postcard::from_bytes(&encoded).expect("decode");
+            assert_eq!(decoded, tail);
+        }
     }
 
     #[test]
