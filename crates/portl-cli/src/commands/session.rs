@@ -22,12 +22,13 @@ use portl_core::StdinResponseFilter;
 use portl_core::attach_control::{
     RenderBarOptions, fit_visible, is_ctrl_backslash_sequence, render_bar,
 };
+use portl_core::herdr_wire::{FrameDirection, HerdrFrameError, MAX_FRAME_SIZE, RawHerdrFrame};
 use portl_core::io::BufferedRecv;
 use portl_core::net::{
-    SessionClient, SessionClientV2, SessionOpenError, open_session_attach_checked,
-    open_session_attach_v2_checked, open_session_history, open_session_kill,
-    open_session_list_detailed, open_session_list_detailed_checked, open_session_providers,
-    open_session_run,
+    HerdrSessionClient, SessionClient, SessionClientV2, SessionOpenError,
+    open_session_attach_checked, open_session_attach_herdr_checked, open_session_attach_v2_checked,
+    open_session_history, open_session_kill, open_session_list_detailed,
+    open_session_list_detailed_checked, open_session_providers, open_session_run,
 };
 use portl_core::terminal::{tmux_cc, zmx_control};
 use portl_core::terminal_mode_tracker::TerminalModeTracker;
@@ -38,7 +39,7 @@ use portl_core::wire::session::{
     ATTACH_V2_MAX_DECODED_PAYLOAD, AttachV2ClientFrame, AttachV2Config, AttachV2Payload,
     AttachV2Progress, AttachV2ServerFrame, SessionControlAction, SessionControlFrame,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
 use tracing::{debug, trace};
 
@@ -1781,7 +1782,9 @@ pub fn attach(
             cols,
             rows,
         };
-        if session_reconnect_enabled() && std::io::stdin().is_terminal() {
+        if should_reconnect_remote_attach(request.provider.as_deref())
+            && std::io::stdin().is_terminal()
+        {
             remote_session_attach_with_reconnect(request).await
         } else {
             remote_session_attach_once_without_reconnect(request).await
@@ -2309,6 +2312,7 @@ struct RemoteSessionAttachRequest {
 }
 
 enum RemoteAttachSession {
+    Herdr(HerdrSessionClient),
     V1(SessionClient),
     V2(SessionClientV2),
 }
@@ -2316,6 +2320,7 @@ enum RemoteAttachSession {
 impl RemoteAttachSession {
     fn provider(&self) -> &str {
         match self {
+            Self::Herdr(session) => &session.provider,
             Self::V1(session) => &session.provider,
             Self::V2(session) => &session.provider,
         }
@@ -2340,7 +2345,11 @@ fn parse_env_u64(name: &str) -> Option<u64> {
 }
 
 fn should_try_attach_v2(provider: Option<&str>) -> bool {
-    !matches!(provider, Some("zmx" | "tmux" | "raw"))
+    !matches!(provider, Some("herdr" | "zmx" | "tmux" | "raw"))
+}
+
+fn should_reconnect_remote_attach(provider: Option<&str>) -> bool {
+    provider != Some("herdr") && session_reconnect_enabled()
 }
 
 fn should_fallback_to_attach_v1(provider: Option<&str>, err: &SessionOpenError) -> bool {
@@ -2366,6 +2375,19 @@ async fn open_remote_attach_session_checked(
     cwd: Option<String>,
     pty: portl_core::net::shell_client::PtyCfg,
 ) -> std::result::Result<RemoteAttachSession, SessionOpenError> {
+    if provider.as_deref() == Some("herdr") {
+        return open_session_attach_herdr_checked(
+            connection,
+            session,
+            session_name,
+            user,
+            cwd,
+            pty,
+        )
+        .await
+        .map(RemoteAttachSession::Herdr);
+    }
+
     if should_try_attach_v2(provider.as_deref()) {
         match open_session_attach_v2_checked(
             connection,
@@ -2673,6 +2695,9 @@ async fn bridge_attach(
     canonical_ref: String,
 ) -> Result<i32> {
     let session = match session {
+        RemoteAttachSession::Herdr(session) => {
+            return bridge_attach_herdr(session, canonical_ref).await;
+        }
         RemoteAttachSession::V1(session) => session,
         RemoteAttachSession::V2(session) => {
             return bridge_attach_v2(session, cols, rows, canonical_ref).await;
@@ -2778,6 +2803,302 @@ async fn bridge_attach(
             }
         }
     }
+}
+
+#[cfg(unix)]
+async fn bridge_attach_herdr(session: HerdrSessionClient, canonical_ref: String) -> Result<i32> {
+    eprintln!("portl: launching local Herdr client for \"{canonical_ref}\"");
+    let socket_dir = HerdrSocketTempDir::create()?;
+    let socket_path = socket_dir.path().join("herdr-client.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path)
+        .with_context(|| format!("bind herdr client socket {}", socket_path.display()))?;
+    let mut child = spawn_local_herdr_client(&socket_path)?;
+    let accepted = tokio::time::timeout(Duration::from_secs(10), listener.accept()).await;
+    let (socket, _) = match accepted {
+        Ok(Ok(accepted)) => accepted,
+        Ok(Err(err)) => {
+            let _ = child.kill().await;
+            return Err(err).context("accept local herdr client socket");
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            anyhow::bail!(
+                "local herdr client did not connect to {}",
+                socket_path.display()
+            );
+        }
+    };
+    let mut bridge_task = tokio::spawn(async move { bridge_herdr_socket(socket, session).await });
+    tokio::select! {
+        status = child.wait() => {
+            bridge_task.abort();
+            let _ = bridge_task.await;
+            Ok(status.context("wait for herdr client")?.code().unwrap_or(1))
+        }
+        result = &mut bridge_task => {
+            match result.context("join herdr socket bridge")? {
+                Ok(()) => {
+                    let status = child.wait().await.context("wait for herdr client")?;
+                    Ok(status.code().unwrap_or(1))
+                }
+                Err(err) => {
+                    let _ = child.kill().await;
+                    Err(err)
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn bridge_attach_herdr(_session: HerdrSessionClient, _canonical_ref: String) -> Result<i32> {
+    anyhow::bail!("herdr attach requires Unix sockets")
+}
+
+#[cfg(unix)]
+struct HerdrSocketTempDir {
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl HerdrSocketTempDir {
+    fn create() -> Result<Self> {
+        let base = std::env::temp_dir();
+        for _ in 0..16 {
+            let candidate = base.join(format!(
+                "portl-herdr-{}-{:016x}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            match std::fs::create_dir(&candidate) {
+                Ok(()) => return Ok(Self { path: candidate }),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err).context("create herdr client socket directory"),
+            }
+        }
+        anyhow::bail!("could not allocate a unique herdr client socket directory")
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+#[cfg(unix)]
+impl Drop for HerdrSocketTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(unix)]
+fn spawn_local_herdr_client(socket_path: &std::path::Path) -> Result<Child> {
+    let path = local_herdr_path()?;
+    let mut command = Command::new(&path);
+    command.arg("client");
+    command.stdin(Stdio::inherit());
+    command.stdout(Stdio::inherit());
+    command.stderr(Stdio::inherit());
+    command.envs(local_herdr_client_env(socket_path));
+    command
+        .spawn()
+        .with_context(|| format!("spawn local herdr client via {}", path.display()))
+}
+
+#[cfg(unix)]
+async fn bridge_herdr_socket(
+    socket: tokio::net::UnixStream,
+    session: HerdrSessionClient,
+) -> Result<()> {
+    let (client_reader, client_writer) = socket.into_split();
+    let HerdrSessionClient {
+        provider: _,
+        control_send: _control_send,
+        control_recv: _control_recv,
+        client_control,
+        client_input,
+        client_resize,
+        client_bulk,
+        server_control,
+        server_render,
+        server_bulk,
+    } = session;
+    let client_to_remote = tokio::spawn(async move {
+        pump_herdr_local_client_frames(
+            client_reader,
+            client_control,
+            client_input,
+            client_resize,
+            client_bulk,
+        )
+        .await
+    });
+    let remote_to_client = tokio::spawn(async move {
+        pump_herdr_server_lanes_to_local(client_writer, server_control, server_render, server_bulk)
+            .await
+    });
+
+    let (client_result, server_result) =
+        tokio::try_join!(client_to_remote, remote_to_client).context("join herdr bridge tasks")?;
+    client_result?;
+    server_result?;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn pump_herdr_local_client_frames<R>(
+    mut reader: R,
+    mut control: SendStream,
+    mut input: SendStream,
+    mut resize: SendStream,
+    mut bulk: SendStream,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    while let Some(frame) =
+        read_next_herdr_frame(&mut reader, FrameDirection::ClientToServer).await?
+    {
+        match frame.client_lane()? {
+            portl_core::herdr_wire::ClientLane::Control => {
+                write_herdr_frame(&mut control, &frame).await?
+            }
+            portl_core::herdr_wire::ClientLane::Input => {
+                write_herdr_frame(&mut input, &frame).await?
+            }
+            portl_core::herdr_wire::ClientLane::Resize => {
+                write_herdr_frame(&mut resize, &frame).await?
+            }
+            portl_core::herdr_wire::ClientLane::Bulk => {
+                write_herdr_frame(&mut bulk, &frame).await?
+            }
+        }
+    }
+    let _ = control.finish();
+    let _ = input.finish();
+    let _ = resize.finish();
+    let _ = bulk.finish();
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn pump_herdr_server_lanes_to_local<W>(
+    mut writer: W,
+    mut control: BufferedRecv,
+    mut render: BufferedRecv,
+    mut bulk: BufferedRecv,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let first = read_next_herdr_frame(&mut control, FrameDirection::ServerToClient)
+        .await?
+        .context("remote herdr bridge closed before Welcome")?;
+    write_herdr_local_frame(&mut writer, &first).await?;
+
+    let mut control_open = true;
+    let mut render_open = true;
+    let mut bulk_open = true;
+    while control_open || render_open || bulk_open {
+        tokio::select! {
+            biased;
+            frame = read_next_herdr_frame(&mut control, FrameDirection::ServerToClient), if control_open => {
+                match frame? {
+                    Some(frame) => write_herdr_local_frame(&mut writer, &frame).await?,
+                    None => control_open = false,
+                }
+            }
+            frame = read_next_herdr_frame(&mut render, FrameDirection::ServerToClient), if render_open => {
+                match frame? {
+                    Some(frame) => write_herdr_local_frame(&mut writer, &frame).await?,
+                    None => render_open = false,
+                }
+            }
+            frame = read_next_herdr_frame(&mut bulk, FrameDirection::ServerToClient), if bulk_open => {
+                match frame? {
+                    Some(frame) => write_herdr_local_frame(&mut writer, &frame).await?,
+                    None => bulk_open = false,
+                }
+            }
+        }
+    }
+    writer
+        .shutdown()
+        .await
+        .context("shutdown herdr client socket")?;
+    Ok(())
+}
+
+async fn write_herdr_frame(send: &mut SendStream, frame: &RawHerdrFrame) -> Result<()> {
+    send.write_all(frame.framed_bytes())
+        .await
+        .context("write herdr frame to portl stream")
+}
+
+async fn write_herdr_local_frame<W>(writer: &mut W, frame: &RawHerdrFrame) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer
+        .write_all(frame.framed_bytes())
+        .await
+        .context("write herdr frame to local client")?;
+    writer.flush().await.context("flush herdr local client")
+}
+
+async fn read_next_herdr_frame<R>(
+    reader: &mut R,
+    direction: FrameDirection,
+) -> Result<Option<RawHerdrFrame>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut len_buf = [0_u8; 4];
+    match reader.read_exact(&mut len_buf).await {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => return Err(err).context("read herdr frame length"),
+    }
+    let claimed = u32::from_le_bytes(len_buf) as usize;
+    if claimed > MAX_FRAME_SIZE {
+        return Err(HerdrFrameError::Oversized {
+            claimed,
+            max: MAX_FRAME_SIZE,
+        })
+        .context("decode herdr frame");
+    }
+    let mut framed = Vec::with_capacity(4 + claimed);
+    framed.extend_from_slice(&len_buf);
+    let mut payload = vec![0_u8; claimed];
+    reader
+        .read_exact(&mut payload)
+        .await
+        .context("read herdr frame payload")?;
+    framed.extend_from_slice(&payload);
+    match direction {
+        FrameDirection::ClientToServer => RawHerdrFrame::decode_client_from_bytes(&framed),
+        FrameDirection::ServerToClient => RawHerdrFrame::decode_server_from_bytes(&framed),
+    }
+    .map(Some)
+    .context("decode herdr frame")
+}
+
+fn local_herdr_path() -> Result<PathBuf> {
+    local_herdr_path_opt().ok_or_else(|| anyhow!("herdr is not installed locally"))
+}
+
+fn local_herdr_path_opt() -> Option<PathBuf> {
+    std::env::var_os("PORTL_HERDR_PATH")
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .or_else(|| find_on_safe_path("herdr"))
+}
+
+fn local_herdr_client_env(socket_path: &std::path::Path) -> Vec<(String, String)> {
+    vec![(
+        "HERDR_CLIENT_SOCKET_PATH".to_owned(),
+        socket_path.display().to_string(),
+    )]
 }
 
 async fn bridge_attach_v2(
@@ -3437,6 +3758,9 @@ async fn run_remote_attach_once(
     signal_watcher: &mut AttachSignalWatcher,
 ) -> AttachEnd {
     match session {
+        RemoteAttachSession::Herdr(_) => {
+            AttachEnd::Disconnected(anyhow!("herdr attach does not support reconnect yet"))
+        }
         RemoteAttachSession::V1(session) => {
             run_remote_attach_v1_once(session, display, coordinator, mode_tracker, signal_watcher)
                 .await
@@ -9388,6 +9712,25 @@ mod tests {
 
         assert_eq!(provider, None);
         assert_eq!(session.as_deref(), Some("herdr"));
+    }
+
+    #[test]
+    fn herdr_attach_disables_reconnect_wrapper() {
+        assert!(!should_reconnect_remote_attach(Some("herdr")));
+    }
+
+    #[test]
+    fn local_herdr_client_env_only_overrides_socket_path() {
+        let env = local_herdr_client_env(std::path::Path::new("/tmp/portl-herdr.sock"));
+
+        assert_eq!(
+            env,
+            vec![(
+                "HERDR_CLIENT_SOCKET_PATH".to_owned(),
+                "/tmp/portl-herdr.sock".to_owned(),
+            ),]
+        );
+        assert!(!env.iter().any(|(key, _)| key == "HERDR_RENDER_ENCODING"));
     }
 
     #[test]

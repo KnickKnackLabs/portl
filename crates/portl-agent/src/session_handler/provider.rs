@@ -646,6 +646,29 @@ impl HerdrProvider {
         parse_herdr_session_json(&output.stdout)
     }
 
+    pub(crate) fn bridge_command(
+        &self,
+        session_name: &str,
+        cwd: Option<&str>,
+        workload_env: &[(String, String)],
+    ) -> Result<Command> {
+        let path = self
+            .resolve_path()
+            .ok_or_else(|| anyhow!("herdr is not installed on the target"))?;
+        let mut command = self.command(&path);
+        command.envs(workload_env.iter().cloned());
+        if session_name != "default" {
+            command.env("HERDR_SESSION", session_name);
+        } else {
+            command.env_remove("HERDR_SESSION");
+        }
+        command.arg("remote-client-bridge");
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+        Ok(command)
+    }
+
     async fn run_capture(&self, args: &[&str]) -> Result<SessionRunResult> {
         let path = self
             .resolve_path()

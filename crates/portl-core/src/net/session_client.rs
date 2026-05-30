@@ -49,6 +49,21 @@ pub struct SessionClient {
     pub control: SendStream,
 }
 
+pub struct HerdrSessionClient {
+    pub provider: String,
+    #[allow(dead_code)]
+    pub control_send: SendStream,
+    #[allow(dead_code)]
+    pub control_recv: BufferedRecv,
+    pub client_control: SendStream,
+    pub client_input: SendStream,
+    pub client_resize: SendStream,
+    pub client_bulk: SendStream,
+    pub server_control: BufferedRecv,
+    pub server_render: BufferedRecv,
+    pub server_bulk: BufferedRecv,
+}
+
 pub struct SessionClientV2 {
     pub provider: String,
     pub attach_id: [u8; 16],
@@ -427,6 +442,112 @@ pub async fn open_session_attach(
     )
     .await
     .map_err(Into::into)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn open_session_attach_herdr_checked(
+    connection: &Connection,
+    session: &PeerSession,
+    session_name: String,
+    user: Option<String>,
+    cwd: Option<String>,
+    pty: PtyCfg,
+) -> std::result::Result<HerdrSessionClient, SessionOpenError> {
+    let (mut control_send, control_recv) = connection
+        .open_bi()
+        .await
+        .context("open herdr session control stream")?;
+    control_send
+        .write_all(&postcard::to_stdvec(&preamble(session)).context("encode session preamble")?)
+        .await
+        .context("write session preamble")?;
+    control_send
+        .write_all(
+            &postcard::to_stdvec(&SessionFirstFrame::Control(SessionReqBody {
+                op: SessionOp::Attach,
+                provider: Some("herdr".to_owned()),
+                session_name: Some(session_name),
+                user,
+                cwd,
+                argv: None,
+                pty: Some(pty),
+                attach_v2: None,
+            }))
+            .context("encode herdr session attach request")?,
+        )
+        .await
+        .context("write herdr session attach request")?;
+    let mut control_recv = BufferedRecv::new(control_recv, Vec::new());
+    let ack: SessionAck = control_recv
+        .read_frame(MAX_ACK_BYTES)
+        .await?
+        .context("missing herdr session attach ack")?;
+    ensure_ok_open(&ack)?;
+    let provider = ack.provider.clone().unwrap_or_else(|| "herdr".to_owned());
+    let session_id = ack.session_id.context("session ack missing session id")?;
+
+    let server_control = open_recv_stream(
+        connection,
+        session,
+        session_id,
+        SessionStreamKind::HerdrServerControl,
+    )
+    .await?;
+    let server_render = open_recv_stream(
+        connection,
+        session,
+        session_id,
+        SessionStreamKind::HerdrServerRender,
+    )
+    .await?;
+    let server_bulk = open_recv_stream(
+        connection,
+        session,
+        session_id,
+        SessionStreamKind::HerdrServerBulk,
+    )
+    .await?;
+    let (client_control, _) = open_send_stream(
+        connection,
+        session,
+        session_id,
+        SessionStreamKind::HerdrClientControl,
+    )
+    .await?;
+    let (client_input, _) = open_send_stream(
+        connection,
+        session,
+        session_id,
+        SessionStreamKind::HerdrClientInput,
+    )
+    .await?;
+    let (client_resize, _) = open_send_stream(
+        connection,
+        session,
+        session_id,
+        SessionStreamKind::HerdrClientResize,
+    )
+    .await?;
+    let (client_bulk, _) = open_send_stream(
+        connection,
+        session,
+        session_id,
+        SessionStreamKind::HerdrClientBulk,
+    )
+    .await?;
+
+    Ok(HerdrSessionClient {
+        provider,
+        control_send,
+        control_recv,
+        client_control,
+        client_input,
+        client_resize,
+        client_bulk,
+        server_control,
+        server_render,
+        server_bulk,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

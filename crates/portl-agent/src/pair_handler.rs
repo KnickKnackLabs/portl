@@ -393,6 +393,7 @@ mod tests {
             rate_limit: OfferRateLimiter::new(&crate::config::RateLimitConfig::default()).unwrap(),
             started_at: Instant::now(),
             shell_registry: ShellRegistry::default(),
+            herdr_attach_registry: dashmap::DashMap::new(),
             #[cfg(feature = "ghostty-vt")]
             ghostty_attach_v2_registry: dashmap::DashMap::new(),
             udp_registry: UdpSessionRegistry::new(60),

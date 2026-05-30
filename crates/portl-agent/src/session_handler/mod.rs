@@ -29,6 +29,7 @@ use crate::{AgentState, audit};
 
 #[cfg(feature = "ghostty-vt")]
 pub(crate) mod ghostty;
+pub(crate) mod herdr;
 pub(crate) mod provider;
 mod tmux_control;
 #[allow(dead_code)]
@@ -452,6 +453,21 @@ async fn serve_attach(
         let name = name.to_owned();
         return serve_ghostty_attach(session, state, send, recv, req, &name, &workload_context)
             .await;
+    }
+
+    if selected == SelectedProvider::Herdr {
+        if req.user.is_some() {
+            let reason = SessionReason::CapabilityUnsupported {
+                provider: "herdr".to_owned(),
+                capability: "user".to_owned(),
+            };
+            record_session_attach_rejection("herdr", &reason);
+            write_ack(&mut send, reject(reason)).await?;
+            let _ = send.finish();
+            return Ok(());
+        }
+        let name = name.to_owned();
+        return herdr::serve_herdr_attach(state, send, recv, &name, &workload_context).await;
     }
 
     if selected == SelectedProvider::Tmux {
@@ -1328,6 +1344,10 @@ async fn serve_substream(
     {
         bail!("invalid session sub-stream preamble")
     }
+    if herdr::is_herdr_stream_kind(tail.kind) {
+        return herdr::serve_substream(state, send, recv, tail).await;
+    }
+
     #[cfg(feature = "ghostty-vt")]
     match tail.kind {
         SessionStreamKind::AttachV2Input | SessionStreamKind::AttachV2Resize => {
