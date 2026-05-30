@@ -48,10 +48,11 @@ pub(crate) async fn serve_herdr_attach(
     mut recv: BufferedRecv,
     name: &str,
     context: &TargetProcessContext,
+    provider: super::provider::HerdrProvider,
 ) -> Result<()> {
     let session_id = rand::random::<[u8; 16]>();
     let audit_session_id = hex::encode(session_id);
-    let attach = match spawn_herdr_attach(name, context, &audit_session_id).await {
+    let attach = match spawn_herdr_attach(name, context, &audit_session_id, &provider).await {
         Ok(attach) => attach,
         Err(err) => {
             let reason = portl_proto::session_v1::SessionReason::SpawnFailed(err.to_string());
@@ -151,8 +152,8 @@ async fn spawn_herdr_attach(
     name: &str,
     context: &TargetProcessContext,
     audit_session_id: &str,
+    provider: &super::provider::HerdrProvider,
 ) -> Result<Arc<HerdrAttach>> {
-    let provider = super::provider::HerdrProvider::new(None);
     let mut command = provider.bridge_command(name, context.cwd.as_deref(), &context.env)?;
     command.stdin(std::process::Stdio::piped());
     command.stdout(std::process::Stdio::piped());

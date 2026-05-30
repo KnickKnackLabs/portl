@@ -7,11 +7,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use portl_agent::{AgentConfig, DiscoveryConfig, run_task};
+use portl_core::herdr_wire::{
+    ClientKeybindings, ClientMessage, FrameDirection, HERDR_PROTOCOL_VERSION, RawHerdrFrame,
+    RenderEncoding, ServerMessage,
+};
 use portl_core::id::Identity;
 use portl_core::net::shell_client::PtyCfg;
 use portl_core::net::{
-    open_session_attach, open_session_entries, open_session_history, open_session_list,
-    open_session_list_detailed, open_session_run, open_ticket_v1,
+    open_session_attach, open_session_attach_herdr_checked, open_session_entries,
+    open_session_history, open_session_list, open_session_list_detailed, open_session_run,
+    open_ticket_v1,
 };
 use portl_core::test_util::pair;
 use portl_core::ticket::mint::mint_root;
@@ -109,6 +114,107 @@ async fn session_zmx_provider_maps_core_ops_over_session_protocol() -> Result<()
         String::from_utf8_lossy(&attached)
     );
     assert_eq!(attach.wait_exit().await?, 0);
+
+    shutdown(connection, client, server, agent).await
+}
+
+#[tokio::test]
+async fn session_herdr_provider_bridges_protocol_lanes() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let fake_herdr = temp.path().join("herdr");
+    let log = temp.path().join("herdr.log");
+    let welcome = RawHerdrFrame::encode_server(&ServerMessage::Welcome {
+        version: HERDR_PROTOCOL_VERSION,
+        encoding: RenderEncoding::SemanticFrame,
+        error: None,
+    })?;
+    write_fake_herdr(&fake_herdr, &log, &hex::encode(welcome.framed_bytes()))?;
+
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator, Some(fake_herdr)).await?;
+    let ticket = root_ticket(&operator, server.addr(), shell_caps(true));
+
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let mut attach = open_session_attach_herdr_checked(
+        &connection,
+        &session,
+        "default".to_owned(),
+        None,
+        None,
+        PtyCfg {
+            term: "xterm-256color".to_owned(),
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await?;
+
+    assert_eq!(attach.provider, "herdr");
+    let hello = RawHerdrFrame::encode_client(&ClientMessage::Hello {
+        version: HERDR_PROTOCOL_VERSION,
+        cols: 80,
+        rows: 24,
+        cell_width_px: 0,
+        cell_height_px: 0,
+        requested_encoding: RenderEncoding::SemanticFrame,
+        keybindings: ClientKeybindings::Server,
+    })?;
+    attach
+        .client_control
+        .write_all(hello.framed_bytes())
+        .await?;
+
+    let received_welcome =
+        read_test_herdr_frame(&mut attach.server_control, FrameDirection::ServerToClient).await?;
+    assert!(matches!(
+        received_welcome.decode_server()?,
+        ServerMessage::Welcome {
+            version: HERDR_PROTOCOL_VERSION,
+            ..
+        }
+    ));
+
+    let resize = RawHerdrFrame::encode_client(&ClientMessage::Resize {
+        cols: 120,
+        rows: 40,
+        cell_width_px: 0,
+        cell_height_px: 0,
+    })?;
+    let input = RawHerdrFrame::encode_client(&ClientMessage::Input {
+        data: b"echo from portl\n".to_vec(),
+    })?;
+    attach
+        .client_resize
+        .write_all(resize.framed_bytes())
+        .await?;
+    attach.client_input.write_all(input.framed_bytes()).await?;
+    let _ = attach.client_control.finish();
+    let _ = attach.client_input.finish();
+    let _ = attach.client_resize.finish();
+    let _ = attach.client_bulk.finish();
+
+    wait_for_log_contains(&log, "argv:remote-client-bridge").await?;
+    wait_for_log_contains(
+        &log,
+        &format!("frame:{}", hex::encode(hello.framed_bytes())),
+    )
+    .await?;
+    wait_for_log_contains(
+        &log,
+        &format!("frame:{}", hex::encode(resize.framed_bytes())),
+    )
+    .await?;
+    wait_for_log_contains(
+        &log,
+        &format!("frame:{}", hex::encode(input.framed_bytes())),
+    )
+    .await?;
+    let calls = fs::read_to_string(&log)?;
+    assert!(
+        calls.contains("env:HERDR_SESSION=<unset>"),
+        "calls were {calls:?}"
+    );
 
     shutdown(connection, client, server, agent).await
 }
@@ -818,6 +924,40 @@ async fn run_query_strip_capture(
     Ok(attached)
 }
 
+async fn read_test_herdr_frame<R>(
+    reader: &mut R,
+    direction: FrameDirection,
+) -> Result<RawHerdrFrame>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut len = [0_u8; 4];
+    reader.read_exact(&mut len).await?;
+    let payload_len = u32::from_le_bytes(len) as usize;
+    let mut framed = Vec::with_capacity(4 + payload_len);
+    framed.extend_from_slice(&len);
+    let mut payload = vec![0_u8; payload_len];
+    reader.read_exact(&mut payload).await?;
+    framed.extend_from_slice(&payload);
+    Ok(match direction {
+        FrameDirection::ClientToServer => RawHerdrFrame::decode_client_from_bytes(&framed)?,
+        FrameDirection::ServerToClient => RawHerdrFrame::decode_server_from_bytes(&framed)?,
+    })
+}
+
+async fn wait_for_log_contains(path: &std::path::Path, needle: &str) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if fs::read_to_string(path).is_ok_and(|contents| contents.contains(needle)) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for {needle:?} in {}", path.display());
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 fn root_ticket(
     operator: &Identity,
     addr: iroh_base::EndpointAddr,
@@ -846,6 +986,68 @@ fn shell_caps(allow: bool) -> Capabilities {
         vpn: None,
         meta: None,
     }
+}
+
+fn write_fake_herdr(
+    path: &std::path::Path,
+    log: &std::path::Path,
+    welcome_hex: &str,
+) -> Result<()> {
+    let script = r#"#!/usr/bin/env python3
+import os
+import struct
+import sys
+
+LOG = __LOG__
+WELCOME = bytes.fromhex(__WELCOME__)
+
+def log(line):
+    with open(LOG, "a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+        handle.flush()
+
+def read_frame():
+    length = sys.stdin.buffer.read(4)
+    if not length:
+        return None
+    if len(length) != 4:
+        log("partial-length")
+        return None
+    size = struct.unpack("<I", length)[0]
+    payload = sys.stdin.buffer.read(size)
+    if len(payload) != size:
+        log("partial-payload")
+        return None
+    framed = length + payload
+    log("frame:" + framed.hex())
+    return framed
+
+args = sys.argv[1:]
+log("argv:" + " ".join(args))
+log("env:HERDR_SESSION=" + os.environ.get("HERDR_SESSION", "<unset>"))
+if args == ["--version"]:
+    print("herdr 0.6.4")
+    raise SystemExit(0)
+if args == ["session", "list", "--json"]:
+    print('{"sessions":[{"name":"default"}]}')
+    raise SystemExit(0)
+if args == ["remote-client-bridge"]:
+    if read_frame() is not None:
+        sys.stdout.buffer.write(WELCOME)
+        sys.stdout.buffer.flush()
+        while read_frame() is not None:
+            pass
+    raise SystemExit(0)
+print("unknown herdr args: " + " ".join(args), file=sys.stderr)
+raise SystemExit(64)
+"#
+    .replace("__LOG__", &format!("{:?}", log.display().to_string()))
+    .replace("__WELCOME__", &format!("{:?}", welcome_hex));
+    fs::write(path, script)?;
+    let mut perms = fs::metadata(path)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms)?;
+    Ok(())
 }
 
 fn write_failing_zmx(path: &std::path::Path) -> Result<()> {

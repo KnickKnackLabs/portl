@@ -91,6 +91,12 @@ async fn serve_control_stream(
         return Ok(());
     }
     let zmx = provider::ZmxProvider::new(state.session_provider_path.clone());
+    let herdr_path = state.session_provider_path.clone().filter(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "herdr")
+    });
+    let herdr = provider::HerdrProvider::new(herdr_path);
     let tmux_path = state.session_provider_path.clone().filter(|path| {
         path.file_name()
             .and_then(|name| name.to_str())
@@ -130,15 +136,16 @@ async fn serve_control_stream(
             Ok(())
         }
         SessionOp::List => {
-            let groups = match list_session_groups(&zmx, &tmux, req.provider.as_deref()).await {
-                Ok(groups) => groups,
-                Err(err) => {
-                    audit::session_reject(&session, "list", "provider_command_failed");
-                    write_ack(&mut send, reject(err)).await?;
-                    let _ = send.finish();
-                    return Ok(());
-                }
-            };
+            let groups =
+                match list_session_groups(&herdr, &zmx, &tmux, req.provider.as_deref()).await {
+                    Ok(groups) => groups,
+                    Err(err) => {
+                        audit::session_reject(&session, "list", "provider_command_failed");
+                        write_ack(&mut send, reject(err)).await?;
+                        let _ = send.finish();
+                        return Ok(());
+                    }
+                };
             let provider_name = groups
                 .iter()
                 .find(|group| group.default)
@@ -167,15 +174,15 @@ async fn serve_control_stream(
             Ok(())
         }
         SessionOp::Run => {
-            let selected = match select_provider(&zmx, &tmux, req.provider.as_deref(), req.op).await
-            {
-                Ok(selected) => selected,
-                Err(reason) => {
-                    write_ack(&mut send, reject(reason)).await?;
-                    let _ = send.finish();
-                    return Ok(());
-                }
-            };
+            let selected =
+                match select_provider(&herdr, &zmx, &tmux, req.provider.as_deref(), req.op).await {
+                    Ok(selected) => selected,
+                    Err(reason) => {
+                        write_ack(&mut send, reject(reason)).await?;
+                        let _ = send.finish();
+                        return Ok(());
+                    }
+                };
             let Some(name) = req.session_name.as_deref() else {
                 write_ack(&mut send, reject(SessionReason::MissingSessionName)).await?;
                 let _ = send.finish();
@@ -220,6 +227,7 @@ async fn serve_control_stream(
                 return Ok(());
             };
             let selected = match resolve_provider_for_session(
+                &herdr,
                 &zmx,
                 &tmux,
                 req.provider.as_deref(),
@@ -270,6 +278,7 @@ async fn serve_control_stream(
                 return Ok(());
             };
             let selected = match resolve_provider_for_session(
+                &herdr,
                 &zmx,
                 &tmux,
                 req.provider.as_deref(),
@@ -310,7 +319,7 @@ async fn serve_control_stream(
             let _ = send.finish();
             Ok(())
         }
-        SessionOp::Attach => serve_attach(session, state, send, recv, req, zmx, tmux).await,
+        SessionOp::Attach => serve_attach(session, state, send, recv, req, herdr, zmx, tmux).await,
         #[cfg(feature = "ghostty-vt")]
         SessionOp::AttachV2 => serve_attach_v2(session, state, send, recv, req, zmx, tmux).await,
         #[cfg(not(feature = "ghostty-vt"))]
@@ -383,6 +392,7 @@ async fn serve_attach(
     mut send: SendStream,
     mut recv: BufferedRecv,
     req: SessionReq,
+    herdr_provider: provider::HerdrProvider,
     zmx: provider::ZmxProvider,
     tmux: provider::TmuxProvider,
 ) -> Result<()> {
@@ -394,6 +404,7 @@ async fn serve_attach(
         return Ok(());
     };
     let selected = match resolve_provider_for_session(
+        &herdr_provider,
         &zmx,
         &tmux,
         req.provider.as_deref(),
@@ -467,7 +478,15 @@ async fn serve_attach(
             return Ok(());
         }
         let name = name.to_owned();
-        return herdr::serve_herdr_attach(state, send, recv, &name, &workload_context).await;
+        return herdr::serve_herdr_attach(
+            state,
+            send,
+            recv,
+            &name,
+            &workload_context,
+            herdr_provider,
+        )
+        .await;
     }
 
     if selected == SelectedProvider::Tmux {
@@ -757,7 +776,9 @@ async fn serve_attach_v2(
         let _ = send.finish();
         return Ok(());
     };
+    let herdr = provider::HerdrProvider::new(None);
     let selected = match resolve_provider_for_session(
+        &herdr,
         &zmx,
         &tmux,
         req.provider.as_deref(),
@@ -1688,6 +1709,7 @@ async fn aggregate_session_entries(
 }
 
 async fn resolve_provider_for_session(
+    herdr: &provider::HerdrProvider,
     zmx: &provider::ZmxProvider,
     tmux: &provider::TmuxProvider,
     requested: Option<&str>,
@@ -1696,7 +1718,7 @@ async fn resolve_provider_for_session(
     create_if_missing: bool,
 ) -> Result<SelectedProvider, SessionReason> {
     if requested.is_some() {
-        return select_provider(zmx, tmux, requested, op).await;
+        return select_provider(herdr, zmx, tmux, requested, op).await;
     }
 
     let entries = aggregate_session_entries(zmx, tmux)
@@ -1731,7 +1753,7 @@ async fn resolve_provider_for_session(
 
     match providers.as_slice() {
         [provider] => Ok(*provider),
-        [] if create_if_missing => select_provider(zmx, tmux, None, op).await,
+        [] if create_if_missing => select_provider(herdr, zmx, tmux, None, op).await,
         [] => Err(SessionReason::SessionNotFound(session_name.to_owned())),
         _ => Err(SessionReason::SessionAmbiguous {
             name: session_name.to_owned(),
@@ -1744,6 +1766,7 @@ async fn resolve_provider_for_session(
 }
 
 async fn select_provider(
+    herdr: &provider::HerdrProvider,
     zmx: &provider::ZmxProvider,
     tmux: &provider::TmuxProvider,
     requested: Option<&str>,
@@ -1761,11 +1784,7 @@ async fn select_provider(
                     capability: op_name(op).to_owned(),
                 })
             }
-            "herdr" => ensure_available(
-                provider::HerdrProvider::new(None).probe().await,
-                "herdr",
-                SelectedProvider::Herdr,
-            ),
+            "herdr" => ensure_available(herdr.probe().await, "herdr", SelectedProvider::Herdr),
             "zmx" => ensure_available(zmx.probe().await, "zmx", SelectedProvider::Zmx),
             "tmux" => {
                 if op == SessionOp::Run {
@@ -1813,12 +1832,13 @@ async fn select_provider(
 }
 
 async fn list_session_groups(
+    herdr: &provider::HerdrProvider,
     zmx: &provider::ZmxProvider,
     tmux: &provider::TmuxProvider,
     requested: Option<&str>,
 ) -> Result<Vec<SessionProviderSessions>, SessionReason> {
     if let Some(provider) = requested {
-        let selected = select_provider(zmx, tmux, Some(provider), SessionOp::List).await?;
+        let selected = select_provider(herdr, zmx, tmux, Some(provider), SessionOp::List).await?;
         let zmx_available = if selected == SelectedProvider::Zmx {
             true
         } else {
@@ -1841,7 +1861,7 @@ async fn list_session_groups(
 
     #[cfg(feature = "ghostty-vt")]
     let ghostty_status = GhosttyProvider::new().status();
-    let herdr_status = provider::HerdrProvider::new(None)
+    let herdr_status = herdr
         .probe()
         .await
         .map_err(|err| SessionReason::InternalError(err.to_string()))?;
@@ -1880,7 +1900,7 @@ async fn list_session_groups(
             provider: "herdr".to_owned(),
             available: true,
             default: false,
-            sessions: provider::HerdrProvider::new(None)
+            sessions: herdr
                 .list_detailed()
                 .await
                 .map_err(|err| SessionReason::SpawnFailed(err.to_string()))?,
