@@ -29,6 +29,7 @@ const AGENT_ENV_VARS: &[&str] = &[
     "PORTL_UDP_SESSION_LINGER_SECS",
     "PORTL_SESSION_PROVIDER",
     "PORTL_SESSION_PROVIDER_PATH",
+    "PORTL_HERDR_PATH",
     "PORTL_MODE",
     "PORTL_AGENT_WATCHDOG",
     "PORTL_AGENT_WATCHDOG_INTERVAL",
@@ -70,7 +71,7 @@ pub struct AgentConfig {
     pub metrics_socket_path: Option<PathBuf>,
     /// Optional preferred target-side persistent-session provider.
     /// `default` normalizes to `ghostty`; explicit overrides support
-    /// `ghostty`, `zmx`, and `tmux`.
+    /// `ghostty`, `herdr`, `zmx`, and `tmux`.
     pub session_provider: Option<String>,
     /// Optional absolute path to the target-side persistent-session provider CLI.
     /// Used for external CLI-backed providers (`zmx` or `tmux`).
@@ -540,12 +541,14 @@ fn parse_rate_limit(value: &str) -> Result<RateLimitConfig> {
 pub const SESSION_PROVIDER_DEFAULT_ALIAS: &str = "default";
 pub const SESSION_PROVIDER_DEFAULT: &str = "ghostty";
 pub const SESSION_PROVIDER_GHOSTTY: &str = "ghostty";
+pub const SESSION_PROVIDER_HERDR: &str = "herdr";
 pub const SESSION_PROVIDER_ZMX: &str = "zmx";
 pub const SESSION_PROVIDER_TMUX: &str = "tmux";
-pub const SESSION_PROVIDER_HELP_VALUES: &str = "default, ghostty, zmx, tmux";
+pub const SESSION_PROVIDER_HELP_VALUES: &str = "default, ghostty, herdr, zmx, tmux";
 pub const SESSION_PROVIDER_CONFIG_VALUES: &[&str] = &[
     SESSION_PROVIDER_DEFAULT_ALIAS,
     SESSION_PROVIDER_GHOSTTY,
+    SESSION_PROVIDER_HERDR,
     SESSION_PROVIDER_ZMX,
     SESSION_PROVIDER_TMUX,
 ];
@@ -555,6 +558,7 @@ pub fn normalize_session_provider_override(value: &str) -> Option<&'static str> 
     match value.trim() {
         SESSION_PROVIDER_DEFAULT_ALIAS => Some(SESSION_PROVIDER_DEFAULT),
         SESSION_PROVIDER_GHOSTTY => Some(SESSION_PROVIDER_GHOSTTY),
+        SESSION_PROVIDER_HERDR => Some(SESSION_PROVIDER_HERDR),
         SESSION_PROVIDER_ZMX => Some(SESSION_PROVIDER_ZMX),
         SESSION_PROVIDER_TMUX => Some(SESSION_PROVIDER_TMUX),
         _ => None,

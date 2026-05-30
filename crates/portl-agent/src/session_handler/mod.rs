@@ -1383,6 +1383,13 @@ async fn serve_substream(
         | SessionStreamKind::AttachV2Viewport
         | SessionStreamKind::AttachV2Live
         | SessionStreamKind::AttachV2History => bail!("attach v2 stream not registered"),
+        SessionStreamKind::HerdrClientControl
+        | SessionStreamKind::HerdrClientInput
+        | SessionStreamKind::HerdrClientResize
+        | SessionStreamKind::HerdrClientBulk
+        | SessionStreamKind::HerdrServerControl
+        | SessionStreamKind::HerdrServerRender
+        | SessionStreamKind::HerdrServerBulk => bail!("herdr stream not registered"),
     }
 }
 
@@ -1527,6 +1534,7 @@ fn session_permits(session: &Session, req: &SessionReq) -> Result<(), SessionRea
 enum SelectedProvider {
     #[cfg(feature = "ghostty-vt")]
     Ghostty,
+    Herdr,
     Zmx,
     Tmux,
     Raw,
@@ -1537,6 +1545,7 @@ impl SelectedProvider {
         match self {
             #[cfg(feature = "ghostty-vt")]
             Self::Ghostty => "ghostty",
+            Self::Herdr => "herdr",
             Self::Zmx => "zmx",
             Self::Tmux => "tmux",
             Self::Raw => "raw",
@@ -1551,6 +1560,7 @@ impl SelectedProvider {
         match self {
             #[cfg(feature = "ghostty-vt")]
             Self::Ghostty => GhosttyProvider::new().list_detailed().await,
+            Self::Herdr => provider::HerdrProvider::new(None).list_detailed().await,
             Self::Zmx => zmx.list_detailed().await,
             Self::Tmux => tmux.list_detailed().await,
             Self::Raw => bail!("raw provider does not support list"),
@@ -1569,6 +1579,7 @@ impl SelectedProvider {
         match self {
             #[cfg(feature = "ghostty-vt")]
             Self::Ghostty => GhosttyProvider::new().run(session, cwd, argv, None).await,
+            Self::Herdr => bail!("herdr provider does not support run"),
             Self::Zmx => zmx.run(session, argv).await,
             Self::Tmux => bail!("tmux provider does not support run"),
             Self::Raw => bail!("raw provider does not support run"),
@@ -1584,6 +1595,7 @@ impl SelectedProvider {
         match self {
             #[cfg(feature = "ghostty-vt")]
             Self::Ghostty => GhosttyProvider::new().history(session).await,
+            Self::Herdr => bail!("herdr provider does not support history"),
             Self::Zmx => zmx.history(session).await,
             Self::Tmux => tmux.history(session).await,
             Self::Raw => bail!("raw provider does not support history"),
@@ -1599,6 +1611,7 @@ impl SelectedProvider {
         match self {
             #[cfg(feature = "ghostty-vt")]
             Self::Ghostty => GhosttyProvider::new().kill(session).await,
+            Self::Herdr => bail!("herdr provider does not support kill"),
             Self::Zmx => zmx.kill(session).await,
             Self::Tmux => tmux.kill(session).await,
             Self::Raw => bail!("raw provider does not support kill"),
@@ -1614,15 +1627,21 @@ async fn aggregate_session_entries(
     #[cfg(feature = "ghostty-vt")]
     let providers = [
         SelectedProvider::Ghostty,
+        SelectedProvider::Herdr,
         SelectedProvider::Zmx,
         SelectedProvider::Tmux,
     ];
     #[cfg(not(feature = "ghostty-vt"))]
-    let providers = [SelectedProvider::Zmx, SelectedProvider::Tmux];
+    let providers = [
+        SelectedProvider::Herdr,
+        SelectedProvider::Zmx,
+        SelectedProvider::Tmux,
+    ];
     for provider in providers {
         let status = match provider {
             #[cfg(feature = "ghostty-vt")]
             SelectedProvider::Ghostty => GhosttyProvider::new().status(),
+            SelectedProvider::Herdr => provider::HerdrProvider::new(None).probe().await?,
             SelectedProvider::Zmx => zmx.probe().await?,
             SelectedProvider::Tmux => tmux.probe().await?,
             SelectedProvider::Raw => portl_proto::session_v1::ProviderStatus {
@@ -1677,6 +1696,9 @@ async fn resolve_provider_for_session(
             "ghostty" if !providers.contains(&SelectedProvider::Ghostty) => {
                 providers.push(SelectedProvider::Ghostty);
             }
+            "herdr" if !providers.contains(&SelectedProvider::Herdr) => {
+                providers.push(SelectedProvider::Herdr);
+            }
             "zmx" if !providers.contains(&SelectedProvider::Zmx) => {
                 providers.push(SelectedProvider::Zmx);
             }
@@ -1713,6 +1735,17 @@ async fn select_provider(
             "ghostty" => Ok(SelectedProvider::Ghostty),
             #[cfg(not(feature = "ghostty-vt"))]
             "ghostty" => Err(SessionReason::ProviderNotFound(provider.to_owned())),
+            "herdr" if matches!(op, SessionOp::Run | SessionOp::History | SessionOp::Kill) => {
+                Err(SessionReason::CapabilityUnsupported {
+                    provider: provider.to_owned(),
+                    capability: op_name(op).to_owned(),
+                })
+            }
+            "herdr" => ensure_available(
+                provider::HerdrProvider::new(None).probe().await,
+                "herdr",
+                SelectedProvider::Herdr,
+            ),
             "zmx" => ensure_available(zmx.probe().await, "zmx", SelectedProvider::Zmx),
             "tmux" => {
                 if op == SessionOp::Run {
@@ -1788,6 +1821,10 @@ async fn list_session_groups(
 
     #[cfg(feature = "ghostty-vt")]
     let ghostty_status = GhosttyProvider::new().status();
+    let herdr_status = provider::HerdrProvider::new(None)
+        .probe()
+        .await
+        .map_err(|err| SessionReason::InternalError(err.to_string()))?;
     let zmx_status = zmx
         .probe()
         .await
@@ -1813,6 +1850,17 @@ async fn list_session_groups(
             available: true,
             default: default_provider == Some("ghostty"),
             sessions: GhosttyProvider::new()
+                .list_detailed()
+                .await
+                .map_err(|err| SessionReason::SpawnFailed(err.to_string()))?,
+        });
+    }
+    if herdr_status.available {
+        groups.push(SessionProviderSessions {
+            provider: "herdr".to_owned(),
+            available: true,
+            default: false,
+            sessions: provider::HerdrProvider::new(None)
                 .list_detailed()
                 .await
                 .map_err(|err| SessionReason::SpawnFailed(err.to_string()))?,

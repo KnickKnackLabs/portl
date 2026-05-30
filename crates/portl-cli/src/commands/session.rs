@@ -785,6 +785,7 @@ fn provider_capabilities(provider: &str) -> ProviderCapabilities {
     match provider {
         #[cfg(feature = "ghostty-vt")]
         "ghostty" => ProviderCapabilities::ghostty(),
+        "herdr" => ProviderCapabilities::herdr(),
         "zmx" => ProviderCapabilities::zmx(),
         "tmux" => ProviderCapabilities::tmux(),
         _ => ProviderCapabilities::raw(),
@@ -7258,6 +7259,14 @@ mod tests {
 
         let status = child.wait().await.expect("wait child");
         assert!(status.success(), "child stdio was not a tty: {status}");
+    }
+
+    #[test]
+    fn provider_capabilities_include_herdr() {
+        assert_eq!(
+            provider_capabilities("herdr"),
+            ProviderCapabilities::herdr()
+        );
     }
 
     #[test]

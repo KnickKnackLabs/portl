@@ -561,6 +561,128 @@ fn parse_tmux_cursor_line(line: &str) -> Option<(u16, u16)> {
     Some((x, y))
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct HerdrProvider {
+    path: Option<PathBuf>,
+    env: Vec<(String, String)>,
+    target_home: Option<PathBuf>,
+}
+
+impl HerdrProvider {
+    pub(crate) fn new(path: Option<PathBuf>) -> Self {
+        Self {
+            path,
+            env: Vec::new(),
+            target_home: default_target_home(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_target_home(mut self, target_home: Option<PathBuf>) -> Self {
+        self.target_home = target_home;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_path(path: PathBuf) -> Self {
+        Self::new(Some(path))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_env(mut self, key: &str, value: &Path) -> Self {
+        self.env.push((key.to_owned(), value.display().to_string()));
+        self
+    }
+
+    pub(crate) async fn probe(&self) -> Result<ProviderStatus> {
+        let Some(path) = self.resolve_path() else {
+            return Ok(herdr_provider_status(
+                false,
+                None,
+                Some("not found".to_owned()),
+                None,
+                Vec::new(),
+            ));
+        };
+        let output = self.command(&path).arg("--version").output().await;
+        match output {
+            Ok(output) if output.status.success() => Ok(herdr_provider_status(
+                true,
+                Some(path.display().to_string()),
+                Some(String::from_utf8_lossy(&output.stdout).trim().to_owned()),
+                Some("protocol-aware".to_owned()),
+                herdr_features(),
+            )),
+            Ok(output) => Ok(herdr_provider_status(
+                false,
+                Some(path.display().to_string()),
+                Some(String::from_utf8_lossy(&output.stderr).trim().to_owned()),
+                None,
+                Vec::new(),
+            )),
+            Err(err) => Ok(herdr_provider_status(
+                false,
+                Some(path.display().to_string()),
+                Some(err.to_string()),
+                None,
+                Vec::new(),
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn list(&self) -> Result<Vec<String>> {
+        Ok(self
+            .list_detailed()
+            .await?
+            .into_iter()
+            .map(|session| session.name)
+            .collect())
+    }
+
+    pub(crate) async fn list_detailed(&self) -> Result<Vec<SessionInfo>> {
+        let output = self.run_capture(&["session", "list", "--json"]).await?;
+        ensure_success("herdr session list --json", &output)?;
+        parse_herdr_session_json(&output.stdout)
+    }
+
+    async fn run_capture(&self, args: &[&str]) -> Result<SessionRunResult> {
+        let path = self
+            .resolve_path()
+            .ok_or_else(|| anyhow!("herdr is not installed on the target"))?;
+        let output = self
+            .command(&path)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .with_context(|| format!("run {} {}", path.display(), args.join(" ")))?;
+        let code = output.status.code().unwrap_or(1);
+        Ok(SessionRunResult {
+            code,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+
+    pub(crate) fn path_discovery(&self) -> ProviderPathDiscovery {
+        let configured = std::env::var_os("PORTL_HERDR_PATH")
+            .map(PathBuf::from)
+            .or_else(|| self.path.clone());
+        discover_provider_path("herdr", configured, self.target_home.as_deref())
+    }
+
+    fn resolve_path(&self) -> Option<PathBuf> {
+        self.path_discovery().path
+    }
+
+    fn command(&self, path: &Path) -> Command {
+        let mut command = Command::new(path);
+        apply_provider_env(&mut command, &self.env, self.target_home.as_deref());
+        command
+    }
+}
+
 impl TmuxProvider {
     pub(crate) fn new(path: Option<PathBuf>) -> Self {
         Self {
@@ -837,6 +959,24 @@ fn provider_status(
     }
 }
 
+fn herdr_provider_status(
+    available: bool,
+    path: Option<String>,
+    notes: Option<String>,
+    tier: Option<String>,
+    features: Vec<String>,
+) -> ProviderStatus {
+    ProviderStatus {
+        name: "herdr".to_owned(),
+        available,
+        path,
+        notes,
+        capabilities: ProviderCapabilities::herdr(),
+        tier,
+        features,
+    }
+}
+
 fn tmux_provider_status(
     available: bool,
     path: Option<String>,
@@ -875,6 +1015,37 @@ fn parse_zmx_session_json(stdout: &str) -> Result<Vec<SessionInfo>> {
                 .map(|name| SessionInfo {
                     name: name.to_owned(),
                     provider: "zmx".to_owned(),
+                    metadata: stringify_json_object(object, &["name", "session"]),
+                }),
+            _ => None,
+        })
+        .collect())
+}
+
+fn parse_herdr_session_json(stdout: &str) -> Result<Vec<SessionInfo>> {
+    let value: serde_json::Value =
+        serde_json::from_str(stdout).context("parse herdr session list --json")?;
+    let items = value
+        .get("sessions")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    Ok(items
+        .iter()
+        .filter_map(|item| match item {
+            serde_json::Value::String(name) => Some(SessionInfo {
+                name: name.clone(),
+                provider: "herdr".to_owned(),
+                metadata: BTreeMap::new(),
+            }),
+            serde_json::Value::Object(object) => object
+                .get("name")
+                .or_else(|| object.get("session"))
+                .and_then(serde_json::Value::as_str)
+                .map(|name| SessionInfo {
+                    name: name.to_owned(),
+                    provider: "herdr".to_owned(),
                     metadata: stringify_json_object(object, &["name", "session"]),
                 }),
             _ => None,
@@ -978,6 +1149,17 @@ fn stringify_json_object(
         .collect()
 }
 
+fn herdr_features() -> Vec<String> {
+    [
+        "herdr_wire.v1",
+        "priority_lanes.v1",
+        "remote_client_bridge.v1",
+    ]
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .collect()
+}
+
 fn tmux_features() -> Vec<String> {
     [
         "tmux_control.v1",
@@ -1008,17 +1190,24 @@ pub(crate) fn provider_discovery_info(
 ) -> crate::status_schema::SessionProvidersInfo {
     let target_home = default_target_home();
     let default_user = default_user_info();
+    let herdr_config = configured_path.and_then(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "herdr")
+            .then(|| path.to_path_buf())
+    });
     let tmux_config = configured_path.and_then(|path| {
         path.file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name == "tmux")
             .then(|| path.to_path_buf())
     });
-    let zmx_config = if tmux_config.is_some() {
+    let zmx_config = if tmux_config.is_some() || herdr_config.is_some() {
         None
     } else {
         configured_path.map(Path::to_path_buf)
     };
+    let herdr = HerdrProvider::new(herdr_config).path_discovery();
     let zmx = discover_provider_path("zmx", zmx_config, target_home.as_deref());
     let tmux = discover_provider_path("tmux", tmux_config, target_home.as_deref());
     let ghostty = ghostty_discovery_info();
@@ -1032,7 +1221,11 @@ pub(crate) fn provider_discovery_info(
     if let Some(info) = ghostty {
         providers.push(info);
     }
-    providers.extend([provider_info("zmx", &zmx), provider_info("tmux", &tmux)]);
+    providers.extend([
+        provider_info("herdr", &herdr),
+        provider_info("zmx", &zmx),
+        provider_info("tmux", &tmux),
+    ]);
     providers.push(crate::status_schema::SessionProviderInfo {
         name: "raw".to_owned(),
         detected: true,
@@ -1041,6 +1234,7 @@ pub(crate) fn provider_discovery_info(
         notes: Some("one-shot PTY fallback".to_owned()),
     });
     let mut search_paths = Vec::new();
+    append_search_paths("herdr", &herdr, &mut search_paths);
     append_search_paths("zmx", &zmx, &mut search_paths);
     append_search_paths("tmux", &tmux, &mut search_paths);
 
@@ -1137,6 +1331,7 @@ pub(crate) async fn provider_report(
     zmx: &ZmxProvider,
     tmux: &TmuxProvider,
 ) -> Result<ProviderReport> {
+    let herdr_status = HerdrProvider::new(None).probe().await?;
     let zmx_status = zmx.probe().await?;
     let tmux_status = tmux.probe().await?;
     let ghostty_status = ghostty_provider_status();
@@ -1151,6 +1346,7 @@ pub(crate) async fn provider_report(
         providers.push(status);
     }
     providers.extend([
+        herdr_status,
         zmx_status,
         tmux_status,
         ProviderStatus {
@@ -1535,6 +1731,58 @@ esac
         Ok(())
     }
 
+    #[tokio::test]
+    async fn herdr_provider_maps_session_list_json() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let fake = temp.path().join("herdr");
+        fs::write(
+            &fake,
+            r#"#!/bin/sh
+printf '%s\n' "$@" >> "$PORTL_FAKE_HERDR_LOG"
+case "$1" in
+  --version) echo "herdr 0.6.4" ;;
+  session)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '{"sessions":[{"name":"default","default":true,"running":true,"socket_path":"/tmp/herdr.sock","session_dir":"/tmp/herdr"},{"name":"ops","default":false,"running":false,"socket_path":"/tmp/ops.sock","session_dir":"/tmp/ops"}]}'
+    fi
+    ;;
+esac
+"#,
+        )?;
+        let mut perms = fs::metadata(&fake)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake, perms)?;
+        let log = temp.path().join("log");
+        let provider = HerdrProvider::with_path(fake).with_env("PORTL_FAKE_HERDR_LOG", &log);
+
+        let status = provider.probe().await?;
+        assert!(status.available);
+        assert_eq!(status.name, "herdr");
+        assert_eq!(status.tier.as_deref(), Some("protocol-aware"));
+        assert_eq!(status.capabilities, ProviderCapabilities::herdr());
+        assert!(status.features.contains(&"herdr_wire.v1".to_owned()));
+
+        assert_eq!(
+            provider.list().await?,
+            vec!["default".to_owned(), "ops".to_owned()]
+        );
+
+        let sessions = provider.list_detailed().await?;
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].provider, "herdr");
+        assert_eq!(sessions[0].name, "default");
+        assert_eq!(sessions[0].metadata["default"], "true");
+        assert_eq!(sessions[0].metadata["running"], "true");
+        assert_eq!(sessions[1].provider, "herdr");
+        assert_eq!(sessions[1].name, "ops");
+        assert_eq!(sessions[1].metadata["running"], "false");
+
+        let calls = fs::read_to_string(log)?;
+        assert!(calls.contains("--version\n"));
+        assert!(calls.contains("session\nlist\n--json\n"));
+        Ok(())
+    }
+
     #[test]
     fn tmux_target_parsing_uses_native_session_window_pane_suffix() {
         assert_eq!(
@@ -1731,7 +1979,7 @@ esac
                 .iter()
                 .map(|status| status.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["ghostty", "zmx", "tmux", "raw"]
+            vec!["ghostty", "herdr", "zmx", "tmux", "raw"]
         );
         let ghostty = &report.providers[0];
         assert!(ghostty.available);
@@ -1770,7 +2018,7 @@ esac
                 .iter()
                 .map(|status| status.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["zmx", "tmux", "raw"]
+            vec!["herdr", "zmx", "tmux", "raw"]
         );
         Ok(())
     }
