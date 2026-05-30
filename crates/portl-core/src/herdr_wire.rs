@@ -289,11 +289,9 @@ fn encode_frame<T: Serialize>(
     let payload = bincode::serde::encode_to_vec(message, bincode::config::standard())
         .map_err(|err| HerdrFrameError::Bincode(err.to_string()))?;
     let len = payload.len();
-    if len > u32::MAX as usize {
-        return Err(HerdrFrameError::TooLargeToEncode { len });
-    }
+    let len_u32 = u32::try_from(len).map_err(|_| HerdrFrameError::TooLargeToEncode { len })?;
     let mut framed = Vec::with_capacity(LENGTH_PREFIX_BYTES + len);
-    framed.extend_from_slice(&(len as u32).to_le_bytes());
+    framed.extend_from_slice(&len_u32.to_le_bytes());
     framed.extend_from_slice(&payload);
     Ok(RawHerdrFrame { direction, framed })
 }
@@ -461,7 +459,8 @@ mod tests {
 
     #[test]
     fn oversized_frame_is_rejected_before_allocation() {
-        let bytes = ((MAX_FRAME_SIZE as u32) + 1).to_le_bytes().to_vec();
+        let claimed = u32::try_from(MAX_FRAME_SIZE).expect("max frame size fits u32") + 1;
+        let bytes = claimed.to_le_bytes().to_vec();
 
         let err = RawHerdrFrame::decode_client_from_bytes(&bytes).unwrap_err();
 

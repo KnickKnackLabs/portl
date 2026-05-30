@@ -385,7 +385,7 @@ async fn plan_tmux_attach(tmux: &provider::TmuxProvider, requested: &str) -> Tmu
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn serve_attach(
     session: Session,
     state: Arc<AgentState>,

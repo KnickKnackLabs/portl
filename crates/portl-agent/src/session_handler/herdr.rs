@@ -54,7 +54,7 @@ pub(crate) async fn serve_herdr_attach(
 ) -> Result<()> {
     let session_id = rand::random::<[u8; 16]>();
     let audit_session_id = hex::encode(session_id);
-    let attach = match spawn_herdr_attach(name, context, &audit_session_id, &provider).await {
+    let attach = match spawn_herdr_attach(name, context, &audit_session_id, &provider) {
         Ok(attach) => attach,
         Err(err) => {
             let reason = portl_proto::session_v1::SessionReason::SpawnFailed(err.to_string());
@@ -150,7 +150,7 @@ pub(crate) async fn serve_substream(
     }
 }
 
-async fn spawn_herdr_attach(
+fn spawn_herdr_attach(
     name: &str,
     context: &TargetProcessContext,
     audit_session_id: &str,
@@ -330,39 +330,35 @@ where
         let frame = tokio::select! {
             biased;
             frame = control_rx.recv(), if control_open => {
-                match frame {
-                    Some(frame) => Some(frame),
-                    None => {
-                        control_open = false;
-                        None
-                    }
+                if let Some(frame) = frame {
+                    Some(frame)
+                } else {
+                    control_open = false;
+                    None
                 }
             }
             frame = input_rx.recv(), if input_open => {
-                match frame {
-                    Some(frame) => Some(frame),
-                    None => {
-                        input_open = false;
-                        None
-                    }
+                if let Some(frame) = frame {
+                    Some(frame)
+                } else {
+                    input_open = false;
+                    None
                 }
             }
             frame = resize_rx.recv(), if resize_open => {
-                match frame {
-                    Some(frame) => Some(frame),
-                    None => {
-                        resize_open = false;
-                        None
-                    }
+                if let Some(frame) = frame {
+                    Some(frame)
+                } else {
+                    resize_open = false;
+                    None
                 }
             }
             frame = bulk_rx.recv(), if bulk_open => {
-                match frame {
-                    Some(frame) => Some(frame),
-                    None => {
-                        bulk_open = false;
-                        None
-                    }
+                if let Some(frame) = frame {
+                    Some(frame)
+                } else {
+                    bulk_open = false;
+                    None
                 }
             }
         };

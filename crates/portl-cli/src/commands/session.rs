@@ -2881,7 +2881,7 @@ impl HerdrSocketTempDir {
                         .with_context(|| format!("set permissions on {}", candidate.display()))?;
                     return Ok(Self { path: candidate });
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(err) => return Err(err).context("create herdr client socket directory"),
             }
         }
@@ -2983,16 +2983,16 @@ where
     {
         match frame.client_lane()? {
             portl_core::herdr_wire::ClientLane::Control => {
-                write_herdr_frame(&mut control, &frame).await?
+                write_herdr_frame(&mut control, &frame).await?;
             }
             portl_core::herdr_wire::ClientLane::Input => {
-                write_herdr_frame(&mut input, &frame).await?
+                write_herdr_frame(&mut input, &frame).await?;
             }
             portl_core::herdr_wire::ClientLane::Resize => {
-                write_herdr_frame(&mut resize, &frame).await?
+                write_herdr_frame(&mut resize, &frame).await?;
             }
             portl_core::herdr_wire::ClientLane::Bulk => {
-                write_herdr_frame(&mut bulk, &frame).await?
+                write_herdr_frame(&mut bulk, &frame).await?;
             }
         }
     }
