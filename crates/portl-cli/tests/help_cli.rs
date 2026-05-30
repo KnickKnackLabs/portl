@@ -23,8 +23,8 @@ fn help_output(args: &[&str]) -> String {
 fn cli_help_lists_expected_top_level_commands() {
     let help = help_output(&["--help"]);
     for command in [
-        "init", "doctor", "status", "shell", "exec", "tcp", "udp", "peer", "invite", "accept",
-        "ticket", "whoami", "config", "install", "docker", "slicer", "gateway",
+        "init", "doctor", "status", "shell", "exec", "ssh", "tcp", "udp", "peer", "invite",
+        "accept", "ticket", "whoami", "config", "install", "docker", "slicer", "gateway",
     ] {
         assert!(
             help.contains(command),
@@ -127,7 +127,7 @@ fn top_level_help_uses_logical_command_groups() {
             "  session",
         ],
         &[
-            "Connect:", "  status", "  shell", "  exec", "  tcp", "  udp",
+            "Connect:", "  status", "  shell", "  exec", "  ssh", "  tcp", "  udp",
         ],
         &["Permissions:", "  ticket"],
         &["Integrations:", "  docker", "  slicer", "  gateway"],
@@ -274,7 +274,7 @@ fn top_level_help_snapshots_match() {
     let cases = [
         (
             &["--help"][..],
-            r#"portl CLI — multicall surface for `portl`, `portl-agent`, and `portl-gateway`.
+            r#"portl CLI — multicall surface for `portl`, `portl-agent`, `portl-gateway`, and `portl-ssh`.
 
 Usage: portl [OPTIONS] <COMMAND>
 

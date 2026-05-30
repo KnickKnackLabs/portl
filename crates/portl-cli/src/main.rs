@@ -1,5 +1,5 @@
-//! portl — multicall surface for `portl`, `portl-agent`, and
-//! `portl-gateway`.
+//! portl — multicall surface for `portl`, `portl-agent`,
+//! `portl-gateway`, and `portl-ssh`.
 //!
 //! Entry point. Argument parsing and dispatch live in `cli.rs`.
 //! This file is intentionally thin so that tests can call into

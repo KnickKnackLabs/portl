@@ -139,6 +139,16 @@ pub enum Command {
         user: Option<String>,
         argv: Vec<String>,
     },
+    Ssh {
+        peer: String,
+        user: Option<String>,
+        tty: Option<bool>,
+        forward_agent: bool,
+        stdin_null: bool,
+        quiet: bool,
+        verbose: u8,
+        remote_command: Vec<String>,
+    },
     Tcp {
         peer: String,
         local: Vec<String>,
@@ -817,6 +827,25 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             user,
             argv,
         } => commands::exec::run(&peer, cwd.as_deref(), user.as_deref(), &argv),
+        Command::Ssh {
+            peer,
+            user,
+            tty,
+            forward_agent,
+            stdin_null,
+            quiet,
+            verbose,
+            remote_command,
+        } => commands::ssh::run(
+            &peer,
+            user.as_deref(),
+            tty,
+            forward_agent,
+            stdin_null,
+            quiet,
+            verbose,
+            &remote_command,
+        ),
         Command::Tcp { peer, local } => commands::tcp::run(&peer, &local),
         Command::Udp { peer, local } => commands::udp::run(&peer, &local),
         Command::PeerLs { json, active } => commands::peer::ls::run(json, active),
@@ -1049,6 +1078,9 @@ fn rewrite_multicall(mut argv: Vec<OsString>) -> Result<Vec<OsString>, ParseErro
     if basename == "portl-gateway" {
         argv[0] = OsString::from("portl");
         argv.insert(1, OsString::from("gateway"));
+    } else if basename == "portl-ssh" {
+        argv[0] = OsString::from("portl");
+        argv.insert(1, OsString::from("ssh"));
     }
     Ok(argv)
 }
@@ -1109,6 +1141,7 @@ Connect:
   status       Report health for this machine or probe a target
   shell        Open a one-shot remote PTY shell
   exec         Run a one-shot remote command without a persistent session
+  ssh          SSH-like native Portl shell/exec command
   tcp          Set up one or more local TCP forwards
   udp          Set up one or more local UDP forwards
 
@@ -1490,6 +1523,50 @@ enum ConnectTopLevel {
         user: Option<String>,
         #[arg(last = true, required = true)]
         argv: Vec<String>,
+    },
+    /// SSH-like native Portl shell/exec command.
+    #[command(display_order = 175)]
+    Ssh {
+        /// Login name. Also accepts USER@TARGET in the target position.
+        #[arg(short = 'l', value_name = "USER")]
+        login_name: Option<String>,
+        /// Request SSH-agent forwarding. Implemented in a later phase.
+        #[arg(short = 'A')]
+        forward_agent: bool,
+        /// Disable SSH-agent forwarding.
+        #[arg(short = 'a')]
+        disable_agent: bool,
+        /// Disable pseudo-terminal allocation.
+        #[arg(short = 'T', conflicts_with = "tty")]
+        no_tty: bool,
+        /// Force pseudo-terminal allocation. Repeat as -tt for OpenSSH compatibility.
+        #[arg(short = 't', action = clap::ArgAction::Count, conflicts_with = "no_tty")]
+        tty: u8,
+        /// Redirect stdin from /dev/null. Parsed for SSH argv compatibility.
+        #[arg(short = 'n')]
+        stdin_null: bool,
+        /// Quiet mode. Parsed for SSH argv compatibility.
+        #[arg(short = 'q')]
+        quiet: bool,
+        /// SSH config option. Parsed for compatibility and ignored by native Portl mode.
+        #[arg(short = 'o', value_name = "OPTION", action = clap::ArgAction::Append)]
+        option: Vec<String>,
+        /// SSH config file. Parsed for compatibility and ignored by native Portl mode.
+        #[arg(short = 'F', value_name = "CONFIG")]
+        config: Option<String>,
+        /// SSH port. Parsed for compatibility and ignored by native Portl mode.
+        #[arg(short = 'p', value_name = "PORT")]
+        port: Option<String>,
+        #[arg(help = TARGET_HELP, value_name = "TARGET")]
+        target: String,
+        #[arg(
+            value_name = "COMMAND",
+            help = "Remote command to execute",
+            num_args = 0..,
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
+        remote_command: Vec<String>,
     },
     /// Set up one or more local TCP forwards.
     #[command(display_order = 180)]
@@ -1991,7 +2068,7 @@ impl Cli {
                 timeout,
             },
             TopLevel::Sessions(action) => session_top_level_into_command(action),
-            TopLevel::Connect(action) => connect_into_command(action),
+            TopLevel::Connect(action) => connect_into_command(action, log_verbose),
             TopLevel::Permissions(action) => permissions_into_command(action),
             TopLevel::Integrations(action) => integrations_into_command(action),
             TopLevel::Utility(UtilityTopLevel::Completions { shell }) => {
@@ -2302,7 +2379,7 @@ fn session_action_into_command(action: SessionAction) -> Command {
 }
 
 #[allow(clippy::too_many_lines)]
-fn connect_into_command(action: ConnectTopLevel) -> Command {
+fn connect_into_command(action: ConnectTopLevel, log_verbose: u8) -> Command {
     match action {
         ConnectTopLevel::Status {
             target,
@@ -2331,8 +2408,68 @@ fn connect_into_command(action: ConnectTopLevel) -> Command {
             user,
             argv,
         },
+        ConnectTopLevel::Ssh {
+            login_name,
+            forward_agent,
+            disable_agent,
+            no_tty,
+            tty,
+            stdin_null,
+            quiet,
+            option: _,
+            config: _,
+            port: _,
+            target,
+            remote_command,
+        } => {
+            let (target_user, peer) = split_ssh_target(&target);
+            let user = login_name.or(target_user);
+            let tty = if no_tty {
+                Some(false)
+            } else if tty > 0 {
+                Some(true)
+            } else {
+                None
+            };
+            Command::Ssh {
+                peer,
+                user,
+                tty,
+                forward_agent: forward_agent && !disable_agent,
+                stdin_null,
+                quiet,
+                verbose: log_verbose,
+                remote_command,
+            }
+        }
         ConnectTopLevel::Tcp { local, peer } => Command::Tcp { peer, local },
         ConnectTopLevel::Udp { local, peer } => Command::Udp { peer, local },
+    }
+}
+
+fn split_ssh_target(target: &str) -> (Option<String>, String) {
+    let Some((user, peer)) = target.rsplit_once('@') else {
+        return (None, target.to_owned());
+    };
+    if user.is_empty() || peer.is_empty() {
+        return (None, target.to_owned());
+    }
+    (Some(user.to_owned()), peer.to_owned())
+}
+
+#[cfg(test)]
+mod ssh_parse_tests {
+    use super::split_ssh_target;
+
+    #[test]
+    fn ssh_target_splits_optional_user_prefix() {
+        assert_eq!(split_ssh_target("vn3"), (None, "vn3".to_owned()));
+        assert_eq!(
+            split_ssh_target("thinh@vn3"),
+            (Some("thinh".to_owned()), "vn3".to_owned())
+        );
+        assert_eq!(split_ssh_target("@vn3"), (None, "@vn3".to_owned()));
+        assert_eq!(split_ssh_target("thinh@"), (None, "thinh@".to_owned()));
     }
 }
 

@@ -144,8 +144,10 @@ jobs:
             cd "staging/${NAME}"
             ln -sf portl portl-agent
             ln -sf portl portl-gateway
+            ln -sf portl portl-ssh
             test -L portl-agent
             test -L portl-gateway
+            test -L portl-ssh
           )
           cp LICENSE-MIT CHANGELOG.md "staging/${NAME}/"
           # --no-mac-metadata strips any remaining com.apple.* xattrs

@@ -6,7 +6,7 @@ license.workspace      = true
 repository.workspace   = true
 authors.workspace      = true
 rust-version.workspace = true
-description  = "portl CLI — multicall surface for `portl`, `portl-agent`, and `portl-gateway`."
+description  = "portl CLI — multicall surface for `portl`, `portl-agent`, `portl-gateway`, and `portl-ssh`."
 
 [lints]
 workspace = true

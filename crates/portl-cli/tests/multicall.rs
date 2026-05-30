@@ -221,6 +221,133 @@ fn shell_exec_tcp_and_udp_subcommands_parse() {
 }
 
 #[test]
+fn portl_ssh_subcommands_parse() {
+    let ssh_shell = parse(argv(&["portl", "ssh", "vn3"])).expect("ssh shell parse");
+    assert_eq!(
+        ssh_shell,
+        Command::Ssh {
+            peer: "vn3".to_owned(),
+            user: None,
+            tty: None,
+            forward_agent: false,
+            stdin_null: false,
+            quiet: false,
+            verbose: 0,
+            remote_command: Vec::new(),
+        }
+    );
+
+    let ssh_exec = parse(argv(&["portl-ssh", "vn3", "hostname"])).expect("portl-ssh exec parse");
+    assert_eq!(
+        ssh_exec,
+        Command::Ssh {
+            peer: "vn3".to_owned(),
+            user: None,
+            tty: None,
+            forward_agent: false,
+            stdin_null: false,
+            quiet: false,
+            verbose: 0,
+            remote_command: vec!["hostname".to_owned()],
+        }
+    );
+
+    let ssh_git = parse(argv(&[
+        "portl-ssh",
+        "-l",
+        "thinh",
+        "-A",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "vn3",
+        "git-upload-pack",
+        "repo.git",
+    ]))
+    .expect("portl-ssh git parse");
+    assert_eq!(
+        ssh_git,
+        Command::Ssh {
+            peer: "vn3".to_owned(),
+            user: Some("thinh".to_owned()),
+            tty: None,
+            forward_agent: true,
+            stdin_null: false,
+            quiet: false,
+            verbose: 0,
+            remote_command: vec!["git-upload-pack".to_owned(), "repo.git".to_owned()],
+        }
+    );
+}
+
+#[test]
+fn portl_ssh_compatibility_options_parse() {
+    let no_tty = parse(argv(&[
+        "portl-ssh",
+        "-T",
+        "-n",
+        "-q",
+        "-p",
+        "1991",
+        "-F",
+        "./ssh_config",
+        "-o",
+        "UserKnownHostsFile=/tmp/known_hosts",
+        "alice@vn3",
+        "--remote-flag",
+    ]))
+    .expect("portl-ssh options parse");
+    assert_eq!(
+        no_tty,
+        Command::Ssh {
+            peer: "vn3".to_owned(),
+            user: Some("alice".to_owned()),
+            tty: Some(false),
+            forward_agent: false,
+            stdin_null: true,
+            quiet: true,
+            verbose: 0,
+            remote_command: vec!["--remote-flag".to_owned()],
+        }
+    );
+
+    let force_tty = parse(argv(&["portl-ssh", "-tt", "vn3"])).expect("force tty parse");
+    assert_eq!(
+        force_tty,
+        Command::Ssh {
+            peer: "vn3".to_owned(),
+            user: None,
+            tty: Some(true),
+            forward_agent: false,
+            stdin_null: false,
+            quiet: false,
+            verbose: 0,
+            remote_command: Vec::new(),
+        }
+    );
+
+    let verbose = parse(argv(&["portl-ssh", "-vv", "vn3"])).expect("verbose parse");
+    assert_eq!(
+        verbose,
+        Command::Ssh {
+            peer: "vn3".to_owned(),
+            user: None,
+            tty: None,
+            forward_agent: false,
+            stdin_null: false,
+            quiet: false,
+            verbose: 2,
+            remote_command: Vec::new(),
+        }
+    );
+
+    let err = parse(argv(&["portl-ssh", "-T", "-t", "vn3"])).expect_err("-T and -t conflict");
+    let portl_cli::ParseError::Clap(err) = err else {
+        panic!("expected clap error for conflicting tty flags");
+    };
+    assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+}
+
+#[test]
 fn ticket_revoke_subcommands_parse() {
     // v0.3.0 moved `revoke` under the `ticket` subcommand. No
     // behavior change; the move groups all credential-lifecycle

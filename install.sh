@@ -247,7 +247,7 @@ do_uninstall() {
         fi
     fi
     # remove binaries from both common locations
-    for p in portl portl-agent portl-gateway; do
+    for p in portl portl-agent portl-gateway portl-ssh; do
         for dir in "$INSTALL_DIR" "${HOME:-/root}/.local/bin" /usr/local/bin; do
             [ -e "$dir/$p" ] && run rm -f "$dir/$p"
         done
@@ -402,14 +402,14 @@ download_and_place() {
 
     run mkdir -p "$INSTALL_DIR"
     run install -m 0755 "$src/portl" "$INSTALL_DIR/portl"
-    # portl is a multicall binary — copy (NOT symlink) portl-agent and
-    # portl-gateway at the same path so plists / units invoking by
+    # portl is a multicall binary — copy (NOT symlink) portl-agent,
+    # portl-gateway, and portl-ssh at the same path so plists / units invoking by
     # absolute path work. Symlinks would be clobbered by
     # `portl install --apply`, whose `fs::copy(current_exe, dst)` opens
     # dst with O_TRUNC and follows the symlink, truncating the source
     # before the read happens. Hardcopies are ~10MB each; trivially
     # cheap and eliminates the footgun class entirely.
-    for sub in portl-agent portl-gateway; do
+    for sub in portl-agent portl-gateway portl-ssh; do
         run install -m 0755 "$INSTALL_DIR/portl" "$INSTALL_DIR/$sub"
     done
     ok "installed ${VER} at ${INSTALL_DIR}/portl"

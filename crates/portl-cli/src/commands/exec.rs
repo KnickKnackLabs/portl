@@ -10,12 +10,32 @@ use portl_core::ticket::schema::{Capabilities, EnvPolicy, ShellCaps};
 use tokio::io::{AsyncWriteExt, copy};
 use tracing::debug;
 
-use crate::commands::peer_resolve::{close_connected, connect_peer};
+use crate::commands::peer_resolve::{close_connected, connect_peer, connect_peer_quiet};
 
 pub fn run(peer: &str, cwd: Option<&str>, user: Option<&str>, argv: &[String]) -> Result<ExitCode> {
+    run_with_options(peer, cwd, user, argv, ExecRunOptions::default())
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ExecRunOptions {
+    pub(crate) quiet_resolve: bool,
+    pub(crate) close_stdin: bool,
+}
+
+pub(crate) fn run_with_options(
+    peer: &str,
+    cwd: Option<&str>,
+    user: Option<&str>,
+    argv: &[String],
+    options: ExecRunOptions,
+) -> Result<ExitCode> {
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
-        let connected = connect_peer(peer, exec_caps()).await?;
+        let connected = if options.quiet_resolve {
+            connect_peer_quiet(peer, exec_caps()).await?
+        } else {
+            connect_peer(peer, exec_caps()).await?
+        };
         let exec = open_exec(
             &connected.connection,
             &connected.session,
@@ -36,7 +56,12 @@ pub fn run(peer: &str, cwd: Option<&str>, user: Option<&str>, argv: &[String]) -
             resize: _,
         } = exec;
 
-        let stdin_task = maybe_spawn_stdin_task(stdin)?;
+        let stdin_task = if options.close_stdin {
+            close_remote_stdin(stdin);
+            None
+        } else {
+            maybe_spawn_stdin_task(stdin)?
+        };
 
         let stdout_task = tokio::spawn(async move {
             let mut stdout = tokio::io::stdout();
@@ -111,9 +136,7 @@ async fn await_output_task(
 
 fn maybe_spawn_stdin_task(mut send: SendStream) -> Result<Option<tokio::task::JoinHandle<()>>> {
     if should_close_idle_stdin()? {
-        if let Err(err) = send.finish().context("finish remote stdin") {
-            debug!(%err, "remote stdin already closed");
-        }
+        close_remote_stdin(send);
         return Ok(None);
     }
 
@@ -121,6 +144,12 @@ fn maybe_spawn_stdin_task(mut send: SendStream) -> Result<Option<tokio::task::Jo
         let mut stdin_src = tokio::io::stdin();
         let _ = stdin_loop(&mut send, &mut stdin_src).await;
     })))
+}
+
+fn close_remote_stdin(mut send: SendStream) {
+    if let Err(err) = send.finish().context("finish remote stdin") {
+        debug!(%err, "remote stdin already closed");
+    }
 }
 
 fn should_close_idle_stdin() -> Result<bool> {
@@ -178,4 +207,16 @@ async fn read_exit(recv: &mut BufferedRecv) -> Result<i32> {
         .await?
         .context("missing exit frame")?;
     Ok(frame.code)
+}
+
+#[cfg(test)]
+mod ssh_exec_options_tests {
+    use super::ExecRunOptions;
+
+    #[test]
+    fn default_exec_options_preserve_existing_behavior() {
+        let options = ExecRunOptions::default();
+        assert!(!options.quiet_resolve);
+        assert!(!options.close_stdin);
+    }
 }

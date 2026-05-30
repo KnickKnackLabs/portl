@@ -16,6 +16,7 @@ pub mod session;
 pub mod session_share;
 pub mod shell;
 pub mod slicer;
+pub mod ssh;
 pub mod status;
 pub mod tcp;
 pub mod ticket;
