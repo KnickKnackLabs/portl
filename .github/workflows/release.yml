@@ -22,6 +22,7 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
   SCCACHE_GHA_ENABLED: "true"
+  APPLE_CODESIGN_VERSION: "0.29.0"
 
 jobs:
   ci-gate:
@@ -129,6 +130,122 @@ jobs:
       - name: Build (macOS native)
         if: matrix.linux != true
         run: cargo build --release --package portl-cli --target ${{ matrix.target }} --features ghostty-vt-static --bin portl
+      - name: Install rcodesign (macOS only)
+        if: matrix.linux != true
+        run: |
+          set -euo pipefail
+          if command -v rcodesign >/dev/null 2>&1 && rcodesign --version 2>/dev/null | grep -q "$APPLE_CODESIGN_VERSION"; then
+            echo "rcodesign $APPLE_CODESIGN_VERSION already installed"
+            exit 0
+          fi
+          tmp=$(mktemp -d)
+          cd "$tmp"
+          arch="aarch64-apple-darwin"
+          if [ "$(uname -m)" = "x86_64" ]; then
+            arch="x86_64-apple-darwin"
+          fi
+          url="https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign/${APPLE_CODESIGN_VERSION}/apple-codesign-${APPLE_CODESIGN_VERSION}-${arch}.tar.gz"
+          curl -sSL -o rcodesign.tar.gz "$url"
+          tar xzf rcodesign.tar.gz
+          mkdir -p "$HOME/.local/bin"
+          mv "apple-codesign-${APPLE_CODESIGN_VERSION}-${arch}/rcodesign" "$HOME/.local/bin/rcodesign"
+          chmod +x "$HOME/.local/bin/rcodesign"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/rcodesign" --version
+      - name: Pull Portl signing assets (macOS only)
+        if: matrix.linux != true
+        env:
+          SIGNING_REPO_DEPLOY_KEY: ${{ secrets.SIGNING_REPO_DEPLOY_KEY }}
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${SIGNING_REPO_DEPLOY_KEY:?SIGNING_REPO_DEPLOY_KEY secret is required for macOS release signing}"
+          : "${MATCH_PASSWORD:?MATCH_PASSWORD secret is required for macOS release signing}"
+
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          keyfile="$HOME/.ssh/signing_repo_deploy_key"
+          printf '%s\n' "$SIGNING_REPO_DEPLOY_KEY" > "$keyfile"
+          chmod 600 "$keyfile"
+          ssh-keyscan -t ed25519,rsa,ecdsa github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
+
+          signing_dir="$RUNNER_TEMP/signing"
+          rm -rf "$signing_dir"
+          GIT_SSH_COMMAND="ssh -i '$keyfile' -o IdentitiesOnly=yes" \
+            git clone --depth 1 git@github.com:unstableneutron/signing-certs.git "$signing_dir"
+
+          pw=$(mktemp)
+          printf '%s' "$MATCH_PASSWORD" > "$pw"
+          chmod 600 "$pw"
+          for f in "$signing_dir"/portl/*.enc; do
+            out="${f%.enc}"
+            openssl enc -d -aes-256-cbc -pbkdf2 -in "$f" -out "$out" -pass "file:$pw"
+          done
+          rm -f "$pw"
+          chmod 600 \
+            "$signing_dir"/portl/developer_id_application.p12 \
+            "$signing_dir"/portl/p12-password \
+            "$signing_dir"/portl/developer_id_installer.p12 \
+            "$signing_dir"/portl/installer-p12-password
+
+          echo "PORTL_SIGNING_P12=$signing_dir/portl/developer_id_application.p12" >> "$GITHUB_ENV"
+          echo "PORTL_SIGNING_P12_PASSWORD_FILE=$signing_dir/portl/p12-password" >> "$GITHUB_ENV"
+          echo "PORTL_INSTALLER_P12=$signing_dir/portl/developer_id_installer.p12" >> "$GITHUB_ENV"
+          echo "PORTL_INSTALLER_P12_PASSWORD_FILE=$signing_dir/portl/installer-p12-password" >> "$GITHUB_ENV"
+
+          echo "Developer ID Application certificate:"
+          rcodesign analyze-certificate \
+            --p12-file "$signing_dir/portl/developer_id_application.p12" \
+            --p12-password-file "$signing_dir/portl/p12-password" | sed -n '1,24p'
+          echo "Developer ID Installer certificate:"
+          rcodesign analyze-certificate \
+            --p12-file "$signing_dir/portl/developer_id_installer.p12" \
+            --p12-password-file "$signing_dir/portl/installer-p12-password" | sed -n '1,24p'
+      - name: Sign macOS binary
+        if: matrix.linux != true
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/portl"
+          rcodesign sign \
+            --p12-file "$PORTL_SIGNING_P12" \
+            --p12-password-file "$PORTL_SIGNING_P12_PASSWORD_FILE" \
+            --binary-identifier com.un.portl \
+            --info-plist-file crates/portl-cli/resources/macos/PortlInfo.plist \
+            --for-notarization \
+            "$bin"
+          /usr/bin/codesign -dvvv "$bin" 2>&1 | head -20
+          /usr/bin/codesign --verify --strict --verbose=2 "$bin"
+      - name: Install asc for notarization (macOS only)
+        if: matrix.linux != true
+        run: |
+          set -euo pipefail
+          if command -v asc >/dev/null 2>&1; then
+            asc --version
+            exit 0
+          fi
+          curl -fsSL https://asccli.sh/install | INSTALL_DIR="$HOME/.local/bin" bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/asc" --version
+      - name: Setup ASC auth for notarization (macOS only)
+        if: matrix.linux != true
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_PRIVATE_KEY_B64: ${{ secrets.ASC_PRIVATE_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          : "${ASC_KEY_ID:?ASC_KEY_ID secret is required for macOS notarization}"
+          : "${ASC_ISSUER_ID:?ASC_ISSUER_ID secret is required for macOS notarization}"
+          : "${ASC_PRIVATE_KEY_B64:?ASC_PRIVATE_KEY_B64 secret is required for macOS notarization}"
+
+          key_path="$RUNNER_TEMP/asc_api_key.p8"
+          printf '%s' "$ASC_PRIVATE_KEY_B64" | base64 --decode > "$key_path"
+          chmod 600 "$key_path"
+          echo "ASC_KEY_ID=$ASC_KEY_ID" >> "$GITHUB_ENV"
+          echo "ASC_ISSUER_ID=$ASC_ISSUER_ID" >> "$GITHUB_ENV"
+          echo "ASC_PRIVATE_KEY_PATH=$key_path" >> "$GITHUB_ENV"
+          echo "ASC_BYPASS_KEYCHAIN=1" >> "$GITHUB_ENV"
+          echo "ASC_PROFILE=" >> "$GITHUB_ENV"
       - name: Package (tar.zst level 19)
         env:
           # Disable macOS AppleDouble metadata so tarballs produced on
@@ -177,6 +294,45 @@ jobs:
               tar "${tar_gz_flags[@]}"
           fi
           (cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
+      - name: Build signed notarized pkg (macOS only)
+        if: matrix.linux != true
+        env:
+          COPYFILE_DISABLE: "1"
+        run: |
+          set -euo pipefail
+          NAME="portl-${{ github.ref_name }}-${{ matrix.target }}"
+          PKG_VERSION="${{ github.ref_name }}"
+          PKG_VERSION="${PKG_VERSION#v}"
+          payload="pkgroot/${NAME}"
+          bin_dir="$payload/usr/local/bin"
+          mkdir -p "$bin_dir" dist
+          install -m 0755 "target/${{ matrix.target }}/release/portl" "$bin_dir/portl"
+          for sub in portl-agent portl-gateway portl-ssh; do
+            install -m 0755 "$bin_dir/portl" "$bin_dir/$sub"
+            /usr/bin/codesign --verify --strict --verbose=1 "$bin_dir/$sub"
+          done
+
+          unsigned_pkg="dist/${NAME}.unsigned.pkg"
+          signed_pkg="dist/${NAME}.pkg"
+          pkgbuild \
+            --root "$payload" \
+            --identifier "com.un.portl.pkg" \
+            --version "$PKG_VERSION" \
+            --install-location "/" \
+            "$unsigned_pkg"
+          rcodesign sign \
+            --p12-file "$PORTL_INSTALLER_P12" \
+            --p12-password-file "$PORTL_INSTALLER_P12_PASSWORD_FILE" \
+            --for-notarization \
+            "$unsigned_pkg"
+          mv "$unsigned_pkg" "$signed_pkg"
+          pkgutil --check-signature "$signed_pkg"
+
+          asc notarization submit --file "$signed_pkg" --wait --timeout 1h --output table
+          xcrun stapler staple "$signed_pkg"
+          xcrun stapler validate "$signed_pkg"
+          spctl --assess --type install -vv "$signed_pkg"
+          (cd dist && shasum -a 256 "${NAME}.pkg" > "${NAME}.pkg.sha256")
       - uses: actions/upload-artifact@v5
         with:
           name: portl-${{ matrix.target }}

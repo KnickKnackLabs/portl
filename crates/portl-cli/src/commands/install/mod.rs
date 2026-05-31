@@ -445,6 +445,8 @@ mod tests {
         let plist = render_launchd_plist(Path::new("/usr/local/bin/portl-agent"));
         assert!(plist.contains("<string>/usr/local/bin/portl-agent</string>"));
         assert!(plist.contains("<key>SuccessfulExit</key><false/>"));
+        assert!(plist.contains("<key>AssociatedBundleIdentifiers</key>"));
+        assert!(plist.contains("<string>com.un.portl</string>"));
         assert!(!plist.contains("EnvironmentVariables"));
         assert!(!plist.contains("PORTL_TRUST_ROOTS"));
 
@@ -454,6 +456,15 @@ mod tests {
             std::fs::write(&path, plist).expect("write plist");
             validate_install_target(InstallTarget::Launchd, &path).expect("lint plist");
         }
+    }
+
+    #[test]
+    fn macos_info_plist_declares_portl_identity() {
+        let plist = include_str!("../../../resources/macos/PortlInfo.plist");
+        assert!(plist.contains("<key>CFBundleIdentifier</key>"));
+        assert!(plist.contains("<string>com.un.portl</string>"));
+        assert!(plist.contains("<key>NSLocalNetworkUsageDescription</key>"));
+        assert!(plist.contains("local network"));
     }
 
     // NOTE: The full end-to-end test for `seed_peer_store_self_row`
