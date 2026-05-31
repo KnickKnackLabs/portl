@@ -2948,14 +2948,11 @@ async fn bridge_local_herdr_attach(
                 }
             };
             let code = status.code().unwrap_or(1);
-            match tokio::time::timeout(Duration::from_secs(2), &mut bridge_task).await {
-                Ok(joined) => {
-                    joined.context("join local herdr bridge")??;
-                }
-                Err(_) => {
-                    bridge_task.abort();
-                    let _ = bridge_task.await;
-                }
+            if let Ok(joined) = tokio::time::timeout(Duration::from_secs(2), &mut bridge_task).await {
+                joined.context("join local herdr bridge")??;
+            } else {
+                bridge_task.abort();
+                let _ = bridge_task.await;
             }
             Ok(code)
         }
@@ -2964,13 +2961,12 @@ async fn bridge_local_herdr_attach(
                 let _ = child.kill().await;
                 return Err(err);
             }
-            match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
-                Ok(status) => Ok(status.context("wait for herdr client")?.code().unwrap_or(1)),
-                Err(_) => {
-                    let _ = child.kill().await;
-                    let status = child.wait().await.context("wait for killed herdr client")?;
-                    Ok(status.code().unwrap_or(1))
-                }
+            if let Ok(status) = tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+                Ok(status.context("wait for herdr client")?.code().unwrap_or(1))
+            } else {
+                let _ = child.kill().await;
+                let status = child.wait().await.context("wait for killed herdr client")?;
+                Ok(status.code().unwrap_or(1))
             }
         }
     }
@@ -3054,15 +3050,14 @@ async fn await_local_herdr_copy_task(
     mut task: tokio::task::JoinHandle<Result<()>>,
     name: &'static str,
 ) -> Result<()> {
-    match tokio::time::timeout(Duration::from_secs(2), &mut task).await {
-        Ok(joined) => joined.with_context(|| format!("join {name} task"))?,
-        Err(_) => {
-            task.abort();
-            match task.await {
-                Ok(result) => result,
-                Err(err) if err.is_cancelled() => Ok(()),
-                Err(err) => Err(err).with_context(|| format!("join aborted {name} task")),
-            }
+    if let Ok(joined) = tokio::time::timeout(Duration::from_secs(2), &mut task).await {
+        joined.with_context(|| format!("join {name} task"))?
+    } else {
+        task.abort();
+        match task.await {
+            Ok(result) => result,
+            Err(err) if err.is_cancelled() => Ok(()),
+            Err(err) => Err(err).with_context(|| format!("join aborted {name} task")),
         }
     }
 }
