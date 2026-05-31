@@ -294,10 +294,12 @@ jobs:
         shell: bash
         env:
           SIGNING_REPO_DEPLOY_KEY: ${{ secrets.SIGNING_REPO_DEPLOY_KEY }}
+          SIGNING_REPO_URL: ${{ secrets.SIGNING_REPO_URL }}
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
         run: |
           set -euo pipefail
           : "${SIGNING_REPO_DEPLOY_KEY:?SIGNING_REPO_DEPLOY_KEY secret is required for macOS release signing}"
+          : "${SIGNING_REPO_URL:?SIGNING_REPO_URL secret is required for macOS release signing}"
           : "${MATCH_PASSWORD:?MATCH_PASSWORD secret is required for macOS release signing}"
 
           mkdir -p "$HOME/.ssh"
@@ -310,7 +312,7 @@ jobs:
           signing_dir="$RUNNER_TEMP/signing"
           rm -rf "$signing_dir"
           GIT_SSH_COMMAND="ssh -i '$keyfile' -o IdentitiesOnly=yes" \
-            git clone --depth 1 git@github.com:unstableneutron/signing-certs.git "$signing_dir"
+            git clone --depth 1 "$SIGNING_REPO_URL" "$signing_dir"
 
           pw=$(mktemp)
           printf '%s' "$MATCH_PASSWORD" > "$pw"
