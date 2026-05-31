@@ -20,6 +20,8 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use iroh::endpoint::{Connection, SendStream};
 use iroh_base::TransportAddr;
+#[cfg(unix)]
+use nix::sys::termios::{SetArg, Termios, tcgetattr, tcsetattr};
 use portl_core::StdinResponseFilter;
 use portl_core::attach_control::{
     RenderBarOptions, fit_visible, is_ctrl_backslash_sequence, render_bar,
@@ -2535,7 +2537,7 @@ async fn remote_session_attach_once_without_reconnect(
 ) -> Result<ExitCode> {
     let connected = connect_peer(&request.target, session_caps()).await?;
     print_remote_attach_start(&request, request.provider.as_deref());
-    let session = open_remote_attach_session_checked(
+    let result = match open_remote_attach_session_checked(
         &connected.connection,
         &connected.session,
         request.provider.clone(),
@@ -2549,12 +2551,20 @@ async fn remote_session_attach_once_without_reconnect(
             rows: request.rows,
         },
     )
-    .await?;
-    let provider = session.provider().to_owned();
-    let canonical_ref = canonical_session_ref(&request.target, &provider, &request.session_name);
-    let code = bridge_attach(session, request.cols, request.rows, canonical_ref).await?;
+    .await
+    {
+        Ok(session) => {
+            let provider = session.provider().to_owned();
+            let canonical_ref =
+                canonical_session_ref(&request.target, &provider, &request.session_name);
+            bridge_attach(session, request.cols, request.rows, canonical_ref)
+                .await
+                .map(exit_code_from_i32)
+        }
+        Err(err) => Err(err.into()),
+    };
     close_connected(connected, b"session complete").await;
-    Ok(exit_code_from_i32(code))
+    result
 }
 
 async fn remote_session_attach_with_reconnect(
@@ -2917,17 +2927,18 @@ async fn bridge_local_herdr_attach(
         .with_context(|| format!("bind herdr client socket {}", socket_path.display()))?;
     set_private_socket_permissions(&socket_path)?;
     let mut bridge = spawn_local_herdr_bridge(session_name, cwd)?;
+    let _terminal_guard = HerdrTerminalRestoreGuard::new_if_terminal()?;
     let mut child = spawn_local_herdr_client(&socket_path, canonical_ref)?;
     let accepted = tokio::time::timeout(Duration::from_secs(10), listener.accept()).await;
     let (socket, _) = match accepted {
         Ok(Ok(accepted)) => accepted,
         Ok(Err(err)) => {
-            let _ = child.kill().await;
+            let _ = terminate_herdr_client_child(&mut child).await;
             let _ = bridge.kill().await;
             return Err(err).context("accept local herdr client socket");
         }
         Err(_) => {
-            let _ = child.kill().await;
+            let _ = terminate_herdr_client_child(&mut child).await;
             let _ = bridge.kill().await;
             anyhow::bail!(
                 "local herdr client did not connect to {}",
@@ -2958,15 +2969,13 @@ async fn bridge_local_herdr_attach(
         }
         result = &mut bridge_task => {
             if let Err(err) = result.context("join local herdr bridge")? {
-                let _ = child.kill().await;
+                let _ = terminate_herdr_client_child(&mut child).await;
                 return Err(err);
             }
             if let Ok(status) = tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
                 Ok(status.context("wait for herdr client")?.code().unwrap_or(1))
             } else {
-                let _ = child.kill().await;
-                let status = child.wait().await.context("wait for killed herdr client")?;
-                Ok(status.code().unwrap_or(1))
+                Ok(terminate_herdr_client_child(&mut child).await.unwrap_or(1))
             }
         }
     }
@@ -3070,16 +3079,17 @@ async fn bridge_attach_herdr(session: HerdrSessionClient, canonical_ref: String)
     let listener = tokio::net::UnixListener::bind(&socket_path)
         .with_context(|| format!("bind herdr client socket {}", socket_path.display()))?;
     set_private_socket_permissions(&socket_path)?;
+    let _terminal_guard = HerdrTerminalRestoreGuard::new_if_terminal()?;
     let mut child = spawn_local_herdr_client(&socket_path, &canonical_ref)?;
     let accepted = tokio::time::timeout(Duration::from_secs(10), listener.accept()).await;
     let (socket, _) = match accepted {
         Ok(Ok(accepted)) => accepted,
         Ok(Err(err)) => {
-            let _ = child.kill().await;
+            let _ = terminate_herdr_client_child(&mut child).await;
             return Err(err).context("accept local herdr client socket");
         }
         Err(_) => {
-            let _ = child.kill().await;
+            let _ = terminate_herdr_client_child(&mut child).await;
             anyhow::bail!(
                 "local herdr client did not connect to {}",
                 socket_path.display()
@@ -3100,7 +3110,7 @@ async fn bridge_attach_herdr(session: HerdrSessionClient, canonical_ref: String)
                     Ok(status.code().unwrap_or(1))
                 }
                 Err(err) => {
-                    let _ = child.kill().await;
+                    let _ = terminate_herdr_client_child(&mut child).await;
                     Err(err)
                 }
             }
@@ -3111,6 +3121,34 @@ async fn bridge_attach_herdr(session: HerdrSessionClient, canonical_ref: String)
 #[cfg(not(unix))]
 async fn bridge_attach_herdr(_session: HerdrSessionClient, _canonical_ref: String) -> Result<i32> {
     anyhow::bail!("herdr attach requires Unix sockets")
+}
+
+const HERDR_CLIENT_TERMINATE_GRACE: Duration = Duration::from_millis(500);
+
+async fn terminate_herdr_client_child(child: &mut Child) -> Option<i32> {
+    #[cfg(unix)]
+    if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+        if let Ok(code) =
+            tokio::time::timeout(HERDR_CLIENT_TERMINATE_GRACE, wait_child_code(child)).await
+        {
+            return code;
+        }
+    }
+
+    let _ = child.kill().await;
+    wait_child_code(child).await
+}
+
+async fn wait_child_code(child: &mut Child) -> Option<i32> {
+    child
+        .wait()
+        .await
+        .ok()
+        .map(|status| status.code().unwrap_or(1))
 }
 
 #[cfg(unix)]
@@ -5747,6 +5785,68 @@ fn write_panic_cleanup_to_fd_if_armed(fd: i32) {
 
     let cleanup = panic_hook_cleanup_bytes();
     let _ = unsafe { nix::libc::write(fd, cleanup.as_ptr().cast(), cleanup.len()) };
+}
+
+struct HerdrTerminalRestoreGuard {
+    #[cfg(unix)]
+    original_termios: Option<Termios>,
+    cleanup: RawModeCleanupWriter,
+}
+
+impl HerdrTerminalRestoreGuard {
+    fn new_if_terminal() -> Result<Option<Self>> {
+        if !std::io::stdin().is_terminal() {
+            return Ok(None);
+        }
+        #[cfg(unix)]
+        let original_termios = snapshot_stdin_termios()?;
+        set_panic_hook_armed(true);
+        Ok(Some(Self {
+            #[cfg(unix)]
+            original_termios: Some(original_termios),
+            cleanup: RawModeCleanupWriter::default(),
+        }))
+    }
+
+    #[cfg(test)]
+    fn without_termios_for_test() -> Self {
+        Self {
+            #[cfg(unix)]
+            original_termios: None,
+            cleanup: RawModeCleanupWriter::default(),
+        }
+    }
+
+    fn restore_to<W: IoWrite>(
+        &mut self,
+        writer: &mut W,
+        variant: RawModeExitVariant,
+    ) -> std::io::Result<()> {
+        self.restore_termios();
+        self.cleanup.write_to(writer, variant)
+    }
+
+    fn restore_termios(&mut self) {
+        #[cfg(unix)]
+        if let Some(original) = self.original_termios.take() {
+            let stdin = std::io::stdin();
+            let _ = tcsetattr(&stdin, SetArg::TCSANOW, &original);
+        }
+    }
+}
+
+impl Drop for HerdrTerminalRestoreGuard {
+    fn drop(&mut self) {
+        set_panic_hook_armed(false);
+        let mut stdout = std::io::stdout();
+        let _ = self.restore_to(&mut stdout, RawModeExitVariant::Normal);
+    }
+}
+
+#[cfg(unix)]
+fn snapshot_stdin_termios() -> Result<Termios> {
+    let stdin = std::io::stdin();
+    tcgetattr(&stdin).context("snapshot terminal mode")
 }
 
 #[derive(Debug, Default)]
@@ -10042,6 +10142,27 @@ mod tests {
     }
 
     #[test]
+    fn herdr_terminal_restore_guard_writes_defensive_cleanup() {
+        let mut guard = HerdrTerminalRestoreGuard::without_termios_for_test();
+        let mut output = Vec::new();
+
+        let _ = guard.restore_to(&mut output, RawModeExitVariant::Normal);
+
+        assert!(
+            output
+                .windows(b"\x1b[?1006l".len())
+                .any(|window| window == b"\x1b[?1006l"),
+            "cleanup should disable SGR mouse reporting: {output:?}"
+        );
+        assert!(
+            output
+                .windows(b"\x1b[?2004l".len())
+                .any(|window| window == b"\x1b[?2004l"),
+            "cleanup should disable bracketed paste: {output:?}"
+        );
+    }
+
+    #[test]
     fn first_herdr_server_frame_must_be_welcome() {
         let notify = RawHerdrFrame::encode_server(&ServerMessage::Notify {
             kind: portl_core::herdr_wire::NotifyKind::Toast,
@@ -10183,6 +10304,27 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
+    async fn local_herdr_attach_gracefully_terminates_client_when_bridge_exits_first() {
+        let temp = TempDir::new().unwrap();
+        let fake_herdr = temp.path().join("herdr");
+        let log = temp.path().join("herdr.log");
+        write_failing_bridge_fake_herdr(&fake_herdr, &log);
+        let _path_guard = EnvVarGuard::set("PORTL_HERDR_PATH", fake_herdr.as_os_str());
+
+        let code = local_session_attach(Some("herdr"), "max-b265", "default", None, None, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains("client:term"),
+            "client should receive SIGTERM before any forced kill; calls were {calls:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
     async fn local_herdr_attach_sets_named_session_env() {
         let temp = TempDir::new().unwrap();
         let fake_herdr = temp.path().join("herdr");
@@ -10261,6 +10403,54 @@ mod tests {
                 None => unsafe { std::env::remove_var(self.name) },
             }
         }
+    }
+
+    #[cfg(unix)]
+    fn write_failing_bridge_fake_herdr(path: &std::path::Path, log: &std::path::Path) {
+        let script = r#"#!/usr/bin/env python3
+import os
+import signal
+import socket
+import sys
+import time
+
+LOG = __LOG__
+
+def log(line):
+    with open(LOG, "a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+        handle.flush()
+
+args = sys.argv[1:]
+log("argv:" + " ".join(args))
+if args == ["--version"]:
+    print("herdr fake")
+    raise SystemExit(0)
+if args == ["session", "list", "--json"]:
+    print('{"sessions":[{"name":"default"}]}')
+    raise SystemExit(0)
+if args == ["client"]:
+    def on_term(signum, frame):
+        log("client:term")
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, on_term)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(os.environ["HERDR_CLIENT_SOCKET_PATH"])
+    sock.sendall(b"not-a-valid-frame")
+    log("client:sent")
+    while True:
+        time.sleep(0.05)
+if args == ["remote-client-bridge"]:
+    log("bridge:exit")
+    raise SystemExit(0)
+print("unexpected args: " + " ".join(args), file=sys.stderr)
+raise SystemExit(64)
+"#
+        .replace("__LOG__", &format!("{:?}", log.display().to_string()));
+        std::fs::write(path, script).unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
     }
 
     #[cfg(unix)]
