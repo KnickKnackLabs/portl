@@ -1,10 +1,11 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use iroh::endpoint::SendStream;
 use portl_core::herdr_wire::{
     ClientLane, ClientMessage, FrameDirection, HerdrFrameError, MAX_FRAME_SIZE, RawHerdrFrame,
-    ServerLane,
+    ServerLane, ServerMessage,
 };
 use portl_core::wire::session::{SessionAck, SessionStreamKind, SessionSubTail};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -17,6 +18,131 @@ use crate::target_context::TargetProcessContext;
 
 const HERDR_LANE_BUFFER: usize = 64;
 const HERDR_RESIZE_BUFFER: usize = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HerdrRenderFrameMeta {
+    SemanticFrame { has_graphics: bool },
+    Terminal { full: bool },
+}
+
+impl HerdrRenderFrameMeta {
+    fn from_frame(frame: &RawHerdrFrame) -> Result<Self> {
+        Ok(match frame.decode_server()? {
+            ServerMessage::Frame(frame) => Self::SemanticFrame {
+                has_graphics: !frame.graphics.is_empty(),
+            },
+            ServerMessage::Terminal(frame) => Self::Terminal { full: frame.full },
+            _ => anyhow::bail!("non-render Herdr frame sent through render coalescer"),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct HerdrRenderPendingFrame {
+    meta: HerdrRenderFrameMeta,
+    frame: RawHerdrFrame,
+}
+
+#[derive(Debug, Default)]
+struct HerdrRenderPendingFrames {
+    frames: VecDeque<HerdrRenderPendingFrame>,
+}
+
+impl HerdrRenderPendingFrames {
+    fn push(&mut self, frame: RawHerdrFrame) -> Result<()> {
+        let meta = HerdrRenderFrameMeta::from_frame(&frame)?;
+        match meta {
+            HerdrRenderFrameMeta::SemanticFrame {
+                has_graphics: false,
+            } => self.frames.retain(|pending| {
+                !matches!(
+                    pending.meta,
+                    HerdrRenderFrameMeta::SemanticFrame {
+                        has_graphics: false
+                    }
+                )
+            }),
+            HerdrRenderFrameMeta::Terminal { full: true } => self
+                .frames
+                .retain(|pending| !matches!(pending.meta, HerdrRenderFrameMeta::Terminal { .. })),
+            HerdrRenderFrameMeta::SemanticFrame { has_graphics: true }
+            | HerdrRenderFrameMeta::Terminal { full: false } => {}
+        }
+        self.frames
+            .push_back(HerdrRenderPendingFrame { meta, frame });
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    fn pop_front(&mut self) -> Option<RawHerdrFrame> {
+        self.frames.pop_front().map(|pending| pending.frame)
+    }
+}
+
+#[derive(Clone)]
+struct HerdrRenderSender {
+    tx: mpsc::Sender<RawHerdrFrame>,
+    pending: Arc<AsyncMutex<HerdrRenderPendingFrames>>,
+    scheduled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl HerdrRenderSender {
+    fn new(tx: mpsc::Sender<RawHerdrFrame>) -> Self {
+        Self {
+            tx,
+            pending: Arc::new(AsyncMutex::new(HerdrRenderPendingFrames::default())),
+            scheduled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    async fn send(&self, frame: RawHerdrFrame) -> Result<()> {
+        if self.tx.is_closed() {
+            anyhow::bail!("send herdr render frame");
+        }
+        self.pending.lock().await.push(frame)?;
+        if !self
+            .scheduled
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            tokio::spawn(drain_herdr_render_pending(
+                self.tx.clone(),
+                Arc::clone(&self.pending),
+                Arc::clone(&self.scheduled),
+            ));
+        }
+        Ok(())
+    }
+}
+
+async fn drain_herdr_render_pending(
+    tx: mpsc::Sender<RawHerdrFrame>,
+    pending: Arc<AsyncMutex<HerdrRenderPendingFrames>>,
+    scheduled: Arc<std::sync::atomic::AtomicBool>,
+) {
+    loop {
+        let frame = pending.lock().await.pop_front();
+        match frame {
+            Some(frame) => {
+                if tx.send(frame).await.is_err() {
+                    scheduled.store(false, std::sync::atomic::Ordering::Release);
+                    return;
+                }
+            }
+            None => {
+                scheduled.store(false, std::sync::atomic::Ordering::Release);
+                if pending.lock().await.is_empty() {
+                    return;
+                }
+                if scheduled.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    return;
+                }
+            }
+        }
+    }
+}
 
 pub(crate) struct HerdrAttach {
     pid: u32,
@@ -403,6 +529,7 @@ async fn pump_bridge_stdout_to_server_lanes<R>(
 where
     R: AsyncRead + Unpin,
 {
+    let render_sender = HerdrRenderSender::new(render_tx);
     while let Some(frame) = read_next_raw_frame(&mut stdout, FrameDirection::ServerToClient).await?
     {
         match frame.server_lane()? {
@@ -410,10 +537,7 @@ where
                 .send(frame)
                 .await
                 .context("send herdr control frame")?,
-            ServerLane::Render => render_tx
-                .send(frame)
-                .await
-                .context("send herdr render frame")?,
+            ServerLane::Render => render_sender.send(frame).await?,
             ServerLane::Bulk => bulk_tx.send(frame).await.context("send herdr bulk frame")?,
         }
     }
@@ -510,7 +634,8 @@ impl Drop for HerdrAttachRegistryGuard {
 mod tests {
     use super::*;
     use portl_core::herdr_wire::{
-        ClientKeybindings, ClientMessage, HERDR_PROTOCOL_VERSION, RawHerdrFrame, RenderEncoding,
+        CellData, ClientKeybindings, ClientMessage, FrameData, HERDR_PROTOCOL_VERSION, NotifyKind,
+        RawHerdrFrame, RenderEncoding, ServerMessage, TerminalFrame,
     };
 
     fn hello_frame() -> RawHerdrFrame {
@@ -524,6 +649,152 @@ mod tests {
             keybindings: ClientKeybindings::Server,
         })
         .unwrap()
+    }
+
+    fn semantic_server_frame(symbol: &str) -> RawHerdrFrame {
+        RawHerdrFrame::encode_server(&ServerMessage::Frame(FrameData {
+            cells: vec![CellData {
+                symbol: symbol.to_owned(),
+                fg: 0,
+                bg: 0,
+                modifier: 0,
+                skip: false,
+                hyperlink: None,
+            }],
+            width: 1,
+            height: 1,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        }))
+        .unwrap()
+    }
+
+    fn terminal_server_frame(seq: u64, full: bool, bytes: &[u8]) -> RawHerdrFrame {
+        RawHerdrFrame::encode_server(&ServerMessage::Terminal(TerminalFrame {
+            seq,
+            width: 80,
+            height: 24,
+            full,
+            bytes: bytes.to_vec(),
+        }))
+        .unwrap()
+    }
+
+    fn notify_server_frame(message: &str) -> RawHerdrFrame {
+        RawHerdrFrame::encode_server(&ServerMessage::Notify {
+            kind: NotifyKind::Toast,
+            message: message.to_owned(),
+        })
+        .unwrap()
+    }
+
+    async fn write_server_frames<W>(writer: &mut W, frames: &[RawHerdrFrame])
+    where
+        W: AsyncWrite + Unpin,
+    {
+        for frame in frames {
+            writer.write_all(frame.framed_bytes()).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn herdr_bridge_sender_coalesces_semantic_render_backlog() {
+        let (mut stdout_writer, stdout_reader) = tokio::io::duplex(8192);
+        let (control_tx, _control_rx) = mpsc::channel(4);
+        let (render_tx, mut render_rx) = mpsc::channel(1);
+        let (bulk_tx, _bulk_rx) = mpsc::channel(4);
+        let frames: Vec<_> = (0..8)
+            .map(|idx| semantic_server_frame(&format!("frame-{idx}")))
+            .collect();
+
+        let pump = tokio::spawn(pump_bridge_stdout_to_server_lanes(
+            stdout_reader,
+            control_tx,
+            render_tx,
+            bulk_tx,
+        ));
+        write_server_frames(&mut stdout_writer, &frames).await;
+        drop(stdout_writer);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), pump)
+            .await
+            .expect("stdout pump should not block on stale render backlog")
+            .unwrap()
+            .unwrap();
+
+        let mut delivered = Vec::new();
+        while let Ok(Some(frame)) =
+            tokio::time::timeout(std::time::Duration::from_millis(100), render_rx.recv()).await
+        {
+            delivered.push(frame);
+        }
+        assert!(
+            delivered.len() < frames.len(),
+            "expected stale semantic frames to be coalesced; delivered {} of {}",
+            delivered.len(),
+            frames.len()
+        );
+        assert_eq!(delivered.last(), frames.last());
+    }
+
+    #[tokio::test]
+    async fn herdr_bridge_sender_preserves_terminal_diffs() {
+        let (mut stdout_writer, stdout_reader) = tokio::io::duplex(8192);
+        let (control_tx, _control_rx) = mpsc::channel(4);
+        let (render_tx, mut render_rx) = mpsc::channel(8);
+        let (bulk_tx, _bulk_rx) = mpsc::channel(4);
+        let frames = vec![
+            terminal_server_frame(1, false, b"diff-1"),
+            terminal_server_frame(2, false, b"diff-2"),
+            terminal_server_frame(3, false, b"diff-3"),
+        ];
+
+        let pump = tokio::spawn(pump_bridge_stdout_to_server_lanes(
+            stdout_reader,
+            control_tx,
+            render_tx,
+            bulk_tx,
+        ));
+        write_server_frames(&mut stdout_writer, &frames).await;
+        drop(stdout_writer);
+        pump.await.unwrap().unwrap();
+
+        let mut delivered = Vec::new();
+        while let Some(frame) = render_rx.recv().await {
+            delivered.push(frame);
+        }
+        assert_eq!(delivered, frames);
+    }
+
+    #[tokio::test]
+    async fn herdr_bridge_sender_control_not_blocked_by_render_backlog() {
+        let (mut stdout_writer, stdout_reader) = tokio::io::duplex(8192);
+        let (control_tx, mut control_rx) = mpsc::channel(4);
+        let (render_tx, _render_rx) = mpsc::channel(1);
+        let (bulk_tx, _bulk_rx) = mpsc::channel(4);
+        let notify = notify_server_frame("control-ready");
+        let mut frames: Vec<_> = (0..8)
+            .map(|idx| semantic_server_frame(&format!("frame-{idx}")))
+            .collect();
+        frames.push(notify.clone());
+
+        let pump = tokio::spawn(pump_bridge_stdout_to_server_lanes(
+            stdout_reader,
+            control_tx,
+            render_tx,
+            bulk_tx,
+        ));
+        write_server_frames(&mut stdout_writer, &frames).await;
+
+        let delivered =
+            tokio::time::timeout(std::time::Duration::from_millis(200), control_rx.recv())
+                .await
+                .expect("control frame should not wait behind render backlog")
+                .expect("control channel should remain open");
+        assert_eq!(delivered, notify);
+        drop(stdout_writer);
+        pump.abort();
     }
 
     #[tokio::test]
