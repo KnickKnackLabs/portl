@@ -5,6 +5,11 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Fixed
+
+- macOS notarization jobs now build the Linux `xar` packaging tool from a
+  pinned upstream source instead of relying on an unavailable Ubuntu package.
+
 ## 0.10.3 — 2026-06-01
 
 ### Added
