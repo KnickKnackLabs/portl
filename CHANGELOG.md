@@ -5,6 +5,17 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Fixed
+
+- Herdr remote attach now reads Portl protocol lanes without canceling partial
+  frame reads, preventing rare bincode frame decode failures under concurrent
+  render/control traffic.
+- Herdr attach now coalesces stale full-screen render snapshots under
+  backpressure so scrolling and workspace switches stay responsive instead of
+  replaying old frames.
+- Herdr attach now restores terminal state and terminates the local Herdr client
+  gracefully if the bridge exits unexpectedly.
+
 ## 0.10.2 — 2026-05-31
 
 ### Fixed

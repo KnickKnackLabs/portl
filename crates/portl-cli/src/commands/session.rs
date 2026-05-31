@@ -20,6 +20,8 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use iroh::endpoint::{Connection, SendStream};
 use iroh_base::TransportAddr;
+#[cfg(unix)]
+use nix::sys::termios::{SetArg, Termios, tcgetattr, tcsetattr};
 use portl_core::StdinResponseFilter;
 use portl_core::attach_control::{
     RenderBarOptions, fit_visible, is_ctrl_backslash_sequence, render_bar,
@@ -2535,7 +2537,7 @@ async fn remote_session_attach_once_without_reconnect(
 ) -> Result<ExitCode> {
     let connected = connect_peer(&request.target, session_caps()).await?;
     print_remote_attach_start(&request, request.provider.as_deref());
-    let session = open_remote_attach_session_checked(
+    let result = match open_remote_attach_session_checked(
         &connected.connection,
         &connected.session,
         request.provider.clone(),
@@ -2549,12 +2551,20 @@ async fn remote_session_attach_once_without_reconnect(
             rows: request.rows,
         },
     )
-    .await?;
-    let provider = session.provider().to_owned();
-    let canonical_ref = canonical_session_ref(&request.target, &provider, &request.session_name);
-    let code = bridge_attach(session, request.cols, request.rows, canonical_ref).await?;
+    .await
+    {
+        Ok(session) => {
+            let provider = session.provider().to_owned();
+            let canonical_ref =
+                canonical_session_ref(&request.target, &provider, &request.session_name);
+            bridge_attach(session, request.cols, request.rows, canonical_ref)
+                .await
+                .map(exit_code_from_i32)
+        }
+        Err(err) => Err(err.into()),
+    };
     close_connected(connected, b"session complete").await;
-    Ok(exit_code_from_i32(code))
+    result
 }
 
 async fn remote_session_attach_with_reconnect(
@@ -2917,17 +2927,18 @@ async fn bridge_local_herdr_attach(
         .with_context(|| format!("bind herdr client socket {}", socket_path.display()))?;
     set_private_socket_permissions(&socket_path)?;
     let mut bridge = spawn_local_herdr_bridge(session_name, cwd)?;
+    let _terminal_guard = HerdrTerminalRestoreGuard::new_if_terminal()?;
     let mut child = spawn_local_herdr_client(&socket_path, canonical_ref)?;
     let accepted = tokio::time::timeout(Duration::from_secs(10), listener.accept()).await;
     let (socket, _) = match accepted {
         Ok(Ok(accepted)) => accepted,
         Ok(Err(err)) => {
-            let _ = child.kill().await;
+            let _ = terminate_herdr_client_child(&mut child).await;
             let _ = bridge.kill().await;
             return Err(err).context("accept local herdr client socket");
         }
         Err(_) => {
-            let _ = child.kill().await;
+            let _ = terminate_herdr_client_child(&mut child).await;
             let _ = bridge.kill().await;
             anyhow::bail!(
                 "local herdr client did not connect to {}",
@@ -2958,15 +2969,13 @@ async fn bridge_local_herdr_attach(
         }
         result = &mut bridge_task => {
             if let Err(err) = result.context("join local herdr bridge")? {
-                let _ = child.kill().await;
+                let _ = terminate_herdr_client_child(&mut child).await;
                 return Err(err);
             }
             if let Ok(status) = tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
                 Ok(status.context("wait for herdr client")?.code().unwrap_or(1))
             } else {
-                let _ = child.kill().await;
-                let status = child.wait().await.context("wait for killed herdr client")?;
-                Ok(status.code().unwrap_or(1))
+                Ok(terminate_herdr_client_child(&mut child).await.unwrap_or(1))
             }
         }
     }
@@ -3070,16 +3079,17 @@ async fn bridge_attach_herdr(session: HerdrSessionClient, canonical_ref: String)
     let listener = tokio::net::UnixListener::bind(&socket_path)
         .with_context(|| format!("bind herdr client socket {}", socket_path.display()))?;
     set_private_socket_permissions(&socket_path)?;
+    let _terminal_guard = HerdrTerminalRestoreGuard::new_if_terminal()?;
     let mut child = spawn_local_herdr_client(&socket_path, &canonical_ref)?;
     let accepted = tokio::time::timeout(Duration::from_secs(10), listener.accept()).await;
     let (socket, _) = match accepted {
         Ok(Ok(accepted)) => accepted,
         Ok(Err(err)) => {
-            let _ = child.kill().await;
+            let _ = terminate_herdr_client_child(&mut child).await;
             return Err(err).context("accept local herdr client socket");
         }
         Err(_) => {
-            let _ = child.kill().await;
+            let _ = terminate_herdr_client_child(&mut child).await;
             anyhow::bail!(
                 "local herdr client did not connect to {}",
                 socket_path.display()
@@ -3100,7 +3110,7 @@ async fn bridge_attach_herdr(session: HerdrSessionClient, canonical_ref: String)
                     Ok(status.code().unwrap_or(1))
                 }
                 Err(err) => {
-                    let _ = child.kill().await;
+                    let _ = terminate_herdr_client_child(&mut child).await;
                     Err(err)
                 }
             }
@@ -3111,6 +3121,34 @@ async fn bridge_attach_herdr(session: HerdrSessionClient, canonical_ref: String)
 #[cfg(not(unix))]
 async fn bridge_attach_herdr(_session: HerdrSessionClient, _canonical_ref: String) -> Result<i32> {
     anyhow::bail!("herdr attach requires Unix sockets")
+}
+
+const HERDR_CLIENT_TERMINATE_GRACE: Duration = Duration::from_millis(500);
+
+async fn terminate_herdr_client_child(child: &mut Child) -> Option<i32> {
+    #[cfg(unix)]
+    if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+        if let Ok(code) =
+            tokio::time::timeout(HERDR_CLIENT_TERMINATE_GRACE, wait_child_code(child)).await
+        {
+            return code;
+        }
+    }
+
+    let _ = child.kill().await;
+    wait_child_code(child).await
+}
+
+async fn wait_child_code(child: &mut Child) -> Option<i32> {
+    child
+        .wait()
+        .await
+        .ok()
+        .map(|status| status.code().unwrap_or(1))
 }
 
 #[cfg(unix)]
@@ -3257,15 +3295,124 @@ where
     Ok(())
 }
 
+const HERDR_SERVER_LANE_BUFFER: usize = 16;
+const HERDR_PENDING_CONTROL_LIMIT: usize = 16;
+const HERDR_PENDING_RENDER_LIMIT: usize = 16;
+const HERDR_PENDING_BULK_LIMIT: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HerdrServerFrameMeta {
+    Welcome,
+    SemanticFrame { has_graphics: bool },
+    Terminal { seq: u64, full: bool },
+    Graphics,
+    ServerShutdown,
+    Notify,
+    Clipboard,
+    ReloadSoundConfig,
+    MouseCapture { enabled: bool },
+}
+
+impl HerdrServerFrameMeta {
+    fn from_frame(frame: &RawHerdrFrame) -> Result<Self> {
+        Ok(match frame.decode_server()? {
+            ServerMessage::Welcome { .. } => Self::Welcome,
+            ServerMessage::Frame(frame) => Self::SemanticFrame {
+                has_graphics: !frame.graphics.is_empty(),
+            },
+            ServerMessage::Terminal(frame) => Self::Terminal {
+                seq: frame.seq,
+                full: frame.full,
+            },
+            ServerMessage::Graphics { .. } => Self::Graphics,
+            ServerMessage::ServerShutdown { .. } => Self::ServerShutdown,
+            ServerMessage::Notify { .. } => Self::Notify,
+            ServerMessage::Clipboard { .. } => Self::Clipboard,
+            ServerMessage::ReloadSoundConfig => Self::ReloadSoundConfig,
+            ServerMessage::MouseCapture { enabled } => Self::MouseCapture { enabled },
+        })
+    }
+}
+
+#[derive(Debug)]
+struct HerdrPendingFrame {
+    meta: HerdrServerFrameMeta,
+    frame: RawHerdrFrame,
+}
+
+#[derive(Debug)]
+struct HerdrPendingFrames {
+    max: usize,
+    frames: VecDeque<HerdrPendingFrame>,
+}
+
+impl HerdrPendingFrames {
+    fn new(max: usize) -> Self {
+        Self {
+            max,
+            frames: VecDeque::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    fn can_accept(&self) -> bool {
+        self.frames.len() < self.max
+    }
+
+    fn push(&mut self, frame: RawHerdrFrame) -> Result<()> {
+        let meta = HerdrServerFrameMeta::from_frame(&frame)?;
+        match meta {
+            HerdrServerFrameMeta::SemanticFrame {
+                has_graphics: false,
+            } => self.frames.retain(|pending| {
+                !matches!(
+                    pending.meta,
+                    HerdrServerFrameMeta::SemanticFrame {
+                        has_graphics: false
+                    }
+                )
+            }),
+            HerdrServerFrameMeta::Terminal { full: true, .. } => self
+                .frames
+                .retain(|pending| !matches!(pending.meta, HerdrServerFrameMeta::Terminal { .. })),
+            HerdrServerFrameMeta::MouseCapture { .. } => self.frames.retain(|pending| {
+                !matches!(pending.meta, HerdrServerFrameMeta::MouseCapture { .. })
+            }),
+            HerdrServerFrameMeta::ReloadSoundConfig => self
+                .frames
+                .retain(|pending| pending.meta != HerdrServerFrameMeta::ReloadSoundConfig),
+            HerdrServerFrameMeta::SemanticFrame { has_graphics: true }
+            | HerdrServerFrameMeta::Terminal { full: false, .. }
+            | HerdrServerFrameMeta::Welcome
+            | HerdrServerFrameMeta::Graphics
+            | HerdrServerFrameMeta::ServerShutdown
+            | HerdrServerFrameMeta::Notify
+            | HerdrServerFrameMeta::Clipboard => {}
+        }
+        self.frames.push_back(HerdrPendingFrame { meta, frame });
+        Ok(())
+    }
+
+    fn pop_front(&mut self) -> Option<RawHerdrFrame> {
+        self.frames.pop_front().map(|pending| pending.frame)
+    }
+}
+
 #[cfg(unix)]
-async fn pump_herdr_server_lanes_to_local<W>(
+async fn pump_herdr_server_lanes_to_local<W, C, R, B>(
     mut writer: W,
-    mut control: BufferedRecv,
-    mut render: BufferedRecv,
-    mut bulk: BufferedRecv,
+    mut control: C,
+    render: R,
+    bulk: B,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
+    C: AsyncRead + Unpin + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
+    B: AsyncRead + Unpin + Send + 'static,
 {
     let first = read_next_herdr_frame(&mut control, FrameDirection::ServerToClient)
         .await?
@@ -3273,37 +3420,148 @@ where
     validate_first_herdr_server_frame(&first)?;
     write_herdr_local_frame(&mut writer, &first).await?;
 
-    let mut control_open = true;
-    let mut render_open = true;
-    let mut bulk_open = true;
-    while control_open || render_open || bulk_open {
-        tokio::select! {
-            biased;
-            frame = read_next_herdr_frame(&mut control, FrameDirection::ServerToClient), if control_open => {
-                match frame? {
-                    Some(frame) => write_herdr_local_frame(&mut writer, &frame).await?,
-                    None => control_open = false,
-                }
-            }
-            frame = read_next_herdr_frame(&mut render, FrameDirection::ServerToClient), if render_open => {
-                match frame? {
-                    Some(frame) => write_herdr_local_frame(&mut writer, &frame).await?,
-                    None => render_open = false,
-                }
-            }
-            frame = read_next_herdr_frame(&mut bulk, FrameDirection::ServerToClient), if bulk_open => {
-                match frame? {
-                    Some(frame) => write_herdr_local_frame(&mut writer, &frame).await?,
-                    None => bulk_open = false,
-                }
-            }
-        }
+    let (control_tx, mut control_rx) = mpsc::channel(HERDR_SERVER_LANE_BUFFER);
+    let (render_tx, mut render_rx) = mpsc::channel(HERDR_SERVER_LANE_BUFFER);
+    let (bulk_tx, mut bulk_rx) = mpsc::channel(HERDR_SERVER_LANE_BUFFER);
+    let control_task = tokio::spawn(read_herdr_server_lane(control, control_tx));
+    let render_task = tokio::spawn(read_herdr_server_lane(render, render_tx));
+    let bulk_task = tokio::spawn(read_herdr_server_lane(bulk, bulk_tx));
+
+    let result = pump_herdr_server_lane_events_to_local(
+        &mut writer,
+        &mut control_rx,
+        &mut render_rx,
+        &mut bulk_rx,
+    )
+    .await;
+    for task in [control_task, render_task, bulk_task] {
+        task.abort();
+        let _ = task.await;
     }
+    result?;
     writer
         .shutdown()
         .await
         .context("shutdown herdr client socket")?;
     Ok(())
+}
+
+async fn read_herdr_server_lane<R>(mut reader: R, tx: mpsc::Sender<Result<Option<RawHerdrFrame>>>)
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        match read_next_herdr_frame(&mut reader, FrameDirection::ServerToClient).await {
+            Ok(Some(frame)) => {
+                if tx.send(Ok(Some(frame))).await.is_err() {
+                    return;
+                }
+            }
+            Ok(None) => {
+                let _ = tx.send(Ok(None)).await;
+                return;
+            }
+            Err(err) => {
+                let _ = tx.send(Err(err)).await;
+                return;
+            }
+        }
+    }
+}
+
+async fn pump_herdr_server_lane_events_to_local<W>(
+    writer: &mut W,
+    control_rx: &mut mpsc::Receiver<Result<Option<RawHerdrFrame>>>,
+    render_rx: &mut mpsc::Receiver<Result<Option<RawHerdrFrame>>>,
+    bulk_rx: &mut mpsc::Receiver<Result<Option<RawHerdrFrame>>>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut control_open = true;
+    let mut render_open = true;
+    let mut bulk_open = true;
+    let mut control_pending = HerdrPendingFrames::new(HERDR_PENDING_CONTROL_LIMIT);
+    let mut render_pending = HerdrPendingFrames::new(HERDR_PENDING_RENDER_LIMIT);
+    let mut bulk_pending = HerdrPendingFrames::new(HERDR_PENDING_BULK_LIMIT);
+
+    while control_open
+        || render_open
+        || bulk_open
+        || !control_pending.is_empty()
+        || !render_pending.is_empty()
+        || !bulk_pending.is_empty()
+    {
+        drain_ready_herdr_lane_events(control_rx, &mut control_pending, &mut control_open)?;
+        drain_ready_herdr_lane_events(render_rx, &mut render_pending, &mut render_open)?;
+        drain_ready_herdr_lane_events(bulk_rx, &mut bulk_pending, &mut bulk_open)?;
+
+        if let Some(frame) = control_pending.pop_front() {
+            write_herdr_local_frame(writer, &frame).await?;
+            continue;
+        }
+        if let Some(frame) = render_pending.pop_front() {
+            write_herdr_local_frame(writer, &frame).await?;
+            continue;
+        }
+        if let Some(frame) = bulk_pending.pop_front() {
+            write_herdr_local_frame(writer, &frame).await?;
+            continue;
+        }
+
+        tokio::select! {
+            biased;
+            event = control_rx.recv(), if control_open => {
+                apply_herdr_lane_event(event, &mut control_pending, &mut control_open)?;
+            }
+            event = render_rx.recv(), if render_open => {
+                apply_herdr_lane_event(event, &mut render_pending, &mut render_open)?;
+            }
+            event = bulk_rx.recv(), if bulk_open => {
+                apply_herdr_lane_event(event, &mut bulk_pending, &mut bulk_open)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn drain_ready_herdr_lane_events(
+    rx: &mut mpsc::Receiver<Result<Option<RawHerdrFrame>>>,
+    pending: &mut HerdrPendingFrames,
+    open: &mut bool,
+) -> Result<()> {
+    if !*open {
+        return Ok(());
+    }
+    while pending.can_accept() {
+        match rx.try_recv() {
+            Ok(event) => apply_herdr_lane_event(Some(event), pending, open)?,
+            Err(mpsc::error::TryRecvError::Empty) => break,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                *open = false;
+                break;
+            }
+        }
+        if !*open {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn apply_herdr_lane_event(
+    event: Option<Result<Option<RawHerdrFrame>>>,
+    pending: &mut HerdrPendingFrames,
+    open: &mut bool,
+) -> Result<()> {
+    match event {
+        Some(Ok(Some(frame))) => pending.push(frame),
+        Some(Ok(None)) | None => {
+            *open = false;
+            Ok(())
+        }
+        Some(Err(err)) => Err(err),
+    }
 }
 
 fn validate_first_herdr_server_frame(frame: &RawHerdrFrame) -> Result<()> {
@@ -5749,6 +6007,68 @@ fn write_panic_cleanup_to_fd_if_armed(fd: i32) {
     let _ = unsafe { nix::libc::write(fd, cleanup.as_ptr().cast(), cleanup.len()) };
 }
 
+struct HerdrTerminalRestoreGuard {
+    #[cfg(unix)]
+    original_termios: Option<Termios>,
+    cleanup: RawModeCleanupWriter,
+}
+
+impl HerdrTerminalRestoreGuard {
+    fn new_if_terminal() -> Result<Option<Self>> {
+        if !std::io::stdin().is_terminal() {
+            return Ok(None);
+        }
+        #[cfg(unix)]
+        let original_termios = snapshot_stdin_termios()?;
+        set_panic_hook_armed(true);
+        Ok(Some(Self {
+            #[cfg(unix)]
+            original_termios: Some(original_termios),
+            cleanup: RawModeCleanupWriter::default(),
+        }))
+    }
+
+    #[cfg(test)]
+    fn without_termios_for_test() -> Self {
+        Self {
+            #[cfg(unix)]
+            original_termios: None,
+            cleanup: RawModeCleanupWriter::default(),
+        }
+    }
+
+    fn restore_to<W: IoWrite>(
+        &mut self,
+        writer: &mut W,
+        variant: RawModeExitVariant,
+    ) -> std::io::Result<()> {
+        self.restore_termios();
+        self.cleanup.write_to(writer, variant)
+    }
+
+    fn restore_termios(&mut self) {
+        #[cfg(unix)]
+        if let Some(original) = self.original_termios.take() {
+            let stdin = std::io::stdin();
+            let _ = tcsetattr(&stdin, SetArg::TCSANOW, &original);
+        }
+    }
+}
+
+impl Drop for HerdrTerminalRestoreGuard {
+    fn drop(&mut self) {
+        set_panic_hook_armed(false);
+        let mut stdout = std::io::stdout();
+        let _ = self.restore_to(&mut stdout, RawModeExitVariant::Normal);
+    }
+}
+
+#[cfg(unix)]
+fn snapshot_stdin_termios() -> Result<Termios> {
+    let stdin = std::io::stdin();
+    tcgetattr(&stdin).context("snapshot terminal mode")
+}
+
 #[derive(Debug, Default)]
 struct RawModeCleanupWriter {
     written: bool,
@@ -7889,7 +8209,8 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use portl_core::herdr_wire::{
-        ClientKeybindings, ClientMessage, HERDR_PROTOCOL_VERSION, RenderEncoding,
+        ClientKeybindings, ClientMessage, FrameData, HERDR_PROTOCOL_VERSION, NotifyKind,
+        RenderEncoding, TerminalFrame,
     };
     use portl_core::peer_store::{PeerEntry, PeerOrigin, PeerStore};
     use portl_core::ticket_store::{SessionShareMetadata, TicketEntry};
@@ -10042,15 +10363,246 @@ mod tests {
     }
 
     #[test]
+    fn herdr_terminal_restore_guard_writes_defensive_cleanup() {
+        let mut guard = HerdrTerminalRestoreGuard::without_termios_for_test();
+        let mut output = Vec::new();
+
+        let _ = guard.restore_to(&mut output, RawModeExitVariant::Normal);
+
+        assert!(
+            output
+                .windows(b"\x1b[?1006l".len())
+                .any(|window| window == b"\x1b[?1006l"),
+            "cleanup should disable SGR mouse reporting: {output:?}"
+        );
+        assert!(
+            output
+                .windows(b"\x1b[?2004l".len())
+                .any(|window| window == b"\x1b[?2004l"),
+            "cleanup should disable bracketed paste: {output:?}"
+        );
+    }
+
+    #[test]
     fn first_herdr_server_frame_must_be_welcome() {
         let notify = RawHerdrFrame::encode_server(&ServerMessage::Notify {
-            kind: portl_core::herdr_wire::NotifyKind::Toast,
+            kind: NotifyKind::Toast,
             message: "not yet".to_owned(),
         })
         .unwrap();
 
         let err = validate_first_herdr_server_frame(&notify).unwrap_err();
         assert!(err.to_string().contains("must be Welcome"));
+    }
+
+    fn empty_herdr_frame(graphics: Vec<u8>) -> FrameData {
+        FrameData {
+            cells: Vec::new(),
+            width: 0,
+            height: 0,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics,
+        }
+    }
+
+    #[test]
+    fn herdr_pending_frames_coalesces_semantic_frames_to_latest() {
+        let first =
+            RawHerdrFrame::encode_server(&ServerMessage::Frame(empty_herdr_frame(Vec::new())))
+                .unwrap();
+        let latest =
+            RawHerdrFrame::encode_server(&ServerMessage::Frame(empty_herdr_frame(Vec::new())))
+                .unwrap();
+        let mut pending = HerdrPendingFrames::new(16);
+
+        pending.push(first).unwrap();
+        pending.push(latest.clone()).unwrap();
+
+        assert_eq!(pending.pop_front(), Some(latest));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn herdr_pending_frames_preserves_terminal_diffs() {
+        let first = RawHerdrFrame::encode_server(&ServerMessage::Terminal(TerminalFrame {
+            seq: 1,
+            width: 80,
+            height: 24,
+            full: false,
+            bytes: b"diff-1".to_vec(),
+        }))
+        .unwrap();
+        let second = RawHerdrFrame::encode_server(&ServerMessage::Terminal(TerminalFrame {
+            seq: 2,
+            width: 80,
+            height: 24,
+            full: false,
+            bytes: b"diff-2".to_vec(),
+        }))
+        .unwrap();
+        let mut pending = HerdrPendingFrames::new(16);
+
+        pending.push(first.clone()).unwrap();
+        pending.push(second.clone()).unwrap();
+
+        assert_eq!(pending.pop_front(), Some(first));
+        assert_eq!(pending.pop_front(), Some(second));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn herdr_pending_frames_full_terminal_supersedes_queued_terminal_frames() {
+        let diff = RawHerdrFrame::encode_server(&ServerMessage::Terminal(TerminalFrame {
+            seq: 1,
+            width: 80,
+            height: 24,
+            full: false,
+            bytes: b"diff".to_vec(),
+        }))
+        .unwrap();
+        let full = RawHerdrFrame::encode_server(&ServerMessage::Terminal(TerminalFrame {
+            seq: 2,
+            width: 80,
+            height: 24,
+            full: true,
+            bytes: b"full".to_vec(),
+        }))
+        .unwrap();
+        let mut pending = HerdrPendingFrames::new(16);
+
+        pending.push(diff).unwrap();
+        pending.push(full.clone()).unwrap();
+
+        assert_eq!(pending.pop_front(), Some(full));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn herdr_pending_frames_never_drops_side_effect_messages() {
+        let notify = RawHerdrFrame::encode_server(&ServerMessage::Notify {
+            kind: NotifyKind::Toast,
+            message: "one".to_owned(),
+        })
+        .unwrap();
+        let clipboard = RawHerdrFrame::encode_server(&ServerMessage::Clipboard {
+            data: "Zm9v".to_owned(),
+        })
+        .unwrap();
+        let graphics = RawHerdrFrame::encode_server(&ServerMessage::Graphics {
+            bytes: b"graphics".to_vec(),
+        })
+        .unwrap();
+        let shutdown = RawHerdrFrame::encode_server(&ServerMessage::ServerShutdown {
+            reason: Some("bye".to_owned()),
+        })
+        .unwrap();
+        let mut pending = HerdrPendingFrames::new(16);
+
+        pending.push(notify.clone()).unwrap();
+        pending.push(clipboard.clone()).unwrap();
+        pending.push(graphics.clone()).unwrap();
+        pending.push(shutdown.clone()).unwrap();
+
+        assert_eq!(pending.pop_front(), Some(notify));
+        assert_eq!(pending.pop_front(), Some(clipboard));
+        assert_eq!(pending.pop_front(), Some(graphics));
+        assert_eq!(pending.pop_front(), Some(shutdown));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn herdr_pending_frames_coalesces_mouse_capture_and_reload() {
+        let mouse_on =
+            RawHerdrFrame::encode_server(&ServerMessage::MouseCapture { enabled: true }).unwrap();
+        let mouse_off =
+            RawHerdrFrame::encode_server(&ServerMessage::MouseCapture { enabled: false }).unwrap();
+        let reload = RawHerdrFrame::encode_server(&ServerMessage::ReloadSoundConfig).unwrap();
+        let mut pending = HerdrPendingFrames::new(16);
+
+        pending.push(mouse_on).unwrap();
+        pending.push(reload.clone()).unwrap();
+        pending.push(mouse_off.clone()).unwrap();
+        pending.push(reload.clone()).unwrap();
+
+        assert_eq!(pending.pop_front(), Some(mouse_off));
+        assert_eq!(pending.pop_front(), Some(reload));
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn herdr_server_lane_scheduler_preserves_frames_when_other_lane_wins_select() {
+        let welcome = RawHerdrFrame::encode_server(&ServerMessage::Welcome {
+            version: HERDR_PROTOCOL_VERSION,
+            encoding: RenderEncoding::SemanticFrame,
+            error: None,
+        })
+        .unwrap();
+        let notify = RawHerdrFrame::encode_server(&ServerMessage::Notify {
+            kind: NotifyKind::Toast,
+            message: "control-before-render".to_owned(),
+        })
+        .unwrap();
+        let render = RawHerdrFrame::encode_server(&ServerMessage::Terminal(TerminalFrame {
+            seq: 1,
+            width: 80,
+            height: 24,
+            full: true,
+            bytes: b"render-frame".to_vec(),
+        }))
+        .unwrap();
+
+        let (mut control_writer, control_reader) = tokio::io::duplex(4096);
+        let (mut render_writer, render_reader) = tokio::io::duplex(4096);
+        let (bulk_writer, bulk_reader) = tokio::io::duplex(4096);
+        let (local_writer, mut local_reader) = tokio::io::duplex(4096);
+
+        let pump = tokio::spawn(pump_herdr_server_lanes_to_local(
+            local_writer,
+            control_reader,
+            render_reader,
+            bulk_reader,
+        ));
+
+        control_writer
+            .write_all(welcome.framed_bytes())
+            .await
+            .unwrap();
+        let split = 2;
+        render_writer
+            .write_all(&render.framed_bytes()[..split])
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        control_writer
+            .write_all(notify.framed_bytes())
+            .await
+            .unwrap();
+        render_writer
+            .write_all(&render.framed_bytes()[split..])
+            .await
+            .unwrap();
+        drop(control_writer);
+        drop(render_writer);
+        drop(bulk_writer);
+
+        let first = read_next_herdr_frame(&mut local_reader, FrameDirection::ServerToClient)
+            .await
+            .unwrap()
+            .unwrap();
+        let second = read_next_herdr_frame(&mut local_reader, FrameDirection::ServerToClient)
+            .await
+            .unwrap()
+            .unwrap();
+        let third = read_next_herdr_frame(&mut local_reader, FrameDirection::ServerToClient)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first, welcome);
+        assert_eq!(second, notify);
+        assert_eq!(third, render);
+        pump.await.unwrap().unwrap();
     }
 
     #[test]
@@ -10183,6 +10735,27 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
+    async fn local_herdr_attach_gracefully_terminates_client_when_bridge_exits_first() {
+        let temp = TempDir::new().unwrap();
+        let fake_herdr = temp.path().join("herdr");
+        let log = temp.path().join("herdr.log");
+        write_failing_bridge_fake_herdr(&fake_herdr, &log);
+        let _path_guard = EnvVarGuard::set("PORTL_HERDR_PATH", fake_herdr.as_os_str());
+
+        let code = local_session_attach(Some("herdr"), "max-b265", "default", None, None, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains("client:term"),
+            "client should receive SIGTERM before any forced kill; calls were {calls:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
     async fn local_herdr_attach_sets_named_session_env() {
         let temp = TempDir::new().unwrap();
         let fake_herdr = temp.path().join("herdr");
@@ -10261,6 +10834,54 @@ mod tests {
                 None => unsafe { std::env::remove_var(self.name) },
             }
         }
+    }
+
+    #[cfg(unix)]
+    fn write_failing_bridge_fake_herdr(path: &std::path::Path, log: &std::path::Path) {
+        let script = r#"#!/usr/bin/env python3
+import os
+import signal
+import socket
+import sys
+import time
+
+LOG = __LOG__
+
+def log(line):
+    with open(LOG, "a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+        handle.flush()
+
+args = sys.argv[1:]
+log("argv:" + " ".join(args))
+if args == ["--version"]:
+    print("herdr fake")
+    raise SystemExit(0)
+if args == ["session", "list", "--json"]:
+    print('{"sessions":[{"name":"default"}]}')
+    raise SystemExit(0)
+if args == ["client"]:
+    def on_term(signum, frame):
+        log("client:term")
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, on_term)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(os.environ["HERDR_CLIENT_SOCKET_PATH"])
+    sock.sendall(b"not-a-valid-frame")
+    log("client:sent")
+    while True:
+        time.sleep(0.05)
+if args == ["remote-client-bridge"]:
+    log("bridge:exit")
+    raise SystemExit(0)
+print("unexpected args: " + " ".join(args), file=sys.stderr)
+raise SystemExit(64)
+"#
+        .replace("__LOG__", &format!("{:?}", log.display().to_string()));
+        std::fs::write(path, script).unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
     }
 
     #[cfg(unix)]
