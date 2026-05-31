@@ -277,6 +277,7 @@ fn portl_ssh_subcommands_parse() {
             tty: None,
             forward_agent: false,
             stdin_null: false,
+            stdio: false,
             quiet: false,
             verbose: 0,
             remote_command: Vec::new(),
@@ -292,11 +293,21 @@ fn portl_ssh_subcommands_parse() {
             tty: None,
             forward_agent: false,
             stdin_null: false,
+            stdio: false,
             quiet: false,
             verbose: 0,
             remote_command: vec!["hostname".to_owned()],
         }
     );
+
+    let ssh_stdio = parse(argv(&["portl-ssh", "--stdio", "vn3"])).expect("stdio parse");
+    match ssh_stdio {
+        Command::Ssh { peer, user, .. } => {
+            assert_eq!(peer, "vn3");
+            assert_eq!(user, None);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
 
     let ssh_git = parse(argv(&[
         "portl-ssh",
@@ -318,6 +329,7 @@ fn portl_ssh_subcommands_parse() {
             tty: None,
             forward_agent: true,
             stdin_null: false,
+            stdio: false,
             quiet: false,
             verbose: 0,
             remote_command: vec!["git-upload-pack".to_owned(), "repo.git".to_owned()],
@@ -428,6 +440,7 @@ fn portl_ssh_compatibility_options_parse() {
             tty: Some(false),
             forward_agent: false,
             stdin_null: true,
+            stdio: false,
             quiet: true,
             verbose: 0,
             remote_command: vec!["--remote-flag".to_owned()],
@@ -443,6 +456,7 @@ fn portl_ssh_compatibility_options_parse() {
             tty: Some(true),
             forward_agent: false,
             stdin_null: false,
+            stdio: false,
             quiet: false,
             verbose: 0,
             remote_command: Vec::new(),
@@ -458,6 +472,7 @@ fn portl_ssh_compatibility_options_parse() {
             tty: None,
             forward_agent: false,
             stdin_null: false,
+            stdio: false,
             quiet: false,
             verbose: 2,
             remote_command: Vec::new(),

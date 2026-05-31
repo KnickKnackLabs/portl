@@ -21,6 +21,11 @@ rust-version = "1.93"
 [workspace.dependencies]
 # transport
 iroh         = { version = "0.98.2", features = ["address-lookup-mdns"] }
+# Keep russh on 0.56 for now: newer 0.60/0.61 releases require
+# prerelease/stable crypto crate versions that Cargo cannot resolve
+# alongside iroh 0.98's exact prerelease pins. `default-features = false`
+# avoids aws-lc-rs; ring is the only enabled backend.
+russh        = { version = "=0.56.0", default-features = false, features = ["ring"] }
 iroh-base    = "0.98"
 iroh-relay   = { version = "0.98", default-features = false, features = ["server"] }
 iroh-tickets = "0.5"

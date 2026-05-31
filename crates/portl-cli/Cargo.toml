@@ -54,6 +54,7 @@ rpassword   = { workspace = true }
 hex         = { workspace = true }
 sha2        = { workspace = true }
 rand        = { workspace = true }
+rand_core   = { workspace = true }
 tar         = { workspace = true }
 zstd        = { workspace = true }
 qrcode      = { workspace = true }
@@ -66,6 +67,7 @@ nix         = { workspace = true }
 reqwest     = { workspace = true }
 async-trait = { workspace = true }
 bollard     = { workspace = true }
+russh       = { workspace = true }
 # Keep default-features off for the portability spike: upstream defaults enable
 # Kitty graphics support, which is not needed for the minimal static-link smoke.
 libghostty-vt = { version = "0.1.1", git = "https://github.com/Uzaaft/libghostty-rs", rev = "5ac47e9eb166add2c00c432bc65c279133629712", package = "libghostty-vt", default-features = false, optional = true }

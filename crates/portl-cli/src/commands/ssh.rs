@@ -18,17 +18,37 @@ fn validate_native_options(tty: Option<bool>, remote_command: &[String]) -> Resu
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+fn validate_stdio_options(stdin_null: bool, remote_command: &[String]) -> Result<()> {
+    if stdin_null {
+        bail!(
+            "portl ssh --stdio cannot combine with -n because stdin/stdout carry SSH protocol bytes"
+        );
+    }
+    if !remote_command.is_empty() {
+        bail!(
+            "portl ssh --stdio does not accept a remote command; the OpenSSH client sends requests over the protocol stream"
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
 pub fn run(
     peer: &str,
     user: Option<&str>,
     tty: Option<bool>,
     forward_agent: bool,
     stdin_null: bool,
+    stdio: bool,
     _quiet: bool,
     _verbose: u8,
     remote_command: &[String],
 ) -> Result<ExitCode> {
+    if stdio {
+        validate_stdio_options(stdin_null, remote_command)?;
+        return crate::commands::ssh_stdio::run(peer, user, forward_agent);
+    }
+
     validate_native_options(tty, remote_command)?;
 
     if forward_agent {
@@ -261,12 +281,25 @@ mod tests {
 
     use super::{
         ensure_agent_env_allowed, remote_agent_socket_path, ssh_auth_sock_from_env, ssh_caps,
-        validate_native_options,
+        validate_native_options, validate_stdio_options,
     };
 
     #[test]
     fn native_ssh_agent_forward_flag_is_validated_later() {
         validate_native_options(None, &["git-upload-pack".to_owned()]).unwrap();
+    }
+
+    #[test]
+    fn stdio_ssh_rejects_stdin_null() {
+        let err = validate_stdio_options(true, &[]).expect_err("-n would close protocol stdin");
+        assert!(err.to_string().contains("cannot combine with -n"));
+    }
+
+    #[test]
+    fn stdio_ssh_rejects_remote_command_arguments() {
+        let err = validate_stdio_options(false, &["hostname".to_owned()])
+            .expect_err("stdio mode receives commands over the SSH protocol");
+        assert!(err.to_string().contains("does not accept a remote command"));
     }
 
     #[test]

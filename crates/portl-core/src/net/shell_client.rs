@@ -118,6 +118,29 @@ pub async fn open_exec_with_env(
     argv: Vec<String>,
     env_patch: Vec<(String, EnvValue)>,
 ) -> Result<ShellClient> {
+    open_exec_session_with_env(connection, session, user, cwd, argv, env_patch, false).await
+}
+
+pub async fn open_exec_with_env_and_controls(
+    connection: &Connection,
+    session: &PeerSession,
+    user: Option<String>,
+    cwd: Option<String>,
+    argv: Vec<String>,
+    env_patch: Vec<(String, EnvValue)>,
+) -> Result<ShellClient> {
+    open_exec_session_with_env(connection, session, user, cwd, argv, env_patch, true).await
+}
+
+async fn open_exec_session_with_env(
+    connection: &Connection,
+    session: &PeerSession,
+    user: Option<String>,
+    cwd: Option<String>,
+    argv: Vec<String>,
+    env_patch: Vec<(String, EnvValue)>,
+    controls: bool,
+) -> Result<ShellClient> {
     let req = ShellReqBody {
         mode: ShellMode::Exec,
         argv: Some(argv),
@@ -126,7 +149,7 @@ pub async fn open_exec_with_env(
         pty: None,
         user,
     };
-    open_shell_session(connection, session, req, false).await
+    open_shell_session(connection, session, req, controls).await
 }
 
 async fn open_shell_session(

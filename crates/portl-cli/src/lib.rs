@@ -151,6 +151,7 @@ pub enum Command {
         tty: Option<bool>,
         forward_agent: bool,
         stdin_null: bool,
+        stdio: bool,
         quiet: bool,
         verbose: u8,
         remote_command: Vec<String>,
@@ -859,6 +860,7 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             tty,
             forward_agent,
             stdin_null,
+            stdio,
             quiet,
             verbose,
             remote_command,
@@ -868,6 +870,7 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             tty,
             forward_agent,
             stdin_null,
+            stdio,
             quiet,
             verbose,
             &remote_command,
@@ -1603,6 +1606,9 @@ enum ConnectTopLevel {
         /// Redirect stdin from /dev/null. Parsed for SSH argv compatibility.
         #[arg(short = 'n')]
         stdin_null: bool,
+        /// Serve one SSH protocol connection on stdin/stdout for OpenSSH `ProxyCommand`.
+        #[arg(long)]
+        stdio: bool,
         /// Quiet mode. Parsed for SSH argv compatibility.
         #[arg(short = 'q')]
         quiet: bool,
@@ -2534,6 +2540,7 @@ fn connect_into_command(action: ConnectTopLevel, log_verbose: u8) -> Command {
             no_tty,
             tty,
             stdin_null,
+            stdio,
             quiet,
             option: _,
             config: _,
@@ -2556,6 +2563,7 @@ fn connect_into_command(action: ConnectTopLevel, log_verbose: u8) -> Command {
                 tty,
                 forward_agent: forward_agent && !disable_agent,
                 stdin_null,
+                stdio,
                 quiet,
                 verbose: log_verbose,
                 remote_command,

@@ -236,6 +236,9 @@ portl udp demo -L 60000:127.0.0.1:60000
 portl ssh-config --mode sshd-proxy demo --host demo-sshd
 ssh demo-sshd
 
+# No-sshd OpenSSH compatibility via Portl's native shell/exec lanes.
+ssh -o 'ProxyCommand=portl-ssh --stdio %h' demo 'hostname'
+
 portl docker rm demo --force
 ```
 
