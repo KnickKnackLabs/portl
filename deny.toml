@@ -23,9 +23,14 @@ yanked  = "warn"
 # client protocol is length-prefixed bincode. This advisory is an
 # unmaintained notice rather than a known vulnerability; revisit when Herdr
 # changes its wire format or adopts a maintained bincode-compatible crate.
+# libcrux-sha3 is pulled in through russh -> libcrux-ml-kem. RUSTSEC-2026-0074
+# affects the incremental portable SHAKE XOF API, and the advisory explicitly
+# says libcrux-ml-kem/libcrux-ml-dsa usage is not impacted. Revisit when russh
+# can move past the current 0.56 pin.
 ignore  = [
     "RUSTSEC-2024-0436",
     "RUSTSEC-2025-0141",
+    "RUSTSEC-2026-0074",
     "RUSTSEC-2026-0119",
     "RUSTSEC-2026-0120",
 ]
