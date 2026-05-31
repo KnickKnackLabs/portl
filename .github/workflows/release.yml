@@ -221,7 +221,11 @@ jobs:
   release-macos-sign-notarize:
     name: sign/notarize macOS (${{ matrix.target }})
     needs: [release-macos-build, release-publish]
+    # Keep the cheap/default GitHub-hosted Linux runner architecture (x64), but
+    # run the job inside Alpine so xar is available as a prebuilt apk package.
     runs-on: ubuntu-latest
+    container:
+      image: node:24-alpine3.23
     continue-on-error: true
     permissions:
       contents: write
@@ -232,72 +236,62 @@ jobs:
           - x86_64-apple-darwin
           - aarch64-apple-darwin
     steps:
+      - name: Install Alpine release dependencies
+        shell: sh
+        run: |
+          set -eu
+          apk add --no-cache \
+            bash \
+            build-base \
+            ca-certificates \
+            cargo \
+            coreutils \
+            cpio \
+            curl \
+            file \
+            git \
+            gzip \
+            openssh-client \
+            openssl \
+            rust \
+            tar \
+            xar \
+            xz \
+            zstd
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v5
         with:
           name: raw-macos-${{ matrix.target }}
           path: raw
-      - name: Install rcodesign
+      - name: Set up mise
+        uses: jdx/mise-action@v4
+        with:
+          install: false
+          cache: true
+          cache_key: "mise-release-signing-{{platform}}-{{version}}-stuckliste-0.4.0-apple-codesign-${{ env.APPLE_CODESIGN_VERSION }}"
+      - name: Install release signing tools
+        shell: bash
         run: |
           set -euo pipefail
-          if command -v rcodesign >/dev/null 2>&1 && rcodesign --version 2>/dev/null | grep -q "$APPLE_CODESIGN_VERSION"; then
-            rcodesign --version
-            exit 0
-          fi
-          tmp=$(mktemp -d)
-          cd "$tmp"
-          arch="x86_64-unknown-linux-musl"
-          if [ "$(uname -m)" = "aarch64" ]; then
-            arch="aarch64-unknown-linux-musl"
-          fi
-          url="https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign/${APPLE_CODESIGN_VERSION}/apple-codesign-${APPLE_CODESIGN_VERSION}-${arch}.tar.gz"
-          curl -sSL -o rcodesign.tar.gz "$url"
-          tar xzf rcodesign.tar.gz
-          mkdir -p "$HOME/.local/bin"
-          mv "apple-codesign-${APPLE_CODESIGN_VERSION}-${arch}/rcodesign" "$HOME/.local/bin/rcodesign"
-          chmod +x "$HOME/.local/bin/rcodesign"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/rcodesign" --version
-      - name: Install Linux pkg builder tools
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y \
-            autoconf \
-            automake \
-            build-essential \
-            cpio \
-            git \
-            gzip \
-            libssl-dev \
-            libtool \
-            libxml2-dev \
-            make \
-            pkg-config \
-            zlib1g-dev \
-            zstd
+          rcodesign_tool="github:indygreg/apple-platform-rs@apple-codesign/${APPLE_CODESIGN_VERSION}"
+          mise install -y cargo:stuckliste-cli@0.4.0 "$rcodesign_tool"
 
-          git clone --depth 1 https://github.com/mackyle/xar.git "$RUNNER_TEMP/xar"
-          git -C "$RUNNER_TEMP/xar" fetch --depth 1 origin 66d451dab1ef859dd0c83995f2379335d35e53c9
-          git -C "$RUNNER_TEMP/xar" checkout 66d451dab1ef859dd0c83995f2379335d35e53c9
-          (
-            cd "$RUNNER_TEMP/xar/xar"
-            ./autogen.sh --noconfigure
-            ./configure --prefix=/usr/local
-            make -j"$(nproc)"
-            sudo make install
-          )
-          sudo ldconfig
+          stuckliste_bin="$(mise where cargo:stuckliste-cli@0.4.0)/bin"
+          rcodesign_dir="$(mise where "$rcodesign_tool")"
+          echo "$stuckliste_bin" >> "$GITHUB_PATH"
+          echo "$rcodesign_dir" >> "$GITHUB_PATH"
+          export PATH="$stuckliste_bin:$rcodesign_dir:$PATH"
 
-          git clone --depth 1 https://github.com/hogliux/bomutils.git "$RUNNER_TEMP/bomutils"
-          git -C "$RUNNER_TEMP/bomutils" fetch --depth 1 origin c247002e2f49878bab32dd0fcf805810ae0992cb
-          git -C "$RUNNER_TEMP/bomutils" checkout c247002e2f49878bab32dd0fcf805810ae0992cb
-          make -C "$RUNNER_TEMP/bomutils" all
-          echo "$RUNNER_TEMP/bomutils/build/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/bomutils/build/bin/mkbom" -h || true
+          command -v mkbom
+          command -v lsbom
+          command -v xar
+          command -v rcodesign
+          mkbom --help | sed -n '1,20p'
           xar --version || true
-          xar --help 2>&1 | grep -q -- '--no-compress'
+          (xar --help 2>&1 || true) | grep -q -- '--no-compress'
+          rcodesign --version | grep -q "$APPLE_CODESIGN_VERSION"
       - name: Pull Portl signing assets
+        shell: bash
         env:
           SIGNING_REPO_DEPLOY_KEY: ${{ secrets.SIGNING_REPO_DEPLOY_KEY }}
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
@@ -346,6 +340,7 @@ jobs:
             --p12-file "$signing_dir/portl/developer_id_installer.p12" \
             --p12-password-file "$signing_dir/portl/installer-p12-password" | sed -n '1,24p'
       - name: Prepare App Store Connect API key for rcodesign
+        shell: bash
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
@@ -364,6 +359,7 @@ jobs:
           chmod 600 "$api_json"
           echo "PORTL_NOTARY_API_KEY=$api_json" >> "$GITHUB_ENV"
       - name: Sign macOS binary and package tarballs
+        shell: bash
         env:
           COPYFILE_DISABLE: "1"
         run: |
@@ -391,9 +387,9 @@ jobs:
           )
           cp LICENSE-MIT CHANGELOG.md "staging/${NAME}/"
           tar -C staging --use-compress-program='zstd -19 -T0 --long' -cf "dist/${NAME}.tar.zst" "${NAME}"
-          (cd dist && shasum -a 256 "${NAME}.tar.zst" > "${NAME}.tar.zst.sha256")
+          (cd dist && sha256sum "${NAME}.tar.zst" > "${NAME}.tar.zst.sha256")
           tar -C staging -czf "dist/${NAME}.tar.gz" "${NAME}"
-          (cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
+          (cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
           echo "PORTL_SIGNED_BINARY=$signed_dir/portl" >> "$GITHUB_ENV"
       - name: Attach signed macOS tarballs
         uses: softprops/action-gh-release@v2
@@ -406,6 +402,7 @@ jobs:
             dist/*.tar.zst.sha256
           fail_on_unmatched_files: true
       - name: Build signed notarized home pkg
+        shell: bash
         run: |
           set -euo pipefail
           NAME="portl-${{ github.ref_name }}-${{ matrix.target }}"
@@ -428,7 +425,7 @@ jobs:
             --staple \
             --max-wait-seconds 3600 \
             "dist/${NAME}.pkg"
-          (cd dist && shasum -a 256 "${NAME}.pkg" > "${NAME}.pkg.sha256")
+          (cd dist && sha256sum "${NAME}.pkg" > "${NAME}.pkg.sha256")
       - name: Attach notarized macOS pkg
         uses: softprops/action-gh-release@v2
         with:
