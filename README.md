@@ -15,7 +15,7 @@ used for NAT traversal when direct paths are unavailable.
 
 ## Status
 
-**v0.10.3** — Herdr local-attach patch. Portl has persistent terminal
+**v0.10.4** — Herdr local-attach patch. Portl has persistent terminal
 sessions via `portl/session/v1`, provider discovery, Herdr bridge
 attach, zmx-control support, tmux `-CC` compatibility, `PORTL-S-*`
 short codes for importing shared session access through `portl accept`,
@@ -63,7 +63,7 @@ curl -fsSL \
 
 The installer is idempotent. Re-run it to upgrade; by default it preserves
 whether this machine was already configured as a client or agent. Set
-`PORTL_VERSION=0.10.3` to pin a release. Use `--agent=off` to disable the
+`PORTL_VERSION=0.10.4` to pin a release. Use `--agent=off` to disable the
 service, or `--uninstall` to remove binaries and service while keeping
 `$PORTL_HOME`. By default, Portl stores local state under `~/.portl` on
 all operating systems (`config/`, `data/`, `state/`, and `run/` subdirs).
@@ -83,7 +83,7 @@ portl-agent down            # stop/disable service, keeping state
 
 ```bash
 # mise
-mise use -g github:KnickKnackLabs/portl@0.10.3
+mise use -g github:KnickKnackLabs/portl@0.10.4
 # mise only shims `portl`; run install.sh with PORTL_AGENT=1 if this machine should be shared.
 
 # cargo
