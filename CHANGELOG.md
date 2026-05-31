@@ -13,6 +13,12 @@ All notable changes land here. This project follows
   GitHub Actions secret instead of hardcoding private repository details in the
   workflow.
 
+### Fixed
+
+- Local Herdr attach now treats a bridge-side shutdown during cleanup as a
+  normal close condition, avoiding a rare broken-pipe failure when the bridge
+  exits before the client copy task finishes.
+
 ## 0.10.4 — 2026-06-01
 
 ### Changed
