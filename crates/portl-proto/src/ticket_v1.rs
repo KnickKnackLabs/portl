@@ -38,6 +38,7 @@ mod tests {
                     ping: true,
                     info: true,
                 }),
+                unix: None,
             }),
             server_time: 1_735_689_600,
         };
