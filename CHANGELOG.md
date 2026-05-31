@@ -5,12 +5,20 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.10.5 — 2026-06-01
+
+### Changed
+
+- macOS release signing now reads the private signing repository URL from a
+  GitHub Actions secret instead of hardcoding private repository details in the
+  workflow.
+
+## 0.10.4 — 2026-06-01
+
 ### Changed
 
 - Herdr attach now accepts protocol 12 and forwards unknown future Herdr frames
   instead of requiring a Portl release for additive protocol events.
-
-## 0.10.4 — 2026-06-01
 
 ### Fixed
 
