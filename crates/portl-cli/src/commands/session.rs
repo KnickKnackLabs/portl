@@ -3295,15 +3295,20 @@ where
     Ok(())
 }
 
+const HERDR_SERVER_LANE_BUFFER: usize = 16;
+
 #[cfg(unix)]
-async fn pump_herdr_server_lanes_to_local<W>(
+async fn pump_herdr_server_lanes_to_local<W, C, R, B>(
     mut writer: W,
-    mut control: BufferedRecv,
-    mut render: BufferedRecv,
-    mut bulk: BufferedRecv,
+    mut control: C,
+    render: R,
+    bulk: B,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
+    C: AsyncRead + Unpin + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
+    B: AsyncRead + Unpin + Send + 'static,
 {
     let first = read_next_herdr_frame(&mut control, FrameDirection::ServerToClient)
         .await?
@@ -3311,37 +3316,101 @@ where
     validate_first_herdr_server_frame(&first)?;
     write_herdr_local_frame(&mut writer, &first).await?;
 
+    let (control_tx, mut control_rx) = mpsc::channel(HERDR_SERVER_LANE_BUFFER);
+    let (render_tx, mut render_rx) = mpsc::channel(HERDR_SERVER_LANE_BUFFER);
+    let (bulk_tx, mut bulk_rx) = mpsc::channel(HERDR_SERVER_LANE_BUFFER);
+    let control_task = tokio::spawn(read_herdr_server_lane(control, control_tx));
+    let render_task = tokio::spawn(read_herdr_server_lane(render, render_tx));
+    let bulk_task = tokio::spawn(read_herdr_server_lane(bulk, bulk_tx));
+
+    let result = pump_herdr_server_lane_events_to_local(
+        &mut writer,
+        &mut control_rx,
+        &mut render_rx,
+        &mut bulk_rx,
+    )
+    .await;
+    for task in [control_task, render_task, bulk_task] {
+        task.abort();
+        let _ = task.await;
+    }
+    result?;
+    writer
+        .shutdown()
+        .await
+        .context("shutdown herdr client socket")?;
+    Ok(())
+}
+
+async fn read_herdr_server_lane<R>(mut reader: R, tx: mpsc::Sender<Result<Option<RawHerdrFrame>>>)
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        match read_next_herdr_frame(&mut reader, FrameDirection::ServerToClient).await {
+            Ok(Some(frame)) => {
+                if tx.send(Ok(Some(frame))).await.is_err() {
+                    return;
+                }
+            }
+            Ok(None) => {
+                let _ = tx.send(Ok(None)).await;
+                return;
+            }
+            Err(err) => {
+                let _ = tx.send(Err(err)).await;
+                return;
+            }
+        }
+    }
+}
+
+async fn pump_herdr_server_lane_events_to_local<W>(
+    writer: &mut W,
+    control_rx: &mut mpsc::Receiver<Result<Option<RawHerdrFrame>>>,
+    render_rx: &mut mpsc::Receiver<Result<Option<RawHerdrFrame>>>,
+    bulk_rx: &mut mpsc::Receiver<Result<Option<RawHerdrFrame>>>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let mut control_open = true;
     let mut render_open = true;
     let mut bulk_open = true;
     while control_open || render_open || bulk_open {
         tokio::select! {
             biased;
-            frame = read_next_herdr_frame(&mut control, FrameDirection::ServerToClient), if control_open => {
-                match frame? {
-                    Some(frame) => write_herdr_local_frame(&mut writer, &frame).await?,
+            event = control_rx.recv(), if control_open => {
+                match decode_herdr_lane_event(event)? {
+                    Some(frame) => write_herdr_local_frame(writer, &frame).await?,
                     None => control_open = false,
                 }
             }
-            frame = read_next_herdr_frame(&mut render, FrameDirection::ServerToClient), if render_open => {
-                match frame? {
-                    Some(frame) => write_herdr_local_frame(&mut writer, &frame).await?,
+            event = render_rx.recv(), if render_open => {
+                match decode_herdr_lane_event(event)? {
+                    Some(frame) => write_herdr_local_frame(writer, &frame).await?,
                     None => render_open = false,
                 }
             }
-            frame = read_next_herdr_frame(&mut bulk, FrameDirection::ServerToClient), if bulk_open => {
-                match frame? {
-                    Some(frame) => write_herdr_local_frame(&mut writer, &frame).await?,
+            event = bulk_rx.recv(), if bulk_open => {
+                match decode_herdr_lane_event(event)? {
+                    Some(frame) => write_herdr_local_frame(writer, &frame).await?,
                     None => bulk_open = false,
                 }
             }
         }
     }
-    writer
-        .shutdown()
-        .await
-        .context("shutdown herdr client socket")?;
     Ok(())
+}
+
+fn decode_herdr_lane_event(
+    event: Option<Result<Option<RawHerdrFrame>>>,
+) -> Result<Option<RawHerdrFrame>> {
+    match event {
+        Some(Ok(frame)) => Ok(frame),
+        Some(Err(err)) => Err(err),
+        None => Ok(None),
+    }
 }
 
 fn validate_first_herdr_server_frame(frame: &RawHerdrFrame) -> Result<()> {
@@ -7989,7 +8058,8 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use portl_core::herdr_wire::{
-        ClientKeybindings, ClientMessage, HERDR_PROTOCOL_VERSION, RenderEncoding,
+        ClientKeybindings, ClientMessage, HERDR_PROTOCOL_VERSION, NotifyKind, RenderEncoding,
+        TerminalFrame,
     };
     use portl_core::peer_store::{PeerEntry, PeerOrigin, PeerStore};
     use portl_core::ticket_store::{SessionShareMetadata, TicketEntry};
@@ -10165,13 +10235,88 @@ mod tests {
     #[test]
     fn first_herdr_server_frame_must_be_welcome() {
         let notify = RawHerdrFrame::encode_server(&ServerMessage::Notify {
-            kind: portl_core::herdr_wire::NotifyKind::Toast,
+            kind: NotifyKind::Toast,
             message: "not yet".to_owned(),
         })
         .unwrap();
 
         let err = validate_first_herdr_server_frame(&notify).unwrap_err();
         assert!(err.to_string().contains("must be Welcome"));
+    }
+
+    #[tokio::test]
+    async fn herdr_server_lane_scheduler_preserves_frames_when_other_lane_wins_select() {
+        let welcome = RawHerdrFrame::encode_server(&ServerMessage::Welcome {
+            version: HERDR_PROTOCOL_VERSION,
+            encoding: RenderEncoding::SemanticFrame,
+            error: None,
+        })
+        .unwrap();
+        let notify = RawHerdrFrame::encode_server(&ServerMessage::Notify {
+            kind: NotifyKind::Toast,
+            message: "control-before-render".to_owned(),
+        })
+        .unwrap();
+        let render = RawHerdrFrame::encode_server(&ServerMessage::Terminal(TerminalFrame {
+            seq: 1,
+            width: 80,
+            height: 24,
+            full: true,
+            bytes: b"render-frame".to_vec(),
+        }))
+        .unwrap();
+
+        let (mut control_writer, control_reader) = tokio::io::duplex(4096);
+        let (mut render_writer, render_reader) = tokio::io::duplex(4096);
+        let (bulk_writer, bulk_reader) = tokio::io::duplex(4096);
+        let (local_writer, mut local_reader) = tokio::io::duplex(4096);
+
+        let pump = tokio::spawn(pump_herdr_server_lanes_to_local(
+            local_writer,
+            control_reader,
+            render_reader,
+            bulk_reader,
+        ));
+
+        control_writer
+            .write_all(welcome.framed_bytes())
+            .await
+            .unwrap();
+        let split = 2;
+        render_writer
+            .write_all(&render.framed_bytes()[..split])
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        control_writer
+            .write_all(notify.framed_bytes())
+            .await
+            .unwrap();
+        render_writer
+            .write_all(&render.framed_bytes()[split..])
+            .await
+            .unwrap();
+        drop(control_writer);
+        drop(render_writer);
+        drop(bulk_writer);
+
+        let first = read_next_herdr_frame(&mut local_reader, FrameDirection::ServerToClient)
+            .await
+            .unwrap()
+            .unwrap();
+        let second = read_next_herdr_frame(&mut local_reader, FrameDirection::ServerToClient)
+            .await
+            .unwrap()
+            .unwrap();
+        let third = read_next_herdr_frame(&mut local_reader, FrameDirection::ServerToClient)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first, welcome);
+        assert_eq!(second, notify);
+        assert_eq!(third, render);
+        pump.await.unwrap().unwrap();
     }
 
     #[test]
