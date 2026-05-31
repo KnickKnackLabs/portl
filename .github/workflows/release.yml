@@ -78,34 +78,19 @@ jobs:
           fi
           echo "OK: $CHECK -> $CONCLUSION"
 
-  release-build:
-    name: release build (${{ matrix.target }})
+  release-linux-build:
+    name: release linux build (${{ matrix.target }})
     needs: [ci-gate]
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # Linux builds use musl for a fully static binary that runs
-          # on any glibc version, Alpine, distroless, etc.
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            linux: true
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
-            linux: true
-          - target: x86_64-apple-darwin
-            os: macos-latest
-          - target: aarch64-apple-darwin
-            os: macos-latest
-    runs-on: ${{ matrix.os }}
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v5
       - uses: mozilla-actions/sccache-action@v0.0.9
-      # Per-target cache. `shared-key: release-<target>` so successive
-      # release tags (v0.1.1 → v0.1.2 → …) warm-start each other on the
-      # same target. First release on a new target is cold; after
-      # that, same-target releases benefit. Cross-target sharing is
-      # impossible because rustc output differs per target triple.
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: ${{ matrix.target }}
@@ -116,33 +101,154 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
-      - name: Install cargo-zigbuild (linux only)
-        # taiki-e/install-action downloads the prebuilt cargo-zigbuild
-        # binary — ~5 s vs ~1 min source build, decoupled from our
-        # pinned 1.93 toolchain.
-        if: matrix.linux
+      - name: Install cargo-zigbuild
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-zigbuild
-      - name: Build (linux musl via zigbuild)
-        if: matrix.linux
+      - name: Build linux musl via zigbuild
         run: cargo zigbuild --release --package portl-cli --target ${{ matrix.target }} --features ghostty-vt-static --bin portl
-      - name: Build (macOS native)
-        if: matrix.linux != true
+      - name: Package linux tarballs
+        run: |
+          set -euo pipefail
+          mkdir -p dist staging
+          NAME="portl-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "staging/${NAME}"
+          cp "target/${{ matrix.target }}/release/portl" "staging/${NAME}/portl"
+          (
+            cd "staging/${NAME}"
+            ln -sf portl portl-agent
+            ln -sf portl portl-gateway
+            ln -sf portl portl-ssh
+            test -L portl-agent
+            test -L portl-gateway
+            test -L portl-ssh
+          )
+          cp LICENSE-MIT CHANGELOG.md "staging/${NAME}/"
+          tar -C staging --use-compress-program='zstd -19 -T0 --long' -cf "dist/${NAME}.tar.zst" "${NAME}"
+          (cd dist && shasum -a 256 "${NAME}.tar.zst" > "${NAME}.tar.zst.sha256")
+          tar -C staging -czf "dist/${NAME}.tar.gz" "${NAME}"
+          (cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
+      - uses: actions/upload-artifact@v5
+        with:
+          name: release-linux-${{ matrix.target }}
+          path: dist/*
+
+  release-macos-build:
+    name: release macOS build (${{ matrix.target }})
+    needs: [ci-gate]
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v5
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+          cache-shared-key: "release-${{ matrix.target }}"
+          cache-save-if: true
+          cache-on-failure: true
+      - name: Install zig for Ghostty static link
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Build macOS native
         run: cargo build --release --package portl-cli --target ${{ matrix.target }} --features ghostty-vt-static --bin portl
-      - name: Install rcodesign (macOS only)
-        if: matrix.linux != true
+      - name: Upload raw macOS binary
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/portl" dist/portl
+      - uses: actions/upload-artifact@v5
+        with:
+          name: raw-macos-${{ matrix.target }}
+          path: dist/portl
+
+  release-publish:
+    name: publish GitHub release
+    needs: [release-linux-build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: release-linux-*
+          path: dist
+          merge-multiple: true
+      # Extract only the CHANGELOG section matching this tag's version
+      # so the GitHub release body shows what's new in this release,
+      # not the full file. CHANGELOG.md uses Keep-a-Changelog style
+      # headings like "## 0.3.1 — 2026-04-23"; we match on the second
+      # whitespace-delimited token after `## `. Fail if no section
+      # exists for the tag — tagging without a CHANGELOG entry is
+      # almost always a mistake.
+      - name: Extract release notes for ${{ github.ref_name }}
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          awk -v ver="$version" '
+            /^## / {
+              if (in_section) exit
+              if ($2 == ver) { in_section = 1; next }
+            }
+            in_section { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error ::no CHANGELOG.md section found for version $version"
+            echo "::error ::add a '## $version — YYYY-MM-DD' heading to CHANGELOG.md before tagging"
+            exit 1
+          fi
+          echo "--- release notes for $TAG ---"
+          cat release-notes.md
+          echo "--- end release notes ---"
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: portl ${{ github.ref_name }}
+          files: dist/*
+          body_path: release-notes.md
+          fail_on_unmatched_files: true
+
+  release-macos-sign-notarize:
+    name: sign/notarize macOS (${{ matrix.target }})
+    needs: [release-macos-build, release-publish]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          name: raw-macos-${{ matrix.target }}
+          path: raw
+      - name: Install rcodesign
         run: |
           set -euo pipefail
           if command -v rcodesign >/dev/null 2>&1 && rcodesign --version 2>/dev/null | grep -q "$APPLE_CODESIGN_VERSION"; then
-            echo "rcodesign $APPLE_CODESIGN_VERSION already installed"
+            rcodesign --version
             exit 0
           fi
           tmp=$(mktemp -d)
           cd "$tmp"
-          arch="aarch64-apple-darwin"
-          if [ "$(uname -m)" = "x86_64" ]; then
-            arch="x86_64-apple-darwin"
+          arch="x86_64-unknown-linux-musl"
+          if [ "$(uname -m)" = "aarch64" ]; then
+            arch="aarch64-unknown-linux-musl"
           fi
           url="https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign/${APPLE_CODESIGN_VERSION}/apple-codesign-${APPLE_CODESIGN_VERSION}-${arch}.tar.gz"
           curl -sSL -o rcodesign.tar.gz "$url"
@@ -152,8 +258,19 @@ jobs:
           chmod +x "$HOME/.local/bin/rcodesign"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/rcodesign" --version
-      - name: Pull Portl signing assets (macOS only)
-        if: matrix.linux != true
+      - name: Install Linux pkg builder tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential cpio git gzip make xar zstd
+          git clone --depth 1 https://github.com/hogliux/bomutils.git "$RUNNER_TEMP/bomutils"
+          git -C "$RUNNER_TEMP/bomutils" fetch --depth 1 origin c247002e2f49878bab32dd0fcf805810ae0992cb
+          git -C "$RUNNER_TEMP/bomutils" checkout c247002e2f49878bab32dd0fcf805810ae0992cb
+          make -C "$RUNNER_TEMP/bomutils" all
+          echo "$RUNNER_TEMP/bomutils/build/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bomutils/build/bin/mkbom" -h || true
+          xar --version || true
+      - name: Pull Portl signing assets
         env:
           SIGNING_REPO_DEPLOY_KEY: ${{ secrets.SIGNING_REPO_DEPLOY_KEY }}
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
@@ -201,33 +318,7 @@ jobs:
           rcodesign analyze-certificate \
             --p12-file "$signing_dir/portl/developer_id_installer.p12" \
             --p12-password-file "$signing_dir/portl/installer-p12-password" | sed -n '1,24p'
-      - name: Sign macOS binary
-        if: matrix.linux != true
-        run: |
-          set -euo pipefail
-          bin="target/${{ matrix.target }}/release/portl"
-          rcodesign sign \
-            --p12-file "$PORTL_SIGNING_P12" \
-            --p12-password-file "$PORTL_SIGNING_P12_PASSWORD_FILE" \
-            --binary-identifier com.un.portl \
-            --info-plist-file crates/portl-cli/resources/macos/PortlInfo.plist \
-            --for-notarization \
-            "$bin"
-          /usr/bin/codesign -dvvv "$bin" 2>&1 | head -20
-          /usr/bin/codesign --verify --strict --verbose=2 "$bin"
-      - name: Install asc for notarization (macOS only)
-        if: matrix.linux != true
-        run: |
-          set -euo pipefail
-          if command -v asc >/dev/null 2>&1; then
-            asc --version
-            exit 0
-          fi
-          curl -fsSL https://asccli.sh/install | INSTALL_DIR="$HOME/.local/bin" bash
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/asc" --version
-      - name: Setup ASC auth for notarization (macOS only)
-        if: matrix.linux != true
+      - name: Prepare App Store Connect API key for rcodesign
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
@@ -241,148 +332,87 @@ jobs:
           key_path="$RUNNER_TEMP/asc_api_key.p8"
           printf '%s' "$ASC_PRIVATE_KEY_B64" | base64 --decode > "$key_path"
           chmod 600 "$key_path"
-          echo "ASC_KEY_ID=$ASC_KEY_ID" >> "$GITHUB_ENV"
-          echo "ASC_ISSUER_ID=$ASC_ISSUER_ID" >> "$GITHUB_ENV"
-          echo "ASC_PRIVATE_KEY_PATH=$key_path" >> "$GITHUB_ENV"
-          echo "ASC_BYPASS_KEYCHAIN=1" >> "$GITHUB_ENV"
-          echo "ASC_PROFILE=" >> "$GITHUB_ENV"
-      - name: Package (tar.zst level 19)
+          api_json="$RUNNER_TEMP/appstore-api-key.json"
+          rcodesign encode-app-store-connect-api-key "$ASC_ISSUER_ID" "$ASC_KEY_ID" "$key_path" --output-path "$api_json"
+          chmod 600 "$api_json"
+          echo "PORTL_NOTARY_API_KEY=$api_json" >> "$GITHUB_ENV"
+      - name: Sign macOS binary and package tarballs
         env:
-          # Disable macOS AppleDouble metadata so tarballs produced on
-          # the macos-latest runners stay clean when extracted on linux.
           COPYFILE_DISABLE: "1"
         run: |
           set -euo pipefail
-          mkdir -p dist staging
           NAME="portl-${{ github.ref_name }}-${{ matrix.target }}"
+          signed_dir="$RUNNER_TEMP/${NAME}"
+          mkdir -p "$signed_dir" dist staging
+          install -m 0755 raw/portl "$signed_dir/portl"
+          rcodesign sign \
+            --p12-file "$PORTL_SIGNING_P12" \
+            --p12-password-file "$PORTL_SIGNING_P12_PASSWORD_FILE" \
+            --binary-identifier com.un.portl \
+            --info-plist-file crates/portl-cli/resources/macos/PortlInfo.plist \
+            --for-notarization \
+            "$signed_dir/portl"
+          rcodesign print-signature-info "$signed_dir/portl" | sed -n '1,40p'
+
           mkdir -p "staging/${NAME}"
-          cp "target/${{ matrix.target }}/release/portl" "staging/${NAME}/portl"
+          cp "$signed_dir/portl" "staging/${NAME}/portl"
           (
             cd "staging/${NAME}"
             ln -sf portl portl-agent
             ln -sf portl portl-gateway
             ln -sf portl portl-ssh
-            test -L portl-agent
-            test -L portl-gateway
-            test -L portl-ssh
           )
           cp LICENSE-MIT CHANGELOG.md "staging/${NAME}/"
-          # --no-mac-metadata strips any remaining com.apple.* xattrs
-          # on macos-latest runners; GNU tar on ubuntu-latest ignores
-          # the flag silently, so the invocation is portable.
-          tar_flags=(-C staging \
-              --use-compress-program='zstd -19 -T0 --long' \
-              -cf "dist/${NAME}.tar.zst" "${NAME}")
-          if tar --help 2>&1 | grep -q -- --no-mac-metadata; then
-              tar --no-mac-metadata "${tar_flags[@]}"
-          else
-              tar "${tar_flags[@]}"
-          fi
-          # Write the shasum with a path-less filename so users can
-          # `sha256sum -c ...sha256` next to the tarball without
-          # recreating a dist/ directory.
+          tar -C staging --use-compress-program='zstd -19 -T0 --long' -cf "dist/${NAME}.tar.zst" "${NAME}"
           (cd dist && shasum -a 256 "${NAME}.tar.zst" > "${NAME}.tar.zst.sha256")
-
-          # Also publish tar.gz so install.sh works on minimal
-          # containers (debian:stable-slim, alpine without zstd
-          # preinstalled). ~20% bigger than tar.zst; gzip is
-          # available in every libc and busybox tar.
-          tar_gz_flags=(-C staging -czf "dist/${NAME}.tar.gz" "${NAME}")
-          if tar --help 2>&1 | grep -q -- --no-mac-metadata; then
-              tar --no-mac-metadata "${tar_gz_flags[@]}"
-          else
-              tar "${tar_gz_flags[@]}"
-          fi
+          tar -C staging -czf "dist/${NAME}.tar.gz" "${NAME}"
           (cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
-      - name: Build signed notarized pkg (macOS only)
-        if: matrix.linux != true
-        env:
-          COPYFILE_DISABLE: "1"
+          echo "PORTL_SIGNED_BINARY=$signed_dir/portl" >> "$GITHUB_ENV"
+      - name: Attach signed macOS tarballs
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.tar.zst
+            dist/*.tar.zst.sha256
+          fail_on_unmatched_files: true
+      - name: Build signed notarized home pkg
         run: |
           set -euo pipefail
           NAME="portl-${{ github.ref_name }}-${{ matrix.target }}"
           PKG_VERSION="${{ github.ref_name }}"
           PKG_VERSION="${PKG_VERSION#v}"
-          payload="pkgroot/${NAME}"
-          bin_dir="$payload/usr/local/bin"
-          mkdir -p "$bin_dir" dist
-          install -m 0755 "target/${{ matrix.target }}/release/portl" "$bin_dir/portl"
-          for sub in portl-agent portl-gateway portl-ssh; do
-            install -m 0755 "$bin_dir/portl" "$bin_dir/$sub"
-            /usr/bin/codesign --verify --strict --verbose=1 "$bin_dir/$sub"
-          done
-
-          unsigned_pkg="dist/${NAME}.unsigned.pkg"
-          signed_pkg="dist/${NAME}.pkg"
-          pkgbuild \
-            --root "$payload" \
-            --identifier "com.un.portl.pkg" \
+          scripts/build-macos-home-pkg.sh \
+            --binary "$PORTL_SIGNED_BINARY" \
             --version "$PKG_VERSION" \
-            --install-location "/" \
-            "$unsigned_pkg"
+            --target "${{ matrix.target }}" \
+            --out dist \
+            --name "$NAME"
           rcodesign sign \
             --p12-file "$PORTL_INSTALLER_P12" \
             --p12-password-file "$PORTL_INSTALLER_P12_PASSWORD_FILE" \
             --for-notarization \
-            "$unsigned_pkg"
-          mv "$unsigned_pkg" "$signed_pkg"
-          pkgutil --check-signature "$signed_pkg"
-
-          asc notarization submit --file "$signed_pkg" --wait --timeout 1h --output table
-          xcrun stapler staple "$signed_pkg"
-          xcrun stapler validate "$signed_pkg"
-          spctl --assess --type install -vv "$signed_pkg"
+            "dist/${NAME}.pkg"
+          rcodesign notary-submit \
+            --api-key-file "$PORTL_NOTARY_API_KEY" \
+            --wait \
+            --staple \
+            --max-wait-seconds 3600 \
+            "dist/${NAME}.pkg"
           (cd dist && shasum -a 256 "${NAME}.pkg" > "${NAME}.pkg.sha256")
-      - uses: actions/upload-artifact@v5
-        with:
-          name: portl-${{ matrix.target }}
-          path: dist/*
-
-  release-publish:
-    name: publish GitHub release
-    needs: [release-build]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v5
-        with:
-          path: dist
-          merge-multiple: true
-      # Extract only the CHANGELOG section matching this tag's version
-      # so the GitHub release body shows what's new in this release,
-      # not the full file. CHANGELOG.md uses Keep-a-Changelog style
-      # headings like "## 0.3.1 — 2026-04-23"; we match on the second
-      # whitespace-delimited token after `## `. Fail if no section
-      # exists for the tag — tagging without a CHANGELOG entry is
-      # almost always a mistake.
-      - name: Extract release notes for ${{ github.ref_name }}
-        env:
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          version="${TAG#v}"
-          awk -v ver="$version" '
-            /^## / {
-              if (in_section) exit
-              if ($2 == ver) { in_section = 1; next }
-            }
-            in_section { print }
-          ' CHANGELOG.md > release-notes.md
-          if [ ! -s release-notes.md ]; then
-            echo "::error ::no CHANGELOG.md section found for version $version"
-            echo "::error ::add a '## $version — YYYY-MM-DD' heading to CHANGELOG.md before tagging"
-            exit 1
-          fi
-          echo "--- release notes for $TAG ---"
-          cat release-notes.md
-          echo "--- end release notes ---"
-      - name: Publish release
+      - name: Attach notarized macOS pkg
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: portl ${{ github.ref_name }}
-          files: dist/*
-          body_path: release-notes.md
+          files: |
+            dist/*.pkg
+            dist/*.pkg.sha256
           fail_on_unmatched_files: true
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: signed-macos-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: ignore

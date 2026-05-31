@@ -1,0 +1,65 @@
+name: Validate macOS Release Assets
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to validate, e.g. v0.10.3
+        required: true
+        type: string
+      install_current_user:
+        description: Install pkg into the runner user's home directory
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  validate-macos-assets:
+    name: validate macOS release assets
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download macOS pkg assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "$TAG" \
+            --pattern '*-apple-darwin.pkg' \
+            --pattern '*-apple-darwin.pkg.sha256' \
+            --dir dist
+          ls -la dist
+      - name: Validate signatures, notarization, and payloads
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          pkgs=(dist/*.pkg)
+          if [ "${#pkgs[@]}" -eq 0 ]; then
+            echo "::error ::no macOS pkg assets downloaded"
+            exit 1
+          fi
+          for pkg in "${pkgs[@]}"; do
+            echo "== $pkg =="
+            (cd "$(dirname "$pkg")" && shasum -a 256 -c "$(basename "$pkg").sha256")
+            pkgutil --check-signature "$pkg"
+            xcrun stapler validate "$pkg"
+            spctl --assess --type install -vv "$pkg"
+            pkgutil --payload-files "$pkg" | tee "${pkg}.payload-files"
+            grep -Fx './.local/bin/portl' "${pkg}.payload-files"
+            grep -Fx './.local/bin/portl-agent' "${pkg}.payload-files"
+            grep -Fx './.local/bin/portl-gateway' "${pkg}.payload-files"
+            grep -Fx './.local/bin/portl-ssh' "${pkg}.payload-files"
+          done
+      - name: Install into current user home
+        if: inputs.install_current_user
+        run: |
+          set -euo pipefail
+          for pkg in dist/*.pkg; do
+            echo "installing $pkg into CurrentUserHomeDirectory"
+            installer -pkg "$pkg" -target CurrentUserHomeDirectory -verboseR
+          done
+          "$HOME/.local/bin/portl" --version
+          "$HOME/.local/bin/portl-agent" --version
