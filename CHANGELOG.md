@@ -5,6 +5,8 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.10.2 — 2026-05-31
+
 ### Fixed
 
 - `portl attach <target>/herdr` now works when the target resolves to the
