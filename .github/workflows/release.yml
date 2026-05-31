@@ -305,13 +305,15 @@ jobs:
           mkdir -p "$HOME/.ssh"
           chmod 700 "$HOME/.ssh"
           keyfile="$HOME/.ssh/signing_repo_deploy_key"
+          known_hosts="$HOME/.ssh/known_hosts"
           printf '%s\n' "$SIGNING_REPO_DEPLOY_KEY" > "$keyfile"
           chmod 600 "$keyfile"
-          ssh-keyscan -t ed25519,rsa,ecdsa github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          ssh-keyscan -H -t ed25519,rsa,ecdsa github.com > "$known_hosts" 2>/dev/null
+          chmod 600 "$known_hosts"
 
           signing_dir="$RUNNER_TEMP/signing"
           rm -rf "$signing_dir"
-          GIT_SSH_COMMAND="ssh -i '$keyfile' -o IdentitiesOnly=yes" \
+          GIT_SSH_COMMAND="ssh -i '$keyfile' -o IdentitiesOnly=yes -o UserKnownHostsFile='$known_hosts' -o StrictHostKeyChecking=accept-new" \
             git clone --depth 1 "$SIGNING_REPO_URL" "$signing_dir"
 
           pw=$(mktemp)
