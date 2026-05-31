@@ -5,6 +5,16 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Added
+
+- Added repo-local App Store Connect automation skills for metadata,
+  TestFlight, screenshots, signing, pricing, and release workflows.
+
+### Changed
+
+- macOS release binaries are now signed and notarized, and the generated
+  launchd install service identifies itself with the Portl bundle metadata.
+
 ### Fixed
 
 - Herdr remote attach now reads Portl protocol lanes without canceling partial
