@@ -5,6 +5,14 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.10.6 — 2026-06-01
+
+### Fixed
+
+- macOS release signing now uses an explicit known-hosts file and SSH host-key
+  checking fallback when cloning the private signing repository, so the signing
+  jobs can pull encrypted certificates inside the Alpine container.
+
 ## 0.10.5 — 2026-06-01
 
 ### Changed
