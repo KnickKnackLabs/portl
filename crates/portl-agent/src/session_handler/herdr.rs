@@ -9,7 +9,7 @@ use portl_core::herdr_wire::{
 };
 use portl_core::wire::session::{SessionAck, SessionStreamKind, SessionSubTail};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
+use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::AgentState;
@@ -18,6 +18,7 @@ use crate::target_context::TargetProcessContext;
 
 const HERDR_LANE_BUFFER: usize = 64;
 const HERDR_RESIZE_BUFFER: usize = 1;
+const HERDR_RENDER_PENDING_LIMIT: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HerdrRenderFrameMeta {
@@ -43,13 +44,21 @@ struct HerdrRenderPendingFrame {
     frame: RawHerdrFrame,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct HerdrRenderPendingFrames {
+    max: usize,
     frames: VecDeque<HerdrRenderPendingFrame>,
 }
 
 impl HerdrRenderPendingFrames {
-    fn push(&mut self, frame: RawHerdrFrame) -> Result<()> {
+    fn new(max: usize) -> Self {
+        Self {
+            max,
+            frames: VecDeque::new(),
+        }
+    }
+
+    fn push_or_return(&mut self, frame: RawHerdrFrame) -> Result<Option<RawHerdrFrame>> {
         let meta = HerdrRenderFrameMeta::from_frame(&frame)?;
         match meta {
             HerdrRenderFrameMeta::SemanticFrame {
@@ -68,9 +77,12 @@ impl HerdrRenderPendingFrames {
             HerdrRenderFrameMeta::SemanticFrame { has_graphics: true }
             | HerdrRenderFrameMeta::Terminal { full: false } => {}
         }
+        if self.frames.len() >= self.max {
+            return Ok(Some(frame));
+        }
         self.frames
             .push_back(HerdrRenderPendingFrame { meta, frame });
-        Ok(())
+        Ok(None)
     }
 
     fn is_empty(&self) -> bool {
@@ -87,22 +99,39 @@ struct HerdrRenderSender {
     tx: mpsc::Sender<RawHerdrFrame>,
     pending: Arc<AsyncMutex<HerdrRenderPendingFrames>>,
     scheduled: Arc<std::sync::atomic::AtomicBool>,
+    notify_space: Arc<Notify>,
 }
 
 impl HerdrRenderSender {
     fn new(tx: mpsc::Sender<RawHerdrFrame>) -> Self {
         Self {
             tx,
-            pending: Arc::new(AsyncMutex::new(HerdrRenderPendingFrames::default())),
+            pending: Arc::new(AsyncMutex::new(HerdrRenderPendingFrames::new(
+                HERDR_RENDER_PENDING_LIMIT,
+            ))),
             scheduled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            notify_space: Arc::new(Notify::new()),
         }
     }
 
-    async fn send(&self, frame: RawHerdrFrame) -> Result<()> {
-        if self.tx.is_closed() {
-            anyhow::bail!("send herdr render frame");
+    async fn send(&self, mut frame: RawHerdrFrame) -> Result<()> {
+        loop {
+            if self.tx.is_closed() {
+                anyhow::bail!("send herdr render frame");
+            }
+            let returned = self.pending.lock().await.push_or_return(frame)?;
+            self.ensure_drain_task();
+            match returned {
+                Some(returned_frame) => {
+                    frame = returned_frame;
+                    self.notify_space.notified().await;
+                }
+                None => return Ok(()),
+            }
         }
-        self.pending.lock().await.push(frame)?;
+    }
+
+    fn ensure_drain_task(&self) {
         if !self
             .scheduled
             .swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -111,9 +140,9 @@ impl HerdrRenderSender {
                 self.tx.clone(),
                 Arc::clone(&self.pending),
                 Arc::clone(&self.scheduled),
+                Arc::clone(&self.notify_space),
             ));
         }
-        Ok(())
     }
 }
 
@@ -121,18 +150,28 @@ async fn drain_herdr_render_pending(
     tx: mpsc::Sender<RawHerdrFrame>,
     pending: Arc<AsyncMutex<HerdrRenderPendingFrames>>,
     scheduled: Arc<std::sync::atomic::AtomicBool>,
+    notify_space: Arc<Notify>,
 ) {
     loop {
-        let frame = pending.lock().await.pop_front();
+        let frame = {
+            let mut pending = pending.lock().await;
+            let frame = pending.pop_front();
+            if frame.is_some() {
+                notify_space.notify_one();
+            }
+            frame
+        };
         match frame {
             Some(frame) => {
                 if tx.send(frame).await.is_err() {
                     scheduled.store(false, std::sync::atomic::Ordering::Release);
+                    notify_space.notify_one();
                     return;
                 }
             }
             None => {
                 scheduled.store(false, std::sync::atomic::Ordering::Release);
+                notify_space.notify_one();
                 if pending.lock().await.is_empty() {
                     return;
                 }
@@ -603,19 +642,47 @@ impl ResizeCoalescer {
             .scheduled
             .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
-            let tx = self.tx.clone();
-            let latest = Arc::clone(&self.latest);
-            let scheduled = Arc::clone(&self.scheduled);
-            tokio::spawn(async move {
-                tokio::task::yield_now().await;
-                let frame = latest.lock().await.take();
-                scheduled.store(false, std::sync::atomic::Ordering::Release);
-                if let Some(frame) = frame {
-                    let _ = tx.send(frame).await;
-                }
-            });
+            tokio::spawn(drain_resize_coalescer(
+                self.tx.clone(),
+                Arc::clone(&self.latest),
+                Arc::clone(&self.scheduled),
+            ));
         }
         Ok(())
+    }
+}
+
+async fn drain_resize_coalescer(
+    tx: mpsc::Sender<RawHerdrFrame>,
+    latest: Arc<AsyncMutex<Option<RawHerdrFrame>>>,
+    scheduled: Arc<std::sync::atomic::AtomicBool>,
+) {
+    loop {
+        tokio::task::yield_now().await;
+        let Ok(permit) = tx.reserve().await else {
+            scheduled.store(false, std::sync::atomic::Ordering::Release);
+            return;
+        };
+        let Some(frame) = latest.lock().await.take() else {
+            drop(permit);
+            scheduled.store(false, std::sync::atomic::Ordering::Release);
+            if latest.lock().await.is_none()
+                || scheduled.swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                return;
+            }
+            continue;
+        };
+        permit.send(frame);
+        if latest.lock().await.is_some() {
+            continue;
+        }
+        scheduled.store(false, std::sync::atomic::Ordering::Release);
+        if latest.lock().await.is_none()
+            || scheduled.swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
     }
 }
 
@@ -739,6 +806,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn herdr_bridge_sender_backpressures_uncoalescible_render_backlog() {
+        let (mut stdout_writer, stdout_reader) = tokio::io::duplex(65_536);
+        let (control_tx, _control_rx) = mpsc::channel(4);
+        let (render_tx, mut render_rx) = mpsc::channel(1);
+        let (bulk_tx, _bulk_rx) = mpsc::channel(4);
+        let frames: Vec<_> = (0..80)
+            .map(|seq| terminal_server_frame(seq, false, format!("diff-{seq}").as_bytes()))
+            .collect();
+
+        let mut pump = tokio::spawn(pump_bridge_stdout_to_server_lanes(
+            stdout_reader,
+            control_tx,
+            render_tx,
+            bulk_tx,
+        ));
+        write_server_frames(&mut stdout_writer, &frames).await;
+        drop(stdout_writer);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut pump)
+                .await
+                .is_err(),
+            "stdout pump should backpressure rather than buffer unbounded terminal diffs"
+        );
+
+        let mut delivered = Vec::new();
+        while delivered.len() < frames.len() {
+            let Some(frame) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), render_rx.recv())
+                    .await
+                    .expect("render diffs should drain once receiver catches up")
+            else {
+                break;
+            };
+            delivered.push(frame);
+        }
+        pump.await.unwrap().unwrap();
+        assert_eq!(delivered, frames);
+    }
+
+    #[tokio::test]
     async fn herdr_bridge_sender_preserves_terminal_diffs() {
         let (mut stdout_writer, stdout_reader) = tokio::io::duplex(8192);
         let (control_tx, _control_rx) = mpsc::channel(4);
@@ -858,6 +966,81 @@ mod tests {
         .await
         .expect_err("non-Hello first frame should fail");
         assert!(err.to_string().contains("first Herdr client control frame"));
+    }
+
+    #[tokio::test]
+    async fn resize_coalescer_emits_latest_resize_under_backpressure() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(
+            RawHerdrFrame::encode_client(&ClientMessage::Resize {
+                cols: 80,
+                rows: 24,
+                cell_width_px: 0,
+                cell_height_px: 0,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let coalescer = ResizeCoalescer::new(tx);
+
+        coalescer
+            .send(
+                RawHerdrFrame::encode_client(&ClientMessage::Resize {
+                    cols: 100,
+                    rows: 30,
+                    cell_width_px: 0,
+                    cell_height_px: 0,
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(50), async {
+            loop {
+                if coalescer.latest.lock().await.is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        coalescer
+            .send(
+                RawHerdrFrame::encode_client(&ClientMessage::Resize {
+                    cols: 120,
+                    rows: 40,
+                    cell_width_px: 0,
+                    cell_height_px: 0,
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let first = rx.recv().await.unwrap();
+        assert!(matches!(
+            first.decode_client().unwrap(),
+            ClientMessage::Resize { cols: 80, .. }
+        ));
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("latest resize should be delivered after backpressure clears")
+            .expect("resize channel should remain open");
+        assert!(matches!(
+            second.decode_client().unwrap(),
+            ClientMessage::Resize {
+                cols: 120,
+                rows: 40,
+                ..
+            }
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "stale intermediate resize should remain coalesced"
+        );
     }
 
     #[tokio::test]
