@@ -368,18 +368,12 @@ fn portl_ssh_proxy_subcommands_parse() {
         }
     );
 
-    let default_config = parse(argv(&[
-        "portl",
-        "ssh-config",
-        "--mode",
-        "sshd-proxy",
-        "vn3",
-    ]))
-    .expect("ssh-config defaults");
+    let default_config = parse(argv(&["portl", "ssh-config", "vn3"]))
+        .expect("ssh-config defaults to native ProxyCommand mode");
     assert_eq!(
         default_config,
         Command::SshConfig {
-            mode: SshConfigMode::SshdProxy,
+            mode: SshConfigMode::NativeProxycommand,
             target: "vn3".to_owned(),
             host_alias: None,
             remote_host: "127.0.0.1".to_owned(),

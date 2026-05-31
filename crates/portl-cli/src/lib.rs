@@ -31,6 +31,8 @@ pub enum InitiatorMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SshConfigMode {
+    /// Generate a no-sshd `ProxyCommand` config backed by `portl ssh --stdio`.
+    NativeProxycommand,
     /// Generate a `ProxyCommand` config that tunnels to a real sshd on the Portl target.
     SshdProxy,
 }
@@ -883,7 +885,7 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             remote_host,
             remote_port,
             portl_bin,
-        } => commands::ssh_proxy::print_config(
+        } => commands::ssh_config::print_config(
             mode,
             &target,
             host_alias.as_deref(),
@@ -1648,7 +1650,7 @@ enum ConnectTopLevel {
     #[command(display_order = 177)]
     SshConfig {
         /// Config generation mode.
-        #[arg(long, value_enum)]
+        #[arg(long, value_enum, default_value_t = SshConfigMode::NativeProxycommand)]
         mode: SshConfigMode,
         #[arg(help = TARGET_HELP, value_name = "TARGET")]
         target: String,

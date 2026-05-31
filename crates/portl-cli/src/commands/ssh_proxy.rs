@@ -1,4 +1,3 @@
-use std::fmt::Write as _;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
@@ -6,7 +5,6 @@ use portl_core::net::open_tcp;
 use portl_core::ticket::schema::{Capabilities, PortRule};
 use tokio::io::{AsyncWriteExt, copy};
 
-use crate::SshConfigMode;
 use crate::commands::peer_resolve::{close_connected, connect_peer_quiet};
 
 pub fn run(peer: &str, host: &str, port: u16) -> Result<ExitCode> {
@@ -21,28 +19,6 @@ pub fn run(peer: &str, host: &str, port: u16) -> Result<ExitCode> {
     });
     runtime.shutdown_background();
     result
-}
-
-pub fn print_config(
-    mode: SshConfigMode,
-    target: &str,
-    host_alias: Option<&str>,
-    remote_host: &str,
-    remote_port: u16,
-    portl_bin: &str,
-) -> Result<ExitCode> {
-    print!(
-        "{}",
-        render_config(
-            mode,
-            target,
-            host_alias,
-            remote_host,
-            remote_port,
-            portl_bin
-        )?
-    );
-    Ok(ExitCode::SUCCESS)
 }
 
 async fn run_stdio_proxy(
@@ -89,49 +65,6 @@ async fn run_stdio_proxy(
     Ok(ExitCode::SUCCESS)
 }
 
-pub(crate) fn render_config(
-    mode: SshConfigMode,
-    target: &str,
-    host_alias: Option<&str>,
-    remote_host: &str,
-    remote_port: u16,
-    portl_bin: &str,
-) -> Result<String> {
-    match mode {
-        SshConfigMode::SshdProxy => render_sshd_proxy_config(
-            target,
-            host_alias.unwrap_or(target),
-            remote_host,
-            remote_port,
-            portl_bin,
-        ),
-    }
-}
-
-fn render_sshd_proxy_config(
-    target: &str,
-    host_alias: &str,
-    remote_host: &str,
-    remote_port: u16,
-    portl_bin: &str,
-) -> Result<String> {
-    validate_ssh_config_token("target", target)?;
-    validate_ssh_config_token("host alias", host_alias)?;
-    validate_ssh_config_token("remote host", remote_host)?;
-    validate_ssh_config_token("portl binary", portl_bin)?;
-    validate_exact_tcp_target(remote_host, remote_port)?;
-
-    let mut output = String::new();
-    writeln!(&mut output, "Host {host_alias}")?;
-    writeln!(&mut output, "  HostName {target}")?;
-    writeln!(&mut output, "  Port {remote_port}")?;
-    writeln!(
-        &mut output,
-        "  ProxyCommand {portl_bin} ssh-proxy %h --host {remote_host} --port %p"
-    )?;
-    Ok(output)
-}
-
 fn ensure_effective_tcp_cap_is_exact(caps: &Capabilities, host: &str, port: u16) -> Result<()> {
     let exact_count = caps
         .tcp
@@ -166,7 +99,7 @@ pub(crate) fn ssh_proxy_caps(host: &str, port: u16) -> Capabilities {
     }
 }
 
-fn validate_exact_tcp_target(host: &str, port: u16) -> Result<()> {
+pub(crate) fn validate_exact_tcp_target(host: &str, port: u16) -> Result<()> {
     if host.is_empty() {
         bail!("ssh-proxy --host must not be empty");
     }
@@ -183,45 +116,9 @@ fn validate_port(port: u16) -> Result<()> {
     Ok(())
 }
 
-fn validate_ssh_config_token(name: &str, value: &str) -> Result<()> {
-    if value.is_empty() {
-        bail!("ssh-config {name} must not be empty");
-    }
-    if value.bytes().any(is_unsafe_ssh_config_byte) {
-        bail!("ssh-config {name} contains unsafe characters");
-    }
-    Ok(())
-}
-
-fn is_unsafe_ssh_config_byte(byte: u8) -> bool {
-    byte.is_ascii_whitespace()
-        || matches!(
-            byte,
-            b'\''
-                | b'"'
-                | b'`'
-                | b'$'
-                | b'\\'
-                | b';'
-                | b'&'
-                | b'|'
-                | b'<'
-                | b'>'
-                | b'('
-                | b')'
-                | b'%'
-                | b'?'
-                | b'['
-                | b']'
-        )
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        ensure_effective_tcp_cap_is_exact, render_config, ssh_proxy_caps, validate_exact_tcp_target,
-    };
-    use crate::SshConfigMode;
+    use super::{ensure_effective_tcp_cap_is_exact, ssh_proxy_caps, validate_exact_tcp_target};
 
     #[test]
     fn ssh_proxy_caps_are_exact_to_host_and_port() {
@@ -265,66 +162,5 @@ mod tests {
     fn ssh_proxy_rejects_wildcard_host_caps() {
         let err = validate_exact_tcp_target("*", 22).expect_err("wildcard host must fail");
         assert!(err.to_string().contains("wildcards"));
-    }
-
-    #[test]
-    fn ssh_proxy_config_uses_percent_host_and_port() {
-        let config = render_config(
-            SshConfigMode::SshdProxy,
-            "vn3",
-            Some("vn3-sshd"),
-            "127.0.0.1",
-            2222,
-            "portl",
-        )
-        .expect("render config");
-        assert_eq!(
-            config,
-            "Host vn3-sshd\n  HostName vn3\n  Port 2222\n  ProxyCommand portl ssh-proxy %h --host 127.0.0.1 --port %p\n"
-        );
-    }
-
-    #[test]
-    fn ssh_proxy_config_rejects_wildcard_remote_host() {
-        let err = render_config(SshConfigMode::SshdProxy, "vn3", None, "*", 22, "portl")
-            .expect_err("wildcard remote host must fail");
-        assert!(err.to_string().contains("wildcards"));
-    }
-
-    #[test]
-    fn ssh_proxy_config_rejects_openssh_percent_tokens() {
-        let err = render_config(SshConfigMode::SshdProxy, "vn3", None, "%n", 22, "portl")
-            .expect_err("percent tokens must fail");
-        assert!(err.to_string().contains("unsafe"));
-    }
-
-    #[test]
-    fn ssh_proxy_config_rejects_shell_globs() {
-        for value in ["portl?", "portl[0]"] {
-            let err = render_config(
-                SshConfigMode::SshdProxy,
-                "vn3",
-                None,
-                "127.0.0.1",
-                22,
-                value,
-            )
-            .expect_err("glob metacharacters must fail");
-            assert!(err.to_string().contains("unsafe"));
-        }
-    }
-
-    #[test]
-    fn ssh_proxy_config_rejects_shell_metacharacters() {
-        let err = render_config(
-            SshConfigMode::SshdProxy,
-            "vn3;rm",
-            None,
-            "127.0.0.1",
-            22,
-            "portl",
-        )
-        .expect_err("unsafe target must fail");
-        assert!(err.to_string().contains("unsafe"));
     }
 }

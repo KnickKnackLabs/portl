@@ -232,12 +232,14 @@ portl session attach demo dev
 portl tcp demo -L 127.0.0.1:18080:127.0.0.1:80
 portl udp demo -L 60000:127.0.0.1:60000
 
-# OpenSSH ProxyCommand passthrough to a real sshd on the target.
+# No-sshd OpenSSH compatibility via Portl's native shell/exec lanes.
+mkdir -p ~/.portl/ssh
+portl ssh-config demo >> ~/.ssh/config
+ssh demo 'hostname'
+
+# OpenSSH ProxyCommand passthrough when a real sshd runs on the target.
 portl ssh-config --mode sshd-proxy demo --host demo-sshd
 ssh demo-sshd
-
-# No-sshd OpenSSH compatibility via Portl's native shell/exec lanes.
-ssh -o 'ProxyCommand=portl-ssh --stdio %h' demo 'hostname'
 
 portl docker rm demo --force
 ```
