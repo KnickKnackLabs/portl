@@ -184,12 +184,17 @@ async fn agent_forward_reverse_loop_survives_missing_local_agent() -> Result<()>
     let _ = failed_request.write_all(b"agent before local exists").await;
     failed_request.shutdown().await.ok();
     let mut ignored = Vec::new();
-    tokio::time::timeout(
+    let failed_read = tokio::time::timeout(
         Duration::from_secs(1),
         failed_request.read_to_end(&mut ignored),
     )
     .await
-    .context("failed request should close promptly")??;
+    .context("failed request should close promptly")?;
+    if let Err(err) = failed_read
+        && err.kind() != std::io::ErrorKind::ConnectionReset
+    {
+        return Err(err.into());
+    }
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
         !reverse_task.is_finished(),
