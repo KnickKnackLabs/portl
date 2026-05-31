@@ -5,6 +5,8 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.10.3 — 2026-06-01
+
 ### Added
 
 - Added repo-local App Store Connect automation skills for metadata,

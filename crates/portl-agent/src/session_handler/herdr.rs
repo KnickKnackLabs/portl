@@ -161,23 +161,20 @@ async fn drain_herdr_render_pending(
             }
             frame
         };
-        match frame {
-            Some(frame) => {
-                if tx.send(frame).await.is_err() {
-                    scheduled.store(false, std::sync::atomic::Ordering::Release);
-                    notify_space.notify_one();
-                    return;
-                }
-            }
-            None => {
+        if let Some(frame) = frame {
+            if tx.send(frame).await.is_err() {
                 scheduled.store(false, std::sync::atomic::Ordering::Release);
                 notify_space.notify_one();
-                if pending.lock().await.is_empty() {
-                    return;
-                }
-                if scheduled.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                    return;
-                }
+                return;
+            }
+        } else {
+            scheduled.store(false, std::sync::atomic::Ordering::Release);
+            notify_space.notify_one();
+            if pending.lock().await.is_empty() {
+                return;
+            }
+            if scheduled.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                return;
             }
         }
     }
