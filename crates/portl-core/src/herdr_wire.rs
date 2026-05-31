@@ -618,8 +618,10 @@ mod tests {
         let mut payload = bincode::serde::encode_to_vec(tag, bincode::config::standard())
             .expect("encode variant tag");
         payload.extend_from_slice(extra_payload);
+        let frame_len =
+            u32::try_from(payload.len()).expect("test payload fits in u32 frame length");
         let mut framed = Vec::new();
-        framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&frame_len.to_le_bytes());
         framed.extend_from_slice(&payload);
         framed
     }
