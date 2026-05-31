@@ -3019,19 +3019,22 @@ async fn bridge_local_herdr_socket(
         .context("missing herdr bridge stderr")?;
     let (mut socket_reader, mut socket_writer) = socket.into_split();
     let client_to_bridge = tokio::spawn(async move {
-        tokio::io::copy(&mut socket_reader, &mut bridge_stdin)
-            .await
-            .context("copy local herdr client to bridge")?;
-        bridge_stdin
-            .shutdown()
-            .await
-            .context("shutdown herdr bridge stdin")?;
+        copy_local_herdr_pipe(
+            &mut socket_reader,
+            &mut bridge_stdin,
+            "copy local herdr client to bridge",
+        )
+        .await?;
+        shutdown_local_herdr_writer(&mut bridge_stdin, "shutdown herdr bridge stdin").await?;
         Ok::<(), anyhow::Error>(())
     });
     let bridge_to_client = tokio::spawn(async move {
-        tokio::io::copy(&mut bridge_stdout, &mut socket_writer)
-            .await
-            .context("copy local herdr bridge to client")?;
+        copy_local_herdr_pipe(
+            &mut bridge_stdout,
+            &mut socket_writer,
+            "copy local herdr bridge to client",
+        )
+        .await?;
         let _ = socket_writer.shutdown().await;
         Ok::<(), anyhow::Error>(())
     });
@@ -3052,6 +3055,35 @@ async fn bridge_local_herdr_socket(
     bridge_to_client_result?;
     client_to_bridge_result?;
     Ok(status.code().unwrap_or(1))
+}
+
+#[cfg(unix)]
+async fn copy_local_herdr_pipe<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    context: &'static str,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin + ?Sized,
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    match tokio::io::copy(reader, writer).await {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(err) => Err(err).context(context),
+    }
+}
+
+#[cfg(unix)]
+async fn shutdown_local_herdr_writer<W>(writer: &mut W, context: &'static str) -> Result<()>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    match writer.shutdown().await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(err) => Err(err).context(context),
+    }
 }
 
 #[cfg(unix)]
