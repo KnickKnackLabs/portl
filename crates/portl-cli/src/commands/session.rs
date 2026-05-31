@@ -3296,6 +3296,110 @@ where
 }
 
 const HERDR_SERVER_LANE_BUFFER: usize = 16;
+const HERDR_PENDING_CONTROL_LIMIT: usize = 16;
+const HERDR_PENDING_RENDER_LIMIT: usize = 16;
+const HERDR_PENDING_BULK_LIMIT: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HerdrServerFrameMeta {
+    Welcome,
+    SemanticFrame { has_graphics: bool },
+    Terminal { seq: u64, full: bool },
+    Graphics,
+    ServerShutdown,
+    Notify,
+    Clipboard,
+    ReloadSoundConfig,
+    MouseCapture { enabled: bool },
+}
+
+impl HerdrServerFrameMeta {
+    fn from_frame(frame: &RawHerdrFrame) -> Result<Self> {
+        Ok(match frame.decode_server()? {
+            ServerMessage::Welcome { .. } => Self::Welcome,
+            ServerMessage::Frame(frame) => Self::SemanticFrame {
+                has_graphics: !frame.graphics.is_empty(),
+            },
+            ServerMessage::Terminal(frame) => Self::Terminal {
+                seq: frame.seq,
+                full: frame.full,
+            },
+            ServerMessage::Graphics { .. } => Self::Graphics,
+            ServerMessage::ServerShutdown { .. } => Self::ServerShutdown,
+            ServerMessage::Notify { .. } => Self::Notify,
+            ServerMessage::Clipboard { .. } => Self::Clipboard,
+            ServerMessage::ReloadSoundConfig => Self::ReloadSoundConfig,
+            ServerMessage::MouseCapture { enabled } => Self::MouseCapture { enabled },
+        })
+    }
+}
+
+#[derive(Debug)]
+struct HerdrPendingFrame {
+    meta: HerdrServerFrameMeta,
+    frame: RawHerdrFrame,
+}
+
+#[derive(Debug)]
+struct HerdrPendingFrames {
+    max: usize,
+    frames: VecDeque<HerdrPendingFrame>,
+}
+
+impl HerdrPendingFrames {
+    fn new(max: usize) -> Self {
+        Self {
+            max,
+            frames: VecDeque::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    fn can_accept(&self) -> bool {
+        self.frames.len() < self.max
+    }
+
+    fn push(&mut self, frame: RawHerdrFrame) -> Result<()> {
+        let meta = HerdrServerFrameMeta::from_frame(&frame)?;
+        match meta {
+            HerdrServerFrameMeta::SemanticFrame {
+                has_graphics: false,
+            } => self.frames.retain(|pending| {
+                !matches!(
+                    pending.meta,
+                    HerdrServerFrameMeta::SemanticFrame {
+                        has_graphics: false
+                    }
+                )
+            }),
+            HerdrServerFrameMeta::Terminal { full: true, .. } => self
+                .frames
+                .retain(|pending| !matches!(pending.meta, HerdrServerFrameMeta::Terminal { .. })),
+            HerdrServerFrameMeta::MouseCapture { .. } => self.frames.retain(|pending| {
+                !matches!(pending.meta, HerdrServerFrameMeta::MouseCapture { .. })
+            }),
+            HerdrServerFrameMeta::ReloadSoundConfig => self
+                .frames
+                .retain(|pending| pending.meta != HerdrServerFrameMeta::ReloadSoundConfig),
+            HerdrServerFrameMeta::SemanticFrame { has_graphics: true }
+            | HerdrServerFrameMeta::Terminal { full: false, .. }
+            | HerdrServerFrameMeta::Welcome
+            | HerdrServerFrameMeta::Graphics
+            | HerdrServerFrameMeta::ServerShutdown
+            | HerdrServerFrameMeta::Notify
+            | HerdrServerFrameMeta::Clipboard => {}
+        }
+        self.frames.push_back(HerdrPendingFrame { meta, frame });
+        Ok(())
+    }
+
+    fn pop_front(&mut self) -> Option<RawHerdrFrame> {
+        self.frames.pop_front().map(|pending| pending.frame)
+    }
+}
 
 #[cfg(unix)]
 async fn pump_herdr_server_lanes_to_local<W, C, R, B>(
@@ -3377,39 +3481,86 @@ where
     let mut control_open = true;
     let mut render_open = true;
     let mut bulk_open = true;
-    while control_open || render_open || bulk_open {
+    let mut control_pending = HerdrPendingFrames::new(HERDR_PENDING_CONTROL_LIMIT);
+    let mut render_pending = HerdrPendingFrames::new(HERDR_PENDING_RENDER_LIMIT);
+    let mut bulk_pending = HerdrPendingFrames::new(HERDR_PENDING_BULK_LIMIT);
+
+    while control_open
+        || render_open
+        || bulk_open
+        || !control_pending.is_empty()
+        || !render_pending.is_empty()
+        || !bulk_pending.is_empty()
+    {
+        drain_ready_herdr_lane_events(control_rx, &mut control_pending, &mut control_open)?;
+        drain_ready_herdr_lane_events(render_rx, &mut render_pending, &mut render_open)?;
+        drain_ready_herdr_lane_events(bulk_rx, &mut bulk_pending, &mut bulk_open)?;
+
+        if let Some(frame) = control_pending.pop_front() {
+            write_herdr_local_frame(writer, &frame).await?;
+            continue;
+        }
+        if let Some(frame) = render_pending.pop_front() {
+            write_herdr_local_frame(writer, &frame).await?;
+            continue;
+        }
+        if let Some(frame) = bulk_pending.pop_front() {
+            write_herdr_local_frame(writer, &frame).await?;
+            continue;
+        }
+
         tokio::select! {
             biased;
             event = control_rx.recv(), if control_open => {
-                match decode_herdr_lane_event(event)? {
-                    Some(frame) => write_herdr_local_frame(writer, &frame).await?,
-                    None => control_open = false,
-                }
+                apply_herdr_lane_event(event, &mut control_pending, &mut control_open)?;
             }
             event = render_rx.recv(), if render_open => {
-                match decode_herdr_lane_event(event)? {
-                    Some(frame) => write_herdr_local_frame(writer, &frame).await?,
-                    None => render_open = false,
-                }
+                apply_herdr_lane_event(event, &mut render_pending, &mut render_open)?;
             }
             event = bulk_rx.recv(), if bulk_open => {
-                match decode_herdr_lane_event(event)? {
-                    Some(frame) => write_herdr_local_frame(writer, &frame).await?,
-                    None => bulk_open = false,
-                }
+                apply_herdr_lane_event(event, &mut bulk_pending, &mut bulk_open)?;
             }
         }
     }
     Ok(())
 }
 
-fn decode_herdr_lane_event(
+fn drain_ready_herdr_lane_events(
+    rx: &mut mpsc::Receiver<Result<Option<RawHerdrFrame>>>,
+    pending: &mut HerdrPendingFrames,
+    open: &mut bool,
+) -> Result<()> {
+    if !*open {
+        return Ok(());
+    }
+    while pending.can_accept() {
+        match rx.try_recv() {
+            Ok(event) => apply_herdr_lane_event(Some(event), pending, open)?,
+            Err(mpsc::error::TryRecvError::Empty) => break,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                *open = false;
+                break;
+            }
+        }
+        if !*open {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn apply_herdr_lane_event(
     event: Option<Result<Option<RawHerdrFrame>>>,
-) -> Result<Option<RawHerdrFrame>> {
+    pending: &mut HerdrPendingFrames,
+    open: &mut bool,
+) -> Result<()> {
     match event {
-        Some(Ok(frame)) => Ok(frame),
+        Some(Ok(Some(frame))) => pending.push(frame),
+        Some(Ok(None)) | None => {
+            *open = false;
+            Ok(())
+        }
         Some(Err(err)) => Err(err),
-        None => Ok(None),
     }
 }
 
@@ -8058,8 +8209,8 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use portl_core::herdr_wire::{
-        ClientKeybindings, ClientMessage, HERDR_PROTOCOL_VERSION, NotifyKind, RenderEncoding,
-        TerminalFrame,
+        ClientKeybindings, ClientMessage, FrameData, HERDR_PROTOCOL_VERSION, NotifyKind,
+        RenderEncoding, TerminalFrame,
     };
     use portl_core::peer_store::{PeerEntry, PeerOrigin, PeerStore};
     use portl_core::ticket_store::{SessionShareMetadata, TicketEntry};
@@ -10242,6 +10393,141 @@ mod tests {
 
         let err = validate_first_herdr_server_frame(&notify).unwrap_err();
         assert!(err.to_string().contains("must be Welcome"));
+    }
+
+    fn empty_herdr_frame(graphics: Vec<u8>) -> FrameData {
+        FrameData {
+            cells: Vec::new(),
+            width: 0,
+            height: 0,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics,
+        }
+    }
+
+    #[test]
+    fn herdr_pending_frames_coalesces_semantic_frames_to_latest() {
+        let first =
+            RawHerdrFrame::encode_server(&ServerMessage::Frame(empty_herdr_frame(Vec::new())))
+                .unwrap();
+        let latest =
+            RawHerdrFrame::encode_server(&ServerMessage::Frame(empty_herdr_frame(Vec::new())))
+                .unwrap();
+        let mut pending = HerdrPendingFrames::new(16);
+
+        pending.push(first).unwrap();
+        pending.push(latest.clone()).unwrap();
+
+        assert_eq!(pending.pop_front(), Some(latest));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn herdr_pending_frames_preserves_terminal_diffs() {
+        let first = RawHerdrFrame::encode_server(&ServerMessage::Terminal(TerminalFrame {
+            seq: 1,
+            width: 80,
+            height: 24,
+            full: false,
+            bytes: b"diff-1".to_vec(),
+        }))
+        .unwrap();
+        let second = RawHerdrFrame::encode_server(&ServerMessage::Terminal(TerminalFrame {
+            seq: 2,
+            width: 80,
+            height: 24,
+            full: false,
+            bytes: b"diff-2".to_vec(),
+        }))
+        .unwrap();
+        let mut pending = HerdrPendingFrames::new(16);
+
+        pending.push(first.clone()).unwrap();
+        pending.push(second.clone()).unwrap();
+
+        assert_eq!(pending.pop_front(), Some(first));
+        assert_eq!(pending.pop_front(), Some(second));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn herdr_pending_frames_full_terminal_supersedes_queued_terminal_frames() {
+        let diff = RawHerdrFrame::encode_server(&ServerMessage::Terminal(TerminalFrame {
+            seq: 1,
+            width: 80,
+            height: 24,
+            full: false,
+            bytes: b"diff".to_vec(),
+        }))
+        .unwrap();
+        let full = RawHerdrFrame::encode_server(&ServerMessage::Terminal(TerminalFrame {
+            seq: 2,
+            width: 80,
+            height: 24,
+            full: true,
+            bytes: b"full".to_vec(),
+        }))
+        .unwrap();
+        let mut pending = HerdrPendingFrames::new(16);
+
+        pending.push(diff).unwrap();
+        pending.push(full.clone()).unwrap();
+
+        assert_eq!(pending.pop_front(), Some(full));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn herdr_pending_frames_never_drops_side_effect_messages() {
+        let notify = RawHerdrFrame::encode_server(&ServerMessage::Notify {
+            kind: NotifyKind::Toast,
+            message: "one".to_owned(),
+        })
+        .unwrap();
+        let clipboard = RawHerdrFrame::encode_server(&ServerMessage::Clipboard {
+            data: "Zm9v".to_owned(),
+        })
+        .unwrap();
+        let graphics = RawHerdrFrame::encode_server(&ServerMessage::Graphics {
+            bytes: b"graphics".to_vec(),
+        })
+        .unwrap();
+        let shutdown = RawHerdrFrame::encode_server(&ServerMessage::ServerShutdown {
+            reason: Some("bye".to_owned()),
+        })
+        .unwrap();
+        let mut pending = HerdrPendingFrames::new(16);
+
+        pending.push(notify.clone()).unwrap();
+        pending.push(clipboard.clone()).unwrap();
+        pending.push(graphics.clone()).unwrap();
+        pending.push(shutdown.clone()).unwrap();
+
+        assert_eq!(pending.pop_front(), Some(notify));
+        assert_eq!(pending.pop_front(), Some(clipboard));
+        assert_eq!(pending.pop_front(), Some(graphics));
+        assert_eq!(pending.pop_front(), Some(shutdown));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn herdr_pending_frames_coalesces_mouse_capture_and_reload() {
+        let mouse_on =
+            RawHerdrFrame::encode_server(&ServerMessage::MouseCapture { enabled: true }).unwrap();
+        let mouse_off =
+            RawHerdrFrame::encode_server(&ServerMessage::MouseCapture { enabled: false }).unwrap();
+        let reload = RawHerdrFrame::encode_server(&ServerMessage::ReloadSoundConfig).unwrap();
+        let mut pending = HerdrPendingFrames::new(16);
+
+        pending.push(mouse_on).unwrap();
+        pending.push(reload.clone()).unwrap();
+        pending.push(mouse_off.clone()).unwrap();
+        pending.push(reload.clone()).unwrap();
+
+        assert_eq!(pending.pop_front(), Some(mouse_off));
+        assert_eq!(pending.pop_front(), Some(reload));
+        assert!(pending.is_empty());
     }
 
     #[tokio::test]
