@@ -8,8 +8,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use portl_agent::{AgentConfig, DiscoveryConfig, run_task};
 use portl_core::herdr_wire::{
-    ClientKeybindings, ClientMessage, FrameDirection, HERDR_PROTOCOL_VERSION, RawHerdrFrame,
-    RenderEncoding, ServerMessage,
+    ClientKeybindings, ClientLaunchMode, ClientMessage, FrameDirection, HERDR_PROTOCOL_VERSION,
+    RawHerdrFrame, RenderEncoding, ServerMessage,
 };
 use portl_core::id::Identity;
 use portl_core::net::shell_client::PtyCfg;
@@ -159,6 +159,7 @@ async fn session_herdr_provider_bridges_protocol_lanes() -> Result<()> {
         cell_height_px: 0,
         requested_encoding: RenderEncoding::SemanticFrame,
         keybindings: ClientKeybindings::Server,
+        launch_mode: ClientLaunchMode::App,
     })?;
     attach
         .client_control
@@ -259,6 +260,7 @@ async fn session_herdr_bridge_exits_when_attach_control_closes() -> Result<()> {
         cell_height_px: 0,
         requested_encoding: RenderEncoding::SemanticFrame,
         keybindings: ClientKeybindings::Server,
+        launch_mode: ClientLaunchMode::App,
     })?;
     attach
         .client_control

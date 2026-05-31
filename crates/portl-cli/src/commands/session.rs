@@ -3311,25 +3311,36 @@ enum HerdrServerFrameMeta {
     Clipboard,
     ReloadSoundConfig,
     MouseCapture { enabled: bool },
+    Unknown,
 }
 
 impl HerdrServerFrameMeta {
     fn from_frame(frame: &RawHerdrFrame) -> Result<Self> {
-        Ok(match frame.decode_server()? {
-            ServerMessage::Welcome { .. } => Self::Welcome,
-            ServerMessage::Frame(frame) => Self::SemanticFrame {
-                has_graphics: !frame.graphics.is_empty(),
+        Ok(match frame.server_variant_tag()? {
+            0 => Self::Welcome,
+            1 => match frame.decode_server() {
+                Ok(ServerMessage::Frame(frame)) => Self::SemanticFrame {
+                    has_graphics: !frame.graphics.is_empty(),
+                },
+                _ => Self::Unknown,
             },
-            ServerMessage::Terminal(frame) => Self::Terminal {
-                seq: frame.seq,
-                full: frame.full,
+            2 => match frame.decode_server() {
+                Ok(ServerMessage::Terminal(frame)) => Self::Terminal {
+                    seq: frame.seq,
+                    full: frame.full,
+                },
+                _ => Self::Unknown,
             },
-            ServerMessage::Graphics { .. } => Self::Graphics,
-            ServerMessage::ServerShutdown { .. } => Self::ServerShutdown,
-            ServerMessage::Notify { .. } => Self::Notify,
-            ServerMessage::Clipboard { .. } => Self::Clipboard,
-            ServerMessage::ReloadSoundConfig => Self::ReloadSoundConfig,
-            ServerMessage::MouseCapture { enabled } => Self::MouseCapture { enabled },
+            3 => Self::Graphics,
+            4 => Self::ServerShutdown,
+            5 => Self::Notify,
+            6 => Self::Clipboard,
+            7 => Self::ReloadSoundConfig,
+            8 => match frame.decode_server() {
+                Ok(ServerMessage::MouseCapture { enabled }) => Self::MouseCapture { enabled },
+                _ => Self::Unknown,
+            },
+            _ => Self::Unknown,
         })
     }
 }
@@ -3390,7 +3401,8 @@ impl HerdrPendingFrames {
             | HerdrServerFrameMeta::Graphics
             | HerdrServerFrameMeta::ServerShutdown
             | HerdrServerFrameMeta::Notify
-            | HerdrServerFrameMeta::Clipboard => {}
+            | HerdrServerFrameMeta::Clipboard
+            | HerdrServerFrameMeta::Unknown => {}
         }
         self.frames.push_back(HerdrPendingFrame { meta, frame });
         Ok(())
@@ -3565,7 +3577,7 @@ fn apply_herdr_lane_event(
 }
 
 fn validate_first_herdr_server_frame(frame: &RawHerdrFrame) -> Result<()> {
-    if matches!(frame.decode_server()?, ServerMessage::Welcome { .. }) {
+    if frame.is_server_welcome()? {
         Ok(())
     } else {
         anyhow::bail!("first Herdr server control frame must be Welcome")
@@ -8209,8 +8221,8 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use portl_core::herdr_wire::{
-        ClientKeybindings, ClientMessage, FrameData, HERDR_PROTOCOL_VERSION, NotifyKind,
-        RenderEncoding, TerminalFrame,
+        ClientKeybindings, ClientLaunchMode, ClientMessage, FrameData, HERDR_PROTOCOL_VERSION,
+        NotifyKind, RenderEncoding, TerminalFrame,
     };
     use portl_core::peer_store::{PeerEntry, PeerOrigin, PeerStore};
     use portl_core::ticket_store::{SessionShareMetadata, TicketEntry};
@@ -10677,6 +10689,7 @@ mod tests {
             cell_height_px: 0,
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
+            launch_mode: ClientLaunchMode::App,
         })
         .unwrap();
         let welcome = RawHerdrFrame::encode_server(&ServerMessage::Welcome {
@@ -10768,6 +10781,7 @@ mod tests {
             cell_height_px: 0,
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
+            launch_mode: ClientLaunchMode::App,
         })
         .unwrap();
         let welcome = RawHerdrFrame::encode_server(&ServerMessage::Welcome {

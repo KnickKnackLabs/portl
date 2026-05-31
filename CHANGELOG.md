@@ -5,6 +5,11 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Changed
+
+- Herdr attach now accepts protocol 12 and forwards unknown future Herdr frames
+  instead of requiring a Portl release for additive protocol events.
+
 ## 0.10.4 — 2026-06-01
 
 ### Fixed

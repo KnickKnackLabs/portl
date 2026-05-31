@@ -4,8 +4,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use iroh::endpoint::SendStream;
 use portl_core::herdr_wire::{
-    ClientLane, ClientMessage, FrameDirection, HerdrFrameError, MAX_FRAME_SIZE, RawHerdrFrame,
-    ServerLane, ServerMessage,
+    ClientLane, FrameDirection, HerdrFrameError, MAX_FRAME_SIZE, RawHerdrFrame, ServerLane,
+    ServerMessage,
 };
 use portl_core::wire::session::{SessionAck, SessionStreamKind, SessionSubTail};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -24,15 +24,22 @@ const HERDR_RENDER_PENDING_LIMIT: usize = 16;
 enum HerdrRenderFrameMeta {
     SemanticFrame { has_graphics: bool },
     Terminal { full: bool },
+    Unknown,
 }
 
 impl HerdrRenderFrameMeta {
     fn from_frame(frame: &RawHerdrFrame) -> Result<Self> {
-        Ok(match frame.decode_server()? {
-            ServerMessage::Frame(frame) => Self::SemanticFrame {
-                has_graphics: !frame.graphics.is_empty(),
+        Ok(match frame.server_variant_tag()? {
+            1 => match frame.decode_server() {
+                Ok(ServerMessage::Frame(frame)) => Self::SemanticFrame {
+                    has_graphics: !frame.graphics.is_empty(),
+                },
+                _ => Self::Unknown,
             },
-            ServerMessage::Terminal(frame) => Self::Terminal { full: frame.full },
+            2 => match frame.decode_server() {
+                Ok(ServerMessage::Terminal(frame)) => Self::Terminal { full: frame.full },
+                _ => Self::Unknown,
+            },
             _ => anyhow::bail!("non-render Herdr frame sent through render coalescer"),
         })
     }
@@ -75,7 +82,8 @@ impl HerdrRenderPendingFrames {
                 .frames
                 .retain(|pending| !matches!(pending.meta, HerdrRenderFrameMeta::Terminal { .. })),
             HerdrRenderFrameMeta::SemanticFrame { has_graphics: true }
-            | HerdrRenderFrameMeta::Terminal { full: false } => {}
+            | HerdrRenderFrameMeta::Terminal { full: false }
+            | HerdrRenderFrameMeta::Unknown => {}
         }
         if self.frames.len() >= self.max {
             return Ok(Some(frame));
@@ -494,7 +502,7 @@ where
         .recv()
         .await
         .context("herdr client control stream closed before Hello")?;
-    if !matches!(hello.decode_client()?, ClientMessage::Hello { .. }) {
+    if !hello.is_client_hello()? {
         anyhow::bail!("first Herdr client control frame must be Hello");
     }
     stdin
@@ -698,8 +706,9 @@ impl Drop for HerdrAttachRegistryGuard {
 mod tests {
     use super::*;
     use portl_core::herdr_wire::{
-        CellData, ClientKeybindings, ClientMessage, FrameData, HERDR_PROTOCOL_VERSION, NotifyKind,
-        RawHerdrFrame, RenderEncoding, ServerMessage, TerminalFrame,
+        CellData, ClientKeybindings, ClientLaunchMode, ClientMessage, FrameData,
+        HERDR_PROTOCOL_VERSION, NotifyKind, RawHerdrFrame, RenderEncoding, ServerMessage,
+        TerminalFrame,
     };
 
     fn hello_frame() -> RawHerdrFrame {
@@ -711,6 +720,7 @@ mod tests {
             cell_height_px: 0,
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
+            launch_mode: ClientLaunchMode::App,
         })
         .unwrap()
     }
