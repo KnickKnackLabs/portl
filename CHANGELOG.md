@@ -5,6 +5,12 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Fixed
+
+- `portl attach <target>/herdr` now works when the target resolves to the
+  local machine, launching the local Herdr client/bridge path instead of
+  rejecting `herdr` as an unsupported local session provider.
+
 ## 0.10.1 — 2026-05-30
 
 ### Fixed

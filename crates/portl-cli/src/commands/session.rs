@@ -803,13 +803,14 @@ async fn local_session_list_detailed(
     match provider {
         #[cfg(feature = "ghostty-vt")]
         Some("ghostty") => Ok(vec![local_ghostty_session_group(true).await?]),
+        Some("herdr") => Ok(vec![local_herdr_session_group(true).await?]),
         Some("zmx") => Ok(vec![local_zmx_session_group(true).await?]),
         Some("tmux") => Ok(vec![
             local_tmux_session_group(local_zmx_path_opt().is_none()).await?,
         ]),
         Some(other) => {
             anyhow::bail!(
-                "unsupported local session provider '{other}' (supported: default, ghostty, zmx, tmux)"
+                "unsupported local session provider '{other}' (supported: default, ghostty, herdr, zmx, tmux)"
             )
         }
         None => {
@@ -819,6 +820,11 @@ async fn local_session_list_detailed(
             groups.push(
                 local_ghostty_session_group(default_provider.as_deref() == Some("ghostty")).await?,
             );
+            if local_herdr_path_opt().is_some() {
+                groups.push(
+                    local_herdr_session_group(default_provider.as_deref() == Some("herdr")).await?,
+                );
+            }
             if local_zmx_path_opt().is_some() {
                 groups.push(
                     local_zmx_session_group(default_provider.as_deref() == Some("zmx")).await?,
@@ -844,6 +850,15 @@ async fn local_ghostty_session_group(is_default: bool) -> Result<SessionProvider
     })
 }
 
+async fn local_herdr_session_group(is_default: bool) -> Result<SessionProviderSessions> {
+    Ok(SessionProviderSessions {
+        provider: "herdr".to_owned(),
+        available: true,
+        default: is_default,
+        sessions: local_herdr_sessions_detailed().await?,
+    })
+}
+
 async fn local_zmx_session_group(is_default: bool) -> Result<SessionProviderSessions> {
     Ok(SessionProviderSessions {
         provider: "zmx".to_owned(),
@@ -860,6 +875,12 @@ async fn local_tmux_session_group(is_default: bool) -> Result<SessionProviderSes
         default: is_default,
         sessions: local_tmux_sessions_detailed().await?,
     })
+}
+
+async fn local_herdr_sessions_detailed() -> Result<Vec<SessionInfo>> {
+    let output = run_local_herdr_capture(&["session", "list", "--json"]).await?;
+    ensure_local_provider_success("herdr session list --json", &output)?;
+    parse_local_herdr_json_sessions(&output.stdout).context("parse herdr session list --json")
 }
 
 async fn local_zmx_sessions_detailed() -> Result<Vec<SessionInfo>> {
@@ -919,6 +940,36 @@ async fn local_tmux_list() -> Result<Vec<String>> {
         ensure_local_provider_success("tmux list-sessions", &output)?;
     }
     Ok(session_names_from_stdout(&output.stdout))
+}
+
+fn parse_local_herdr_json_sessions(stdout: &str) -> Option<Vec<SessionInfo>> {
+    let value: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    let items = value
+        .get("sessions")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| value.as_array())?;
+    Some(
+        items
+            .iter()
+            .filter_map(|item| match item {
+                serde_json::Value::String(name) => Some(SessionInfo {
+                    name: name.clone(),
+                    provider: "herdr".to_owned(),
+                    metadata: BTreeMap::new(),
+                }),
+                serde_json::Value::Object(object) => object
+                    .get("name")
+                    .or_else(|| object.get("session"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(|name| SessionInfo {
+                        name: name.to_owned(),
+                        provider: "herdr".to_owned(),
+                        metadata: stringify_local_json_object(object, &["name", "session"]),
+                    }),
+                _ => None,
+            })
+            .collect(),
+    )
 }
 
 fn parse_local_zmx_json_sessions(stdout: &str) -> Option<Vec<SessionInfo>> {
@@ -1020,6 +1071,9 @@ async fn local_session_run(
     match provider {
         #[cfg(feature = "ghostty-vt")]
         Some("ghostty") => portl_agent::ghostty_session_run(session, None, argv).await,
+        Some("herdr") => {
+            anyhow::bail!("persistent session provider 'herdr' does not support run")
+        }
         Some("zmx") => {
             let mut zmx_args = vec!["run", session];
             zmx_args.extend(argv.iter().map(String::as_str));
@@ -1028,7 +1082,7 @@ async fn local_session_run(
         Some("tmux") => anyhow::bail!("persistent session provider 'tmux' does not support run"),
         Some(other) => {
             anyhow::bail!(
-                "unsupported local session provider '{other}' (supported: default, ghostty, zmx, tmux)"
+                "unsupported local session provider '{other}' (supported: default, ghostty, herdr, zmx, tmux)"
             )
         }
         None => unreachable!("handled above"),
@@ -1063,6 +1117,7 @@ async fn local_session_history(provider: Option<&str>, session: &str) -> Result<
             ensure_local_provider_success("tmux capture-pane", &output)?;
             Ok(output.stdout)
         }
+        "herdr" => anyhow::bail!("persistent session provider 'herdr' does not support history"),
         other => unreachable!("unsupported provider {other}"),
     }
 }
@@ -1082,6 +1137,7 @@ async fn local_session_kill(provider: Option<&str>, session: &str) -> Result<()>
             let output = run_local_tmux_capture(&["kill-session", "-t", session]).await?;
             ensure_local_provider_success("tmux kill-session", &output)
         }
+        "herdr" => anyhow::bail!("persistent session provider 'herdr' does not support kill"),
         other => unreachable!("unsupported provider {other}"),
     }
 }
@@ -1105,10 +1161,35 @@ async fn local_session_attach(
     {
         #[cfg(feature = "ghostty-vt")]
         "ghostty" => local_ghostty_attach(target, session, cwd, argv).await,
+        "herdr" => local_herdr_attach(target, session, cwd, argv).await,
         "zmx" => local_zmx_attach(target, session, cwd, argv).await,
         "tmux" => local_tmux_attach(target, session, cwd, argv).await,
         other => unreachable!("unsupported provider {other}"),
     }
+}
+
+#[cfg(unix)]
+async fn local_herdr_attach(
+    target: &str,
+    session: &str,
+    cwd: Option<&str>,
+    _argv: &[String],
+) -> Result<ExitCode> {
+    let canonical_ref = canonical_session_ref(target, "herdr", session);
+    eprintln!("portl: using local session provider herdr");
+    eprintln!("portl: attaching to local session \"{canonical_ref}\"");
+    let code = bridge_local_herdr_attach(session, cwd, &canonical_ref).await?;
+    Ok(exit_code_from_i32(code))
+}
+
+#[cfg(not(unix))]
+async fn local_herdr_attach(
+    _target: &str,
+    _session: &str,
+    _cwd: Option<&str>,
+    _argv: &[String],
+) -> Result<ExitCode> {
+    anyhow::bail!("herdr attach requires Unix sockets")
 }
 
 #[cfg(feature = "ghostty-vt")]
@@ -1480,10 +1561,10 @@ async fn resolve_local_provider_for_session(
         match provider {
             #[cfg(feature = "ghostty-vt")]
             "ghostty" => return Ok(provider.to_owned()),
-            "zmx" | "tmux" => return Ok(provider.to_owned()),
+            "herdr" | "zmx" | "tmux" => return Ok(provider.to_owned()),
             other => {
                 anyhow::bail!(
-                    "unsupported local session provider '{other}' (supported: default, ghostty, zmx, tmux)"
+                    "unsupported local session provider '{other}' (supported: default, ghostty, herdr, zmx, tmux)"
                 )
             }
         }
@@ -1497,6 +1578,14 @@ async fn resolve_local_provider_for_session(
         .any(|entry| entry.name == session)
     {
         providers.push("ghostty".to_owned());
+    }
+    if local_herdr_path_opt().is_some()
+        && local_herdr_sessions_detailed()
+            .await?
+            .iter()
+            .any(|entry| entry.name == session)
+    {
+        providers.push("herdr".to_owned());
     }
     if local_zmx_path_opt().is_some() && local_zmx_list().await?.iter().any(|name| name == session)
     {
@@ -1539,6 +1628,13 @@ fn local_default_provider() -> Result<String> {
             anyhow::bail!("no local persistent session provider is installed")
         }
     }
+}
+
+async fn run_local_herdr_capture(
+    args: &[&str],
+) -> Result<portl_proto::session_v1::SessionRunResult> {
+    let path = local_herdr_path()?;
+    run_local_capture(&path, args).await
 }
 
 async fn run_local_zmx_capture(args: &[&str]) -> Result<portl_proto::session_v1::SessionRunResult> {
@@ -1652,7 +1748,7 @@ fn local_zmx_path() -> Result<PathBuf> {
 
 fn local_zmx_path_opt() -> Option<PathBuf> {
     configured_session_provider_path()
-        .filter(|path| !path_is_program(path, "tmux"))
+        .filter(|path| !path_is_program(path, "tmux") && !path_is_program(path, "herdr"))
         .filter(|path| path.exists())
         .or_else(|| find_on_safe_path("zmx"))
 }
@@ -2810,6 +2906,168 @@ async fn bridge_attach(
 }
 
 #[cfg(unix)]
+async fn bridge_local_herdr_attach(
+    session_name: &str,
+    cwd: Option<&str>,
+    canonical_ref: &str,
+) -> Result<i32> {
+    let socket_dir = HerdrSocketTempDir::create()?;
+    let socket_path = socket_dir.path().join("herdr-client.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path)
+        .with_context(|| format!("bind herdr client socket {}", socket_path.display()))?;
+    set_private_socket_permissions(&socket_path)?;
+    let mut bridge = spawn_local_herdr_bridge(session_name, cwd)?;
+    let mut child = spawn_local_herdr_client(&socket_path, canonical_ref)?;
+    let accepted = tokio::time::timeout(Duration::from_secs(10), listener.accept()).await;
+    let (socket, _) = match accepted {
+        Ok(Ok(accepted)) => accepted,
+        Ok(Err(err)) => {
+            let _ = child.kill().await;
+            let _ = bridge.kill().await;
+            return Err(err).context("accept local herdr client socket");
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = bridge.kill().await;
+            anyhow::bail!(
+                "local herdr client did not connect to {}",
+                socket_path.display()
+            );
+        }
+    };
+    let mut bridge_task =
+        tokio::spawn(async move { bridge_local_herdr_socket(socket, bridge).await });
+    tokio::select! {
+        status = child.wait() => {
+            let status = match status {
+                Ok(status) => status,
+                Err(err) => {
+                    bridge_task.abort();
+                    let _ = bridge_task.await;
+                    return Err(err).context("wait for herdr client");
+                }
+            };
+            let code = status.code().unwrap_or(1);
+            match tokio::time::timeout(Duration::from_secs(2), &mut bridge_task).await {
+                Ok(joined) => {
+                    joined.context("join local herdr bridge")??;
+                }
+                Err(_) => {
+                    bridge_task.abort();
+                    let _ = bridge_task.await;
+                }
+            }
+            Ok(code)
+        }
+        result = &mut bridge_task => {
+            if let Err(err) = result.context("join local herdr bridge")? {
+                let _ = child.kill().await;
+                return Err(err);
+            }
+            match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+                Ok(status) => Ok(status.context("wait for herdr client")?.code().unwrap_or(1)),
+                Err(_) => {
+                    let _ = child.kill().await;
+                    let status = child.wait().await.context("wait for killed herdr client")?;
+                    Ok(status.code().unwrap_or(1))
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn spawn_local_herdr_bridge(session_name: &str, cwd: Option<&str>) -> Result<Child> {
+    let path = local_herdr_path()?;
+    let mut command = Command::new(&path);
+    command.kill_on_drop(true);
+    command.arg("remote-client-bridge");
+    if session_name == "default" {
+        command.env_remove("HERDR_SESSION");
+    } else {
+        command.env("HERDR_SESSION", session_name);
+    }
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawn local herdr bridge via {}", path.display()))
+}
+
+#[cfg(unix)]
+async fn bridge_local_herdr_socket(
+    socket: tokio::net::UnixStream,
+    mut bridge: Child,
+) -> Result<i32> {
+    let mut bridge_stdin = bridge.stdin.take().context("missing herdr bridge stdin")?;
+    let mut bridge_stdout = bridge
+        .stdout
+        .take()
+        .context("missing herdr bridge stdout")?;
+    let mut bridge_stderr = bridge
+        .stderr
+        .take()
+        .context("missing herdr bridge stderr")?;
+    let (mut socket_reader, mut socket_writer) = socket.into_split();
+    let client_to_bridge = tokio::spawn(async move {
+        tokio::io::copy(&mut socket_reader, &mut bridge_stdin)
+            .await
+            .context("copy local herdr client to bridge")?;
+        bridge_stdin
+            .shutdown()
+            .await
+            .context("shutdown herdr bridge stdin")?;
+        Ok::<(), anyhow::Error>(())
+    });
+    let bridge_to_client = tokio::spawn(async move {
+        tokio::io::copy(&mut bridge_stdout, &mut socket_writer)
+            .await
+            .context("copy local herdr bridge to client")?;
+        let _ = socket_writer.shutdown().await;
+        Ok::<(), anyhow::Error>(())
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        let _ = bridge_stderr.read_to_end(&mut bytes).await;
+        if !bytes.is_empty() {
+            debug!(stderr = %String::from_utf8_lossy(&bytes), "local herdr bridge stderr");
+        }
+    });
+
+    let status = bridge.wait().await.context("wait for local herdr bridge")?;
+    let bridge_to_client_result =
+        await_local_herdr_copy_task(bridge_to_client, "local herdr bridge-to-client").await;
+    let client_to_bridge_result =
+        await_local_herdr_copy_task(client_to_bridge, "local herdr client-to-bridge").await;
+    let _ = stderr_task.await;
+    bridge_to_client_result?;
+    client_to_bridge_result?;
+    Ok(status.code().unwrap_or(1))
+}
+
+#[cfg(unix)]
+async fn await_local_herdr_copy_task(
+    mut task: tokio::task::JoinHandle<Result<()>>,
+    name: &'static str,
+) -> Result<()> {
+    match tokio::time::timeout(Duration::from_secs(2), &mut task).await {
+        Ok(joined) => joined.with_context(|| format!("join {name} task"))?,
+        Err(_) => {
+            task.abort();
+            match task.await {
+                Ok(result) => result,
+                Err(err) if err.is_cancelled() => Ok(()),
+                Err(err) => Err(err).with_context(|| format!("join aborted {name} task")),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
 async fn bridge_attach_herdr(session: HerdrSessionClient, canonical_ref: String) -> Result<i32> {
     eprintln!("portl: launching local Herdr client for \"{canonical_ref}\"");
     let socket_dir = HerdrSocketTempDir::create()?;
@@ -2910,6 +3168,7 @@ fn set_private_socket_permissions(socket_path: &std::path::Path) -> Result<()> {
 fn spawn_local_herdr_client(socket_path: &std::path::Path, canonical_ref: &str) -> Result<Child> {
     let path = local_herdr_path()?;
     let mut command = Command::new(&path);
+    command.kill_on_drop(true);
     command.arg("client");
     command.stdin(Stdio::inherit());
     command.stdout(Stdio::inherit());
@@ -3119,9 +3378,14 @@ fn local_herdr_path() -> Result<PathBuf> {
 }
 
 fn local_herdr_path_opt() -> Option<PathBuf> {
-    std::env::var_os("PORTL_HERDR_PATH")
-        .map(PathBuf::from)
+    configured_session_provider_path()
+        .filter(|path| path_is_program(path, "herdr"))
         .filter(|path| path.exists())
+        .or_else(|| {
+            std::env::var_os("PORTL_HERDR_PATH")
+                .map(PathBuf::from)
+                .filter(|path| path.exists())
+        })
         .or_else(|| find_on_safe_path("herdr"))
 }
 
@@ -7628,6 +7892,10 @@ async fn read_exit(recv: &mut BufferedRecv) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use portl_core::herdr_wire::{
+        ClientKeybindings, ClientMessage, HERDR_PROTOCOL_VERSION, RenderEncoding,
+    };
     use portl_core::peer_store::{PeerEntry, PeerOrigin, PeerStore};
     use portl_core::ticket_store::{SessionShareMetadata, TicketEntry};
     use tempfile::TempDir;
@@ -9829,6 +10097,254 @@ mod tests {
         );
 
         assert!(!env.iter().any(|(key, _)| key == "HERDR_REMOTE_KEYBINDINGS"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_herdr_list_reports_explicit_provider_as_default() {
+        let temp = TempDir::new().unwrap();
+        let fake_herdr = temp.path().join("herdr");
+        let log = temp.path().join("herdr.log");
+        write_fake_local_herdr(&fake_herdr, &log, "", "");
+        let _path_guard = EnvVarGuard::set("PORTL_HERDR_PATH", fake_herdr.as_os_str());
+
+        let groups = local_session_list_detailed(Some("herdr")).await.unwrap();
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].provider, "herdr");
+        assert!(groups[0].default);
+        assert_eq!(groups[0].sessions[0].name, "default");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_herdr_attach_spawns_client_and_bridge() {
+        let temp = TempDir::new().unwrap();
+        let fake_herdr = temp.path().join("herdr");
+        let log = temp.path().join("herdr.log");
+        let hello = RawHerdrFrame::encode_client(&ClientMessage::Hello {
+            version: HERDR_PROTOCOL_VERSION,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            requested_encoding: RenderEncoding::SemanticFrame,
+            keybindings: ClientKeybindings::Server,
+        })
+        .unwrap();
+        let welcome = RawHerdrFrame::encode_server(&ServerMessage::Welcome {
+            version: HERDR_PROTOCOL_VERSION,
+            encoding: RenderEncoding::SemanticFrame,
+            error: None,
+        })
+        .unwrap();
+        write_fake_local_herdr(
+            &fake_herdr,
+            &log,
+            &hex::encode(hello.framed_bytes()),
+            &hex::encode(welcome.framed_bytes()),
+        );
+        let _path_guard = EnvVarGuard::set("PORTL_HERDR_PATH", fake_herdr.as_os_str());
+        let _socket_guard = EnvVarGuard::set("HERDR_SOCKET_PATH", "must-not-leak");
+
+        let code = local_session_attach(Some("herdr"), "max-b265", "default", None, None, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(calls.contains("argv:client"), "calls were {calls:?}");
+        assert!(
+            calls.contains("argv:remote-client-bridge"),
+            "calls were {calls:?}"
+        );
+        assert!(
+            calls.contains("env:HERDR_REATTACH_COMMAND=portl attach max-b265/herdr/default"),
+            "calls were {calls:?}"
+        );
+        assert!(
+            calls.contains("env:HERDR_SOCKET_PATH=<unset>"),
+            "calls were {calls:?}"
+        );
+        assert!(
+            calls.contains("env:HERDR_SESSION=<unset>"),
+            "calls were {calls:?}"
+        );
+        assert!(
+            calls.contains(&format!(
+                "client_recv:{}",
+                hex::encode(welcome.framed_bytes())
+            )),
+            "calls were {calls:?}"
+        );
+        assert!(
+            calls.contains(&format!(
+                "bridge_recv:{}",
+                hex::encode(hello.framed_bytes())
+            )),
+            "calls were {calls:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_herdr_attach_sets_named_session_env() {
+        let temp = TempDir::new().unwrap();
+        let fake_herdr = temp.path().join("herdr");
+        let log = temp.path().join("herdr.log");
+        let hello = RawHerdrFrame::encode_client(&ClientMessage::Hello {
+            version: HERDR_PROTOCOL_VERSION,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            requested_encoding: RenderEncoding::SemanticFrame,
+            keybindings: ClientKeybindings::Server,
+        })
+        .unwrap();
+        let welcome = RawHerdrFrame::encode_server(&ServerMessage::Welcome {
+            version: HERDR_PROTOCOL_VERSION,
+            encoding: RenderEncoding::SemanticFrame,
+            error: None,
+        })
+        .unwrap();
+        write_fake_local_herdr(
+            &fake_herdr,
+            &log,
+            &hex::encode(hello.framed_bytes()),
+            &hex::encode(welcome.framed_bytes()),
+        );
+        let _path_guard = EnvVarGuard::set("PORTL_HERDR_PATH", fake_herdr.as_os_str());
+
+        let code = local_session_attach(
+            Some("herdr"),
+            "max-b265",
+            "fresh-test-session",
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains("env:HERDR_SESSION=fresh-test-session"),
+            "calls were {calls:?}"
+        );
+        assert!(
+            calls.contains(
+                "env:HERDR_REATTACH_COMMAND=portl attach max-b265/herdr/fresh-test-session"
+            ),
+            "calls were {calls:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(name);
+            unsafe { std::env::set_var(name, value) };
+            Self { name, previous }
+        }
+    }
+
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => unsafe { std::env::set_var(self.name, value) },
+                None => unsafe { std::env::remove_var(self.name) },
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_fake_local_herdr(
+        path: &std::path::Path,
+        log: &std::path::Path,
+        hello_hex: &str,
+        welcome_hex: &str,
+    ) {
+        let script = r#"#!/usr/bin/env python3
+import os
+import socket
+import struct
+import sys
+
+LOG = __LOG__
+HELLO = bytes.fromhex(__HELLO__)
+WELCOME = bytes.fromhex(__WELCOME__)
+
+def log(line):
+    with open(LOG, "a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+        handle.flush()
+
+def read_frame(stream):
+    length = stream.read(4)
+    if not length:
+        return None
+    if len(length) != 4:
+        log("partial-length")
+        return None
+    size = struct.unpack("<I", length)[0]
+    payload = stream.read(size)
+    if len(payload) != size:
+        log("partial-payload")
+        return None
+    return length + payload
+
+args = sys.argv[1:]
+log("argv:" + " ".join(args))
+if args == ["--version"]:
+    print("herdr fake")
+    raise SystemExit(0)
+if args == ["session", "list", "--json"]:
+    print('{"sessions":[{"name":"default"}]}')
+    raise SystemExit(0)
+if args == ["client"]:
+    log("env:HERDR_CLIENT_SOCKET_PATH=" + os.environ.get("HERDR_CLIENT_SOCKET_PATH", "<unset>"))
+    log("env:HERDR_REATTACH_COMMAND=" + os.environ.get("HERDR_REATTACH_COMMAND", "<unset>"))
+    log("env:HERDR_REMOTE_KEYBINDINGS=" + os.environ.get("HERDR_REMOTE_KEYBINDINGS", "<unset>"))
+    log("env:HERDR_SOCKET_PATH=" + os.environ.get("HERDR_SOCKET_PATH", "<unset>"))
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(os.environ["HERDR_CLIENT_SOCKET_PATH"])
+    sock.sendall(HELLO)
+    data = sock.recv(1024)
+    log("client_recv:" + data.hex())
+    sock.close()
+    raise SystemExit(0)
+if args == ["remote-client-bridge"]:
+    log("env:HERDR_SESSION=" + os.environ.get("HERDR_SESSION", "<unset>"))
+    first = read_frame(sys.stdin.buffer)
+    if first is not None:
+        log("bridge_recv:" + first.hex())
+        sys.stdout.buffer.write(WELCOME)
+        sys.stdout.buffer.flush()
+    while read_frame(sys.stdin.buffer) is not None:
+        pass
+    log("exit:remote-client-bridge")
+    raise SystemExit(0)
+print("unexpected args: " + " ".join(args), file=sys.stderr)
+raise SystemExit(64)
+"#
+        .replace("__LOG__", &format!("{:?}", log.display().to_string()))
+        .replace("__HELLO__", &format!("{hello_hex:?}"))
+        .replace("__WELCOME__", &format!("{welcome_hex:?}"));
+        std::fs::write(path, script).unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
     }
 
     #[cfg(unix)]
