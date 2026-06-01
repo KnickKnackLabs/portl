@@ -34,6 +34,7 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           gh release download "$TAG" \
+            --repo "${GITHUB_REPOSITORY}" \
             --pattern '*-apple-darwin.pkg' \
             --pattern '*-apple-darwin.pkg.sha256' \
             --pattern '*-apple-darwin.tar.gz' \
