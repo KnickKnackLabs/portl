@@ -20,7 +20,13 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Download macOS pkg assets
+      - name: Install validation tools
+        run: |
+          set -euo pipefail
+          if ! command -v zstd >/dev/null 2>&1; then
+            brew install zstd
+          fi
+      - name: Download macOS release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.tag }}
@@ -30,15 +36,75 @@ jobs:
           gh release download "$TAG" \
             --pattern '*-apple-darwin.pkg' \
             --pattern '*-apple-darwin.pkg.sha256' \
+            --pattern '*-apple-darwin.tar.gz' \
+            --pattern '*-apple-darwin.tar.gz.sha256' \
+            --pattern '*-apple-darwin.tar.zst' \
+            --pattern '*-apple-darwin.tar.zst.sha256' \
             --dir dist
           ls -la dist
-      - name: Validate signatures, notarization, and payloads
+      - name: Validate tarball signatures and native launch
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tarballs=(dist/*.tar.gz dist/*.tar.zst)
+          if [ "${#tarballs[@]}" -ne 4 ]; then
+            echo "::error ::expected 4 macOS tarballs, found ${#tarballs[@]}"
+            printf 'found: %s\n' "${tarballs[@]}"
+            exit 1
+          fi
+
+          native_target=""
+          case "$(uname -m)" in
+            arm64) native_target="aarch64-apple-darwin" ;;
+            x86_64) native_target="x86_64-apple-darwin" ;;
+          esac
+
+          for archive in "${tarballs[@]}"; do
+            echo "== $archive =="
+            (cd "$(dirname "$archive")" && shasum -a 256 -c "$(basename "$archive").sha256")
+
+            name="$(basename "$archive")"
+            dir="${name%.tar.gz}"
+            dir="${dir%.tar.zst}"
+            extract_dir="$(mktemp -d)"
+            case "$archive" in
+              *.tar.zst) zstd -dc "$archive" | tar -xf - -C "$extract_dir" ;;
+              *) tar -xf "$archive" -C "$extract_dir" ;;
+            esac
+            root="$extract_dir/$dir"
+            binary="$root/portl"
+
+            test -x "$binary"
+            test "$(readlink "$root/portl-agent")" = portl
+            test "$(readlink "$root/portl-gateway")" = portl
+            test "$(readlink "$root/portl-ssh")" = portl
+            codesign --verify --verbose=4 "$binary"
+            codesign -dvvv "$binary" 2>&1 | tee "${archive}.codesign"
+            grep -F 'Authority=Developer ID Application: Sherlock Technologies Inc (NM7NK4ZVD4)' "${archive}.codesign"
+            grep -F 'TeamIdentifier=NM7NK4ZVD4' "${archive}.codesign"
+            grep -E 'flags=.*runtime' "${archive}.codesign"
+
+            # Standalone Mach-O CLI tools can be notarized but cannot have
+            # tickets stapled to the raw executable. Exercise the native tarball
+            # payload under quarantine so Gatekeeper can consult the notary
+            # service for the submitted binary hash.
+            if [ -n "$native_target" ] && [[ "$dir" == *"$native_target" ]]; then
+              xattr -w com.apple.quarantine \
+                "0081;$(printf '%x' "$(date +%s)");GitHubActions;https://github.com/KnickKnackLabs/portl/releases/download/${TAG}/${name}" \
+                "$binary"
+              "$binary" --version | grep -Fx "portl ${TAG#v}"
+            fi
+          done
+      - name: Validate pkg signatures, notarization, and payloads
         run: |
           set -euo pipefail
           shopt -s nullglob
           pkgs=(dist/*.pkg)
-          if [ "${#pkgs[@]}" -eq 0 ]; then
-            echo "::error ::no macOS pkg assets downloaded"
+          if [ "${#pkgs[@]}" -ne 2 ]; then
+            echo "::error ::expected 2 macOS pkg assets, found ${#pkgs[@]}"
+            printf 'found: %s\n' "${pkgs[@]}"
             exit 1
           fi
           for pkg in "${pkgs[@]}"; do

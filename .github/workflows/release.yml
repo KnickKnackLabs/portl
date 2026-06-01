@@ -257,6 +257,7 @@ jobs:
             tar \
             xar \
             xz \
+            zip \
             zstd
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v5
@@ -362,7 +363,7 @@ jobs:
           rcodesign encode-app-store-connect-api-key "$ASC_ISSUER_ID" "$ASC_KEY_ID" "$key_path" --output-path "$api_json"
           chmod 600 "$api_json"
           echo "PORTL_NOTARY_API_KEY=$api_json" >> "$GITHUB_ENV"
-      - name: Sign macOS binary and package tarballs
+      - name: Sign and notarize macOS binary, then package tarballs
         shell: bash
         env:
           COPYFILE_DISABLE: "1"
@@ -381,6 +382,22 @@ jobs:
             "$signed_dir/portl"
           rcodesign print-signature-info "$signed_dir/portl" | sed -n '1,40p'
 
+          # Apple creates notary tickets for standalone binaries submitted inside
+          # ZIP archives, but those tickets cannot be stapled to raw Mach-O CLI
+          # files. Notarize the signed binary before building the tarballs so
+          # Gatekeeper can validate the tarball payload online; the pkg path
+          # below remains the offline-stapled macOS installer artifact.
+          notary_dir="$RUNNER_TEMP/${NAME}-notary"
+          notary_zip="$RUNNER_TEMP/${NAME}-notary.zip"
+          mkdir -p "$notary_dir"
+          cp "$signed_dir/portl" "$notary_dir/portl"
+          (cd "$notary_dir" && zip -qry "$notary_zip" portl)
+          rcodesign notary-submit \
+            --api-key-file "$PORTL_NOTARY_API_KEY" \
+            --wait \
+            --max-wait-seconds 3600 \
+            "$notary_zip"
+
           mkdir -p "staging/${NAME}"
           cp "$signed_dir/portl" "staging/${NAME}/portl"
           (
@@ -395,7 +412,7 @@ jobs:
           tar -C staging -czf "dist/${NAME}.tar.gz" "${NAME}"
           (cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
           echo "PORTL_SIGNED_BINARY=$signed_dir/portl" >> "$GITHUB_ENV"
-      - name: Attach signed macOS tarballs
+      - name: Attach signed notarized macOS tarballs
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}

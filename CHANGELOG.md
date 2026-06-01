@@ -5,6 +5,14 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.10.7 — 2026-06-01
+
+### Fixed
+
+- macOS release tarballs now notarize the signed command-line binary before
+  upload, and release validation checks tarball checksums, signatures, and a
+  quarantined native launch in addition to stapled installer packages.
+
 ## 0.10.6 — 2026-06-01
 
 ### Fixed
