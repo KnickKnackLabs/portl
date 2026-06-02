@@ -2,8 +2,10 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use portl_core::net::{
-    LocalUdpForwardHandle, UnixListenControl, open_udp, open_unix_listen,
-    run_local_forward as run_local_tcp_forward, run_local_unix_forward, run_unix_reverse_forwards,
+    LocalUdpForwardHandle, UnixListenControl, bind_local_forward_listener,
+    bind_local_unix_listener, open_udp, open_unix_listen,
+    run_local_forward_with_listener as run_local_tcp_forward_with_listener,
+    run_local_unix_forward_with_listener, run_unix_reverse_forwards,
 };
 use portl_core::ticket::schema::{Capabilities, PortRule};
 use portl_proto::udp_v1::UdpBind;
@@ -197,24 +199,52 @@ impl ForwardPlan {
 
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn start(&self, connected: &ConnectedPeer) -> Result<ForwardRuntime> {
-        let mut tasks = Vec::new();
-        let mut listen_controls = Vec::new();
-        let mut reverse_forwards = Vec::new();
+        let mut tcp_forwards = Vec::new();
+        let mut udp_forwards = Vec::new();
+        let mut unix_connects = Vec::new();
+        let mut unix_listens = Vec::new();
 
         for spec in &self.tcp {
             let local_addr = spec.local_addr();
-            let connection = connected.connection.clone();
-            let session = connected.session.clone();
-            let remote_host = spec.remote_host.clone();
-            let remote_port = spec.remote_port;
-            tasks.push(tokio::spawn(async move {
-                run_local_tcp_forward(connection, session, &local_addr, remote_host, remote_port)
-                    .await
-            }));
+            let listener = bind_local_forward_listener(&local_addr).await?;
+            tcp_forwards.push((
+                listener,
+                local_addr,
+                spec.remote_host.clone(),
+                spec.remote_port,
+            ));
         }
 
         for spec in &self.udp {
             let forward = LocalUdpForwardHandle::bind(&spec.local_addr())?;
+            udp_forwards.push((spec.clone(), forward));
+        }
+
+        for mode in &self.unix {
+            match mode {
+                socket::SocketMode::Connect {
+                    local,
+                    remote,
+                    cleanup,
+                    generated,
+                } => {
+                    if *generated {
+                        socket::ensure_generated_socket_parent(local, "portl-to-")?;
+                    }
+                    let listener = bind_local_unix_listener(local, *cleanup)?;
+                    unix_connects.push((listener, local.clone(), remote.clone()));
+                }
+                socket::SocketMode::Listen {
+                    remote,
+                    local,
+                    cleanup,
+                    ..
+                } => unix_listens.push((remote.clone(), local.clone(), *cleanup)),
+            }
+        }
+
+        let mut udp_ready = Vec::new();
+        for (spec, forward) in udp_forwards {
             let control = open_udp(
                 &connected.connection,
                 &connected.session,
@@ -226,9 +256,39 @@ impl ForwardPlan {
                 }],
             )
             .await?;
+            udp_ready.push((spec, forward, control));
+        }
+
+        let mut listen_controls = Vec::new();
+        let mut reverse_forwards = Vec::new();
+        for (remote, local, cleanup) in unix_listens {
+            let control =
+                open_unix_listen(&connected.connection, &connected.session, &remote, cleanup)
+                    .await?;
+            listen_controls.push(control);
+            reverse_forwards.push((remote, local));
+        }
+
+        let mut tasks = Vec::new();
+        for (listener, local_addr, remote_host, remote_port) in tcp_forwards {
+            let connection = connected.connection.clone();
+            let session = connected.session.clone();
+            tasks.push(tokio::spawn(async move {
+                run_local_tcp_forward_with_listener(
+                    listener,
+                    connection,
+                    session,
+                    local_addr,
+                    remote_host,
+                    remote_port,
+                )
+                .await
+            }));
+        }
+
+        for (spec, forward, control) in udp_ready {
             let connection = connected.connection.clone();
             let remote_port = spec.remote_port;
-            let spec = spec.clone();
             tasks.push(tokio::spawn(async move {
                 let opened_at = Instant::now();
                 let start_stats = forward.stats_snapshot();
@@ -252,42 +312,14 @@ impl ForwardPlan {
             }));
         }
 
-        for mode in &self.unix {
-            match mode {
-                socket::SocketMode::Connect {
-                    local,
-                    remote,
-                    cleanup,
-                    generated,
-                } => {
-                    if *generated {
-                        socket::ensure_generated_socket_parent(local, "portl-to-")?;
-                    }
-                    tasks.push(tokio::spawn(run_local_unix_forward(
-                        connected.connection.clone(),
-                        connected.session.clone(),
-                        local.clone(),
-                        remote.clone(),
-                        *cleanup,
-                    )));
-                }
-                socket::SocketMode::Listen {
-                    remote,
-                    local,
-                    cleanup,
-                    ..
-                } => {
-                    let control = open_unix_listen(
-                        &connected.connection,
-                        &connected.session,
-                        remote,
-                        *cleanup,
-                    )
-                    .await?;
-                    listen_controls.push(control);
-                    reverse_forwards.push((remote.clone(), local.clone()));
-                }
-            }
+        for (listener, local, remote) in unix_connects {
+            tasks.push(tokio::spawn(run_local_unix_forward_with_listener(
+                listener,
+                connected.connection.clone(),
+                connected.session.clone(),
+                local,
+                remote,
+            )));
         }
 
         if !reverse_forwards.is_empty() {
@@ -360,7 +392,12 @@ pub(crate) fn parse_for_target(peer: &str, args: &ForwardingArgs) -> Result<(Str
 #[cfg(test)]
 mod tests {
     use super::ForwardingArgs;
+    use crate::commands::peer_resolve::ConnectedPeer;
+    use portl_core::net::PeerSession;
+    use portl_core::test_util::pair;
     use portl_core::ticket::schema::{Capabilities, ShellCaps};
+
+    const TEST_ALPN: &[u8] = b"portl/forwarding-plan-start-test/v1";
 
     #[test]
     fn parses_mixed_local_and_remote_forwarding_flags() {
@@ -404,6 +441,116 @@ mod tests {
         assert_eq!(summary.matches("Forwarding through remote-dev").count(), 1);
         assert!(summary.contains("TCP ports:"));
         assert!(summary.contains("Unix sockets:"));
+    }
+
+    #[tokio::test]
+    async fn forwarding_plan_start_fails_before_session_when_tcp_port_is_occupied() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = occupied.local_addr().unwrap();
+        let (connected, accept_task) = connected_test_peer().await;
+        let args = ForwardingArgs {
+            local: vec![format!(
+                "{}:{}",
+                local_addr.port(),
+                local_addr.port().saturating_add(1)
+            )],
+            remote: Vec::new(),
+        };
+        let plan = args.parse("remote-dev", "local-dev").unwrap();
+
+        let err = match plan.start(&connected).await {
+            Ok(_) => panic!("occupied local TCP port should fail before attach/shell starts"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("bind local listener"), "{err}");
+        finish_connected_test_peer(connected, accept_task).await;
+    }
+
+    #[tokio::test]
+    async fn forwarding_plan_start_does_not_leave_partial_tcp_listener_when_later_bind_fails() {
+        let first_port = unused_tcp_port().await;
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let occupied_port = occupied.local_addr().unwrap().port();
+        let (connected, accept_task) = connected_test_peer().await;
+        let args = ForwardingArgs {
+            local: vec![
+                format!("{}:{}", first_port, first_port.saturating_add(1)),
+                format!("{}:{}", occupied_port, occupied_port.saturating_add(1)),
+            ],
+            remote: Vec::new(),
+        };
+        let plan = args.parse("remote-dev", "local-dev").unwrap();
+
+        let err = match plan.start(&connected).await {
+            Ok(_) => panic!("occupied second TCP port should fail plan startup"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("bind local listener"), "{err}");
+
+        let first_addr = format!("127.0.0.1:{first_port}");
+        let leaked_listener = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            tokio::net::TcpStream::connect(&first_addr),
+        )
+        .await;
+        assert!(
+            !matches!(leaked_listener, Ok(Ok(_))),
+            "failed plan startup left {first_addr} listening"
+        );
+        finish_connected_test_peer(connected, accept_task).await;
+    }
+
+    async fn unused_tcp_port() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    async fn connected_test_peer() -> (ConnectedPeer, tokio::task::JoinHandle<()>) {
+        let (client, server) = pair().await.expect("endpoint pair");
+        server.inner().set_alpns(vec![TEST_ALPN.to_vec()]);
+        let accept_task = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let incoming = server.inner().accept().await.expect("incoming connection");
+                let conn = incoming.await.expect("handshake");
+                conn.close(0u32.into(), b"done");
+            }
+        });
+        let connection = client
+            .inner()
+            .connect(server.addr(), TEST_ALPN)
+            .await
+            .expect("connect test endpoints");
+        let connected = ConnectedPeer {
+            endpoint: client.inner().clone(),
+            connection,
+            session: PeerSession {
+                peer_token: [0; 16],
+                effective_caps: Capabilities {
+                    presence: 0,
+                    shell: None,
+                    tcp: None,
+                    udp: None,
+                    fs: None,
+                    vpn: None,
+                    meta: None,
+                    unix: None,
+                },
+                server_time: 0,
+            },
+        };
+        (connected, accept_task)
+    }
+
+    async fn finish_connected_test_peer(
+        connected: ConnectedPeer,
+        accept_task: tokio::task::JoinHandle<()>,
+    ) {
+        connected.connection.close(0u32.into(), b"done");
+        tokio::time::timeout(std::time::Duration::from_secs(5), accept_task)
+            .await
+            .expect("accept task timeout")
+            .expect("accept task panic");
     }
 
     #[test]

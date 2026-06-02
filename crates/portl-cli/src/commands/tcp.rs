@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use portl_core::net::run_local_forward;
+use portl_core::net::{bind_local_forward_listener, run_local_forward_with_listener};
 use portl_core::ticket::schema::{Capabilities, PortRule};
 
 use crate::commands::peer_resolve::connect_peer;
@@ -21,13 +21,16 @@ pub fn run(peer: &str, specs: &[String]) -> Result<ExitCode> {
 
         let mut tasks = Vec::new();
         for parsed in parsed_specs {
+            let local_addr = parsed.local_addr();
+            let listener = bind_local_forward_listener(&local_addr).await?;
             let connection = connected.connection.clone();
             let session = connected.session.clone();
             tasks.push(tokio::spawn(async move {
-                run_local_forward(
+                run_local_forward_with_listener(
+                    listener,
                     connection,
                     session,
-                    &parsed.local_addr(),
+                    local_addr,
                     parsed.remote_host,
                     parsed.remote_port,
                 )

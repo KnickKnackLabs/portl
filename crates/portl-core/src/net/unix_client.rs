@@ -111,6 +111,30 @@ pub async fn open_unix_listen_with_options(
     })
 }
 
+pub struct LocalUnixForwardListener {
+    listener: UnixListener,
+    _cleanup: UnixSocketCleanup,
+}
+
+pub fn bind_local_unix_listener(
+    local_path: &str,
+    cleanup: bool,
+) -> Result<LocalUnixForwardListener> {
+    let local_path_buf = PathBuf::from(local_path);
+    if cleanup {
+        remove_existing_socket_for_bind(&local_path_buf)?;
+    }
+    let listener = UnixListener::bind(&local_path_buf)
+        .with_context(|| format!("bind local unix listener on {local_path}"))?;
+    Ok(LocalUnixForwardListener {
+        listener,
+        _cleanup: UnixSocketCleanup {
+            path: local_path_buf,
+            cleanup,
+        },
+    })
+}
+
 pub async fn run_local_unix_forward(
     connection: Connection,
     session: PeerSession,
@@ -118,17 +142,19 @@ pub async fn run_local_unix_forward(
     remote_path: String,
     cleanup: bool,
 ) -> Result<()> {
-    let local_path_buf = PathBuf::from(&local_path);
-    if cleanup {
-        remove_existing_socket_for_bind(&local_path_buf)?;
-    }
-    let listener = UnixListener::bind(&local_path_buf)
-        .with_context(|| format!("bind local unix listener on {local_path}"))?;
-    let _cleanup = UnixSocketCleanup {
-        path: local_path_buf,
-        cleanup,
-    };
+    let listener = bind_local_unix_listener(&local_path, cleanup)?;
+    run_local_unix_forward_with_listener(listener, connection, session, local_path, remote_path)
+        .await
+}
 
+pub async fn run_local_unix_forward_with_listener(
+    listener: LocalUnixForwardListener,
+    connection: Connection,
+    session: PeerSession,
+    local_path: String,
+    remote_path: String,
+) -> Result<()> {
+    let LocalUnixForwardListener { listener, _cleanup } = listener;
     loop {
         let (local, _) = listener
             .accept()
@@ -443,7 +469,23 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::time::Duration;
 
-    use super::{UnixForwardStats, format_close_line, remove_existing_socket_for_bind};
+    use super::{
+        UnixForwardStats, bind_local_unix_listener, format_close_line,
+        remove_existing_socket_for_bind,
+    };
+
+    #[test]
+    fn unix_forward_listener_bind_refuses_active_socket_before_session_starts() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("active.sock");
+        let _listener = UnixListener::bind(&path).unwrap();
+
+        let err = match bind_local_unix_listener(path.to_str().unwrap(), true) {
+            Ok(_) => panic!("active local socket should fail before session starts"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("already active"), "{err}");
+    }
 
     #[test]
     fn unix_close_line_includes_elapsed_and_byte_totals() {

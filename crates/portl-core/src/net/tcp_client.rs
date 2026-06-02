@@ -52,6 +52,12 @@ struct TcpForwardStats {
     downstream_bytes: u64,
 }
 
+pub async fn bind_local_forward_listener(local_addr: &str) -> Result<TcpListener> {
+    TcpListener::bind(local_addr)
+        .await
+        .with_context(|| format!("bind local listener on {local_addr}"))
+}
+
 pub async fn run_local_forward(
     connection: Connection,
     session: PeerSession,
@@ -59,10 +65,26 @@ pub async fn run_local_forward(
     remote_host: String,
     remote_port: u16,
 ) -> Result<()> {
-    let listener = TcpListener::bind(local_addr)
-        .await
-        .with_context(|| format!("bind local listener on {local_addr}"))?;
+    let listener = bind_local_forward_listener(local_addr).await?;
+    run_local_forward_with_listener(
+        listener,
+        connection,
+        session,
+        local_addr.to_owned(),
+        remote_host,
+        remote_port,
+    )
+    .await
+}
 
+pub async fn run_local_forward_with_listener(
+    listener: TcpListener,
+    connection: Connection,
+    session: PeerSession,
+    local_addr: String,
+    remote_host: String,
+    remote_port: u16,
+) -> Result<()> {
     loop {
         let (local, client_addr) = listener
             .accept()
@@ -71,7 +93,7 @@ pub async fn run_local_forward(
         let connection = connection.clone();
         let session = session.clone();
         let remote_host = remote_host.clone();
-        let local_addr = local_addr.to_owned();
+        let local_addr = local_addr.clone();
         tokio::spawn(async move {
             let started = Instant::now();
             eprintln!(
@@ -168,7 +190,18 @@ mod tests {
     use std::net::SocketAddr;
     use std::time::Duration;
 
-    use super::{TcpForwardStats, format_close_line};
+    use super::{TcpForwardStats, bind_local_forward_listener, format_close_line};
+
+    #[tokio::test]
+    async fn tcp_forward_listener_bind_fails_when_addr_is_in_use() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = occupied.local_addr().unwrap().to_string();
+
+        let err = bind_local_forward_listener(&addr)
+            .await
+            .expect_err("occupied local port should fail before session starts");
+        assert!(err.to_string().contains("bind local listener"), "{err}");
+    }
 
     #[test]
     fn tcp_close_line_includes_elapsed_and_byte_totals() {

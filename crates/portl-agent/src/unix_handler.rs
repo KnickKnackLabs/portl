@@ -294,12 +294,28 @@ fn ensure_generated_forward_parent(path: &Path) -> Result<Option<AgentParentClea
     if !is_generated_forward_parent(parent) {
         return Ok(None);
     }
-    std::fs::create_dir_all(parent).with_context(|| {
-        format!(
-            "create generated unix forwarding directory {}",
-            parent.display()
-        )
-    })?;
+    match std::fs::symlink_metadata(parent) {
+        Ok(metadata) => validate_generated_forward_parent_type(parent, &metadata)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(parent)
+                .with_context(|| {
+                    format!(
+                        "create generated unix forwarding directory {}",
+                        parent.display()
+                    )
+                })?;
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "stat generated unix forwarding directory {}",
+                    parent.display()
+                )
+            });
+        }
+    }
     std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).with_context(
         || {
             format!(
@@ -314,21 +330,37 @@ fn ensure_generated_forward_parent(path: &Path) -> Result<Option<AgentParentClea
             parent.display()
         )
     })?;
+    validate_generated_forward_parent_metadata(parent, &metadata)?;
+    Ok(Some(AgentParentCleanup {
+        path: parent.to_path_buf(),
+    }))
+}
+
+fn validate_generated_forward_parent_type(
+    parent: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<()> {
     if !metadata.file_type().is_dir() {
         bail!(
             "generated unix forwarding parent is not a directory {}",
             parent.display()
         );
     }
+    Ok(())
+}
+
+fn validate_generated_forward_parent_metadata(
+    parent: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<()> {
+    validate_generated_forward_parent_type(parent, metadata)?;
     if metadata.permissions().mode() & 0o777 != 0o700 {
         bail!(
             "generated unix forwarding directory has unsafe permissions {}",
             parent.display()
         );
     }
-    Ok(Some(AgentParentCleanup {
-        path: parent.to_path_buf(),
-    }))
+    Ok(())
 }
 
 fn is_generated_forward_parent(parent: &Path) -> bool {
@@ -403,6 +435,60 @@ mod tests {
         assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
         drop(cleanup);
         assert!(!parent.exists());
+    }
+
+    #[test]
+    fn generated_forward_parent_tightens_existing_directory_permissions() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let parent = std::path::PathBuf::from("/tmp").join(format!(
+            "portl-from-existing-dir-test-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = parent.join("agent.sock");
+
+        let cleanup = ensure_generated_forward_parent(&path)
+            .unwrap()
+            .expect("generated parent should return cleanup guard");
+
+        let metadata = std::fs::symlink_metadata(&parent).unwrap();
+        assert!(metadata.file_type().is_dir());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        drop(cleanup);
+        assert!(!parent.exists());
+    }
+
+    #[test]
+    fn generated_forward_parent_rejects_symlink_without_chmod_target() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let target = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(target.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let parent = std::path::PathBuf::from("/tmp").join(format!(
+            "portl-from-symlink-test-{}-{unique}",
+            std::process::id()
+        ));
+        std::os::unix::fs::symlink(target.path(), &parent).unwrap();
+        let path = parent.join("agent.sock");
+
+        let err = match ensure_generated_forward_parent(&path) {
+            Ok(_) => panic!("generated parent symlink should be rejected before chmod"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("not a directory"), "{err}");
+        let target_mode = std::fs::symlink_metadata(target.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(target_mode, 0o755);
+        std::fs::remove_file(parent).unwrap();
     }
 
     #[test]

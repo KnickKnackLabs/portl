@@ -18,13 +18,16 @@ pub use shell_client::{
     ShellClient, open_exec, open_exec_with_env, open_exec_with_env_and_controls, open_shell,
     open_shell_with_env,
 };
-pub use tcp_client::{open_tcp, run_local_forward};
+pub use tcp_client::{
+    bind_local_forward_listener, open_tcp, run_local_forward, run_local_forward_with_listener,
+};
 pub use udp_client::{
     LocalUdpForwardHandle, UdpControl, UdpForwardStatsSnapshot, open_udp,
     run_local_forward as run_local_udp_forward,
 };
 pub use unix_client::{
-    UnixListenControl, UnixListenOptions, accept_unix_reverse_once, open_unix, open_unix_listen,
-    open_unix_listen_with_options, run_local_unix_forward, run_unix_reverse_forward,
+    LocalUnixForwardListener, UnixListenControl, UnixListenOptions, accept_unix_reverse_once,
+    bind_local_unix_listener, open_unix, open_unix_listen, open_unix_listen_with_options,
+    run_local_unix_forward, run_local_unix_forward_with_listener, run_unix_reverse_forward,
     run_unix_reverse_forwards,
 };
