@@ -17,6 +17,12 @@ All notable changes land here. This project follows
   manifest, doctor output, config summary, recent local logs, and best-effort
   status/metrics snapshots for troubleshooting live targets.
 
+### Changed
+
+- Updated Portl's transport stack to the iroh 1.0 release candidate and russh
+  0.61, keeping the CLI and agent on current upstream transport APIs while
+  preserving Portl's ring-only TLS provider policy.
+
 ### Fixed
 
 - Remote `portl run` now closes the peer endpoint before returning unsupported

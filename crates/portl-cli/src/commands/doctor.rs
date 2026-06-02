@@ -377,7 +377,7 @@ fn check_stored_ticket_expiry() -> CheckResult {
         let Ok(raw) = std::fs::read_to_string(&ticket_path) else {
             continue;
         };
-        let Ok(ticket) = <PortlTicket as Ticket>::deserialize(raw.trim()) else {
+        let Ok(ticket) = <PortlTicket as Ticket>::decode_string(raw.trim()) else {
             continue;
         };
         if ticket.body.not_after <= now {

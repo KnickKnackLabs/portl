@@ -516,7 +516,7 @@ pub(super) async fn watch_container_restarts<D: DockerOps, H: HostOps>(
                         match attach_existing(docker, host, container, binary_source, operator, session_provider).await {
                             Ok(outcome) => {
                                 save_injected_alias(&outcome)?;
-                                println!("{}", outcome.plan.ticket.serialize());
+                            println!("{}", outcome.plan.ticket.encode_string());
                                 needs_reinject = false;
                             }
                             Err(err) => {

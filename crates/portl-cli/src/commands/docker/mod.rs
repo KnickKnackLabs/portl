@@ -110,7 +110,7 @@ pub fn run(
         .await?;
         finalize_connectable_ticket(&operator, &mut outcome.plan).await?;
         save_injected_alias(&outcome)?;
-        println!("{}", outcome.plan.ticket.serialize());
+        println!("{}", outcome.plan.ticket.encode_string());
         if watch {
             watch_container_restarts(
                 &docker,
@@ -149,7 +149,7 @@ pub fn attach(
         .await?;
         finalize_connectable_ticket(&operator, &mut outcome.plan).await?;
         save_injected_alias(&outcome)?;
-        println!("{}", outcome.plan.ticket.serialize());
+        println!("{}", outcome.plan.ticket.encode_string());
         Ok(ExitCode::SUCCESS)
     })
 }

@@ -87,7 +87,7 @@ fn decode_rejects_body_with_non_canonical_presence_bitmap() {
 fn iroh_tickets_display_starts_with_portl_prefix() {
     use iroh_tickets::Ticket;
     let t = fixture_signed_root();
-    let s = t.serialize();
+    let s = t.encode_string();
     assert!(
         s.starts_with(<PortlTicket as Ticket>::KIND),
         "iroh_tickets Display should emit KIND prefix; got {s}"
@@ -98,7 +98,7 @@ fn iroh_tickets_display_starts_with_portl_prefix() {
 fn iroh_tickets_parse_roundtrip() {
     use iroh_tickets::Ticket;
     let t = fixture_signed_root();
-    let s = t.serialize();
-    let back = PortlTicket::deserialize(&s).expect("deserialize");
+    let s = t.encode_string();
+    let back = PortlTicket::decode_string(&s).expect("deserialize");
     assert_eq!(t, back);
 }

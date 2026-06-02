@@ -39,8 +39,8 @@ rand        = { workspace = true }
 iroh        = { workspace = true }
 iroh-base   = { workspace = true }
 iroh-relay  = { workspace = true }
+iroh-mdns-address-lookup = { workspace = true }
 rustls           = { workspace = true }
-rustls-pki-types = { workspace = true }
 tokio       = { workspace = true }
 tokio-util  = { workspace = true }
 governor    = { workspace = true }
@@ -52,7 +52,6 @@ bytes       = { workspace = true }
 sha2        = { workspace = true }
 url         = { workspace = true }
 prometheus-client = { workspace = true }
-directories = { workspace = true }
 uuid        = { workspace = true }
 # Keep default-features off: upstream defaults enable Kitty graphics support,
 # which is not needed for the native session provider MVP or static smoke.
@@ -62,7 +61,8 @@ tracing-journald = { workspace = true }
 
 [dev-dependencies]
 portl-core = { version = "0.11.1", path = "../portl-core", features = ["test-util"] }
-tempfile  = { workspace = true }
+http       = { workspace = true }
+tempfile   = { workspace = true }
 iroh-base = { workspace = true }
 tokio      = { workspace = true }
 tokio-util = { workspace = true }

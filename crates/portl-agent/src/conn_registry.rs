@@ -13,10 +13,10 @@
 //! reflects iroh's actual state at the moment of the query.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
-use iroh::endpoint::{Connection, PathInfo};
+use iroh::endpoint::Connection;
 use serde::{Deserialize, Serialize};
 
 /// Composite key for the registry: `(peer_eid, stable_id)`. Two
@@ -158,16 +158,12 @@ impl ConnectionRegistry {
 /// the connection has no non-closed paths (shouldn't happen while
 /// the Drop guard is alive, but handled defensively).
 fn classify_path_and_rtt(conn: &Connection) -> (PathKind, Option<u64>) {
-    let paths: Vec<PathInfo> = conn
-        .paths()
-        .into_iter()
-        .filter(|p| !p.is_closed())
-        .collect();
+    let paths = conn.paths();
     if paths.is_empty() {
         return (PathKind::Unknown, None);
     }
-    let has_ip = paths.iter().any(PathInfo::is_ip);
-    let has_relay = paths.iter().any(PathInfo::is_relay);
+    let has_ip = paths.iter().any(|p| p.is_ip());
+    let has_relay = paths.iter().any(|p| p.is_relay());
     let kind = match (has_ip, has_relay) {
         (true, true) => PathKind::Mixed,
         (true, false) => PathKind::DirectUdp,
@@ -176,11 +172,14 @@ fn classify_path_and_rtt(conn: &Connection) -> (PathKind, Option<u64>) {
     };
     let rtt = paths
         .iter()
-        .find(|p| p.is_selected())
-        .or_else(|| paths.first())
-        .and_then(PathInfo::rtt)
-        .map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX));
+        .find(iroh::endpoint::Path::is_selected)
+        .or_else(|| paths.iter().next())
+        .and_then(|p| rtt_micros_if_sampled(p.rtt()));
     (kind, rtt)
+}
+
+fn rtt_micros_if_sampled(rtt: Duration) -> Option<u64> {
+    (!rtt.is_zero()).then(|| u64::try_from(rtt.as_micros()).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]
@@ -195,6 +194,12 @@ mod tests {
         assert_eq!(PathKind::Relay.as_str(), "relay");
         assert_eq!(PathKind::Mixed.as_str(), "mixed");
         assert_eq!(PathKind::Unknown.as_str(), "unknown");
+    }
+
+    #[test]
+    fn zero_rtt_is_treated_as_missing_sample() {
+        assert_eq!(rtt_micros_if_sampled(Duration::ZERO), None);
+        assert_eq!(rtt_micros_if_sampled(Duration::from_micros(42)), Some(42));
     }
 
     #[test]

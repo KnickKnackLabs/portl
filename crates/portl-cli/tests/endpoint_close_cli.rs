@@ -29,7 +29,7 @@ async fn cli_closes_endpoint_after_dial_timeout() -> Result<()> {
         now + 300,
         None,
     )?;
-    let ticket_uri = ticket.serialize();
+    let ticket_uri = ticket.encode_string();
 
     let output = Command::new(assert_cmd::cargo::cargo_bin("portl"))
         .env("PORTL_HOME", home.path())

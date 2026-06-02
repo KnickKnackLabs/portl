@@ -45,14 +45,14 @@ pub fn decode(bytes: &[u8]) -> Result<PortlTicket> {
 impl Ticket for PortlTicket {
     const KIND: &'static str = "portl";
 
-    fn to_bytes(&self) -> Vec<u8> {
+    fn encode_bytes(&self) -> Vec<u8> {
         // iroh_tickets doesn't return Result here, so we fall back
         // to the non-canonical form on error. In practice a ticket
         // that passed canonical_check at mint time always encodes.
         postcard::to_stdvec(self).unwrap_or_default()
     }
 
-    fn from_bytes(bytes: &[u8]) -> std::result::Result<Self, ParseError> {
+    fn decode_bytes(bytes: &[u8]) -> std::result::Result<Self, ParseError> {
         let ticket: Self = postcard::from_bytes(bytes)?;
         canonical_check_ticket(&ticket).map_err(|_| {
             e!(ParseError::Verify {

@@ -230,7 +230,7 @@ pub(crate) async fn resolve_peer(peer: &str, opts: &ResolveOpts<'_>) -> Result<R
     // 1) Inline `portl…` ticket pasted as the arg. Check first so
     //    paste-a-ticket workflows work even when a label happens to
     //    collide (unlikely: tickets start with `portl`).
-    if let Ok(ticket) = <PortlTicket as Ticket>::deserialize(peer) {
+    if let Ok(ticket) = <PortlTicket as Ticket>::decode_string(peer) {
         if ticket.body.parent.is_some() {
             bail!(
                 "delegated tickets not yet supported by this command; use the root ticket \
@@ -313,7 +313,7 @@ pub(crate) async fn resolve_peer(peer: &str, opts: &ResolveOpts<'_>) -> Result<R
         if !opts.quiet {
             eprintln!("using ticket \"{peer}\"");
         }
-        let ticket = <PortlTicket as Ticket>::deserialize(&entry.ticket_string)
+        let ticket = <PortlTicket as Ticket>::decode_string(&entry.ticket_string)
             .map_err(|err| anyhow!("stored ticket '{peer}' is malformed: {err}"))?;
         return Ok(ResolvedPeer {
             ticket: maybe_force_relay_ticket(ticket, opts.force_relay)?,
@@ -331,7 +331,7 @@ pub(crate) async fn resolve_peer(peer: &str, opts: &ResolveOpts<'_>) -> Result<R
         {
             let raw = std::fs::read_to_string(&ticket_path)
                 .with_context(|| format!("read stored ticket {}", ticket_path.display()))?;
-            let ticket = <PortlTicket as Ticket>::deserialize(raw.trim())
+            let ticket = <PortlTicket as Ticket>::decode_string(raw.trim())
                 .map_err(|err| anyhow!("parse stored ticket {}: {err}", ticket_path.display()))?;
             if !opts.quiet {
                 eprintln!("using alias \"{peer}\" (stored ticket)");

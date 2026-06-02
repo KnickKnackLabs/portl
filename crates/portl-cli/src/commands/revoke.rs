@@ -48,8 +48,8 @@ fn revoke_ticket_uri(uri: &str, path: &Path) -> Result<[u8; 16]> {
         return Ok(id);
     }
 
-    let ticket =
-        <PortlTicket as Ticket>::deserialize(uri).map_err(|err| anyhow!("parse ticket: {err}"))?;
+    let ticket = <PortlTicket as Ticket>::decode_string(uri)
+        .map_err(|err| anyhow!("parse ticket: {err}"))?;
     let id = ticket_id(&ticket.sig);
     append_manual_revocation(id, path)?;
     Ok(id)
@@ -90,7 +90,7 @@ fn alias_ticket_id(name: &str, store: &AliasStore) -> Result<[u8; 16]> {
     if let Some(ticket_path) = spec.ticket_file_path {
         let raw = fs::read_to_string(&ticket_path)
             .with_context(|| format!("read stored ticket {}", ticket_path.display()))?;
-        let ticket = <PortlTicket as Ticket>::deserialize(raw.trim())
+        let ticket = <PortlTicket as Ticket>::decode_string(raw.trim())
             .map_err(|err| anyhow!("parse stored ticket {}: {err}", ticket_path.display()))?;
         return Ok(ticket_id(&ticket.sig));
     }
@@ -208,7 +208,7 @@ mod tests {
         let expected = ticket_id(&ticket.sig);
 
         let path = dir.path().join("revocations.jsonl");
-        let revoked = revoke_ticket_uri(&ticket.serialize(), &path).expect("revoke uri");
+        let revoked = revoke_ticket_uri(&ticket.encode_string(), &path).expect("revoke uri");
         assert_eq!(revoked, expected);
 
         let contents = std::fs::read_to_string(path).expect("read revocations");
@@ -252,7 +252,7 @@ mod tests {
         )
         .expect("mint root");
         let ticket_path = dir.path().join("demo.ticket");
-        std::fs::write(&ticket_path, ticket.serialize()).expect("write ticket");
+        std::fs::write(&ticket_path, ticket.encode_string()).expect("write ticket");
         store
             .save(
                 &AliasRecord {

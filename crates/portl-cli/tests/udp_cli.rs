@@ -36,7 +36,7 @@ async fn udp_command_connects_and_forwards_datagrams() -> Result<()> {
     let (client, server) = pair().await?;
     let operator = Identity::new();
     let agent = start_agent(server.clone(), &operator).await?;
-    let ticket = root_ticket(&operator, server.addr(), udp_caps(remote_port)).serialize();
+    let ticket = root_ticket(&operator, server.addr(), udp_caps(remote_port)).encode_string();
     let home = tempdir()?;
     let identity_path = home.path().join("identity.bin");
     store::save(&Identity::new(), &identity_path)?;
@@ -85,7 +85,7 @@ async fn udp_forward_handle_reconnects_and_preserves_session() -> Result<()> {
     let (client, server) = pair().await?;
     let operator = Identity::new();
     let agent = start_agent(server.clone(), &operator).await?;
-    let ticket = root_ticket(&operator, server.addr(), udp_caps(remote_port)).serialize();
+    let ticket = root_ticket(&operator, server.addr(), udp_caps(remote_port)).encode_string();
     let identity = Identity::new();
     let local_port = reserve_udp_port()?;
     let forward = Arc::new(LocalUdpForwardHandle::bind(&format!(
@@ -161,7 +161,8 @@ async fn connect_and_open(
     remote_port: u16,
     session_id: Option<[u8; 8]>,
 ) -> Result<OpenedUdp> {
-    let ticket = <PortlTicket as Ticket>::deserialize(ticket).context("deserialize udp ticket")?;
+    let ticket =
+        <PortlTicket as Ticket>::decode_string(ticket).context("deserialize udp ticket")?;
     let (connection, session) = open_ticket_v1(client, &ticket, &[], identity).await?;
     let control = open_udp(
         &connection,

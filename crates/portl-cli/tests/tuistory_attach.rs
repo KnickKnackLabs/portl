@@ -2970,7 +2970,7 @@ async fn start_remote_reconnect_agent_async(
         ..AgentConfig::default()
     })
     .await?;
-    let ticket = root_ticket(&operator, server.addr(), shell_caps(true)).serialize();
+    let ticket = root_ticket(&operator, server.addr(), shell_caps(true)).encode_string();
     let _ = ready_tx.send(Ok(ticket));
     tokio::task::spawn_blocking(move || {
         let _ = stop_rx.recv();

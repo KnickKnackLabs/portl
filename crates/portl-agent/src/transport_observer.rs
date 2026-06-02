@@ -1,4 +1,6 @@
-use iroh::endpoint::{Connection, PathInfo};
+use std::time::Duration;
+
+use iroh::endpoint::Connection;
 
 pub(crate) fn spawn_connection_observer(
     connection: Connection,
@@ -25,12 +27,15 @@ pub(crate) fn spawn_connection_observer(
 }
 
 fn log_current_paths(connection_id: u64, connection: &Connection) {
-    for (idx, path) in connection
-        .paths()
-        .into_iter()
-        .filter(|path| !path.is_closed())
-        .enumerate()
-    {
+    let paths = connection.paths();
+    for (idx, path) in paths.iter().enumerate() {
+        let path_kind = if path.is_relay() {
+            "relay"
+        } else if path.is_ip() {
+            "direct_udp"
+        } else {
+            "unknown"
+        };
         tracing::info!(
             event = if path.is_selected() {
                 "transport.path.selected"
@@ -39,22 +44,14 @@ fn log_current_paths(connection_id: u64, connection: &Connection) {
             },
             connection_id,
             path_index = idx,
-            path = transport_path_kind(&path),
-            rtt_micros = path
-                .rtt()
-                .map(|rtt| u64::try_from(rtt.as_micros()).unwrap_or(u64::MAX)),
+            path = path_kind,
+            rtt_micros = rtt_micros_if_sampled(path.rtt()),
         );
     }
 }
 
-fn transport_path_kind(path: &PathInfo) -> &'static str {
-    if path.is_relay() {
-        "relay"
-    } else if path.is_ip() {
-        "direct_udp"
-    } else {
-        "unknown"
-    }
+fn rtt_micros_if_sampled(rtt: Duration) -> Option<u64> {
+    (!rtt.is_zero()).then(|| u64::try_from(rtt.as_micros()).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]
@@ -68,10 +65,21 @@ pub(crate) fn transport_addr_kind_for_test(kind: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     #[test]
     fn path_kind_labels_are_stable() {
         assert_eq!(super::transport_addr_kind_for_test("relay"), "relay");
         assert_eq!(super::transport_addr_kind_for_test("ip"), "direct_udp");
         assert_eq!(super::transport_addr_kind_for_test("other"), "unknown");
+    }
+
+    #[test]
+    fn zero_rtt_is_treated_as_missing_sample() {
+        assert_eq!(super::rtt_micros_if_sampled(Duration::ZERO), None);
+        assert_eq!(
+            super::rtt_micros_if_sampled(Duration::from_micros(42)),
+            Some(42)
+        );
     }
 }

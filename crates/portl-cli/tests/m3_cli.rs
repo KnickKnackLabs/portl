@@ -20,7 +20,7 @@ async fn exec_command_connects_and_returns_output() -> Result<()> {
     let (client, server) = pair().await?;
     let operator = Identity::new();
     let agent = start_agent(server.clone(), &operator).await?;
-    let ticket = root_ticket(&operator, server.addr(), shell_caps()).serialize();
+    let ticket = root_ticket(&operator, server.addr(), shell_caps()).encode_string();
     let home = tempdir()?;
     let identity_path = home.path().join("identity.bin");
     store::save(&Identity::new(), &identity_path)?;
@@ -58,7 +58,7 @@ async fn exec_exits_promptly_when_child_exits_with_stdin_idle() -> Result<()> {
     let (client, server) = pair().await?;
     let operator = Identity::new();
     let agent = start_agent(server.clone(), &operator).await?;
-    let ticket = root_ticket(&operator, server.addr(), shell_caps()).serialize();
+    let ticket = root_ticket(&operator, server.addr(), shell_caps()).encode_string();
     let home = tempdir()?;
     let identity_path = home.path().join("identity.bin");
     store::save(&Identity::new(), &identity_path)?;
@@ -88,7 +88,7 @@ async fn shell_command_connects_and_dispatches_noninteractive_session() -> Resul
     let (client, server) = pair().await?;
     let operator = Identity::new();
     let agent = start_agent(server.clone(), &operator).await?;
-    let ticket = root_ticket(&operator, server.addr(), shell_caps()).serialize();
+    let ticket = root_ticket(&operator, server.addr(), shell_caps()).encode_string();
     let home = tempdir()?;
     let identity_path = home.path().join("identity.bin");
     store::save(&Identity::new(), &identity_path)?;
@@ -147,7 +147,7 @@ async fn tcp_command_connects_and_forwards_bytes() -> Result<()> {
     let (client, server) = pair().await?;
     let operator = Identity::new();
     let agent = start_agent(server.clone(), &operator).await?;
-    let ticket = root_ticket(&operator, server.addr(), tcp_caps(remote_port)).serialize();
+    let ticket = root_ticket(&operator, server.addr(), tcp_caps(remote_port)).encode_string();
     let home = tempdir()?;
     let identity_path = home.path().join("identity.bin");
     store::save(&Identity::new(), &identity_path)?;

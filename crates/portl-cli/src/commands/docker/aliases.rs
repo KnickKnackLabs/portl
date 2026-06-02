@@ -151,7 +151,8 @@ pub(super) fn write_ticket(path: &Path, ticket: &PortlTicket) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    fs::write(path, ticket.serialize()).with_context(|| format!("write ticket {}", path.display()))
+    fs::write(path, ticket.encode_string())
+        .with_context(|| format!("write ticket {}", path.display()))
 }
 
 pub(super) fn ticket_not_after(created_at: i64, ttl_secs: u64) -> Option<u64> {

@@ -187,7 +187,7 @@ pub fn vm_add(
             },
         )?;
 
-        println!("{}", ticket.serialize());
+        println!("{}", ticket.encode_string());
         client.shutdown().await;
         Ok(ExitCode::SUCCESS)
     })
@@ -501,13 +501,13 @@ fn read_ticket(spec: &str) -> Result<PortlTicket> {
     if Path::new(spec).exists() {
         return read_ticket_from_path(Path::new(spec));
     }
-    <PortlTicket as Ticket>::deserialize(spec).map_err(|err| anyhow!("parse ticket: {err}"))
+    <PortlTicket as Ticket>::decode_string(spec).map_err(|err| anyhow!("parse ticket: {err}"))
 }
 
 fn read_ticket_from_path(path: &Path) -> Result<PortlTicket> {
     let raw =
         fs::read_to_string(path).with_context(|| format!("read ticket {}", path.display()))?;
-    <PortlTicket as Ticket>::deserialize(raw.trim())
+    <PortlTicket as Ticket>::decode_string(raw.trim())
         .map_err(|err| anyhow!("parse ticket {}: {err}", path.display()))
 }
 
@@ -515,7 +515,8 @@ fn write_ticket(path: &Path, ticket: &PortlTicket) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    fs::write(path, ticket.serialize()).with_context(|| format!("write ticket {}", path.display()))
+    fs::write(path, ticket.encode_string())
+        .with_context(|| format!("write ticket {}", path.display()))
 }
 
 fn slicer_home() -> PathBuf {

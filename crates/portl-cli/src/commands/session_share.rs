@@ -169,7 +169,7 @@ pub(crate) fn classify_share_target(
     let trimmed = target.trim();
 
     // 1) Inline `portl…` ticket pasted as the arg. Refuse — never echo.
-    if <PortlTicket as Ticket>::deserialize(trimmed).is_ok() {
+    if <PortlTicket as Ticket>::decode_string(trimmed).is_ok() {
         return Err(ResolveTargetError::TicketCredential);
     }
 
@@ -337,7 +337,7 @@ pub(crate) fn build_session_share_envelope(inputs: EnvelopeInputs<'_>) -> Result
         target_endpoint_id_hex: target_eid_hex,
         provider: inputs.provider.map(ToOwned::to_owned),
         provider_session: inputs.session_name.to_owned(),
-        ticket: ticket.serialize(),
+        ticket: ticket.encode_string(),
         access_not_after_unix: not_after,
     };
     let envelope = PortlExchangeEnvelopeV1::session_share(share, inputs.now_unix, Some(not_after));
@@ -498,7 +498,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let target = ticket.serialize();
+        let target = ticket.encode_string();
         let peers = PeerStore::default();
         let tickets = TicketStore::default();
         let aliases = AliasStore::default();
@@ -652,7 +652,7 @@ mod tests {
         // the recipient hello.
         let portl_core::rendezvous::exchange::ExchangePayload::SessionShare(payload) =
             &built.envelope.payload;
-        let ticket = <PortlTicket as Ticket>::deserialize(&payload.ticket).unwrap();
+        let ticket = <PortlTicket as Ticket>::decode_string(&payload.ticket).unwrap();
         assert_eq!(ticket.body.to, Some([0xAAu8; 32]));
     }
 
@@ -701,7 +701,7 @@ mod tests {
         assert_eq!(built.effective_access_ttl, BEARER_FALLBACK_MAX_TTL);
         let portl_core::rendezvous::exchange::ExchangePayload::SessionShare(payload) =
             &built.envelope.payload;
-        let ticket = <PortlTicket as Ticket>::deserialize(&payload.ticket).unwrap();
+        let ticket = <PortlTicket as Ticket>::decode_string(&payload.ticket).unwrap();
         assert_eq!(
             ticket.body.to, None,
             "bearer fallback must not bind a recipient"

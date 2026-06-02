@@ -2,9 +2,9 @@
 //!
 //! v0.3.3 ships an HTTP-only relay bound to a user-chosen socket.
 //! Authorization piggy-backs on the agent's existing `PeerStore`:
-//! `AccessConfig::Restricted` calls into a closure that consults
-//! `state.trust_roots`. Because `trust_roots` is swapped live by
-//! the peer-store reload task, relay access updates with zero
+//! `PortlRelayAccess` implements iroh-relay's access-control hook by
+//! consulting `state.trust_roots`. Because `trust_roots` is swapped
+//! live by the peer-store reload task, relay access updates with zero
 //! restart.
 //!
 //! HTTPS and Let's Encrypt are deferred to v0.3.3.1 — the wire is
@@ -13,7 +13,7 @@
 //! (`nginx` or `caddy`) and point the proxy at the HTTP bind addr.
 //!
 //! Policy tiers:
-//! - `open`       — `AccessConfig::Everyone`; for isolated LANs only.
+//! - `open`       — accepts everyone; for isolated LANs only.
 //! - `peers-only` — endpoint must be in the agent's `trust_roots`.
 //! - `pairs-only` — v0.3.3 behaves like peers-only (enforcement
 //!   requires v0.3.4 pair protocol). Flagged in `portl status
@@ -27,8 +27,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use iroh_base::EndpointId;
 use iroh_relay::server::{
-    Access, AccessConfig, CertConfig, RelayConfig, Server, ServerConfig as IrohServerConfig,
-    TlsConfig,
+    Access, AccessControl, CertConfig, ClientRequest, DynAccessControl, RelayConfig, Server,
+    ServerConfig as IrohServerConfig, TlsConfig,
 };
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -109,63 +109,30 @@ pub(crate) async fn spawn(
     state: Arc<AgentState>,
     shutdown: CancellationToken,
 ) -> Result<RelayHandle> {
-    let access = match cfg.policy {
-        RelayPolicy::Open => {
-            // Still record accepts so `portl status relay`
-            // and operators can see connection volume. Open
-            // mode can't reject on this path.
-            let state_for_gate = Arc::clone(&state);
-            AccessConfig::Restricted(Box::new(move |_: EndpointId| {
-                let s = Arc::clone(&state_for_gate);
-                Box::pin(async move {
-                    s.metrics.relay_accepts_total.inc();
-                    Access::Allow
-                })
-            }))
-        }
-        // v0.3.3: pairs-only falls back to peers-only behavior;
-        // full enforcement requires the v0.3.4 pair protocol.
-        RelayPolicy::PeersOnly | RelayPolicy::PairsOnly => {
-            let state_for_gate = Arc::clone(&state);
-            AccessConfig::Restricted(Box::new(move |eid: EndpointId| {
-                let s = Arc::clone(&state_for_gate);
-                Box::pin(async move {
-                    if is_trusted(&s, eid) {
-                        s.metrics.relay_accepts_total.inc();
-                        Access::Allow
-                    } else {
-                        s.metrics
-                            .relay_rejects_total
-                            .get_or_create(&crate::metrics::AckReasonLabel {
-                                reason: "not_in_peer_store".to_owned(),
-                            })
-                            .inc();
-                        Access::Deny
-                    }
-                })
-            }))
-        }
-    };
+    let access: Arc<dyn DynAccessControl> = Arc::new(PortlRelayAccess {
+        state: Arc::clone(&state),
+        policy: cfg.policy,
+    });
 
     let tls_config = match cfg.tls.as_ref() {
         Some(tls_cfg) => Some(build_tls_config(tls_cfg)?),
         None => None,
     };
-    let relay = RelayConfig::<(), ()> {
-        http_bind_addr: cfg.http_bind,
-        tls: tls_config,
-        limits: iroh_relay::server::Limits::default(),
-        key_cache_capacity: None,
-        access,
-    };
-    let server_cfg = IrohServerConfig::<(), ()> {
-        relay: Some(relay),
-        quic: None,
-        // iroh-relay's `server` feature unconditionally exposes a
-        // metrics-server toggle. We don't use it (portl exposes
-        // its own metrics on `metrics.sock`).
-        metrics_addr: None,
-    };
+    let mut relay = RelayConfig::new(cfg.http_bind);
+    relay.tls = tls_config;
+    relay.limits = iroh_relay::server::Limits::default();
+    relay.key_cache_capacity = None;
+    relay.access = access;
+
+    let mut server_cfg = IrohServerConfig::default();
+    server_cfg.relay = Some(relay);
+    // Disable iroh-relay's optional QUIC address-discovery server for the
+    // embedded relay. This does not disable normal Portl peer transport over
+    // QUIC; it only avoids opening the relay server's extra UDP listener.
+    server_cfg.quic = None;
+    // iroh-relay's `server` feature exposes a metrics-server toggle. We don't
+    // use it (portl exposes its own metrics on `metrics.sock`).
+    server_cfg.metrics_addr = None;
 
     let server = Server::spawn(server_cfg)
         .await
@@ -193,6 +160,49 @@ pub(crate) async fn spawn(
     Ok(handle)
 }
 
+struct PortlRelayAccess {
+    state: Arc<AgentState>,
+    policy: RelayPolicy,
+}
+
+impl std::fmt::Debug for PortlRelayAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PortlRelayAccess")
+            .field("policy", &self.policy)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AccessControl for PortlRelayAccess {
+    async fn on_connect(&self, request: &ClientRequest) -> Access {
+        match self.policy {
+            RelayPolicy::Open => {
+                // Still record accepts so `portl status relay` and operators can
+                // see connection volume. Open mode can't reject on this path.
+                self.state.metrics.relay_accepts_total.inc();
+                Access::Allow
+            }
+            // v0.3.3: pairs-only falls back to peers-only behavior; full
+            // enforcement requires the v0.3.4 pair protocol.
+            RelayPolicy::PeersOnly | RelayPolicy::PairsOnly => {
+                if is_trusted(&self.state, request.endpoint_id()) {
+                    self.state.metrics.relay_accepts_total.inc();
+                    Access::Allow
+                } else {
+                    self.state
+                        .metrics
+                        .relay_rejects_total
+                        .get_or_create(&crate::metrics::AckReasonLabel {
+                            reason: "not_in_peer_store".to_owned(),
+                        })
+                        .inc();
+                    Access::Deny { reason: None }
+                }
+            }
+        }
+    }
+}
+
 fn is_trusted(state: &AgentState, eid: EndpointId) -> bool {
     let bytes = *eid.as_bytes();
     match state.trust_roots.read() {
@@ -207,8 +217,8 @@ fn is_trusted(state: &AgentState, eid: EndpointId) -> bool {
 /// Build iroh-relay's TLS config from operator-provided PEM files.
 /// iroh-relay wires everything up internally once we hand it the
 /// `rustls::ServerConfig`; our job is just to load the cert chain
-/// and key and pick a default QUIC bind addr.
-fn build_tls_config(cfg: &RelayTlsConfig) -> Result<TlsConfig<(), ()>> {
+/// and key.
+fn build_tls_config(cfg: &RelayTlsConfig) -> Result<TlsConfig> {
     // Install a process-global default crypto provider the first
     // time any relay with TLS is spawned. rustls requires exactly
     // one; we pick ring (matches Cargo feature set). Subsequent
@@ -229,17 +239,10 @@ fn build_tls_config(cfg: &RelayTlsConfig) -> Result<TlsConfig<(), ()>> {
             )
         })?;
 
-    // iroh-relay defaults QUIC address discovery to port 7842 when
-    // operators want it; we don't enable QAD in v0.3.3.2 so this
-    // bind addr is unused but must be provided.
-    let quic_bind_addr = SocketAddr::new(cfg.https_bind.ip(), 7842);
-
-    Ok(TlsConfig {
-        https_bind_addr: cfg.https_bind,
-        quic_bind_addr,
-        cert: CertConfig::Manual { certs },
-        server_config,
-    })
+    Ok(TlsConfig::new(
+        cfg.https_bind,
+        CertConfig::Manual { server_config },
+    ))
 }
 
 fn load_certs(path: &std::path::Path) -> Result<Vec<CertificateDer<'static>>> {
@@ -360,7 +363,80 @@ impl RelayStatus {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::sync::{Arc, RwLock};
+    use std::time::{Instant, SystemTime};
+
+    use iroh_relay::http::ProtocolVersion;
+    use portl_core::ticket::verify::TrustRoots;
+
     use super::*;
+    use crate::config::{AgentMode, DiscoveryConfig, RateLimitConfig};
+    use crate::conn_registry::ConnectionRegistry;
+    use crate::metrics::Metrics;
+    use crate::network_watchdog::NetworkWatchdogHealth;
+    use crate::rate_limit::OfferRateLimiter;
+    use crate::revocations::{DEFAULT_REVOCATIONS_MAX_BYTES, RevocationSet};
+    use crate::shell_registry::ShellRegistry;
+    use crate::udp_registry::UdpSessionRegistry;
+
+    fn relay_test_state(trust_roots: HashSet<[u8; 32]>) -> Arc<AgentState> {
+        let revocations_path = std::env::temp_dir().join(format!(
+            "portl-relay-test-revocations-{}.jsonl",
+            std::process::id()
+        ));
+        Arc::new(AgentState {
+            trust_roots: RwLock::new(TrustRoots(trust_roots)),
+            bootstrap_roots: HashSet::new(),
+            revocations: RwLock::new(
+                RevocationSet::load_with_max_bytes(revocations_path, DEFAULT_REVOCATIONS_MAX_BYTES)
+                    .unwrap(),
+            ),
+            rate_limit: OfferRateLimiter::new(&RateLimitConfig::default()).unwrap(),
+            started_at: Instant::now(),
+            shell_registry: ShellRegistry::default(),
+            herdr_attach_registry: dashmap::DashMap::new(),
+            #[cfg(feature = "ghostty-vt")]
+            ghostty_attach_v2_registry: dashmap::DashMap::new(),
+            udp_registry: UdpSessionRegistry::new(60),
+            mode: AgentMode::Listener,
+            metrics: Arc::new(Metrics::default()),
+            connections: ConnectionRegistry::new(),
+            peers_path: None,
+            discovery: DiscoveryConfig::in_process(),
+            home: std::env::temp_dir(),
+            metrics_socket: std::env::temp_dir().join("portl-relay-test-metrics.sock"),
+            session_provider_path: None,
+            started_at_unix: 0,
+            self_endpoint_id: [0; 32],
+            watchdog_probe_endpoint_id: None,
+            network_watchdog: NetworkWatchdogHealth::new(SystemTime::now()),
+            relay_status: RwLock::new(RelayStatus::disabled()),
+        })
+    }
+
+    fn relay_client_request(endpoint_id: EndpointId) -> ClientRequest {
+        let request = http::Request::builder()
+            .uri("/relay")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        ClientRequest::new(endpoint_id, ProtocolVersion::V2, request)
+    }
+
+    #[tokio::test]
+    async fn peers_only_denial_does_not_expose_policy_reason() {
+        let access = PortlRelayAccess {
+            state: relay_test_state(HashSet::new()),
+            policy: RelayPolicy::PeersOnly,
+        };
+        let request = relay_client_request(iroh_base::SecretKey::generate().public());
+
+        let decision = AccessControl::on_connect(&access, &request).await;
+
+        assert_eq!(decision, Access::Deny { reason: None });
+    }
 
     #[test]
     fn policy_parses_canonical_forms() {

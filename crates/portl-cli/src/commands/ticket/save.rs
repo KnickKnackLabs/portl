@@ -30,7 +30,7 @@ pub fn run(label: &str, ticket_string: Option<&str>) -> Result<ExitCode> {
         Some(ticket_string) => (Some(label), ticket_string),
         None => (None, label),
     };
-    let ticket = <PortlTicket as Ticket>::deserialize(ticket_string)
+    let ticket = <PortlTicket as Ticket>::decode_string(ticket_string)
         .map_err(|err| anyhow!("parse ticket: {err}"))?;
     // Pull endpoint_id and `not_after` directly from the ticket —
     // `addr.endpoint_id` is the terminal target, `body.not_after`

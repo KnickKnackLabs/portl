@@ -428,11 +428,11 @@ async fn meta_request(
 }
 
 fn path_label(connection: &Connection) -> String {
-    let path = connection
-        .paths()
-        .into_iter()
-        .find(iroh::endpoint::PathInfo::is_selected)
-        .or_else(|| connection.paths().into_iter().next());
+    let paths = connection.paths();
+    let path = paths
+        .iter()
+        .find(iroh::endpoint::Path::is_selected)
+        .or_else(|| paths.iter().next());
     match path.map(|path| path.remote_addr().clone()) {
         Some(TransportAddr::Relay(url)) => format!("relay {url}"),
         Some(_) | None => "direct".to_owned(),

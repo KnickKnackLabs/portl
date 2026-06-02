@@ -24,7 +24,6 @@ tokio        = { workspace = true }
 tracing      = { workspace = true }
 hex          = { workspace = true }
 iroh-base    = { workspace = true }
-tempfile     = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

@@ -20,23 +20,18 @@ rust-version = "1.93"
 
 [workspace.dependencies]
 # transport
-iroh         = { version = "0.98.2", features = ["address-lookup-mdns"] }
-# Keep russh on 0.56 for now: newer 0.60/0.61 releases require
-# prerelease/stable crypto crate versions that Cargo cannot resolve
-# alongside iroh 0.98's exact prerelease pins. `default-features = false`
-# avoids aws-lc-rs; ring is the only enabled backend.
-russh        = { version = "=0.56.0", default-features = false, features = ["ring"] }
-iroh-base    = "0.98"
-iroh-relay   = { version = "0.98", default-features = false, features = ["server"] }
-iroh-tickets = "0.5"
-# TLS for the embedded relay server (v0.3.3.2+). Feature set
-# matches iroh-relay's own default: ring provider, tls12, logging
-# off by default. No aws-lc-rs (v0.2.4 removed it to fix the macOS
-# SIGABRT).
+iroh         = "1.0.0-rc.1"
+iroh-base    = "1.0.0-rc.1"
+iroh-relay   = { version = "1.0.0-rc.1", default-features = false, features = ["server"] }
+iroh-tickets = "1.0.0-rc.1"
+iroh-mdns-address-lookup = "0.3.0"
+# Keep russh default-features off: upstream defaults enable aws-lc-rs;
+# Portl standardises on rustls/ring to avoid mixed-provider link/runtime
+# surprises on macOS and static Linux builds.
+russh        = { version = "0.61.1", default-features = false, features = ["ring"] }
+# TLS for the embedded relay server. Feature set matches Portl's ring-only
+# provider policy; no aws-lc-rs.
 rustls          = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
-# PEM loading uses rustls-pki-types' PemObject trait (replacement
-# for the archived rustls-pemfile crate).
-rustls-pki-types = { version = "1", features = ["std"] }
 tokio        = { version = "1", features = [
     "fs", "io-std", "io-util", "macros", "net", "process",
     "rt-multi-thread", "signal", "sync", "time",
@@ -106,11 +101,12 @@ age         = { version = "0.11", default-features = false, features = ["armor"]
 directories = "5"
 fd-lock     = "4"
 hex         = "0.4"
-rpassword   = "7"
 qrcode      = "0.14"
 zeroize     = { version = "1", features = ["derive"] }
 rand        = "0.8"
 rand_core   = "0.6"
+rand_core_010 = { package = "rand_core", version = "0.10" }
+getrandom_03 = { package = "getrandom", version = "0.3" }
 uuid        = { version = "1", features = ["v4"] }
 humantime   = "2"
 nix         = { version = "0.30", features = ["fs", "poll", "process", "resource", "signal", "term", "user"] }

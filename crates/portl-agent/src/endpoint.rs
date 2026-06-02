@@ -1,10 +1,11 @@
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use anyhow::Result;
-use iroh::address_lookup::{DnsAddressLookup, MdnsAddressLookup, PkarrPublisher, PkarrResolver};
+use iroh::address_lookup::{DnsAddressLookup, PkarrPublisher, PkarrResolver};
 use iroh::dns::DnsResolver;
 use iroh::endpoint::{RelayMode, presets};
 use iroh_base::SecretKey;
+use iroh_mdns_address_lookup::MdnsAddressLookup;
 use portl_core::id::Identity;
 use tracing::instrument;
 

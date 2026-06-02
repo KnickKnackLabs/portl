@@ -16,32 +16,9 @@ yanked  = "warn"
 # no safe alternative on the iroh side yet; the upstream migration
 # to `pastey` or similar is tracked by netlink-packet-*.
 # Revisit when iroh updates its netwatch dep chain.
-# Hickory 0.26.0-beta.4 is pulled in by the current latest iroh release
-# (0.98.2). Hickory has fixed releases, but there is no iroh version that
-# allows them yet; revisit when iroh updates its hickory dependency chain.
-# Bincode v2 is required for Herdr protocol compatibility: Herdr's binary
-# client protocol is length-prefixed bincode. This advisory is an
-# unmaintained notice rather than a known vulnerability; revisit when Herdr
-# changes its wire format or adopts a maintained bincode-compatible crate.
-# libcrux-sha3 is pulled in through russh -> libcrux-ml-kem. RUSTSEC-2026-0074
-# affects the incremental portable SHAKE XOF API, and the advisory explicitly
-# says libcrux-ml-kem/libcrux-ml-dsa usage is not impacted. Revisit when russh
-# can move past the current 0.56 pin.
-# RUSTSEC-2026-0153 and RUSTSEC-2026-0154 affect russh's SSH agent frame
-# handling and old CryptoVec growth paths. Fixed russh >=0.60.3 currently
-# cannot resolve with iroh 0.98.2's exact der 0.8.0-rc.10 pin (`cargo update
-# -p russh --precise 0.60.3` selects stable der 0.8). Portl's russh usage is
-# limited to the local `portl ssh --stdio` bridge; it is not a network-facing
-# daemon and Portl does not use russh's SSH agent server/client module. Revisit
-# as soon as iroh releases a compatible crypto dependency update.
 ignore  = [
     "RUSTSEC-2024-0436",
     "RUSTSEC-2025-0141",
-    "RUSTSEC-2026-0074",
-    "RUSTSEC-2026-0119",
-    "RUSTSEC-2026-0120",
-    "RUSTSEC-2026-0153",
-    "RUSTSEC-2026-0154",
 ]
 
 [licenses]

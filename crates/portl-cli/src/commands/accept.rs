@@ -189,7 +189,7 @@ pub(crate) fn import_exchange_envelope(
         bail!("session share access expired; ask the sender to mint a fresh share");
     }
 
-    let ticket = <PortlTicket as Ticket>::deserialize(&share.ticket)
+    let ticket = <PortlTicket as Ticket>::decode_string(&share.ticket)
         .map_err(|err| anyhow!("parse embedded session ticket: {err}"))?;
     canonical_check_ticket(&ticket)
         .map_err(|err| anyhow!("invalid embedded session ticket: {err}"))?;
@@ -392,7 +392,7 @@ mod tests {
             target_endpoint_id_hex: hex::encode(addr.id.as_bytes()),
             provider: Some("zmx".to_owned()),
             provider_session: friendly_name.to_owned(),
-            ticket: ticket.serialize(),
+            ticket: ticket.encode_string(),
             access_not_after_unix: now + ttl_secs,
         };
         PortlExchangeEnvelopeV1::session_share(share, now, Some(now + 300))

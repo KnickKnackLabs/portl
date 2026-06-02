@@ -22,7 +22,7 @@ use portl_core::ticket::schema::{
     Capabilities, EnvPolicy, PortRule, ShellCaps, UnixCaps, UnixPathRule,
 };
 use portl_core::wire::shell::{EnvValue, PtyCfg, ResizeFrame, SignalFrame};
-use rand_core::OsRng;
+use rand_core_010::{TryCryptoRng, TryRng, UnwrapErr};
 use russh::keys::{Algorithm, Certificate, PrivateKey, load_secret_key, ssh_key};
 use russh::server::{self, Auth, Msg, Session as RusshSession};
 use russh::{Channel, ChannelId, ChannelMsg, Sig};
@@ -167,6 +167,30 @@ fn load_or_generate_host_key(target: &str) -> Result<PrivateKey> {
     load_or_generate_host_key_at(&portl_core::paths::home_dir(), target)
 }
 
+struct SshKeyOsRng;
+
+impl TryRng for SshKeyOsRng {
+    type Error = getrandom_03::Error;
+
+    fn try_next_u32(&mut self) -> std::result::Result<u32, Self::Error> {
+        let mut bytes = [0u8; 4];
+        self.try_fill_bytes(&mut bytes)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn try_next_u64(&mut self) -> std::result::Result<u64, Self::Error> {
+        let mut bytes = [0u8; 8];
+        self.try_fill_bytes(&mut bytes)?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> std::result::Result<(), Self::Error> {
+        getrandom_03::fill(dest)
+    }
+}
+
+impl TryCryptoRng for SshKeyOsRng {}
+
 fn load_or_generate_host_key_at(home: &Path, target: &str) -> Result<PrivateKey> {
     let path = host_key_path_for_target(home, target);
     if path.exists() {
@@ -176,8 +200,9 @@ fn load_or_generate_host_key_at(home: &Path, target: &str) -> Result<PrivateKey>
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
-        .context("generate SSH facade host key")?;
+    let mut rng = UnwrapErr(SshKeyOsRng);
+    let key =
+        PrivateKey::random(&mut rng, Algorithm::Ed25519).context("generate SSH facade host key")?;
     let encoded = key
         .to_openssh(ssh_key::LineEnding::LF)
         .context("encode SSH facade host key")?;
@@ -536,7 +561,7 @@ impl server::Handler for PortlSshServer {
     ) -> Result<(), Self::Error> {
         let _ = self.channels.remove(&channel);
         let message = format!("portl-ssh --stdio does not implement subsystem {name}\n");
-        session.extended_data(channel, 1, message.into_bytes().into())?;
+        session.extended_data(channel, 1, message.into_bytes())?;
         session.exit_status_request(channel, 1)?;
         session.channel_failure(channel)?;
         session.eof(channel)?;

@@ -60,7 +60,7 @@ pub fn run(
             .unwrap_or_else(|| local_endpoint_addr(&identity));
         mint_root(identity.signing_key(), addr, caps, now, not_after, to)?
     };
-    let ticket_uri = ticket.serialize();
+    let ticket_uri = ticket.encode_string();
 
     match print {
         MintRootPrint::String => println!("{ticket_uri}"),
@@ -368,7 +368,7 @@ pub(crate) fn parse_ttl(spec: &str) -> Result<u64> {
 }
 
 fn parse_ticket(spec: &str) -> Result<portl_core::ticket::schema::PortlTicket> {
-    <portl_core::ticket::schema::PortlTicket as Ticket>::deserialize(spec)
+    <portl_core::ticket::schema::PortlTicket as Ticket>::decode_string(spec)
         .map_err(|err| anyhow!("parse parent ticket: {err}"))
 }
 

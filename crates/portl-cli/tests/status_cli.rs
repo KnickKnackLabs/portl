@@ -33,7 +33,7 @@ async fn status_command_reports_cached_ticket_peer() -> Result<()> {
         now + 300,
         None,
     )?;
-    let ticket_uri = ticket.serialize();
+    let ticket_uri = ticket.encode_string();
 
     let ticket_uri_for_status = ticket_uri.clone();
     let identity_path_for_status = identity_path.clone();
@@ -112,7 +112,7 @@ async fn status_refuses_delegated_tickets() -> Result<()> {
         now + 300,
         None,
     )?;
-    let delegated_uri = delegated.serialize();
+    let delegated_uri = delegated.encode_string();
     let identity_path_for_status = identity_path.clone();
 
     let err = tokio::task::spawn_blocking(move || {

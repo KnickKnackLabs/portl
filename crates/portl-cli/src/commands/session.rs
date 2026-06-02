@@ -3882,22 +3882,18 @@ struct AttachPathSnapshot {
 
 impl AttachPathSnapshot {
     fn from_connection(connection: &Connection) -> Option<Self> {
-        let paths: Vec<_> = connection
-            .paths()
-            .into_iter()
-            .filter(|path| !path.is_closed())
-            .collect();
+        let paths = connection.paths();
         let path = paths
             .iter()
-            .find(|path| path.is_selected())
-            .or_else(|| paths.first())?;
+            .find(iroh::endpoint::Path::is_selected)
+            .or_else(|| paths.iter().next())?;
         let label = match path.remote_addr() {
             TransportAddr::Relay(url) => format!("relay {url}"),
             _ => "direct".to_owned(),
         };
         Some(Self {
             label,
-            rtt: path.rtt(),
+            rtt: rtt_if_sampled(path.rtt()),
         })
     }
 }
@@ -3968,7 +3964,7 @@ impl AttachFlightRecorder {
             );
             if let Some(path) = &event.path {
                 let _ = write!(out, " (path: {}", path.label);
-                if let Some(rtt) = path.rtt {
+                if let Some(rtt) = path.rtt.and_then(rtt_if_sampled) {
                     let _ = write!(out, ", rtt: {}", format_compact_duration(rtt));
                 }
                 out.push(')');
@@ -3981,6 +3977,10 @@ impl AttachFlightRecorder {
 
 fn attach_path_snapshot(connection: &Connection) -> Option<AttachPathSnapshot> {
     AttachPathSnapshot::from_connection(connection)
+}
+
+fn rtt_if_sampled(rtt: Duration) -> Option<Duration> {
+    (!rtt.is_zero()).then_some(rtt)
 }
 
 fn format_compact_duration(duration: Duration) -> String {
@@ -10056,6 +10056,27 @@ mod tests {
         let recorder = AttachFlightRecorder::new();
 
         assert_eq!(recorder.render_recent(), None);
+    }
+
+    #[test]
+    fn attach_flight_recorder_omits_zero_rtt_samples() {
+        let mut recorder = AttachFlightRecorder::new();
+        recorder.record_at(
+            Duration::from_millis(100),
+            "connected before rtt sample",
+            Some(AttachPathSnapshot {
+                label: "direct".to_owned(),
+                rtt: Some(Duration::ZERO),
+            }),
+        );
+
+        let rendered = recorder.render_recent().expect("events render");
+
+        assert!(
+            rendered.contains("connected before rtt sample (path: direct)"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("rtt: 0ms"), "{rendered}");
     }
 
     #[test]
