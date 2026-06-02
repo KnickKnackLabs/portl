@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use anyhow::{Context, Result, bail};
 use iroh::endpoint::Connection;
 
@@ -9,6 +11,10 @@ use crate::ticket::schema::{Capabilities, PortlTicket};
 use crate::wire::{AckReason, TicketAck, TicketOffer};
 
 const MAX_ACK_BYTES: usize = 64 * 1024;
+
+fn elapsed_millis_u64(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerSession {
@@ -51,8 +57,15 @@ pub async fn open_ticket_v1(
     // only a tiny bit of first-dial latency in exchange for not
     // crashing the CLI. Drop this workaround once we move to an
     // iroh release that fixes the `online()` drop path.
+    let started = Instant::now();
+    let endpoint_id = hex::encode(ticket.addr.id.as_bytes());
+    tracing::info!(
+        event = "portl.ticket_handshake.start",
+        endpoint = %endpoint_id,
+        chain_len = chain.len(),
+    );
     tracing::debug!(
-        endpoint = %hex::encode(ticket.addr.id.as_bytes()),
+        endpoint = %endpoint_id,
         "connecting ticket/v1"
     );
     let connection = endpoint
@@ -60,6 +73,11 @@ pub async fn open_ticket_v1(
         .connect(ticket.addr.clone(), portl_alpn::ALPN_TICKET_V1)
         .await
         .context("connect ticket/v1")?;
+    tracing::info!(
+        event = "portl.ticket_handshake.connected",
+        remote = %connection.remote_id().fmt_short(),
+        duration_ms = elapsed_millis_u64(started),
+    );
     tracing::debug!(remote = %connection.remote_id().fmt_short(), "connected ticket/v1");
     let (mut send, mut recv) = connection.open_bi().await.context("open ticket stream")?;
 
@@ -88,8 +106,19 @@ pub async fn open_ticket_v1(
     tracing::debug!(offer_bytes = offer_bytes.len(), "sent ticket offer");
     let ack_bytes = recv.read_to_end(MAX_ACK_BYTES).await.context("read ack")?;
     let ack: TicketAck = postcard::from_bytes(&ack_bytes).context("decode ticket ack")?;
+    tracing::info!(
+        event = "portl.ticket_handshake.ack",
+        ok = ack.ok,
+        reason = ?ack.reason,
+        duration_ms = elapsed_millis_u64(started),
+    );
     tracing::debug!(ok = ack.ok, reason = ?ack.reason, "received ticket ack");
     if !ack.ok {
+        tracing::warn!(
+            event = "portl.ticket_handshake.rejected",
+            reason = ?ack.reason,
+        duration_ms = elapsed_millis_u64(started),
+        );
         return Err(TicketHandshakeError { reason: ack.reason }.into());
     }
 

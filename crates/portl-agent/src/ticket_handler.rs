@@ -132,6 +132,8 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
 
     let udp_context = Arc::new(UdpConnectionContext::new(state.udp_registry.clone()));
     let conn_key = state.connections.insert(source_id, connection.clone());
+    let _connection_observer =
+        crate::transport_observer::spawn_connection_observer(connection.clone(), source_id);
     let _conn_registry_guard = ConnectionRegistryGuard {
         connections: state.connections.clone(),
         key: conn_key,

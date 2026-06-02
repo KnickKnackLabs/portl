@@ -72,6 +72,11 @@ impl PortlPaths {
     }
 
     #[must_use]
+    pub fn logs_dir(&self) -> PathBuf {
+        self.root.join("logs")
+    }
+
+    #[must_use]
     pub fn config_path(&self) -> PathBuf {
         self.config_dir().join("portl.toml")
     }
@@ -109,6 +114,11 @@ impl PortlPaths {
     #[must_use]
     pub fn metrics_socket_path(&self) -> PathBuf {
         self.run_dir().join("metrics.sock")
+    }
+
+    #[must_use]
+    pub fn agent_run_marker_path(&self) -> PathBuf {
+        self.state_dir().join("agent-run.json")
     }
 
     #[must_use]
@@ -186,6 +196,16 @@ pub fn metrics_socket_path() -> PathBuf {
 }
 
 #[must_use]
+pub fn logs_dir() -> PathBuf {
+    current().logs_dir()
+}
+
+#[must_use]
+pub fn agent_run_marker_path() -> PathBuf {
+    current().agent_run_marker_path()
+}
+
+#[must_use]
 pub fn ghostty_state_dir() -> PathBuf {
     current().ghostty_state_dir()
 }
@@ -219,6 +239,7 @@ fn ensure_layout_dirs(paths: &PortlPaths) -> Result<()> {
         paths.data_dir(),
         paths.state_dir(),
         paths.run_dir(),
+        paths.logs_dir(),
     ] {
         fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     }

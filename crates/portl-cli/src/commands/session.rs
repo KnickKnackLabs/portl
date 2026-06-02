@@ -387,16 +387,16 @@ pub fn run(
             local_session_run(provider.as_deref(), &resolved.session, argv).await?
         } else {
             let connected = connect_peer(&resolved.target, session_caps()).await?;
-            let run = open_session_run(
+            let run_result = open_session_run(
                 &connected.connection,
                 &connected.session,
                 provider.clone(),
                 resolved.session,
                 argv.to_vec(),
             )
-            .await?;
+            .await;
             close_connected(connected, b"session complete").await;
-            run
+            run_result?
         };
         print!("{}", run.stdout);
         eprint!("{}", run.stderr);
@@ -1862,6 +1862,12 @@ pub fn attach(
             Some(&resolved.session),
             provider.as_deref(),
         )?;
+        log_attach_state(
+            "resolved",
+            &resolved.target,
+            provider_name.as_deref(),
+            &session_name,
+        );
         if resolved_target_is_local(&resolved.target)? {
             if !forwarding.is_empty() {
                 anyhow::bail!("portl attach -L/-R requires a remote target");
@@ -2470,6 +2476,35 @@ fn should_reconnect_remote_attach(provider: Option<&str>) -> bool {
     provider != Some("herdr") && session_reconnect_enabled()
 }
 
+fn attach_disconnect_reason_for_error(error: &str) -> &'static str {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("early eof") || lower.contains("closed") {
+        "remote_stream_closed"
+    } else if lower.contains("decode") || lower.contains("postcard") || lower.contains("protocol") {
+        "protocol_decode_error"
+    } else if lower.contains("timeout") {
+        "timeout"
+    } else if lower.contains("rejected") || lower.contains("provider") {
+        "provider_rejected"
+    } else {
+        "unknown"
+    }
+}
+
+fn log_attach_state(state: &'static str, target: &str, provider: Option<&str>, session_name: &str) {
+    tracing::info!(
+        event = "cli.session.attach.state",
+        state,
+        target,
+        provider = provider.unwrap_or(""),
+        session = session_name,
+    );
+}
+
+fn exit_code_from_portl(code: ExitCode) -> u8 {
+    u8::from(code != ExitCode::SUCCESS)
+}
+
 fn should_fallback_to_attach_v1(provider: Option<&str>, err: &SessionOpenError) -> bool {
     provider.is_none()
         && matches!(
@@ -2555,7 +2590,19 @@ async fn remote_session_attach_once_without_reconnect(
     if let Some((_source_label, plan)) = request.forwarding_plan.as_ref() {
         plan.augment_caps(&mut caps);
     }
+    log_attach_state(
+        "connecting",
+        &request.target,
+        request.provider.as_deref(),
+        &request.session_name,
+    );
     let connected = connect_peer(&request.target, caps).await?;
+    log_attach_state(
+        "connected",
+        &request.target,
+        request.provider.as_deref(),
+        &request.session_name,
+    );
     let _forward_runtime = if let Some((source_label, plan)) = request.forwarding_plan.as_ref() {
         eprint!("{}", plan.render_summary(&request.target, source_label));
         Some(plan.start(&connected).await?)
@@ -2563,6 +2610,12 @@ async fn remote_session_attach_once_without_reconnect(
         None
     };
     print_remote_attach_start(&request, request.provider.as_deref());
+    log_attach_state(
+        "opening_session",
+        &request.target,
+        request.provider.as_deref(),
+        &request.session_name,
+    );
     let result = match open_remote_attach_session_checked(
         &connected.connection,
         &connected.session,
@@ -2581,6 +2634,12 @@ async fn remote_session_attach_once_without_reconnect(
     {
         Ok(session) => {
             let provider = session.provider().to_owned();
+            tracing::info!(
+                event = "cli.session.attach.ready",
+                target = %request.target,
+                provider = %provider,
+                session = %request.session_name,
+            );
             let canonical_ref =
                 canonical_session_ref(&request.target, &provider, &request.session_name);
             bridge_attach(session, request.cols, request.rows, canonical_ref)
@@ -2589,6 +2648,24 @@ async fn remote_session_attach_once_without_reconnect(
         }
         Err(err) => Err(err.into()),
     };
+    match &result {
+        Ok(code) => tracing::info!(
+            event = "cli.session.attach.closed",
+            target = %request.target,
+            provider = request.provider.as_deref().unwrap_or(""),
+            session = %request.session_name,
+            reason = "normal",
+            exit_code = exit_code_from_portl(*code),
+        ),
+        Err(err) => tracing::warn!(
+            event = "cli.session.attach.closed",
+            target = %request.target,
+            provider = request.provider.as_deref().unwrap_or(""),
+            session = %request.session_name,
+            reason = attach_disconnect_reason_for_error(&format!("{err:#}")),
+            error = %format!("{err:#}"),
+        ),
+    }
     close_connected(connected, b"session complete").await;
     result
 }
@@ -8272,6 +8349,29 @@ async fn read_exit(recv: &mut BufferedRecv) -> Result<i32> {
         .await?
         .context("missing exit frame")?;
     Ok(frame.code)
+}
+
+#[cfg(test)]
+mod attach_log_tests {
+    #[test]
+    fn attach_disconnect_reason_labels_are_stable() {
+        assert_eq!(
+            super::attach_disconnect_reason_for_error("read attach v2 live frame: early eof"),
+            "remote_stream_closed"
+        );
+        assert_eq!(
+            super::attach_disconnect_reason_for_error("decode attach v2 frame"),
+            "protocol_decode_error"
+        );
+        assert_eq!(
+            super::attach_disconnect_reason_for_error("timeout after 5s"),
+            "timeout"
+        );
+        assert_eq!(
+            super::attach_disconnect_reason_for_error("provider rejected"),
+            "provider_rejected"
+        );
+    }
 }
 
 #[cfg(test)]

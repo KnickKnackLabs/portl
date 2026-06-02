@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use tracing::Level;
+use tracing_appender::rolling::RollingFileAppender;
 use tracing_subscriber::{EnvFilter, prelude::*};
 
 use crate::session::Session;
@@ -38,19 +39,61 @@ pub(crate) fn init() {
         #[cfg(target_os = "linux")]
         {
             if let Ok(layer) = tracing_journald::layer() {
-                let _ = tracing_subscriber::registry()
-                    .with(env_filter)
-                    .with(layer)
-                    .try_init();
+                if let Some(writer) = json_file_writer(portl_core::diagnostics::LogKind::Agent) {
+                    let file_layer = tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_ansi(false)
+                        .with_writer(writer)
+                        .with_filter(EnvFilter::new(file_filter_directive()));
+                    let _ = tracing_subscriber::registry()
+                        .with(layer.with_filter(env_filter))
+                        .with(file_layer)
+                        .try_init();
+                } else {
+                    let _ = tracing_subscriber::registry()
+                        .with(layer.with_filter(env_filter))
+                        .try_init();
+                }
                 return;
             }
         }
 
-        let _ = tracing_subscriber::registry()
-            .with(env_filter)
-            .with(tracing_subscriber::fmt::layer())
-            .try_init();
+        let stderr_layer = tracing_subscriber::fmt::layer().with_filter(env_filter);
+        if let Some(writer) = json_file_writer(portl_core::diagnostics::LogKind::Agent) {
+            let file_layer = tracing_subscriber::fmt::layer()
+                .json()
+                .with_ansi(false)
+                .with_writer(writer)
+                .with_filter(EnvFilter::new(file_filter_directive()));
+            let _ = tracing_subscriber::registry()
+                .with(stderr_layer)
+                .with(file_layer)
+                .try_init();
+        } else {
+            let _ = tracing_subscriber::registry().with(stderr_layer).try_init();
+        }
     });
+}
+
+fn json_file_writer(kind: portl_core::diagnostics::LogKind) -> Option<RollingFileAppender> {
+    if !portl_core::diagnostics::file_logs_enabled() {
+        return None;
+    }
+    let path = portl_core::diagnostics::log_path(kind);
+    if let Err(err) = portl_core::diagnostics::ensure_log_file_ready(&path) {
+        eprintln!(
+            "warning: could not initialize Portl file log {}: {err:#}",
+            path.display()
+        );
+        return None;
+    }
+    let parent = path.parent()?;
+    let file_name = path.file_name()?.to_str()?;
+    Some(tracing_appender::rolling::never(parent, file_name))
+}
+
+fn file_filter_directive() -> &'static str {
+    "portl_agent=info,portl_core=info,portl_cli=info,iroh=warn,quinn=warn,rustls=warn,h2=warn"
 }
 
 fn filter_directive(default_filter: &str) -> String {
@@ -255,6 +298,12 @@ mod tests {
 
         restore_env("PORTL_LOG", old_portl);
         restore_env("RUST_LOG", old_rust);
+    }
+
+    #[test]
+    fn agent_log_path_uses_portl_home_logs_dir() {
+        let path = portl_core::diagnostics::log_path(portl_core::diagnostics::LogKind::Agent);
+        assert!(path.ends_with("logs/agent.ndjson"));
     }
 
     fn restore_env(name: &str, value: Option<OsString>) {

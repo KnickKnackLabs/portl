@@ -1,5 +1,6 @@
 use std::sync::OnceLock;
 
+use tracing_appender::rolling::RollingFileAppender;
 use tracing_subscriber::{EnvFilter, prelude::*};
 
 static LOGGING_INIT: OnceLock<()> = OnceLock::new();
@@ -16,11 +17,40 @@ pub(crate) fn init(verbose: u8, explicit_filter: Option<&str>) {
                 EnvFilter::new(default_filter(0))
             }
         };
-        let _ = tracing_subscriber::registry()
-            .with(env_filter)
-            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
-            .try_init();
+        let stderr_layer = tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_filter(env_filter);
+        if let Some(writer) = json_file_writer(portl_core::diagnostics::LogKind::Cli) {
+            let file_layer = tracing_subscriber::fmt::layer()
+                .json()
+                .with_ansi(false)
+                .with_writer(writer)
+                .with_filter(EnvFilter::new(file_log_filter()));
+            let _ = tracing_subscriber::registry()
+                .with(stderr_layer)
+                .with(file_layer)
+                .try_init();
+        } else {
+            let _ = tracing_subscriber::registry().with(stderr_layer).try_init();
+        }
     });
+}
+
+fn json_file_writer(kind: portl_core::diagnostics::LogKind) -> Option<RollingFileAppender> {
+    if !portl_core::diagnostics::file_logs_enabled() {
+        return None;
+    }
+    let path = portl_core::diagnostics::log_path(kind);
+    if let Err(err) = portl_core::diagnostics::ensure_log_file_ready(&path) {
+        eprintln!(
+            "warning: could not initialize Portl file log {}: {err:#}",
+            path.display()
+        );
+        return None;
+    }
+    let parent = path.parent()?;
+    let file_name = path.file_name()?.to_str()?;
+    Some(tracing_appender::rolling::never(parent, file_name))
 }
 
 pub(crate) fn filter_directive(verbose: u8, explicit_filter: Option<&str>) -> String {
@@ -29,6 +59,10 @@ pub(crate) fn filter_directive(verbose: u8, explicit_filter: Option<&str>) -> St
         .or_else(|| std::env::var("PORTL_LOG").ok())
         .or_else(|| std::env::var("RUST_LOG").ok())
         .unwrap_or_else(|| default_filter(verbose))
+}
+
+fn file_log_filter() -> &'static str {
+    "portl_cli=info,portl_core=info,portl_agent=info,iroh=warn,quinn=warn,rustls=warn,h2=warn"
 }
 
 fn default_filter(verbose: u8) -> String {
@@ -59,5 +93,11 @@ mod tests {
             filter_directive(0, None),
             "error,portl_cli=warn,portl_core=warn,portl_agent=warn"
         );
+    }
+
+    #[test]
+    fn cli_log_path_uses_portl_home_logs_dir() {
+        let path = portl_core::diagnostics::log_path(portl_core::diagnostics::LogKind::Cli);
+        assert!(path.ends_with("logs/cli.ndjson"));
     }
 }

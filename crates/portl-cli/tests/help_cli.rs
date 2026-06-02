@@ -172,6 +172,14 @@ fn top_level_help_uses_logical_command_groups() {
 }
 
 #[test]
+fn doctor_help_lists_bundle_flags() {
+    let help = help_output(&["doctor", "--help"]);
+    for needle in ["--bundle", "--output <PATH>"] {
+        assert!(help.contains(needle), "missing {needle:?}\n{help}");
+    }
+}
+
+#[test]
 fn invite_accept_help_matches_model_a_surface() {
     let top = help_output(&["--help"]);
     assert!(top.contains("invite"), "{top}");

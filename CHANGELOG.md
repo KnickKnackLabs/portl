@@ -5,6 +5,24 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.11.1 — 2026-06-03
+
+### Added
+
+- Added persistent structured diagnostics logs under `$PORTL_HOME/logs` for the
+  CLI and agent, including command, target-resolution, ticket-handshake,
+  endpoint-close, and session-attach lifecycle events with invite and ticket
+  secrets redacted.
+- Added `portl doctor --bundle` to produce a redacted support zip containing a
+  manifest, doctor output, config summary, recent local logs, and best-effort
+  status/metrics snapshots for troubleshooting live targets.
+
+### Fixed
+
+- Remote `portl run` now closes the peer endpoint before returning unsupported
+  provider errors, avoiding ungraceful endpoint-drop diagnostics when a
+  persistent session provider such as Herdr does not support one-shot runs.
+
 ## 0.11.0 — 2026-06-02
 
 ### Added

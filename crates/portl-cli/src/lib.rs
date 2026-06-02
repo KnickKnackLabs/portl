@@ -81,6 +81,8 @@ pub enum Command {
         verbose: bool,
         json: bool,
         quiet: bool,
+        bundle: bool,
+        output: Option<PathBuf>,
     },
     Status {
         target: Option<String>,
@@ -440,6 +442,127 @@ fn dispatch_command(command: Command) -> ExitCode {
     }
 }
 
+#[derive(Debug, Clone)]
+struct CommandLogContext {
+    command_id: String,
+    argv: Vec<String>,
+    cwd: String,
+}
+
+fn command_log_context(argv: &[OsString]) -> CommandLogContext {
+    let argv_strings = argv
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let started_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    CommandLogContext {
+        command_id: format!("{}-{started_nanos}", std::process::id()),
+        argv: portl_core::diagnostics::redact_argv(&argv_strings),
+        cwd: std::env::current_dir().map_or_else(
+            |_| "<unknown>".to_owned(),
+            |path| path.display().to_string(),
+        ),
+    }
+}
+
+fn dispatch_command_logged(command: Command, context: &CommandLogContext) -> ExitCode {
+    let command_name = command_log_name(&command);
+    let started = std::time::Instant::now();
+    tracing::info!(
+        event = "cli.command.start",
+        command_id = %context.command_id,
+        command = command_name,
+        argv = ?context.argv,
+        cwd = %context.cwd,
+    );
+    match dispatch(command) {
+        Ok(code) => {
+            tracing::info!(
+                event = "cli.command.finish",
+                command_id = %context.command_id,
+                command = command_name,
+                exit_code = exit_code_u8(code),
+                duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            );
+            code
+        }
+        Err(err) => {
+            let log_error = portl_core::diagnostics::redact_text(&format!("{err:#}"));
+            tracing::error!(
+                event = "cli.command.error",
+                command_id = %context.command_id,
+                command = command_name,
+                error = %log_error,
+                duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            );
+            eprintln!("{err:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn exit_code_u8(code: ExitCode) -> u8 {
+    u8::from(code != ExitCode::SUCCESS)
+}
+
+fn command_log_name(command: &Command) -> &'static str {
+    match command {
+        Command::AgentRun { .. } => "agent.run",
+        Command::AgentLifecycle { .. } => "agent",
+        Command::Init { .. } => "init",
+        Command::Doctor { .. } => "doctor",
+        Command::Status { .. } => "status",
+        Command::Shell { .. } => "shell",
+        Command::SessionProviders { .. } => "session.providers",
+        Command::SessionAttach { .. } => "session.attach",
+        Command::SessionLs { .. } => "session.ls",
+        Command::SessionRun { .. } => "session.run",
+        Command::SessionHistory { .. } => "session.history",
+        Command::SessionKill { .. } => "session.kill",
+        Command::SessionShare { .. } => "session.share",
+        Command::Exec { .. } => "exec",
+        Command::Ssh { .. } => "ssh",
+        Command::SshProxy { .. } => "ssh.proxy",
+        Command::SshConfig { .. } => "ssh.config",
+        Command::Tcp { .. } => "tcp",
+        Command::Udp { .. } => "udp",
+        Command::Socket { .. } => "socket",
+        Command::PeerLs { .. } => "peer.ls",
+        Command::PeerRm { .. } => "peer.rm",
+        Command::PeerAddUnsafeRaw { .. } => "peer.add-unsafe-raw",
+        Command::InviteIssue { .. } => "invite.issue",
+        Command::InviteLs { .. } => "invite.ls",
+        Command::InviteRm { .. } => "invite.rm",
+        Command::Accept { .. } => "accept",
+        Command::TicketIssue { .. } => "ticket.issue",
+        Command::TicketCaps { .. } => "ticket.caps",
+        Command::TicketSave { .. } => "ticket.save",
+        Command::TicketLs { .. } => "ticket.ls",
+        Command::TicketRm { .. } => "ticket.rm",
+        Command::TicketPrune => "ticket.prune",
+        Command::TicketRevoke { .. } => "ticket.revoke",
+        Command::Whoami { .. } => "whoami",
+        Command::Config { .. } => "config",
+        Command::Install { .. } => "install",
+        Command::DockerRun { .. } => "docker.run",
+        Command::DockerAttach { .. } => "docker.attach",
+        Command::DockerDetach { .. } => "docker.detach",
+        Command::DockerList { .. } => "docker.list",
+        Command::DockerRm { .. } => "docker.rm",
+        Command::DockerBake { .. } => "docker.bake",
+        Command::SlicerRun { .. } => "slicer.run",
+        Command::SlicerList { .. } => "slicer.list",
+        Command::SlicerRm { .. } => "slicer.rm",
+        Command::Gateway { .. } => "gateway",
+        Command::Completions { .. } => "completions",
+        Command::Man { .. } => "man",
+        Command::GhosttySessionHelper { .. } => "ghostty.session-helper",
+        Command::GhosttySmoke => "ghostty.smoke",
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LayoutMigrationAction {
     Run,
@@ -476,7 +599,9 @@ fn layout_migration_action(command: &Command) -> LayoutMigrationAction {
 
 #[cfg(test)]
 mod service_safe_upgrade_tests {
-    use super::{Command, InstallTarget, LayoutMigrationAction, layout_migration_action};
+    use super::{
+        Command, InstallTarget, LayoutMigrationAction, command_log_name, layout_migration_action,
+    };
 
     #[test]
     fn install_apply_yes_stops_requested_target_before_migration() {
@@ -569,8 +694,38 @@ mod service_safe_upgrade_tests {
                 verbose: false,
                 json: false,
                 quiet: false,
+                bundle: false,
+                output: None,
             }),
             LayoutMigrationAction::Skip
+        );
+    }
+
+    #[test]
+    fn command_log_name_is_stable_for_status_and_doctor() {
+        assert_eq!(
+            command_log_name(&Command::Status {
+                target: Some("vn3".to_owned()),
+                relay: true,
+                json: false,
+                watch: None,
+                count: 1,
+                timeout: std::time::Duration::from_secs(5),
+            }),
+            "status"
+        );
+
+        assert_eq!(
+            command_log_name(&Command::Doctor {
+                fix: false,
+                yes: false,
+                verbose: false,
+                json: false,
+                quiet: false,
+                bundle: false,
+                output: None,
+            }),
+            "doctor"
         );
     }
 }
@@ -719,6 +874,7 @@ pub fn run(argv: Vec<OsString>) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    let log_context = command_log_context(&argv);
     let cli = match Cli::try_parse_from(argv) {
         Ok(cli) => cli,
         Err(err) => {
@@ -738,7 +894,7 @@ pub fn run(argv: Vec<OsString>) -> ExitCode {
         return code;
     }
 
-    dispatch_command(command)
+    dispatch_command_logged(command, &log_context)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -755,12 +911,16 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             verbose,
             json,
             quiet,
-        } => Ok(commands::doctor::run(commands::doctor::RunOpts {
+            bundle,
+            output,
+        } => Ok(commands::doctor::run(&commands::doctor::RunOpts {
             fix,
             yes,
             verbose,
             json,
             quiet,
+            bundle,
+            output,
         })),
         Command::Status {
             target,
@@ -1423,6 +1583,12 @@ enum SetupTopLevel {
         /// Emit structured JSON instead of the human-readable table.
         #[arg(long)]
         json: bool,
+        /// Write a support bundle with doctor/status/metrics/log snapshots.
+        #[arg(long)]
+        bundle: bool,
+        /// Bundle output file or directory. Defaults to a timestamped zip in the current directory.
+        #[arg(long, value_name = "PATH", requires = "bundle")]
+        output: Option<PathBuf>,
     },
     /// Install the daemon for a supported target.
     #[command(display_order = 30)]
@@ -2317,12 +2483,20 @@ fn setup_into_command(action: SetupTopLevel, log_verbose: u8) -> Command {
             role,
             quiet: quiet || env_flag("PORTL_QUIET"),
         },
-        SetupTopLevel::Doctor { fix, yes, json } => Command::Doctor {
+        SetupTopLevel::Doctor {
+            fix,
+            yes,
+            json,
+            bundle,
+            output,
+        } => Command::Doctor {
             fix,
             yes,
             verbose: log_verbose > 0,
             json: json || env_flag("PORTL_JSON"),
             quiet: env_flag("PORTL_QUIET"),
+            bundle,
+            output,
         },
         SetupTopLevel::Install {
             target,

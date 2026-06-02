@@ -23,6 +23,11 @@ pub fn default_socket_path() -> PathBuf {
     portl_core::paths::metrics_socket_path()
 }
 
+/// Fetch a raw IPC route body from the agent's socket.
+pub(crate) async fn fetch_raw(socket: &Path, path: &str) -> Result<String> {
+    get(socket, path).await
+}
+
 /// Fetch `/status` from the agent's IPC socket.
 pub async fn fetch_status(socket: &Path) -> Result<StatusResponse> {
     let body = get(socket, "/status").await?;

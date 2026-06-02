@@ -62,6 +62,19 @@ pub(crate) enum PeerSource {
     RawEid,
 }
 
+impl PeerSource {
+    const fn as_log_str(self) -> &'static str {
+        match self {
+            Self::Inline => "inline",
+            Self::PeerStore => "peer_store",
+            Self::TicketStore => "ticket_store",
+            Self::AliasStoreTicket => "alias_store_ticket",
+            Self::AliasStoreEid => "alias_store_eid",
+            Self::RawEid => "raw_eid",
+        }
+    }
+}
+
 /// Resolution output. `discovery` describes how the address was
 /// located ("cached" for inline tickets, "stored-ticket" for any
 /// label→stored-ticket hit, or the iroh discovery provenance like
@@ -138,16 +151,29 @@ pub(crate) async fn close_connected(connected: ConnectedPeer, reason: &'static [
 }
 
 pub(crate) async fn close_client_endpoint(endpoint: iroh::Endpoint, context: &'static str) {
+    tracing::info!(event = "cli.endpoint.close.start", context);
+    let started = std::time::Instant::now();
     if tokio::time::timeout(Duration::from_millis(500), endpoint.close())
         .await
         .is_err()
     {
+        tracing::warn!(
+            event = "cli.endpoint.close.timeout",
+            context,
+            duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
         debug!(context, "timed out closing CLI endpoint");
         // Short-lived CLI commands should not hang for several seconds after
         // printing their result. If iroh's graceful QUIC close does not finish
         // quickly, let process exit reclaim the socket instead of dropping the
         // still-closing endpoint and emitting an alarming user-facing error.
         std::mem::forget(endpoint);
+    } else {
+        tracing::info!(
+            event = "cli.endpoint.close.complete",
+            context,
+            duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
     }
 }
 
@@ -163,6 +189,12 @@ pub(crate) async fn connect_peer_with_endpoint(
     quiet: bool,
 ) -> Result<ConnectedPeer> {
     let endpoint_wrapper = Endpoint::from(endpoint.clone());
+    let peer_log = portl_core::diagnostics::redact_arg(peer);
+    tracing::info!(
+        event = "cli.target.resolve.start",
+        peer = %peer_log,
+        force_relay = false,
+    );
     let resolved = resolve_peer(
         peer,
         &ResolveOpts {
@@ -174,6 +206,13 @@ pub(crate) async fn connect_peer_with_endpoint(
         },
     )
     .await?;
+    tracing::info!(
+        event = "cli.target.resolve.complete",
+        peer = %peer_log,
+        source = resolved.source.as_log_str(),
+        discovery = %resolved.discovery,
+        force_relay = false,
+    );
     let (connection, session) = open_ticket_v1(&endpoint_wrapper, &resolved.ticket, &[], identity)
         .await
         .context("run ticket handshake")?;

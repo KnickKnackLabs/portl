@@ -34,7 +34,7 @@ struct CheckResult {
     detail: String,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct RunOpts {
     pub fix: bool,
@@ -46,9 +46,13 @@ pub struct RunOpts {
     pub json: bool,
     /// Suppress non-error human output.
     pub quiet: bool,
+    /// Write a local support bundle after running checks.
+    pub bundle: bool,
+    /// Bundle output file or directory.
+    pub output: Option<PathBuf>,
 }
 
-pub fn run(opts: RunOpts) -> ExitCode {
+pub fn run(opts: &RunOpts) -> ExitCode {
     let results: Vec<CheckResult> = vec![
         check_clock_skew(),
         check_identity(),
@@ -63,6 +67,7 @@ pub fn run(opts: RunOpts) -> ExitCode {
         check_session_providers(),
         check_service_drift(),
         check_agent_runtime_socket(),
+        check_agent_last_exit(),
         check_agent_network_endpoint(),
     ];
 
@@ -82,6 +87,25 @@ pub fn run(opts: RunOpts) -> ExitCode {
             }
             Err(e) => {
                 eprintln!("fix failed: {e:#}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    if opts.bundle {
+        match crate::commands::doctor_bundle::collect(
+            &crate::commands::doctor_bundle::BundleInput {
+                doctor_json: json_value(&results),
+                output: opts.output.as_deref(),
+            },
+        ) {
+            Ok(path) if !opts.quiet && opts.json => {
+                eprintln!("wrote doctor bundle: {}", path.display());
+            }
+            Ok(path) if !opts.quiet => println!("wrote doctor bundle: {}", path.display()),
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!("bundle failed: {err:#}");
                 return ExitCode::FAILURE;
             }
         }
@@ -114,6 +138,13 @@ fn render_human(results: &[CheckResult], verbose: bool) {
 }
 
 fn render_json(results: &[CheckResult]) {
+    match serde_json::to_string_pretty(&json_value(results)) {
+        Ok(s) => println!("{s}"),
+        Err(e) => eprintln!("failed to serialize doctor JSON: {e}"),
+    }
+}
+
+fn json_value(results: &[CheckResult]) -> serde_json::Value {
     use serde_json::json;
     let checks: Vec<serde_json::Value> = results
         .iter()
@@ -129,16 +160,12 @@ fn render_json(results: &[CheckResult]) {
             })
         })
         .collect();
-    let envelope = json!({
+    json!({
         "schema": 1,
         "kind": "doctor",
         "any_fail": results.iter().any(|r| r.status == Status::Fail),
         "checks": checks,
-    });
-    match serde_json::to_string_pretty(&envelope) {
-        Ok(s) => println!("{s}"),
-        Err(e) => eprintln!("failed to serialize doctor JSON: {e}"),
-    }
+    })
 }
 
 /// Sanity-check the wall clock against `UNIX_EPOCH`. `doctor` is
@@ -794,6 +821,51 @@ fn version_tag(version: &str) -> String {
     format!("v{}", normalize_version(version))
 }
 
+fn check_agent_last_exit() -> CheckResult {
+    let path = portl_core::paths::agent_run_marker_path();
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return CheckResult {
+                name: "agent-last-exit",
+                status: Status::Warn,
+                detail: format!("no agent run marker at {}", path.display()),
+            };
+        }
+        Err(err) => {
+            return CheckResult {
+                name: "agent-last-exit",
+                status: Status::Warn,
+                detail: format!("cannot read {}: {err}", path.display()),
+            };
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(err) => {
+            return CheckResult {
+                name: "agent-last-exit",
+                status: Status::Warn,
+                detail: format!("invalid run marker JSON: {err}"),
+            };
+        }
+    };
+    let clean = value
+        .get("clean_shutdown")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    CheckResult {
+        name: "agent-last-exit",
+        status: if clean { Status::Ok } else { Status::Warn },
+        detail: if clean {
+            "previous agent shutdown was clean".to_owned()
+        } else {
+            "previous agent run marker indicates an unclean exit or currently running agent"
+                .to_owned()
+        },
+    }
+}
+
 fn check_agent_network_endpoint() -> CheckResult {
     let socket = portl_core::paths::metrics_socket_path();
     match fetch_agent_status_sync(&socket) {
@@ -1194,6 +1266,19 @@ fn run_remediation(bin: &str, args: &[&str]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_value_includes_schema_and_fail_status() {
+        let value = json_value(&[CheckResult {
+            name: "example",
+            status: Status::Fail,
+            detail: "broken".to_owned(),
+        }]);
+        assert_eq!(value["schema"], 1);
+        assert_eq!(value["kind"], "doctor");
+        assert_eq!(value["any_fail"], true);
+        assert_eq!(value["checks"][0]["status"], "fail");
+    }
 
     #[test]
     fn clock_check_returns_ok_on_sane_system() {

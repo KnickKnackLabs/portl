@@ -1,3 +1,4 @@
+use std::fs;
 use std::process::Command as ProcessCommand;
 
 use assert_cmd::{Command, cargo::CommandCargoExt};
@@ -268,6 +269,69 @@ fn hidden_ghostty_session_helper_parses_under_portl_agent_symlink_name() {
         .expect("parse"),
         ParsedCommand::GhosttySessionHelper { .. }
     ));
+}
+
+#[test]
+fn doctor_bundle_parse_includes_output() {
+    let cmd = parse_args(&["doctor", "--bundle", "--output", "debug.zip"]).expect("parse");
+    match cmd {
+        ParsedCommand::Doctor { bundle, output, .. } => {
+            assert!(bundle);
+            assert_eq!(output, Some(std::path::PathBuf::from("debug.zip")));
+        }
+        other => panic!("expected doctor command, got {other:?}"),
+    }
+}
+
+#[test]
+fn doctor_json_bundle_stdout_remains_json() {
+    let home = tempdir().expect("temp home");
+    let bundle = home.path().join("doctor.zip");
+    let output = Command::cargo_bin("portl")
+        .expect("cargo bin")
+        .env("PORTL_HOME", home.path())
+        .args(["doctor", "--json", "--bundle", "--output"])
+        .arg(&bundle)
+        .output()
+        .expect("run doctor bundle");
+
+    assert!(
+        output.status.success(),
+        "doctor failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice::<serde_json::Value>(&output.stdout).expect("json stdout");
+    assert!(bundle.exists(), "expected bundle at {}", bundle.display());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("wrote doctor bundle:"),
+        "expected bundle status on stderr"
+    );
+}
+
+#[test]
+fn ticket_like_status_target_is_redacted_in_persistent_cli_log() {
+    let home = tempdir().expect("temp home");
+    let output = Command::cargo_bin("portl")
+        .expect("cargo bin")
+        .env("PORTL_HOME", home.path())
+        .args(["status", "PORTLINV-AAAA", "--timeout", "1ms"])
+        .output()
+        .expect("run status");
+
+    assert!(
+        !output.status.success(),
+        "expected invalid ticket-like target to fail"
+    );
+    let log = fs::read_to_string(home.path().join("logs/cli.ndjson")).expect("cli log");
+    assert!(
+        !log.contains("PORTLINV-AAAA"),
+        "raw ticket-like value leaked to log:\n{log}"
+    );
+    assert!(
+        log.contains("<redacted:ticket>"),
+        "expected redacted marker in log:\n{log}"
+    );
 }
 
 #[test]

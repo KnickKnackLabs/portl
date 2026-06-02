@@ -38,11 +38,20 @@ pub mod stream_io;
 mod target_context;
 pub mod tcp_handler;
 pub mod ticket_handler;
+mod transport_observer;
 pub mod udp_handler;
 pub mod udp_registry;
 pub mod unix_handler;
 
 pub use config::{AgentConfig, AgentMode, DiscoveryConfig, RateLimitConfig};
+
+pub(crate) fn short_eid_for_log(hex: &str) -> String {
+    if hex.len() <= 16 {
+        hex.to_owned()
+    } else {
+        format!("{}…{}", &hex[..8], &hex[hex.len() - 8..])
+    }
+}
 
 #[cfg(feature = "ghostty-vt")]
 pub enum GhosttyAttachInput {
@@ -431,6 +440,46 @@ pub async fn run(cfg: AgentConfig) -> Result<()> {
     run_with_shutdown(cfg, CancellationToken::new()).await
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AgentRunMarker {
+    schema: u32,
+    pid: u32,
+    started_at_unix: u64,
+    clean_shutdown: bool,
+    shutdown_at_unix: Option<u64>,
+    shutdown_reason: Option<String>,
+}
+
+fn unix_now_secs_for_marker() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+fn write_agent_run_marker(clean_shutdown: bool, reason: Option<&str>) {
+    let now = unix_now_secs_for_marker();
+    let marker = AgentRunMarker {
+        schema: 1,
+        pid: std::process::id(),
+        started_at_unix: now,
+        clean_shutdown,
+        shutdown_at_unix: clean_shutdown.then_some(now),
+        shutdown_reason: reason.map(ToOwned::to_owned),
+    };
+    let path = portl_core::paths::agent_run_marker_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match serde_json::to_vec_pretty(&marker) {
+        Ok(bytes) => {
+            if let Err(err) = std::fs::write(&path, bytes) {
+                warn!(?err, path = %path.display(), "write agent run marker");
+            }
+        }
+        Err(err) => warn!(?err, "serialize agent run marker"),
+    }
+}
+
 /// Test-only panic hook. Enabled by the `test-panic-trigger` feature
 /// (never enable in production); panics if `PORTL_TEST_PANIC_AT=startup`
 /// is set so `tests/panic_abort.rs` can observe the release profile's
@@ -450,6 +499,8 @@ fn maybe_test_panic() {}
 #[allow(clippy::too_many_lines)]
 pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) -> Result<()> {
     audit::init();
+    write_agent_run_marker(false, None);
+    tracing::info!(event = "agent.start", pid = std::process::id());
 
     let watchdog_enabled = cfg.watchdog.enabled && cfg.endpoint.is_none();
     if cfg.watchdog.enabled
@@ -682,12 +733,17 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
     }
 
     if signal_shutdown.load(Ordering::SeqCst) && !all_sessions_reaped {
+        write_agent_run_marker(false, Some("shell_sessions_unreaped"));
         anyhow::bail!("graceful shutdown left live shell sessions unreaped");
     }
     if let Some(err) = fatal_watchdog_error {
+        write_agent_run_marker(false, Some("fatal_watchdog_error"));
+        tracing::info!(event = "agent.shutdown", reason = "fatal_watchdog_error");
         return Err(err);
     }
 
+    write_agent_run_marker(true, Some("normal"));
+    tracing::info!(event = "agent.shutdown", reason = "normal");
     Ok(())
 }
 
@@ -898,11 +954,29 @@ fn spawn_peer_store_reload_task(
 }
 
 async fn graceful_close_endpoint(endpoint: &iroh::Endpoint) {
+    let context = endpoint_close_context("shutdown");
+    tracing::info!(event = "agent.endpoint.close.start", context);
+    let started = Instant::now();
     if let Err(err) =
         tokio::time::timeout(std::time::Duration::from_secs(10), endpoint.close()).await
     {
+        tracing::warn!(
+            event = "agent.endpoint.close.timeout",
+            context,
+            duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
         warn!(?err, "endpoint close exceeded 10 second shutdown budget");
+    } else {
+        tracing::info!(
+            event = "agent.endpoint.close.complete",
+            context,
+            duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
     }
+}
+
+fn endpoint_close_context(context: &'static str) -> &'static str {
+    context
 }
 
 fn collect_shell_processes(state: &AgentState) -> Vec<Arc<shell_registry::ShellProcess>> {
@@ -1073,6 +1147,30 @@ mod tests {
         let paths = portl_core::paths::for_home(home);
         config.peers_path = Some(paths.peers_path());
         config.revocations_path = Some(paths.revocations_path());
+    }
+
+    #[test]
+    fn endpoint_close_context_strings_are_stable() {
+        assert_eq!(super::endpoint_close_context("shutdown"), "shutdown");
+        assert_eq!(
+            super::endpoint_close_context("connected peer"),
+            "connected peer"
+        );
+    }
+
+    #[test]
+    fn agent_run_marker_serializes_clean_shutdown() {
+        let marker = super::AgentRunMarker {
+            schema: 1,
+            pid: 42,
+            started_at_unix: 100,
+            clean_shutdown: true,
+            shutdown_at_unix: Some(200),
+            shutdown_reason: Some("normal".to_owned()),
+        };
+        let json = serde_json::to_string(&marker).unwrap();
+        assert!(json.contains(r#""clean_shutdown":true"#));
+        assert!(json.contains(r#""shutdown_reason":"normal""#));
     }
 
     #[test]

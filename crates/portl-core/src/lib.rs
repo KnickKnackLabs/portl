@@ -7,6 +7,7 @@
 pub mod attach_control;
 pub mod bootstrap;
 pub mod caps;
+pub mod diagnostics;
 pub mod endpoint;
 pub mod error;
 pub mod herdr_wire;

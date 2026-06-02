@@ -138,6 +138,8 @@ fn global_verbose_flags_do_not_change_command_shape() {
             verbose: true,
             json: false,
             quiet: false,
+            bundle: false,
+            output: None,
         }
     );
 }

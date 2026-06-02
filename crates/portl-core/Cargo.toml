@@ -66,7 +66,7 @@ http             = { workspace = true }
 zstd             = { workspace = true }
 
 [dev-dependencies]
-portl-core = { version = "0.11.0", path = ".", features = ["test-util"] }
+portl-core = { version = "0.11.1", path = ".", features = ["test-util"] }
 tokio      = { workspace = true }
 tokio-websockets = { workspace = true, features = ["server"] }
 proptest   = { workspace = true }

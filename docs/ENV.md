@@ -13,10 +13,30 @@ surface.
 | `PORTL_TARGET` | Default target for session commands. Accepts peer labels, saved ticket labels, endpoint IDs, aliases, and unique hostname shorthands such as `max` for `max-b265`. Explicit `--target` or `host/session` refs take precedence. |
 | `PORTL_JSON` | Force `--json` on commands that support structured output. Truthy values are `1`, `true`, `yes`, and `on`; falsey values are `0`, `false`, `no`, and `off`. |
 | `PORTL_QUIET` | Force quiet output on commands that support it, including `init` and `doctor`. Uses the same boolean values as `PORTL_JSON`. |
+| `PORTL_LOG_FILES` | Enable or disable local structured log files. File logs are enabled by default; set to `off`, `0`, `false`, or `no` to disable them. |
 | `NO_COLOR` | Disable color output, following the community `NO_COLOR` convention. |
 
 Precedence for behavior variables is: explicit CLI flag, then the
 environment variable, then the built-in default.
+
+## Local logs and doctor bundles
+
+Portl writes local structured JSON-lines logs by default:
+
+- `$PORTL_HOME/logs/agent.ndjson`
+- `$PORTL_HOME/logs/cli.ndjson`
+
+Set `PORTL_LOG_FILES=off` to disable file logs. Logs include command
+lifecycle events, cwd, redacted argv, peer labels, session/provider names,
+connection/path state, and disconnect reasons. Portl ticket strings, identity
+secrets, API tokens, bearer values, and password-like values are redacted.
+Terminal content is not logged by default.
+
+Use `portl doctor --bundle` to write a support bundle. Without `--output`, the
+bundle is written to the current directory as
+`portl-doctor-bundle-YYYYMMDD-HHMMSSZ.zip`. If `--output` is a directory, Portl
+writes the timestamped zip inside that directory. If `--output` is a file path,
+Portl writes exactly that file and fails if it already exists.
 
 ## Relay operator surface
 

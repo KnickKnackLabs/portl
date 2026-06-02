@@ -3,6 +3,7 @@ pub mod agent;
 pub mod config;
 pub mod docker;
 pub mod doctor;
+pub mod doctor_bundle;
 pub mod exec;
 pub mod forwarding;
 pub mod ghostty_smoke;
