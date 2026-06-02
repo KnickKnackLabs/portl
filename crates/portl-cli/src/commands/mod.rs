@@ -4,6 +4,7 @@ pub mod config;
 pub mod docker;
 pub mod doctor;
 pub mod exec;
+pub mod forwarding;
 pub mod ghostty_smoke;
 pub mod init;
 pub mod install;

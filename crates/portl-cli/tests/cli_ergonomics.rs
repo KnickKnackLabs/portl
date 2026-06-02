@@ -322,6 +322,8 @@ fn session_surface_matches_spec() {
             provider: Some("zmx".to_owned()),
             user: Some("root".to_owned()),
             cwd: Some("/work".to_owned()),
+            forward_l: Vec::new(),
+            forward_r: Vec::new(),
             argv: vec!["zellij".to_owned(), "a".to_owned()],
         }
     );
@@ -417,6 +419,29 @@ fn top_level_session_aliases_parse_like_session_subcommands() {
             provider: Some("zmx".to_owned()),
             user: None,
             cwd: None,
+            forward_l: Vec::new(),
+            forward_r: Vec::new(),
+            argv: Vec::new(),
+        }
+    );
+    assert_eq!(
+        parse_args(&[
+            "attach",
+            "remote-dev/work",
+            "-L",
+            "8080:3000",
+            "-R",
+            "/tmp/local-agent.sock",
+        ])
+        .expect("parse"),
+        ParsedCommand::SessionAttach {
+            target: None,
+            session: Some("remote-dev/work".to_owned()),
+            provider: None,
+            user: None,
+            cwd: None,
+            forward_l: vec!["8080:3000".to_owned()],
+            forward_r: vec!["/tmp/local-agent.sock".to_owned()],
             argv: Vec::new(),
         }
     );

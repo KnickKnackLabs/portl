@@ -303,7 +303,12 @@ pub fn vm_logs(name: &str, base_url: Option<&str>, tail: usize) -> Result<ExitCo
 }
 
 pub fn vm_shell(name: &str) -> Result<ExitCode> {
-    crate::commands::shell::run(name, None, None)
+    crate::commands::shell::run(
+        name,
+        None,
+        None,
+        crate::commands::forwarding::ForwardingArgs::default(),
+    )
 }
 
 struct ClientContext {

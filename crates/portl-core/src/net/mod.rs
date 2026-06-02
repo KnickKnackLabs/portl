@@ -20,9 +20,11 @@ pub use shell_client::{
 };
 pub use tcp_client::{open_tcp, run_local_forward};
 pub use udp_client::{
-    LocalUdpForwardHandle, UdpControl, open_udp, run_local_forward as run_local_udp_forward,
+    LocalUdpForwardHandle, UdpControl, UdpForwardStatsSnapshot, open_udp,
+    run_local_forward as run_local_udp_forward,
 };
 pub use unix_client::{
     UnixListenControl, UnixListenOptions, accept_unix_reverse_once, open_unix, open_unix_listen,
     open_unix_listen_with_options, run_local_unix_forward, run_unix_reverse_forward,
+    run_unix_reverse_forwards,
 };

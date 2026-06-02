@@ -160,6 +160,31 @@ fn shell_exec_tcp_and_udp_subcommands_parse() {
             peer: "peer-ticket".to_owned(),
             cwd: Some("/tmp".to_owned()),
             user: Some("alice".to_owned()),
+            forward_l: Vec::new(),
+            forward_r: Vec::new(),
+        }
+    );
+
+    let shell_forward = parse(argv(&[
+        "portl",
+        "shell",
+        "-L",
+        "8080:3000",
+        "-L",
+        "/run/herdr.sock",
+        "-R",
+        "/tmp/local-agent.sock",
+        "peer-ticket",
+    ]))
+    .expect("shell forwarding parse should succeed");
+    assert_eq!(
+        shell_forward,
+        Command::Shell {
+            peer: "peer-ticket".to_owned(),
+            cwd: None,
+            user: None,
+            forward_l: vec!["8080:3000".to_owned(), "/run/herdr.sock".to_owned()],
+            forward_r: vec!["/tmp/local-agent.sock".to_owned()],
         }
     );
 
@@ -236,9 +261,11 @@ fn socket_subcommands_parse() {
         connect,
         Command::Socket {
             peer: "peer-ticket".to_owned(),
-            local: "/tmp/local.sock".to_owned(),
+            local: Some("/tmp/local.sock".to_owned()),
             connect: Some("/run/remote.sock".to_owned()),
             listen: None,
+            socket_l: Vec::new(),
+            socket_r: Vec::new(),
             cleanup: false,
         }
     );
@@ -258,21 +285,46 @@ fn socket_subcommands_parse() {
         listen,
         Command::Socket {
             peer: "peer-ticket".to_owned(),
-            local: "/run/local-agent.sock".to_owned(),
+            local: Some("/run/local-agent.sock".to_owned()),
             connect: None,
             listen: Some("/tmp/portl-agent.sock".to_owned()),
+            socket_l: Vec::new(),
+            socket_r: Vec::new(),
             cleanup: true,
+        }
+    );
+
+    let shorthand = parse(argv(&[
+        "portl",
+        "socket",
+        "-L",
+        "/run/herdr.sock",
+        "-R",
+        "/tmp/local-agent.sock",
+        "peer-ticket",
+    ]))
+    .expect("socket shorthand parse should succeed");
+    assert_eq!(
+        shorthand,
+        Command::Socket {
+            peer: "peer-ticket".to_owned(),
+            local: None,
+            connect: None,
+            listen: None,
+            socket_l: vec!["/run/herdr.sock".to_owned()],
+            socket_r: vec!["/tmp/local-agent.sock".to_owned()],
+            cleanup: false,
         }
     );
 }
 
 #[test]
 fn portl_ssh_subcommands_parse() {
-    let ssh_shell = parse(argv(&["portl", "ssh", "vn3"])).expect("ssh shell parse");
+    let ssh_shell = parse(argv(&["portl", "ssh", "remote-dev"])).expect("ssh shell parse");
     assert_eq!(
         ssh_shell,
         Command::Ssh {
-            peer: "vn3".to_owned(),
+            peer: "remote-dev".to_owned(),
             user: None,
             tty: None,
             forward_agent: false,
@@ -280,15 +332,26 @@ fn portl_ssh_subcommands_parse() {
             stdio: false,
             quiet: false,
             verbose: 0,
+            forward_l: Vec::new(),
+            forward_r: Vec::new(),
             remote_command: Vec::new(),
         }
     );
 
-    let ssh_exec = parse(argv(&["portl-ssh", "vn3", "hostname"])).expect("portl-ssh exec parse");
+    let ssh_forward = parse(argv(&[
+        "portl",
+        "ssh",
+        "-L",
+        "8025:localhost:8025",
+        "-R",
+        "/tmp/local-agent.sock",
+        "remote-dev",
+    ]))
+    .expect("portl ssh forwarding parse");
     assert_eq!(
-        ssh_exec,
+        ssh_forward,
         Command::Ssh {
-            peer: "vn3".to_owned(),
+            peer: "remote-dev".to_owned(),
             user: None,
             tty: None,
             forward_agent: false,
@@ -296,14 +359,35 @@ fn portl_ssh_subcommands_parse() {
             stdio: false,
             quiet: false,
             verbose: 0,
+            forward_l: vec!["8025:localhost:8025".to_owned()],
+            forward_r: vec!["/tmp/local-agent.sock".to_owned()],
+            remote_command: Vec::new(),
+        }
+    );
+
+    let ssh_exec =
+        parse(argv(&["portl-ssh", "remote-dev", "hostname"])).expect("portl-ssh exec parse");
+    assert_eq!(
+        ssh_exec,
+        Command::Ssh {
+            peer: "remote-dev".to_owned(),
+            user: None,
+            tty: None,
+            forward_agent: false,
+            stdin_null: false,
+            stdio: false,
+            quiet: false,
+            verbose: 0,
+            forward_l: Vec::new(),
+            forward_r: Vec::new(),
             remote_command: vec!["hostname".to_owned()],
         }
     );
 
-    let ssh_stdio = parse(argv(&["portl-ssh", "--stdio", "vn3"])).expect("stdio parse");
+    let ssh_stdio = parse(argv(&["portl-ssh", "--stdio", "remote-dev"])).expect("stdio parse");
     match ssh_stdio {
         Command::Ssh { peer, user, .. } => {
-            assert_eq!(peer, "vn3");
+            assert_eq!(peer, "remote-dev");
             assert_eq!(user, None);
         }
         other => panic!("unexpected command: {other:?}"),
@@ -312,11 +396,11 @@ fn portl_ssh_subcommands_parse() {
     let ssh_git = parse(argv(&[
         "portl-ssh",
         "-l",
-        "thinh",
+        "devuser",
         "--forward-agent",
         "-o",
         "StrictHostKeyChecking=no",
-        "vn3",
+        "remote-dev",
         "git-upload-pack",
         "repo.git",
     ]))
@@ -324,14 +408,16 @@ fn portl_ssh_subcommands_parse() {
     assert_eq!(
         ssh_git,
         Command::Ssh {
-            peer: "vn3".to_owned(),
-            user: Some("thinh".to_owned()),
+            peer: "remote-dev".to_owned(),
+            user: Some("devuser".to_owned()),
             tty: None,
             forward_agent: true,
             stdin_null: false,
             stdio: false,
             quiet: false,
             verbose: 0,
+            forward_l: Vec::new(),
+            forward_r: Vec::new(),
             remote_command: vec!["git-upload-pack".to_owned(), "repo.git".to_owned()],
         }
     );
@@ -339,20 +425,23 @@ fn portl_ssh_subcommands_parse() {
 
 #[test]
 fn portl_ssh_proxy_subcommands_parse() {
-    let default_proxy = parse(argv(&["portl", "ssh-proxy", "vn3"])).expect("ssh-proxy defaults");
+    let default_proxy =
+        parse(argv(&["portl", "ssh-proxy", "remote-dev"])).expect("ssh-proxy defaults");
     assert_eq!(
         default_proxy,
         Command::SshProxy {
-            peer: "vn3".to_owned(),
+            peer: "remote-dev".to_owned(),
             host: "127.0.0.1".to_owned(),
             port: 22,
+            forward_l: Vec::new(),
+            forward_r: Vec::new(),
         }
     );
 
     let proxy = parse(argv(&[
         "portl",
         "ssh-proxy",
-        "vn3",
+        "remote-dev",
         "--host",
         "127.0.0.1",
         "--port",
@@ -362,19 +451,44 @@ fn portl_ssh_proxy_subcommands_parse() {
     assert_eq!(
         proxy,
         Command::SshProxy {
-            peer: "vn3".to_owned(),
+            peer: "remote-dev".to_owned(),
             host: "127.0.0.1".to_owned(),
             port: 2222,
+            forward_l: Vec::new(),
+            forward_r: Vec::new(),
         }
     );
 
-    let default_config = parse(argv(&["portl", "ssh-config", "vn3"]))
+    let proxy_forward = parse(argv(&[
+        "portl",
+        "ssh-proxy",
+        "-L",
+        "8080:3000",
+        "remote-dev",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "2222",
+    ]))
+    .expect("ssh-proxy forwarding parse");
+    assert_eq!(
+        proxy_forward,
+        Command::SshProxy {
+            peer: "remote-dev".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 2222,
+            forward_l: vec!["8080:3000".to_owned()],
+            forward_r: Vec::new(),
+        }
+    );
+
+    let default_config = parse(argv(&["portl", "ssh-config", "remote-dev"]))
         .expect("ssh-config defaults to native ProxyCommand mode");
     assert_eq!(
         default_config,
         Command::SshConfig {
             mode: SshConfigMode::NativeProxycommand,
-            target: "vn3".to_owned(),
+            target: "remote-dev".to_owned(),
             host_alias: None,
             remote_host: "127.0.0.1".to_owned(),
             remote_port: 22,
@@ -387,9 +501,9 @@ fn portl_ssh_proxy_subcommands_parse() {
         "ssh-config",
         "--mode",
         "sshd-proxy",
-        "vn3",
+        "remote-dev",
         "--host",
-        "vn3-sshd",
+        "remote-dev-sshd",
         "--remote-port",
         "2222",
         "--portl",
@@ -400,8 +514,8 @@ fn portl_ssh_proxy_subcommands_parse() {
         config,
         Command::SshConfig {
             mode: SshConfigMode::SshdProxy,
-            target: "vn3".to_owned(),
-            host_alias: Some("vn3-sshd".to_owned()),
+            target: "remote-dev".to_owned(),
+            host_alias: Some("remote-dev-sshd".to_owned()),
             remote_host: "127.0.0.1".to_owned(),
             remote_port: 2222,
             portl_bin: "/usr/local/bin/portl".to_owned(),
@@ -422,14 +536,14 @@ fn portl_ssh_compatibility_options_parse() {
         "./ssh_config",
         "-o",
         "UserKnownHostsFile=/tmp/known_hosts",
-        "alice@vn3",
+        "alice@remote-dev",
         "--remote-flag",
     ]))
     .expect("portl-ssh options parse");
     assert_eq!(
         no_tty,
         Command::Ssh {
-            peer: "vn3".to_owned(),
+            peer: "remote-dev".to_owned(),
             user: Some("alice".to_owned()),
             tty: Some(false),
             forward_agent: false,
@@ -437,15 +551,17 @@ fn portl_ssh_compatibility_options_parse() {
             stdio: false,
             quiet: true,
             verbose: 0,
+            forward_l: Vec::new(),
+            forward_r: Vec::new(),
             remote_command: vec!["--remote-flag".to_owned()],
         }
     );
 
-    let force_tty = parse(argv(&["portl-ssh", "-tt", "vn3"])).expect("force tty parse");
+    let force_tty = parse(argv(&["portl-ssh", "-tt", "remote-dev"])).expect("force tty parse");
     assert_eq!(
         force_tty,
         Command::Ssh {
-            peer: "vn3".to_owned(),
+            peer: "remote-dev".to_owned(),
             user: None,
             tty: Some(true),
             forward_agent: false,
@@ -453,15 +569,17 @@ fn portl_ssh_compatibility_options_parse() {
             stdio: false,
             quiet: false,
             verbose: 0,
+            forward_l: Vec::new(),
+            forward_r: Vec::new(),
             remote_command: Vec::new(),
         }
     );
 
-    let verbose = parse(argv(&["portl-ssh", "-vv", "vn3"])).expect("verbose parse");
+    let verbose = parse(argv(&["portl-ssh", "-vv", "remote-dev"])).expect("verbose parse");
     assert_eq!(
         verbose,
         Command::Ssh {
-            peer: "vn3".to_owned(),
+            peer: "remote-dev".to_owned(),
             user: None,
             tty: None,
             forward_agent: false,
@@ -469,11 +587,14 @@ fn portl_ssh_compatibility_options_parse() {
             stdio: false,
             quiet: false,
             verbose: 2,
+            forward_l: Vec::new(),
+            forward_r: Vec::new(),
             remote_command: Vec::new(),
         }
     );
 
-    let err = parse(argv(&["portl-ssh", "-T", "-t", "vn3"])).expect_err("-T and -t conflict");
+    let err =
+        parse(argv(&["portl-ssh", "-T", "-t", "remote-dev"])).expect_err("-T and -t conflict");
     let portl_cli::ParseError::Clap(err) = err else {
         panic!("expected clap error for conflicting tty flags");
     };

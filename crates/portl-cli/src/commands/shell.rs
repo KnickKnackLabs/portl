@@ -13,13 +13,27 @@ use portl_core::wire::shell::EnvValue;
 use tokio::io::{AsyncWriteExt, copy};
 use tracing::debug;
 
+use crate::commands::forwarding::{ForwardPlan, ForwardingArgs};
 use crate::commands::peer_resolve::{
     ConnectedPeer, close_connected, connect_peer, connect_peer_quiet,
 };
 use crate::commands::session::{AttachSignalWatcher, RawModeExitVariant, RawModeGuard};
 
-pub fn run(peer: &str, cwd: Option<&str>, user: Option<&str>) -> Result<ExitCode> {
-    run_with_options(peer, cwd, user, ShellRunOptions::default())
+pub fn run(
+    peer: &str,
+    cwd: Option<&str>,
+    user: Option<&str>,
+    forwarding: ForwardingArgs,
+) -> Result<ExitCode> {
+    run_with_options(
+        peer,
+        cwd,
+        user,
+        ShellRunOptions {
+            forwarding,
+            ..Default::default()
+        },
+    )
 }
 
 #[derive(Debug, Clone, Default)]
@@ -27,6 +41,8 @@ pub(crate) struct ShellRunOptions {
     pub(crate) quiet_resolve: bool,
     pub(crate) close_stdin: bool,
     pub(crate) env_patch: Vec<(String, EnvValue)>,
+    pub(crate) forwarding: ForwardingArgs,
+    pub(crate) forwarding_plan: Option<(String, String, ForwardPlan)>,
 }
 
 pub(crate) fn run_with_options(
@@ -37,10 +53,18 @@ pub(crate) fn run_with_options(
 ) -> Result<ExitCode> {
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
+        let mut options = options;
+        let mut caps = shell_caps();
+        if !options.forwarding.is_empty() {
+            let (source_label, plan) =
+                crate::commands::forwarding::parse_for_target(peer, &options.forwarding)?;
+            plan.augment_caps(&mut caps);
+            options.forwarding_plan = Some((peer.to_owned(), source_label, plan));
+        }
         let connected = if options.quiet_resolve {
-            connect_peer_quiet(peer, shell_caps()).await?
+            connect_peer_quiet(peer, caps).await?
         } else {
-            connect_peer(peer, shell_caps()).await?
+            connect_peer(peer, caps).await?
         };
         let result = run_on_connected(&connected, cwd, user, options).await;
         close_connected(connected, b"shell complete").await;
@@ -56,6 +80,13 @@ pub(crate) async fn run_on_connected(
     user: Option<&str>,
     options: ShellRunOptions,
 ) -> Result<ExitCode> {
+    let _forward_runtime =
+        if let Some((target_label, source_label, plan)) = options.forwarding_plan.as_ref() {
+            eprint!("{}", plan.render_summary(target_label, source_label));
+            Some(plan.start(connected).await?)
+        } else {
+            None
+        };
     let (cols, rows) = size().unwrap_or((80, 24));
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_owned());
     let shell = open_shell_with_env(

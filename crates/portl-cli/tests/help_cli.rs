@@ -280,6 +280,27 @@ fn top_level_help_groups_daily_session_aliases() {
 }
 
 #[test]
+fn tcp_udp_help_include_beginner_forwarding_examples() {
+    let tcp = help_output(&["tcp", "--help"]);
+    for needle in [
+        "portl tcp -L 9090 remote-dev",
+        "Forwards port 9090 on the current machine to port 9090 on remote-dev.",
+        "portl tcp -L 15432:db.internal:5432 remote-dev",
+    ] {
+        assert!(tcp.contains(needle), "tcp help missing {needle:?}:\n{tcp}");
+    }
+
+    let udp = help_output(&["udp", "--help"]);
+    for needle in [
+        "portl udp -L 5353/udp remote-dev",
+        "Forwards UDP port 5353 on the current machine to UDP port 5353 on remote-dev.",
+        "portl udp -L 1053:dns.internal:53/udp remote-dev",
+    ] {
+        assert!(udp.contains(needle), "udp help missing {needle:?}:\n{udp}");
+    }
+}
+
+#[test]
 fn help_documents_session_environment_overrides() {
     for args in [&["--help"][..], &["session", "--help"][..]] {
         let help = help_output(args);

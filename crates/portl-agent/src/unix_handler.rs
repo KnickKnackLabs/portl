@@ -1,4 +1,5 @@
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -98,7 +99,15 @@ async fn serve_listen(
             }
         }
     } else {
-        None
+        match ensure_generated_forward_parent(&path_buf) {
+            Ok(cleanup) => cleanup,
+            Err(err) => {
+                write_ack(&mut send, false, Some(err.to_string())).await?;
+                send.finish()
+                    .context("finish failed generated unix listen setup ack")?;
+                return Ok(());
+            }
+        }
     };
     if cleanup && let Err(err) = remove_existing_socket_for_bind(&path_buf) {
         write_ack(&mut send, false, Some(err.to_string())).await?;
@@ -278,6 +287,57 @@ fn create_private_agent_parent(path: &Path) -> Result<AgentParentCleanup> {
     })
 }
 
+fn ensure_generated_forward_parent(path: &Path) -> Result<Option<AgentParentCleanup>> {
+    let Some(parent) = path.parent() else {
+        return Ok(None);
+    };
+    if !is_generated_forward_parent(parent) {
+        return Ok(None);
+    }
+    std::fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "create generated unix forwarding directory {}",
+            parent.display()
+        )
+    })?;
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).with_context(
+        || {
+            format!(
+                "chmod generated unix forwarding directory {}",
+                parent.display()
+            )
+        },
+    )?;
+    let metadata = std::fs::symlink_metadata(parent).with_context(|| {
+        format!(
+            "stat generated unix forwarding directory {}",
+            parent.display()
+        )
+    })?;
+    if !metadata.file_type().is_dir() {
+        bail!(
+            "generated unix forwarding parent is not a directory {}",
+            parent.display()
+        );
+    }
+    if metadata.permissions().mode() & 0o777 != 0o700 {
+        bail!(
+            "generated unix forwarding directory has unsafe permissions {}",
+            parent.display()
+        );
+    }
+    Ok(Some(AgentParentCleanup {
+        path: parent.to_path_buf(),
+    }))
+}
+
+fn is_generated_forward_parent(parent: &Path) -> bool {
+    let Some(name) = parent.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    parent.parent() == Some(Path::new("/tmp")) && name.starts_with("portl-from-")
+}
+
 fn validate_agent_parent(parent: &Path) -> Result<()> {
     let Some(name) = parent.file_name().and_then(|name| name.to_str()) else {
         bail!("ssh-agent forwarding parent must have a utf-8 name");
@@ -294,12 +354,21 @@ fn validate_agent_parent(parent: &Path) -> Result<()> {
 
 fn remove_existing_socket_for_bind(path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => std::fs::remove_file(path)
-            .with_context(|| format!("remove stale unix socket {}", path.display())),
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            if unix_socket_is_active(path) {
+                bail!("unix socket is already active: {}", path.display());
+            }
+            std::fs::remove_file(path)
+                .with_context(|| format!("remove stale unix socket {}", path.display()))
+        }
         Ok(_) => bail!("refusing to remove non-socket path {}", path.display()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err).with_context(|| format!("stat unix socket path {}", path.display())),
     }
+}
+
+fn unix_socket_is_active(path: &Path) -> bool {
+    StdUnixStream::connect(path).is_ok()
 }
 
 fn remove_socket_if_present(path: &Path) {
@@ -310,7 +379,53 @@ fn remove_socket_if_present(path: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::remove_existing_socket_for_bind;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+
+    use super::{ensure_generated_forward_parent, remove_existing_socket_for_bind};
+
+    #[test]
+    fn generated_forward_parent_is_created_private() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let parent = std::path::PathBuf::from("/tmp")
+            .join(format!("portl-from-test-{}-{unique}", std::process::id()));
+        let path = parent.join("agent.sock");
+
+        let cleanup = ensure_generated_forward_parent(&path)
+            .unwrap()
+            .expect("generated parent should return cleanup guard");
+
+        let metadata = std::fs::symlink_metadata(&parent).unwrap();
+        assert!(metadata.file_type().is_dir());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        drop(cleanup);
+        assert!(!parent.exists());
+    }
+
+    #[test]
+    fn cleanup_refuses_active_socket() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("active.sock");
+        let _listener = UnixListener::bind(&path).unwrap();
+
+        let err = remove_existing_socket_for_bind(&path).expect_err("active sockets are protected");
+        assert!(err.to_string().contains("already active"), "{err}");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn cleanup_removes_stale_socket() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("stale.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        drop(listener);
+
+        remove_existing_socket_for_bind(&path).unwrap();
+        assert!(!path.exists());
+    }
 
     #[test]
     fn cleanup_refuses_regular_files() {

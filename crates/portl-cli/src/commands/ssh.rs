@@ -8,6 +8,7 @@ use portl_core::net::{UnixListenOptions, open_unix_listen_with_options, run_unix
 use portl_core::ticket::schema::{Capabilities, EnvPolicy, ShellCaps, UnixCaps, UnixPathRule};
 use portl_core::wire::shell::EnvValue;
 
+use crate::commands::forwarding::ForwardingArgs;
 use crate::commands::peer_resolve::{ConnectedPeer, close_connected, connect_peer_quiet};
 use crate::commands::{exec, shell};
 
@@ -43,19 +44,25 @@ pub fn run(
     _quiet: bool,
     _verbose: u8,
     remote_command: &[String],
+    forwarding: ForwardingArgs,
 ) -> Result<ExitCode> {
     if stdio {
         validate_stdio_options(stdin_null, remote_command)?;
+        if !forwarding.is_empty() {
+            bail!(
+                "portl ssh --stdio cannot combine with -L/-R; let OpenSSH own forwarding for ProxyCommand use"
+            );
+        }
         return crate::commands::ssh_stdio::run(peer, user, forward_agent);
     }
 
     validate_native_options(tty, remote_command)?;
 
     if forward_agent {
-        return run_with_agent_forwarding(peer, user, stdin_null, remote_command);
+        return run_with_agent_forwarding(peer, user, stdin_null, remote_command, forwarding);
     }
 
-    run_without_agent_forwarding(peer, user, stdin_null, remote_command)
+    run_without_agent_forwarding(peer, user, stdin_null, remote_command, forwarding)
 }
 
 fn run_without_agent_forwarding(
@@ -63,6 +70,7 @@ fn run_without_agent_forwarding(
     user: Option<&str>,
     stdin_null: bool,
     remote_command: &[String],
+    forwarding: ForwardingArgs,
 ) -> Result<ExitCode> {
     if remote_command.is_empty() {
         return shell::run_with_options(
@@ -72,23 +80,52 @@ fn run_without_agent_forwarding(
             shell::ShellRunOptions {
                 quiet_resolve: true,
                 close_stdin: stdin_null,
+                forwarding,
                 ..Default::default()
             },
         );
     }
 
     let argv = ssh_remote_command_argv(remote_command);
-    exec::run_with_options(
-        peer,
-        None,
-        user,
-        &argv,
-        exec::ExecRunOptions {
-            quiet_resolve: true,
-            close_stdin: stdin_null,
-            ..Default::default()
-        },
-    )
+    if forwarding.is_empty() {
+        return exec::run_with_options(
+            peer,
+            None,
+            user,
+            &argv,
+            exec::ExecRunOptions {
+                quiet_resolve: true,
+                close_stdin: stdin_null,
+                ..Default::default()
+            },
+        );
+    }
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let result = runtime.block_on(async move {
+        let (source_label, plan) =
+            crate::commands::forwarding::parse_for_target(peer, &forwarding)?;
+        let mut caps = ssh_caps(None);
+        plan.augment_caps(&mut caps);
+        let connected = connect_peer_quiet(peer, caps).await?;
+        eprint!("{}", plan.render_summary(peer, &source_label));
+        let _forward_runtime = plan.start(&connected).await?;
+        let result = exec::run_on_connected(
+            &connected,
+            None,
+            user,
+            &argv,
+            exec::ExecRunOptions {
+                close_stdin: stdin_null,
+                ..Default::default()
+            },
+        )
+        .await;
+        close_connected(connected, b"ssh complete").await;
+        result
+    });
+    runtime.shutdown_background();
+    result
 }
 
 fn run_with_agent_forwarding(
@@ -96,13 +133,31 @@ fn run_with_agent_forwarding(
     user: Option<&str>,
     stdin_null: bool,
     remote_command: &[String],
+    forwarding: ForwardingArgs,
 ) -> Result<ExitCode> {
     let local_agent_path = ssh_auth_sock_from_env(std::env::var_os("SSH_AUTH_SOCK"))?;
     let remote_agent_path = remote_agent_socket_path(rand::random());
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
-        let connected = connect_peer_quiet(peer, ssh_caps(Some(&remote_agent_path))).await?;
+        let forward_plan = if forwarding.is_empty() {
+            None
+        } else {
+            let (source_label, plan) =
+                crate::commands::forwarding::parse_for_target(peer, &forwarding)?;
+            Some((source_label, plan))
+        };
+        let mut caps = ssh_caps(Some(&remote_agent_path));
+        if let Some((_source_label, plan)) = forward_plan.as_ref() {
+            plan.augment_caps(&mut caps);
+        }
+        let connected = connect_peer_quiet(peer, caps).await?;
         ensure_agent_env_allowed(&connected.session.effective_caps)?;
+        let _forward_runtime = if let Some((source_label, plan)) = forward_plan.as_ref() {
+            eprint!("{}", plan.render_summary(peer, source_label));
+            Some(plan.start(&connected).await?)
+        } else {
+            None
+        };
         let result = run_agent_forwarded_session(
             &connected,
             user,

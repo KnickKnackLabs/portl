@@ -5,14 +5,37 @@ use portl_core::net::open_tcp;
 use portl_core::ticket::schema::{Capabilities, PortRule};
 use tokio::io::{AsyncWriteExt, copy};
 
+use crate::commands::forwarding::ForwardingArgs;
 use crate::commands::peer_resolve::{close_connected, connect_peer_quiet};
 
-pub fn run(peer: &str, host: &str, port: u16) -> Result<ExitCode> {
+pub fn run(peer: &str, host: &str, port: u16, forwarding: ForwardingArgs) -> Result<ExitCode> {
     validate_exact_tcp_target(host, port)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
-        let connected = connect_peer_quiet(peer, ssh_proxy_caps(host, port)).await?;
-        ensure_effective_tcp_cap_is_exact(&connected.session.effective_caps, host, port)?;
+        let forward_plan = if forwarding.is_empty() {
+            None
+        } else {
+            let (source_label, plan) =
+                crate::commands::forwarding::parse_for_target(peer, &forwarding)?;
+            Some((source_label, plan))
+        };
+        let mut caps = ssh_proxy_caps(host, port);
+        if let Some((_source_label, plan)) = forward_plan.as_ref() {
+            plan.augment_caps(&mut caps);
+        }
+        let connected = connect_peer_quiet(peer, caps).await?;
+        ensure_effective_tcp_cap_is_exact(
+            &connected.session.effective_caps,
+            host,
+            port,
+            forward_plan.is_some(),
+        )?;
+        let _forward_runtime = if let Some((source_label, plan)) = forward_plan.as_ref() {
+            eprint!("{}", plan.render_summary(peer, source_label));
+            Some(plan.start(&connected).await?)
+        } else {
+            None
+        };
         let result = run_stdio_proxy(&connected.connection, &connected.session, host, port).await;
         close_connected(connected, b"ssh proxy complete").await;
         result
@@ -65,7 +88,12 @@ async fn run_stdio_proxy(
     Ok(ExitCode::SUCCESS)
 }
 
-fn ensure_effective_tcp_cap_is_exact(caps: &Capabilities, host: &str, port: u16) -> Result<()> {
+fn ensure_effective_tcp_cap_is_exact(
+    caps: &Capabilities,
+    host: &str,
+    port: u16,
+    allow_extra_rules: bool,
+) -> Result<()> {
     let exact_count = caps
         .tcp
         .as_ref()
@@ -73,9 +101,10 @@ fn ensure_effective_tcp_cap_is_exact(caps: &Capabilities, host: &str, port: u16)
         .flatten()
         .filter(|rule| rule.host_glob == host && rule.port_min == port && rule.port_max == port)
         .count();
-    if caps.presence == 0b0000_0010
-        && caps.tcp.as_ref().is_some_and(|rules| rules.len() == 1)
-        && exact_count == 1
+    if exact_count == 1
+        && (allow_extra_rules
+            || (caps.presence == 0b0000_0010
+                && caps.tcp.as_ref().is_some_and(|rules| rules.len() == 1)))
     {
         return Ok(());
     }
@@ -119,6 +148,7 @@ fn validate_port(port: u16) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{ensure_effective_tcp_cap_is_exact, ssh_proxy_caps, validate_exact_tcp_target};
+    use crate::commands::forwarding::ForwardingArgs;
 
     #[test]
     fn ssh_proxy_caps_are_exact_to_host_and_port() {
@@ -146,7 +176,7 @@ mod tests {
             meta: None,
             unix: None,
         };
-        let err = ensure_effective_tcp_cap_is_exact(&broad, "127.0.0.1", 22)
+        let err = ensure_effective_tcp_cap_is_exact(&broad, "127.0.0.1", 22, false)
             .expect_err("broad effective caps must fail");
         assert!(err.to_string().contains("exact TCP ticket"));
     }
@@ -154,8 +184,27 @@ mod tests {
     #[test]
     fn ssh_proxy_accepts_exact_effective_caps() {
         let caps = ssh_proxy_caps("127.0.0.1", 22);
-        ensure_effective_tcp_cap_is_exact(&caps, "127.0.0.1", 22)
+        ensure_effective_tcp_cap_is_exact(&caps, "127.0.0.1", 22, false)
             .expect("exact effective caps should pass");
+    }
+
+    #[test]
+    fn ssh_proxy_forwarding_caps_stay_canonical_with_extra_forwards() {
+        let mut caps = ssh_proxy_caps("127.0.0.1", 22);
+        let plan = ForwardingArgs {
+            local: vec!["8080:3000".to_owned()],
+            remote: Vec::new(),
+        }
+        .parse("remote-dev", "local-dev")
+        .unwrap();
+        plan.augment_caps(&mut caps);
+
+        let tcp = caps.tcp.as_ref().expect("tcp caps");
+        assert_eq!(tcp.len(), 2);
+        assert_eq!(tcp[0].host_glob, "*");
+        assert_eq!(tcp[1].host_glob, "127.0.0.1");
+        ensure_effective_tcp_cap_is_exact(&caps, "127.0.0.1", 22, true)
+            .expect("exact target should remain present when forwarding adds wildcard caps");
     }
 
     #[test]

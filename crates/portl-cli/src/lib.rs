@@ -94,6 +94,8 @@ pub enum Command {
         peer: String,
         cwd: Option<String>,
         user: Option<String>,
+        forward_l: Vec<String>,
+        forward_r: Vec<String>,
     },
     SessionProviders {
         target: Option<String>,
@@ -105,6 +107,8 @@ pub enum Command {
         provider: Option<String>,
         user: Option<String>,
         cwd: Option<String>,
+        forward_l: Vec<String>,
+        forward_r: Vec<String>,
         argv: Vec<String>,
     },
     SessionLs {
@@ -156,12 +160,16 @@ pub enum Command {
         stdio: bool,
         quiet: bool,
         verbose: u8,
+        forward_l: Vec<String>,
+        forward_r: Vec<String>,
         remote_command: Vec<String>,
     },
     SshProxy {
         peer: String,
         host: String,
         port: u16,
+        forward_l: Vec<String>,
+        forward_r: Vec<String>,
     },
     SshConfig {
         mode: SshConfigMode,
@@ -181,9 +189,11 @@ pub enum Command {
     },
     Socket {
         peer: String,
-        local: String,
+        local: Option<String>,
         connect: Option<String>,
         listen: Option<String>,
+        socket_l: Vec<String>,
+        socket_r: Vec<String>,
         cleanup: bool,
     },
     // v0.3.0: peer / ticket / whoami replace top-level mint + revoke.
@@ -760,9 +770,21 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             count,
             timeout,
         } => commands::status::run(target.as_deref(), relay, json, watch, count, timeout),
-        Command::Shell { peer, cwd, user } => {
-            commands::shell::run(&peer, cwd.as_deref(), user.as_deref())
-        }
+        Command::Shell {
+            peer,
+            cwd,
+            user,
+            forward_l,
+            forward_r,
+        } => commands::shell::run(
+            &peer,
+            cwd.as_deref(),
+            user.as_deref(),
+            commands::forwarding::ForwardingArgs {
+                local: forward_l,
+                remote: forward_r,
+            },
+        ),
         Command::GhosttySessionHelper {
             name,
             socket_path,
@@ -782,6 +804,8 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             provider,
             user,
             cwd,
+            forward_l,
+            forward_r,
             argv,
         } => commands::session::attach(
             session.as_deref(),
@@ -790,6 +814,10 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             user.as_deref(),
             cwd.as_deref(),
             &argv,
+            commands::forwarding::ForwardingArgs {
+                local: forward_l,
+                remote: forward_r,
+            },
         ),
         Command::SessionLs {
             target_ref,
@@ -865,6 +893,8 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             stdio,
             quiet,
             verbose,
+            forward_l,
+            forward_r,
             remote_command,
         } => commands::ssh::run(
             &peer,
@@ -876,8 +906,26 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             quiet,
             verbose,
             &remote_command,
+            commands::forwarding::ForwardingArgs {
+                local: forward_l,
+                remote: forward_r,
+            },
         ),
-        Command::SshProxy { peer, host, port } => commands::ssh_proxy::run(&peer, &host, port),
+        Command::SshProxy {
+            peer,
+            host,
+            port,
+            forward_l,
+            forward_r,
+        } => commands::ssh_proxy::run(
+            &peer,
+            &host,
+            port,
+            commands::forwarding::ForwardingArgs {
+                local: forward_l,
+                remote: forward_r,
+            },
+        ),
         Command::SshConfig {
             mode,
             target,
@@ -900,12 +948,16 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             local,
             connect,
             listen,
+            socket_l,
+            socket_r,
             cleanup,
         } => commands::socket::run(
             &peer,
-            &local,
+            local.as_deref(),
             connect.as_deref(),
             listen.as_deref(),
+            &socket_l,
+            &socket_r,
             cleanup,
         ),
         Command::PeerLs { json, active } => commands::peer::ls::run(json, active),
@@ -1256,6 +1308,12 @@ Session environment overrides:
 
 See `docs/ENV.md` for the full list including relay and internal variables.";
 
+const TCP_AFTER_HELP: &str = "TCP forwarding examples:\n  portl tcp -L 9090 remote-dev\n      Forwards port 9090 on the current machine to port 9090 on remote-dev.\n\n  portl tcp -L 8080:3000 remote-dev\n      Forwards port 8080 on the current machine to port 3000 on remote-dev.\n\n  portl tcp -L 15432:db.internal:5432 remote-dev\n      Forwards local port 15432 to db.internal:5432 as seen from remote-dev.\n";
+
+const UDP_AFTER_HELP: &str = "UDP forwarding examples:\n  portl udp -L 5353/udp remote-dev\n      Forwards UDP port 5353 on the current machine to UDP port 5353 on remote-dev.\n\n  portl udp -L 1053:dns.internal:53/udp remote-dev\n      Forwards local UDP port 1053 to dns.internal:53 as seen from remote-dev.\n";
+
+const SOCKET_AFTER_HELP: &str = "Socket forwarding quick guide:\n  -L opens a socket on the current machine; traffic exits on the target.\n  -R opens a socket on the target; traffic comes back to this machine.\n\nAssuming this machine is local-dev and the target is remote-dev:\n  -L /run/myapp/api.sock remote-dev\n      creates /tmp/portl-to-remote-dev/api.sock on local-dev\n      and forwards it to remote-dev:/run/myapp/api.sock\n\n  -R /tmp/local-agent.sock remote-dev\n      creates /tmp/portl-from-local-dev/local-agent.sock on remote-dev\n      and forwards it back to local-dev:/tmp/local-agent.sock\n\nExample with both directions:\n  $ portl socket -L /run/herdr/server.sock -R /tmp/herdr-client.sock remote-dev\n\n  local-dev:/tmp/portl-to-remote-dev/server.sock              -> remote-dev:/run/herdr/server.sock\n  remote-dev:/tmp/portl-from-local-dev/herdr-client.sock      -> local-dev:/tmp/herdr-client.sock\n\nIf a generated socket path is already active, Portl refuses to replace it.\nStop the existing forward, or choose an explicit path with LOCAL:REMOTE.";
+
 const RELATIONSHIP_HELP: &str = "Relationship between portl trust objects:\n\n                    peer              invite                ticket\nOwns on disk        peers.json        pending_invites.json   tickets.json + revocations.jsonl\nLifecycle           permanent         ephemeral (single-use) scoped by TTL\nWhen created        on accept         by `portl invite`      by `portl ticket issue`\nWhen consumed       on rm             on `portl accept`      every connection/operation\n\nWorkflow:\n    first contact     →  `portl invite` + `portl accept`       (writes peer row)\n    day-to-day auth   →  `portl shell <target>`                (one-shot terminal)\n    persistent auth   →  `portl attach <session> --target <target>` (persistent terminal, if available)\n    advanced: bounded →  `portl ticket issue` + `ticket save`  (explicit permission)";
 
 const INVITE_AFTER_HELP: &str = "Examples:\n  portl invite                              # mutual pair, 1h TTL\n  portl invite --initiator me --for cust    # remote-support invite\n  portl invite --ttl 10m --for laptop\n  portl invite ls\n  portl invite rm abc123\n\nRelationship between portl trust objects:\n\n                    peer              invite                ticket\nOwns on disk        peers.json        pending_invites.json   tickets.json + revocations.jsonl\nLifecycle           permanent         ephemeral (single-use) scoped by TTL\nWhen created        on accept         by `portl invite`      by `portl ticket issue`\nWhen consumed       on rm             on `portl accept`      every connection/operation\n\nWorkflow:\n    first contact     →  `portl invite` + `portl accept`       (writes peer row)\n    day-to-day auth   →  `portl shell <target>`                (one-shot terminal)\n    persistent auth   →  `portl attach <session> --target <target>` (persistent terminal, if available)\n    advanced: bounded →  `portl ticket issue` + `ticket save`  (explicit permission)";
@@ -1476,6 +1534,12 @@ enum SessionTopLevel {
         user: Option<String>,
         #[arg(long)]
         cwd: Option<String>,
+        /// Forward from the current machine to the target. Accepts TCP, UDP (/udp), or Unix socket specs.
+        #[arg(short = 'L', value_name = "SPEC")]
+        forward_l: Vec<String>,
+        /// Forward from the target back to this machine. Unix sockets only for now.
+        #[arg(short = 'R', value_name = "SPEC")]
+        forward_r: Vec<String>,
         #[arg(last = true)]
         argv: Vec<String>,
     },
@@ -1496,7 +1560,7 @@ enum SessionTopLevel {
     /// List persistent sessions.
     #[command(display_order = 102)]
     Ls {
-        /// Optional target/provider shorthand, e.g. `max` or `max/tmux`.
+        /// Optional target/provider shorthand, e.g. `remote-dev` or `remote-dev/tmux`.
         #[arg(value_name = "TARGET_REF")]
         target_ref: Option<String>,
         /// Explicit remote target. Defaults to `PORTL_TARGET`, then local.
@@ -1574,6 +1638,12 @@ enum ConnectTopLevel {
         cwd: Option<String>,
         #[arg(long)]
         user: Option<String>,
+        /// Forward from the current machine to the target. Accepts TCP, UDP (/udp), or Unix socket specs.
+        #[arg(short = 'L', value_name = "SPEC")]
+        forward_l: Vec<String>,
+        /// Forward from the target back to this machine. Unix sockets only for now.
+        #[arg(short = 'R', value_name = "SPEC")]
+        forward_r: Vec<String>,
     },
     /// Run a one-shot remote command without a persistent session.
     #[command(display_order = 170)]
@@ -1623,6 +1693,12 @@ enum ConnectTopLevel {
         /// SSH port. Parsed for compatibility and ignored by native Portl mode.
         #[arg(short = 'p', value_name = "PORT")]
         port: Option<String>,
+        /// Forward from the current machine to the target. Accepts TCP, UDP (/udp), or Unix socket specs.
+        #[arg(short = 'L', value_name = "SPEC")]
+        forward_l: Vec<String>,
+        /// Forward from the target back to this machine. Unix sockets only for now.
+        #[arg(short = 'R', value_name = "SPEC")]
+        forward_r: Vec<String>,
         #[arg(help = TARGET_HELP, value_name = "TARGET")]
         target: String,
         #[arg(
@@ -1645,6 +1721,12 @@ enum ConnectTopLevel {
         /// Port to connect to from the target.
         #[arg(long, default_value_t = 22)]
         port: u16,
+        /// Forward from the current machine to the target. Accepts TCP, UDP (/udp), or Unix socket specs.
+        #[arg(short = 'L', value_name = "SPEC")]
+        forward_l: Vec<String>,
+        /// Forward from the target back to this machine. Unix sockets only for now.
+        #[arg(short = 'R', value_name = "SPEC")]
+        forward_r: Vec<String>,
     },
     /// Emit OpenSSH config snippets for Portl SSH workflows.
     #[command(display_order = 177)]
@@ -1668,45 +1750,41 @@ enum ConnectTopLevel {
         portl_bin: String,
     },
     /// Set up one or more local TCP forwards.
-    #[command(display_order = 180)]
+    #[command(display_order = 180, after_long_help = TCP_AFTER_HELP)]
     Tcp {
-        /// Local forward spec: `[LOCAL_HOST:]LOCAL_PORT:REMOTE_HOST:REMOTE_PORT`.
+        /// Local forward spec: `LOCAL_PORT`, `LOCAL_PORT:REMOTE_PORT`, or `[LOCAL_HOST:]LOCAL_PORT:REMOTE_HOST:REMOTE_PORT[/tcp]`.
         #[arg(short = 'L', required = true)]
         local: Vec<String>,
         #[arg(help = TARGET_HELP, value_name = "TARGET")]
         peer: String,
     },
     /// Set up one or more local UDP forwards.
-    #[command(display_order = 190)]
+    #[command(display_order = 190, after_long_help = UDP_AFTER_HELP)]
     Udp {
-        /// Local forward spec: `[LOCAL_HOST:]LOCAL_PORT:REMOTE_HOST:REMOTE_PORT`.
+        /// Local forward spec: `LOCAL_PORT`, `LOCAL_PORT:REMOTE_PORT`, or `[LOCAL_HOST:]LOCAL_PORT:REMOTE_HOST:REMOTE_PORT[/udp]`.
         #[arg(short = 'L', required = true)]
         local: Vec<String>,
         #[arg(help = TARGET_HELP, value_name = "TARGET")]
         peer: String,
     },
     /// Set up Unix-domain socket forwards.
-    #[command(display_order = 195)]
+    #[command(display_order = 195, after_long_help = SOCKET_AFTER_HELP)]
     Socket {
         /// Local Unix socket path. In --connect mode this is the local listener; in --listen mode this is the local target socket.
         #[arg(long, value_name = "PATH")]
-        local: String,
+        local: Option<String>,
         /// Remote Unix socket path to connect to for each local connection.
-        #[arg(
-            long,
-            value_name = "REMOTE_PATH",
-            conflicts_with = "listen",
-            required_unless_present = "listen"
-        )]
+        #[arg(long, value_name = "REMOTE_PATH", conflicts_with = "listen")]
         connect: Option<String>,
         /// Remote Unix socket path the agent should listen on and reverse-forward back to --local.
-        #[arg(
-            long,
-            value_name = "REMOTE_PATH",
-            conflicts_with = "connect",
-            required_unless_present = "connect"
-        )]
+        #[arg(long, value_name = "REMOTE_PATH", conflicts_with = "connect")]
         listen: Option<String>,
+        /// Unix local forward: `[LOCAL_SOCKET:]REMOTE_SOCKET`. A single path generates the local socket.
+        #[arg(short = 'L', value_name = "SPEC")]
+        socket_l: Vec<String>,
+        /// Unix remote forward: `[REMOTE_SOCKET:]LOCAL_SOCKET`. A single path generates the remote socket.
+        #[arg(short = 'R', value_name = "SPEC")]
+        socket_r: Vec<String>,
         /// Remove an existing socket path before binding and remove it on exit.
         #[arg(long)]
         cleanup: bool,
@@ -1790,12 +1868,18 @@ enum SessionAction {
         user: Option<String>,
         #[arg(long)]
         cwd: Option<String>,
+        /// Forward from the current machine to the target. Accepts TCP, UDP (/udp), or Unix socket specs.
+        #[arg(short = 'L', value_name = "SPEC")]
+        forward_l: Vec<String>,
+        /// Forward from the target back to this machine. Unix sockets only for now.
+        #[arg(short = 'R', value_name = "SPEC")]
+        forward_r: Vec<String>,
         #[arg(last = true)]
         argv: Vec<String>,
     },
     /// List persistent sessions.
     Ls {
-        /// Optional target/provider shorthand, e.g. `max` or `max/tmux`.
+        /// Optional target/provider shorthand, e.g. `remote-dev` or `remote-dev/tmux`.
         #[arg(value_name = "TARGET_REF")]
         target_ref: Option<String>,
         /// Explicit remote target. Defaults to `PORTL_TARGET`, then local.
@@ -2362,6 +2446,8 @@ fn session_top_level_into_command(action: SessionTopLevel) -> Command {
             provider,
             user,
             cwd,
+            forward_l,
+            forward_r,
             argv,
         } => Command::SessionAttach {
             session,
@@ -2369,6 +2455,8 @@ fn session_top_level_into_command(action: SessionTopLevel) -> Command {
             provider,
             user,
             cwd,
+            forward_l,
+            forward_r,
             argv,
         },
         SessionTopLevel::Run {
@@ -2430,6 +2518,8 @@ fn session_action_into_command(action: SessionAction) -> Command {
             provider,
             user,
             cwd,
+            forward_l,
+            forward_r,
             argv,
         } => Command::SessionAttach {
             session,
@@ -2437,6 +2527,8 @@ fn session_action_into_command(action: SessionAction) -> Command {
             provider,
             user,
             cwd,
+            forward_l,
+            forward_r,
             argv,
         },
         SessionAction::Ls {
@@ -2523,7 +2615,19 @@ fn connect_into_command(action: ConnectTopLevel, log_verbose: u8) -> Command {
             count,
             timeout,
         },
-        ConnectTopLevel::Shell { peer, cwd, user } => Command::Shell { peer, cwd, user },
+        ConnectTopLevel::Shell {
+            peer,
+            cwd,
+            user,
+            forward_l,
+            forward_r,
+        } => Command::Shell {
+            peer,
+            cwd,
+            user,
+            forward_l,
+            forward_r,
+        },
         ConnectTopLevel::Exec {
             peer,
             cwd,
@@ -2547,6 +2651,8 @@ fn connect_into_command(action: ConnectTopLevel, log_verbose: u8) -> Command {
             option: _,
             config: _,
             port: _,
+            forward_l,
+            forward_r,
             target,
             remote_command,
         } => {
@@ -2568,13 +2674,23 @@ fn connect_into_command(action: ConnectTopLevel, log_verbose: u8) -> Command {
                 stdio,
                 quiet,
                 verbose: log_verbose,
+                forward_l,
+                forward_r,
                 remote_command,
             }
         }
-        ConnectTopLevel::SshProxy { target, host, port } => Command::SshProxy {
+        ConnectTopLevel::SshProxy {
+            target,
+            host,
+            port,
+            forward_l,
+            forward_r,
+        } => Command::SshProxy {
             peer: target,
             host,
             port,
+            forward_l,
+            forward_r,
         },
         ConnectTopLevel::SshConfig {
             mode,
@@ -2598,12 +2714,16 @@ fn connect_into_command(action: ConnectTopLevel, log_verbose: u8) -> Command {
             local,
             connect,
             listen,
+            socket_l,
+            socket_r,
             cleanup,
         } => Command::Socket {
             peer,
             local,
             connect,
             listen,
+            socket_l,
+            socket_r,
             cleanup,
         },
     }
@@ -2625,13 +2745,19 @@ mod ssh_parse_tests {
 
     #[test]
     fn ssh_target_splits_optional_user_prefix() {
-        assert_eq!(split_ssh_target("vn3"), (None, "vn3".to_owned()));
         assert_eq!(
-            split_ssh_target("thinh@vn3"),
-            (Some("thinh".to_owned()), "vn3".to_owned())
+            split_ssh_target("remote-dev"),
+            (None, "remote-dev".to_owned())
         );
-        assert_eq!(split_ssh_target("@vn3"), (None, "@vn3".to_owned()));
-        assert_eq!(split_ssh_target("thinh@"), (None, "thinh@".to_owned()));
+        assert_eq!(
+            split_ssh_target("devuser@remote-dev"),
+            (Some("devuser".to_owned()), "remote-dev".to_owned())
+        );
+        assert_eq!(
+            split_ssh_target("@remote-dev"),
+            (None, "@remote-dev".to_owned())
+        );
+        assert_eq!(split_ssh_target("devuser@"), (None, "devuser@".to_owned()));
     }
 }
 

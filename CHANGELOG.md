@@ -5,6 +5,25 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.11.0 — 2026-06-02
+
+### Added
+
+- Added SSH-style forwarding UX across `portl tcp`, `portl udp`, and
+  `portl socket`, including repeatable shorthand `-L`/`-R` specs, grouped
+  startup summaries, generated Unix socket paths, and open/close lifecycle
+  logging with byte totals.
+- Added shared `-L`/`-R` forwarding flags to `portl shell`, `portl attach`,
+  `portl ssh`, and `portl ssh-proxy` so interactive sessions and SSH workflows
+  can keep Portl-managed TCP, UDP, and Unix socket forwards alive on the same
+  peer connection.
+
+### Fixed
+
+- Generated remote Unix socket parents under `/tmp/portl-from-*` are now removed
+  when the corresponding reverse forward closes, keeping live target machines
+  clean after socket forwarding exits.
+
 ## 0.10.7 — 2026-06-01
 
 ### Fixed

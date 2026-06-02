@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -33,6 +34,63 @@ impl UdpControl {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UdpForwardStatsSnapshot {
+    pub upstream_bytes: u64,
+    pub downstream_bytes: u64,
+    pub upstream_datagrams: u64,
+    pub downstream_datagrams: u64,
+}
+
+impl UdpForwardStatsSnapshot {
+    #[must_use]
+    pub fn delta_since(self, earlier: Self) -> Self {
+        Self {
+            upstream_bytes: self.upstream_bytes.saturating_sub(earlier.upstream_bytes),
+            downstream_bytes: self
+                .downstream_bytes
+                .saturating_sub(earlier.downstream_bytes),
+            upstream_datagrams: self
+                .upstream_datagrams
+                .saturating_sub(earlier.upstream_datagrams),
+            downstream_datagrams: self
+                .downstream_datagrams
+                .saturating_sub(earlier.downstream_datagrams),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct UdpForwardStats {
+    upstream_bytes: AtomicU64,
+    downstream_bytes: AtomicU64,
+    upstream_datagrams: AtomicU64,
+    downstream_datagrams: AtomicU64,
+}
+
+impl UdpForwardStats {
+    fn record_upstream(&self, bytes: usize) {
+        self.upstream_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.upstream_datagrams.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_downstream(&self, bytes: usize) {
+        self.downstream_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.downstream_datagrams.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> UdpForwardStatsSnapshot {
+        UdpForwardStatsSnapshot {
+            upstream_bytes: self.upstream_bytes.load(Ordering::Relaxed),
+            downstream_bytes: self.downstream_bytes.load(Ordering::Relaxed),
+            upstream_datagrams: self.upstream_datagrams.load(Ordering::Relaxed),
+            downstream_datagrams: self.downstream_datagrams.load(Ordering::Relaxed),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct LocalUdpForwardHandle {
     local_socket: Arc<UdpSocket>,
@@ -44,6 +102,7 @@ pub struct LocalUdpForwardHandle {
     // scratch/2026-04-21-udp-review-gemini.md §"Real-Code Concerns".
     src_tags: Arc<Mutex<SrcTagTable>>,
     session_id: Arc<Mutex<Option<[u8; 8]>>>,
+    stats: Arc<UdpForwardStats>,
 }
 
 #[derive(Debug)]
@@ -84,11 +143,16 @@ impl LocalUdpForwardHandle {
             ),
             src_tags: Arc::new(Mutex::new(SrcTagTable::default())),
             session_id: Arc::new(Mutex::new(None)),
+            stats: Arc::new(UdpForwardStats::default()),
         })
     }
 
     pub fn session_id(&self) -> Option<[u8; 8]> {
         *self.session_id.lock().expect("session_id mutex poisoned")
+    }
+
+    pub fn stats_snapshot(&self) -> UdpForwardStatsSnapshot {
+        self.stats.snapshot()
     }
 
     pub async fn run_with_control(
@@ -104,6 +168,7 @@ impl LocalUdpForwardHandle {
             connection.clone(),
             Arc::clone(&self.local_socket),
             Arc::clone(&self.src_tags),
+            Arc::clone(&self.stats),
             session_id,
             target_port,
         );
@@ -111,6 +176,7 @@ impl LocalUdpForwardHandle {
             connection,
             Arc::clone(&self.local_socket),
             Arc::clone(&self.src_tags),
+            Arc::clone(&self.stats),
             session_id,
         );
 
@@ -224,6 +290,7 @@ async fn upstream_loop(
     connection: Connection,
     local_socket: Arc<UdpSocket>,
     src_tags: Arc<Mutex<SrcTagTable>>,
+    stats: Arc<UdpForwardStats>,
     session_id: [u8; 8],
     target_port: u16,
 ) -> Result<()> {
@@ -287,7 +354,7 @@ async fn upstream_loop(
             // `tokio::select!` below by returning here so select cancels
             // the sender future (and vice versa on sender error).
             match tx.try_send(Bytes::from(encoded)) {
-                Ok(()) => {}
+                Ok(()) => stats.record_upstream(read),
                 Err(TrySendError::Full(_)) => {
                     crate::runtime::record_udp_datagram_drop("client_upstream", "queue_full");
                 }
@@ -322,6 +389,7 @@ async fn reverse_loop(
     connection: Connection,
     local_socket: Arc<UdpSocket>,
     src_tags: Arc<Mutex<SrcTagTable>>,
+    stats: Arc<UdpForwardStats>,
     session_id: [u8; 8],
 ) -> Result<()> {
     loop {
@@ -344,6 +412,7 @@ async fn reverse_loop(
             .send_to(&datagram.payload, to)
             .await
             .context("send udp payload to local app")?;
+        stats.record_downstream(datagram.payload.len());
     }
 }
 

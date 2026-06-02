@@ -49,6 +49,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
 use tracing::{debug, trace};
 
+use crate::commands::forwarding::{ForwardPlan, ForwardingArgs};
 use crate::commands::peer_resolve::{
     bind_client_endpoint, close_client_endpoint, close_connected, connect_peer, connect_peer_quiet,
     connect_peer_with_endpoint, resolve_identity_path,
@@ -1849,6 +1850,7 @@ pub fn attach(
     user: Option<&str>,
     cwd: Option<&str>,
     argv: &[String],
+    forwarding: ForwardingArgs,
 ) -> Result<ExitCode> {
     let provider = effective_provider(provider);
     let runtime = tokio::runtime::Runtime::new()?;
@@ -1861,6 +1863,9 @@ pub fn attach(
             provider.as_deref(),
         )?;
         if resolved_target_is_local(&resolved.target)? {
+            if !forwarding.is_empty() {
+                anyhow::bail!("portl attach -L/-R requires a remote target");
+            }
             return local_session_attach(
                 provider_name.as_deref(),
                 &resolved.target,
@@ -1872,6 +1877,13 @@ pub fn attach(
             .await;
         }
 
+        let forwarding_plan = if forwarding.is_empty() {
+            None
+        } else {
+            let (source_label, plan) =
+                crate::commands::forwarding::parse_for_target(&resolved.target, &forwarding)?;
+            Some((source_label, plan))
+        };
         let (cols, rows) = size().unwrap_or((80, 24));
         let request = RemoteSessionAttachRequest {
             target: resolved.target,
@@ -1883,8 +1895,11 @@ pub fn attach(
             term: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_owned()),
             cols,
             rows,
+            forwarding_plan,
         };
-        if should_reconnect_remote_attach(request.provider.as_deref())
+        if request.forwarding_plan.is_some() {
+            remote_session_attach_once_without_reconnect(request).await
+        } else if should_reconnect_remote_attach(request.provider.as_deref())
             && std::io::stdin().is_terminal()
         {
             remote_session_attach_with_reconnect(request).await
@@ -2411,6 +2426,7 @@ struct RemoteSessionAttachRequest {
     term: String,
     cols: u16,
     rows: u16,
+    forwarding_plan: Option<(String, ForwardPlan)>,
 }
 
 enum RemoteAttachSession {
@@ -2535,7 +2551,17 @@ fn session_reconnect_enabled() -> bool {
 async fn remote_session_attach_once_without_reconnect(
     request: RemoteSessionAttachRequest,
 ) -> Result<ExitCode> {
-    let connected = connect_peer(&request.target, session_caps()).await?;
+    let mut caps = session_caps();
+    if let Some((_source_label, plan)) = request.forwarding_plan.as_ref() {
+        plan.augment_caps(&mut caps);
+    }
+    let connected = connect_peer(&request.target, caps).await?;
+    let _forward_runtime = if let Some((source_label, plan)) = request.forwarding_plan.as_ref() {
+        eprint!("{}", plan.render_summary(&request.target, source_label));
+        Some(plan.start(&connected).await?)
+    } else {
+        None
+    };
     print_remote_attach_start(&request, request.provider.as_deref());
     let result = match open_remote_attach_session_checked(
         &connected.connection,
