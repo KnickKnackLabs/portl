@@ -458,9 +458,8 @@ mod tests {
         };
         let plan = args.parse("remote-dev", "local-dev").unwrap();
 
-        let err = match plan.start(&connected).await {
-            Ok(_) => panic!("occupied local TCP port should fail before attach/shell starts"),
-            Err(err) => err,
+        let Err(err) = plan.start(&connected).await else {
+            panic!("occupied local TCP port should fail before attach/shell starts");
         };
         assert!(err.to_string().contains("bind local listener"), "{err}");
         finish_connected_test_peer(connected, accept_task).await;
@@ -481,9 +480,8 @@ mod tests {
         };
         let plan = args.parse("remote-dev", "local-dev").unwrap();
 
-        let err = match plan.start(&connected).await {
-            Ok(_) => panic!("occupied second TCP port should fail plan startup"),
-            Err(err) => err,
+        let Err(err) = plan.start(&connected).await else {
+            panic!("occupied second TCP port should fail plan startup");
         };
         assert!(err.to_string().contains("bind local listener"), "{err}");
 

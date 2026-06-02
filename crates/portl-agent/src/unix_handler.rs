@@ -477,9 +477,8 @@ mod tests {
         std::os::unix::fs::symlink(target.path(), &parent).unwrap();
         let path = parent.join("agent.sock");
 
-        let err = match ensure_generated_forward_parent(&path) {
-            Ok(_) => panic!("generated parent symlink should be rejected before chmod"),
-            Err(err) => err,
+        let Err(err) = ensure_generated_forward_parent(&path) else {
+            panic!("generated parent symlink should be rejected before chmod");
         };
         assert!(err.to_string().contains("not a directory"), "{err}");
         let target_mode = std::fs::symlink_metadata(target.path())

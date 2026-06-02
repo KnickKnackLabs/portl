@@ -480,9 +480,8 @@ mod tests {
         let path = temp.path().join("active.sock");
         let _listener = UnixListener::bind(&path).unwrap();
 
-        let err = match bind_local_unix_listener(path.to_str().unwrap(), true) {
-            Ok(_) => panic!("active local socket should fail before session starts"),
-            Err(err) => err,
+        let Err(err) = bind_local_unix_listener(path.to_str().unwrap(), true) else {
+            panic!("active local socket should fail before session starts");
         };
         assert!(err.to_string().contains("already active"), "{err}");
     }
