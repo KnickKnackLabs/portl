@@ -1,4 +1,11 @@
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
 use anyhow::{Context, Result};
+use iroh::address_lookup::{DnsAddressLookup, PkarrResolver};
+use iroh::dns::DnsResolver;
+use iroh::endpoint::{RelayMode, presets};
+use iroh_base::SecretKey;
+use iroh_mdns_address_lookup::MdnsAddressLookup;
 use portl_core::id::Identity;
 
 pub(crate) fn load_client_config() -> Result<portl_agent::AgentConfig> {
@@ -12,13 +19,17 @@ pub(crate) fn load_client_config() -> Result<portl_agent::AgentConfig> {
     Ok(cfg)
 }
 
+fn local_only_dns_resolver() -> DnsResolver {
+    DnsResolver::with_nameserver(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9)))
+}
+
 pub(crate) async fn bind_client_endpoint(identity: &Identity) -> Result<iroh::Endpoint> {
     let cfg = load_client_config()?;
     bind_client_endpoint_with_config(identity, &cfg).await
 }
 
 pub(crate) async fn bind_client_endpoint_with_config(
-    identity: &Identity,
+    _identity: &Identity,
     cfg: &portl_agent::AgentConfig,
 ) -> Result<iroh::Endpoint> {
     tracing::debug!(
@@ -28,9 +39,51 @@ pub(crate) async fn bind_client_endpoint_with_config(
         relays = cfg.discovery.relays.len(),
         "binding CLI client endpoint"
     );
+    let mut builder = iroh::Endpoint::builder(presets::Minimal).secret_key(SecretKey::generate());
+
+    builder = if cfg.discovery.relays.is_empty() {
+        builder.relay_mode(RelayMode::Disabled)
+    } else {
+        builder.relay_mode(RelayMode::custom(cfg.discovery.relays.iter().cloned()))
+    };
+
+    if cfg.discovery.relays.is_empty() && !cfg.discovery.dns && !cfg.discovery.pkarr {
+        builder = builder.dns_resolver(local_only_dns_resolver());
+    }
+
+    if cfg.discovery.pkarr {
+        builder = builder.address_lookup(PkarrResolver::n0_dns());
+    }
+    if cfg.discovery.dns {
+        builder = builder.address_lookup(DnsAddressLookup::n0_dns());
+    }
+    if cfg.discovery.local {
+        builder = builder.address_lookup(MdnsAddressLookup::builder().advertise(false));
+    }
+    if let Some(bind_addr) = cfg.bind_addr {
+        builder = builder.bind_addr(bind_addr)?;
+    }
+
+    builder.bind().await.context("bind client endpoint")
+}
+
+pub(crate) async fn bind_pairing_client_endpoint_with_config(
+    identity: &Identity,
+    cfg: &portl_agent::AgentConfig,
+) -> Result<iroh::Endpoint> {
+    tracing::debug!(
+        dns = cfg.discovery.dns,
+        pkarr = cfg.discovery.pkarr,
+        local = cfg.discovery.local,
+        relays = cfg.discovery.relays.len(),
+        "binding CLI pairing endpoint"
+    );
+    // Pairing v1 identifies the acceptor by the Iroh transport identity
+    // observed by the inviter. Keep pairing on the stable machine key until
+    // a future pair protocol carries a separately signed stable identity.
     portl_agent::endpoint::bind(cfg, identity)
         .await
-        .context("bind client endpoint")
+        .context("bind pairing client endpoint")
 }
 
 pub(crate) fn preferred_relay_hint(cfg: &portl_agent::AgentConfig) -> Option<String> {
@@ -70,6 +123,50 @@ mod tests {
 
         assert_eq!(cfg.bind_addr, None);
         restore_env("PORTL_LISTEN_ADDR", old);
+    }
+
+    #[tokio::test]
+    async fn bind_client_endpoint_with_config_uses_ephemeral_transport_identity() {
+        let identity = portl_core::id::Identity::new();
+        let cfg = portl_agent::AgentConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("bind addr")),
+            discovery: portl_agent::DiscoveryConfig::in_process(),
+            ..portl_agent::AgentConfig::default()
+        };
+
+        let endpoint = super::bind_client_endpoint_with_config(&identity, &cfg)
+            .await
+            .expect("bind CLI endpoint");
+
+        assert_ne!(endpoint.id().as_bytes(), &identity.verifying_key());
+        if tokio::time::timeout(std::time::Duration::from_millis(500), endpoint.close())
+            .await
+            .is_err()
+        {
+            std::mem::forget(endpoint);
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_pairing_client_endpoint_with_config_uses_stable_transport_identity() {
+        let identity = portl_core::id::Identity::new();
+        let cfg = portl_agent::AgentConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("bind addr")),
+            discovery: portl_agent::DiscoveryConfig::in_process(),
+            ..portl_agent::AgentConfig::default()
+        };
+
+        let endpoint = super::bind_pairing_client_endpoint_with_config(&identity, &cfg)
+            .await
+            .expect("bind pairing endpoint");
+
+        assert_eq!(endpoint.id().as_bytes(), &identity.verifying_key());
+        if tokio::time::timeout(std::time::Duration::from_millis(500), endpoint.close())
+            .await
+            .is_err()
+        {
+            std::mem::forget(endpoint);
+        }
     }
 
     fn restore_env(name: &str, value: Option<OsString>) {

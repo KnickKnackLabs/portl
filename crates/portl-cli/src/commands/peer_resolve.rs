@@ -40,6 +40,8 @@ use tracing::debug;
 
 use crate::alias_store::AliasStore;
 
+const CLI_ENDPOINT_CLOSE_GRACE: Duration = Duration::from_millis(100);
+
 /// Which store a `resolve_peer` call matched in. Surfaced in
 /// `ResolvedPeer.source` for callers that want to report it, and
 /// used internally to shape the "using …" stderr message.
@@ -153,19 +155,20 @@ pub(crate) async fn close_connected(connected: ConnectedPeer, reason: &'static [
 pub(crate) async fn close_client_endpoint(endpoint: iroh::Endpoint, context: &'static str) {
     tracing::info!(event = "cli.endpoint.close.start", context);
     let started = std::time::Instant::now();
-    if tokio::time::timeout(Duration::from_millis(500), endpoint.close())
+    if tokio::time::timeout(CLI_ENDPOINT_CLOSE_GRACE, endpoint.close())
         .await
         .is_err()
     {
-        tracing::warn!(
+        debug!(
             event = "cli.endpoint.close.timeout",
             context,
             duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "timed out closing CLI endpoint"
         );
-        debug!(context, "timed out closing CLI endpoint");
-        // Short-lived CLI commands should not hang for several seconds after
-        // printing their result. If iroh's graceful QUIC close does not finish
-        // quickly, let process exit reclaim the socket instead of dropping the
+        // Short-lived CLI commands should not hang after printing their result
+        // or after the user detaches from an interactive session. If iroh's
+        // graceful QUIC close does not finish within the short grace period,
+        // let process exit reclaim the socket instead of dropping the
         // still-closing endpoint and emitting an alarming user-facing error.
         std::mem::forget(endpoint);
     } else {
@@ -472,8 +475,15 @@ fn label_hostname(label: &str) -> Option<String> {
 
 fn mint_fresh(identity: &Identity, addr: EndpointAddr, caps: Capabilities) -> Result<PortlTicket> {
     let now = unix_now()?;
-    mint_root(identity.signing_key(), addr, caps, now, now + 300, None)
-        .context("mint ephemeral peer ticket")
+    mint_root(
+        identity.signing_key(),
+        addr,
+        caps,
+        now,
+        now + 300,
+        Some(identity.verifying_key()),
+    )
+    .context("mint ephemeral peer ticket")
 }
 
 fn unix_now() -> Result<u64> {
@@ -743,6 +753,19 @@ mod tests {
     }
 
     #[test]
+    fn mint_fresh_binds_ticket_to_stable_identity() {
+        let identity = Identity::new();
+        let ticket = mint_fresh(&identity, relay_addr(), meta_caps()).expect("mint fresh ticket");
+
+        assert_eq!(ticket.body.to, Some(identity.verifying_key()));
+    }
+
+    #[test]
+    fn cli_endpoint_close_grace_keeps_shell_return_fast() {
+        assert!(CLI_ENDPOINT_CLOSE_GRACE <= Duration::from_millis(100));
+    }
+
+    #[test]
     fn static_relay_hints_are_added_to_discovered_addr() {
         let endpoint_id = endpoint_id();
         let discovered = EndpointAddr::new(endpoint_id)
@@ -806,5 +829,26 @@ mod tests {
 
     fn relay_urls(addr: &EndpointAddr) -> Vec<String> {
         addr.relay_urls().map(ToString::to_string).collect()
+    }
+
+    fn relay_addr() -> EndpointAddr {
+        EndpointAddr::new(endpoint_id())
+            .with_relay_url("https://relay.example/".parse().expect("relay url"))
+    }
+
+    fn meta_caps() -> Capabilities {
+        Capabilities {
+            presence: 0b0010_0000,
+            shell: None,
+            tcp: None,
+            udp: None,
+            fs: None,
+            vpn: None,
+            meta: Some(portl_core::ticket::schema::MetaCaps {
+                ping: true,
+                info: true,
+            }),
+            unix: None,
+        }
     }
 }

@@ -35,6 +35,8 @@ pub enum AcceptanceOutcome {
         caps: Box<Capabilities>,
         ticket_id: [u8; 16],
         ticket_chain_ids: Vec<[u8; 16]>,
+        ticket_issuer_id: [u8; 32],
+        ticket_holder_id: Option<[u8; 32]>,
         bearer: Option<Vec<u8>>,
     },
     Rejected {
@@ -63,8 +65,8 @@ pub fn evaluate_offer(input: &AcceptanceInput<'_>) -> AcceptanceOutcome {
         Err(reason) => return reject(reason),
     };
 
-    let caps = match verify_chain_without_time(&terminal, &chain, input.trust_roots) {
-        Ok(caps) => caps,
+    let verified = match verify_chain_without_time(&terminal, &chain, input.trust_roots) {
+        Ok(verified) => verified,
         Err(reason) => return reject(reason),
     };
 
@@ -107,9 +109,11 @@ pub fn evaluate_offer(input: &AcceptanceInput<'_>) -> AcceptanceOutcome {
         .collect();
     AcceptanceOutcome::Accepted {
         peer_token: derive_peer_token(input.source_id, terminal_ticket_id),
-        caps: Box::new(caps),
+        caps: Box::new(verified.caps),
         ticket_id: terminal_ticket_id,
         ticket_chain_ids,
+        ticket_issuer_id: verified.root_issuer,
+        ticket_holder_id: terminal.body.to,
         bearer,
     }
 }
@@ -133,11 +137,16 @@ fn decode_offer_ticket(bytes: &[u8]) -> Result<PortlTicket, AckReason> {
     Ok(ticket)
 }
 
+struct VerifiedChain {
+    caps: Capabilities,
+    root_issuer: [u8; 32],
+}
+
 fn verify_chain_without_time(
     terminal: &PortlTicket,
     chain: &[PortlTicket],
     roots: &TrustRoots,
-) -> Result<Capabilities, AckReason> {
+) -> Result<VerifiedChain, AckReason> {
     let all_tickets: Vec<&PortlTicket> = chain.iter().chain(std::iter::once(terminal)).collect();
     if all_tickets.is_empty() {
         return Err(AckReason::BadChain);
@@ -205,7 +214,10 @@ fn verify_chain_without_time(
         parent = child;
     }
 
-    Ok(terminal.body.caps.clone())
+    Ok(VerifiedChain {
+        caps: terminal.body.caps.clone(),
+        root_issuer: root_key,
+    })
 }
 
 fn check_validity_windows(

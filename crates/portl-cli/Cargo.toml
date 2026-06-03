@@ -50,6 +50,7 @@ futures-util = { workspace = true }
 bytes       = { workspace = true }
 iroh-base   = { workspace = true }
 iroh        = { workspace = true }
+iroh-mdns-address-lookup = { workspace = true }
 iroh-tickets = { workspace = true }
 hex         = { workspace = true }
 sha2        = { workspace = true }

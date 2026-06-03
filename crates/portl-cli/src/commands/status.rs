@@ -150,9 +150,10 @@ fn render_dashboard_human(snap: &portl_agent::status_schema::StatusResponse) -> 
             .rtt_micros
             .map_or_else(|| "—".to_owned(), |u| format!("{}ms", u / 1000));
         let up_secs = now.saturating_sub(c.up_since_unix);
+        let auth = connection_auth_label(c);
         let _ = writeln!(
             s,
-            "                - {eid_short} #{cid:x}  path={path}  rtt={rtt}  up={up_secs}s  rx={rx}B tx={tx}B",
+            "                - {eid_short}{auth} #{cid:x}  path={path}  rtt={rtt}  up={up_secs}s  rx={rx}B tx={tx}B",
             eid_short = crate::eid::format_short(&c.peer_eid),
             cid = c.connection_id,
             path = c.path.as_str(),
@@ -161,6 +162,21 @@ fn render_dashboard_human(snap: &portl_agent::status_schema::StatusResponse) -> 
         );
     }
     s
+}
+
+fn connection_auth_label(c: &portl_agent::conn_registry::ConnectionSnapshot) -> String {
+    let Some(auth_id) = c
+        .ticket_holder_id
+        .as_deref()
+        .or(c.ticket_issuer_id.as_deref())
+    else {
+        return String::new();
+    };
+    if auth_id == c.peer_eid {
+        String::new()
+    } else {
+        format!(" auth={}", crate::eid::format_short(auth_id))
+    }
 }
 
 fn render_provider_summary(
@@ -750,6 +766,7 @@ struct MetaEnvelope {
 mod tests {
     use serde_json::Value;
 
+    use portl_agent::conn_registry::{ConnectionSnapshot, PathKind};
     use portl_agent::status_schema::{
         AgentInfo, DefaultUserInfo, DiscoveryInfo, NetworkHealthInfo, NetworkInfo,
         SessionProviderInfo, SessionProviderSearchPath, SessionProvidersInfo, StatusResponse,
@@ -872,6 +889,88 @@ mod tests {
         assert_eq!(summary.paths[0].count, 2);
         assert_eq!(summary.paths[1].path, "relay https://example");
         assert_eq!(summary.paths[1].count, 1);
+    }
+
+    #[test]
+    fn dashboard_renders_connection_auth_identity_when_transport_is_ephemeral() {
+        let transport = "1111111111111111111111111111111111111111111111111111111111111111";
+        let auth = "2222222222222222222222222222222222222222222222222222222222222222";
+        let snap = StatusResponse::new(
+            AgentInfo {
+                pid: 42,
+                version: "0.11.1".to_owned(),
+                started_at_unix: 1_704_067_200,
+                home: "/Users/demo/.portl".to_owned(),
+                metrics_socket: "/Users/demo/.portl/run/metrics.sock".to_owned(),
+            },
+            vec![ConnectionSnapshot {
+                peer_eid: transport.to_owned(),
+                ticket_issuer_id: Some(auth.to_owned()),
+                ticket_holder_id: Some(auth.to_owned()),
+                connection_id: 7,
+                path: PathKind::Relay,
+                rtt_micros: Some(1_000),
+                bytes_rx: 10,
+                bytes_tx: 20,
+                up_since_unix: 1_704_067_199,
+            }],
+            NetworkInfo {
+                relays: Vec::new(),
+                discovery: DiscoveryInfo {
+                    dns: true,
+                    pkarr: true,
+                    local: true,
+                },
+            },
+            NetworkHealthInfo::disabled(),
+            SessionProvidersInfo::default(),
+            portl_agent::relay::RelayStatus::disabled(),
+        );
+
+        let rendered = super::render_dashboard_human(&snap);
+
+        assert!(rendered.contains("11111111…1111 auth=22222222…2222"));
+    }
+
+    #[test]
+    fn dashboard_renders_connection_issuer_auth_identity_without_holder() {
+        let transport = "1111111111111111111111111111111111111111111111111111111111111111";
+        let issuer = "3333333333333333333333333333333333333333333333333333333333333333";
+        let snap = StatusResponse::new(
+            AgentInfo {
+                pid: 42,
+                version: "0.11.1".to_owned(),
+                started_at_unix: 1_704_067_200,
+                home: "/Users/demo/.portl".to_owned(),
+                metrics_socket: "/Users/demo/.portl/run/metrics.sock".to_owned(),
+            },
+            vec![ConnectionSnapshot {
+                peer_eid: transport.to_owned(),
+                ticket_issuer_id: Some(issuer.to_owned()),
+                ticket_holder_id: None,
+                connection_id: 7,
+                path: PathKind::Relay,
+                rtt_micros: Some(1_000),
+                bytes_rx: 10,
+                bytes_tx: 20,
+                up_since_unix: 1_704_067_199,
+            }],
+            NetworkInfo {
+                relays: Vec::new(),
+                discovery: DiscoveryInfo {
+                    dns: true,
+                    pkarr: true,
+                    local: true,
+                },
+            },
+            NetworkHealthInfo::disabled(),
+            SessionProvidersInfo::default(),
+            portl_agent::relay::RelayStatus::disabled(),
+        );
+
+        let rendered = super::render_dashboard_human(&snap);
+
+        assert!(rendered.contains("11111111…1111 auth=33333333…3333"));
     }
 
     #[test]

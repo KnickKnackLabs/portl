@@ -56,7 +56,8 @@ async fn run_async(invite: &InviteCode) -> Result<ExitCode> {
     let client_cfg = crate::client_endpoint::load_client_config()?;
     let caller_relay_hint = crate::client_endpoint::preferred_relay_hint(&client_cfg);
     let endpoint =
-        crate::client_endpoint::bind_client_endpoint_with_config(&identity, &client_cfg).await?;
+        crate::client_endpoint::bind_pairing_client_endpoint_with_config(&identity, &client_cfg)
+            .await?;
     let result = run_async_with_endpoint(
         invite,
         &identity,

@@ -14,7 +14,7 @@ use portl_core::endpoint::Endpoint;
 use portl_core::id::{Identity, store};
 use portl_core::net::{PeerSession, open_tcp, open_ticket_v1};
 use portl_core::ticket::hash::ticket_id;
-use portl_core::ticket::schema::PortlTicket;
+use portl_core::ticket::schema::{Capabilities, PortlTicket};
 use slicer_portl::http::SlicerClient;
 use slicer_portl::{
     ADAPTER_NAME, SlicerBootstrapper, SlicerHandle, SlicerProvisionParams, parse_tag,
@@ -128,22 +128,10 @@ pub fn vm_add(
         let handle = bootstrapper.provision(&provision).await?;
         let inner = SlicerHandle::from_handle(&handle)?;
         let now = u64::try_from(now_unix_secs()?)?;
-        let ticket = portl_core::ticket::mint::mint_root(
-            operator.signing_key(),
-            iroh_base::EndpointAddr::new(
-                iroh_base::EndpointId::from_bytes(
-                    &hex::decode(&inner.endpoint_id)?
-                        .try_into()
-                        .map_err(|_| anyhow!("endpoint id must be 32 bytes"))?,
-                )
-                .context("decode slicer endpoint id")?,
-            ),
-            parse_caps(DEFAULT_AGENT_CAPS)?,
-            now,
-            now.checked_add(parse_ttl(DEFAULT_TICKET_TTL)?)
-                .context("ticket ttl overflow")?,
-            None,
-        )?;
+        let caps = parse_caps(DEFAULT_AGENT_CAPS)?;
+        let ttl_secs = parse_ttl(DEFAULT_TICKET_TTL)?;
+        let ticket =
+            mint_slicer_vm_ticket(&operator, &inner.endpoint_id, caps.clone(), now, ttl_secs)?;
         let ticket_path = ticket_out.map_or_else(
             || {
                 slicer_home()
@@ -164,9 +152,9 @@ pub fn vm_add(
                 created_at: now_unix_secs()?,
             },
             &StoredSpec {
-                caps: parse_caps(DEFAULT_AGENT_CAPS)?,
-                ttl_secs: parse_ttl(DEFAULT_TICKET_TTL)?,
-                to: None,
+                caps,
+                ttl_secs,
+                to: Some(operator.verifying_key()),
                 labels: label_pairs,
                 root_ticket_id: Some(ticket_id(&ticket.sig)),
                 ticket_file_path: Some(ticket_path.clone()),
@@ -354,12 +342,12 @@ impl GatewayTunnel {
     async fn open(record: &SlicerLoginRecord, identity: &Identity) -> Result<Self> {
         let ticket = read_ticket_from_path(&record.ticket_file_path)?;
         let (remote_host, remote_port) = master_ticket_target(&ticket)?;
-        let endpoint = portl_agent::endpoint::bind(
+        let endpoint = crate::client_endpoint::bind_client_endpoint_with_config(
+            identity,
             &portl_agent::AgentConfig {
                 discovery: portl_agent::DiscoveryConfig::in_process(),
                 ..portl_agent::AgentConfig::default()
             },
-            identity,
         )
         .await
         .context("bind local gateway client endpoint")?;
@@ -400,7 +388,7 @@ impl GatewayTunnel {
     async fn shutdown(self) {
         self.connection.close(0u32.into(), b"done");
         self.task.abort();
-        self.endpoint.close().await;
+        crate::commands::peer_resolve::close_client_endpoint(self.endpoint, "slicer gateway").await;
     }
 }
 
@@ -432,6 +420,30 @@ async fn forward_one(
     };
     tokio::try_join!(upstream, downstream)?;
     Ok(())
+}
+
+fn mint_slicer_vm_ticket(
+    operator: &Identity,
+    endpoint_id_hex: &str,
+    caps: Capabilities,
+    now: u64,
+    ttl_secs: u64,
+) -> Result<PortlTicket> {
+    let endpoint_id = iroh_base::EndpointId::from_bytes(
+        &hex::decode(endpoint_id_hex)?
+            .try_into()
+            .map_err(|_| anyhow!("endpoint id must be 32 bytes"))?,
+    )
+    .context("decode slicer endpoint id")?;
+    portl_core::ticket::mint::mint_root(
+        operator.signing_key(),
+        iroh_base::EndpointAddr::new(endpoint_id),
+        caps,
+        now,
+        now.checked_add(ttl_secs).context("ticket ttl overflow")?,
+        Some(operator.verifying_key()),
+    )
+    .context("mint slicer VM ticket")
 }
 
 fn master_ticket_target(ticket: &PortlTicket) -> Result<(String, u16)> {
@@ -554,7 +566,11 @@ fn append_revocation(
 
 #[cfg(test)]
 mod tests {
-    use super::{append_revocation, master_ticket_target, validate_master_ticket_for_login};
+    use super::{
+        append_revocation, master_ticket_target, mint_slicer_vm_ticket,
+        validate_master_ticket_for_login,
+    };
+    use portl_core::id::Identity;
     use tempfile::tempdir;
 
     #[test]
@@ -566,6 +582,33 @@ mod tests {
         assert!(contents.contains("slicer_vm_delete"));
         assert!(contents.contains(&hex::encode([0x11; 16])));
         assert!(contents.contains("99"));
+    }
+
+    #[test]
+    fn slicer_vm_ticket_binds_to_operator_identity() {
+        let operator =
+            Identity::from_signing_key(ed25519_dalek::SigningKey::from_bytes(&[72u8; 32]));
+        let target = ed25519_dalek::SigningKey::from_bytes(&[73u8; 32]);
+        let target_eid = hex::encode(target.verifying_key().to_bytes());
+        let ticket = mint_slicer_vm_ticket(
+            &operator,
+            &target_eid,
+            portl_core::ticket::schema::Capabilities {
+                presence: 0,
+                shell: None,
+                tcp: None,
+                udp: None,
+                fs: None,
+                vpn: None,
+                meta: None,
+                unix: None,
+            },
+            10,
+            20,
+        )
+        .expect("mint slicer VM ticket");
+
+        assert_eq!(ticket.body.to, Some(operator.verifying_key()));
     }
 
     #[test]

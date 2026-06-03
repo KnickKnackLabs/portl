@@ -222,6 +222,36 @@ fn rejects_invalid_proof() {
 }
 
 #[test]
+fn accepts_proof_bound_ticket_from_ephemeral_transport_and_reports_auth_identity() {
+    let fixture = Fixture::new();
+    let holder = fixture.operator.verifying_key();
+    let ticket = fixture.root_ticket(meta_caps(true, true), NOW, NOW + 300, Some(holder));
+    let proof = compute_pop_sig(
+        fixture.operator.signing_key(),
+        &ticket_id(&ticket.sig),
+        &[3; 16],
+    );
+
+    let outcome = fixture.evaluate(
+        &offer_with_nonce(&ticket, &[], Some(proof), [3; 16]),
+        &AllowAll,
+    );
+
+    match outcome {
+        AcceptanceOutcome::Accepted {
+            ticket_issuer_id,
+            ticket_holder_id,
+            ..
+        } => {
+            assert_ne!(SOURCE_ID, holder);
+            assert_eq!(ticket_issuer_id, fixture.operator.verifying_key());
+            assert_eq!(ticket_holder_id, Some(holder));
+        }
+        AcceptanceOutcome::Rejected { reason } => panic!("unexpected rejection: {reason:?}"),
+    }
+}
+
+#[test]
 fn rejects_rate_limited_source() {
     let fixture = Fixture::new();
     let ticket = fixture.root_ticket(meta_caps(true, true), NOW, NOW + 300, None);

@@ -7,5 +7,7 @@ pub struct Session {
     pub ticket_id: [u8; 16],
     pub ticket_chain_ids: Vec<[u8; 16]>,
     pub caller_endpoint_id: [u8; 32],
+    pub ticket_issuer_id: [u8; 32],
+    pub ticket_holder_id: Option<[u8; 32]>,
     pub bearer: Option<Vec<u8>>,
 }

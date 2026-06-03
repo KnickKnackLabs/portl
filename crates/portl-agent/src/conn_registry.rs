@@ -53,8 +53,14 @@ impl PathKind {
 /// agent process can mutate these.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionSnapshot {
-    /// 64-char hex of the remote `endpoint_id`.
+    /// 64-char hex of the remote transport `endpoint_id`.
     pub peer_eid: String,
+    /// 64-char hex of the root ticket issuer that authorized this connection.
+    #[serde(default)]
+    pub ticket_issuer_id: Option<String>,
+    /// 64-char hex of the proof-of-possession holder, when the ticket was `to`-bound.
+    #[serde(default)]
+    pub ticket_holder_id: Option<String>,
     /// iroh `Connection::stable_id()` — unique per QUIC connection,
     /// so two concurrent connections from the same peer are
     /// distinguishable in output.
@@ -74,6 +80,8 @@ pub struct ConnectionSnapshot {
 #[derive(Debug, Clone)]
 struct Entry {
     connection: Connection,
+    ticket_issuer_id: [u8; 32],
+    ticket_holder_id: Option<[u8; 32]>,
     up_since_unix: u64,
 }
 
@@ -96,7 +104,13 @@ impl ConnectionRegistry {
     /// connections from the same peer get distinct rows. Inserting
     /// the same key twice (shouldn't happen — `stable_id` is unique
     /// per-connection) overwrites the prior row.
-    pub fn insert(&self, peer_eid: [u8; 32], connection: Connection) -> ConnKey {
+    pub fn insert(
+        &self,
+        peer_eid: [u8; 32],
+        connection: Connection,
+        ticket_issuer_id: [u8; 32],
+        ticket_holder_id: Option<[u8; 32]>,
+    ) -> ConnKey {
         let key = (peer_eid, connection.stable_id());
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -105,6 +119,8 @@ impl ConnectionRegistry {
             key,
             Entry {
                 connection,
+                ticket_issuer_id,
+                ticket_holder_id,
                 up_since_unix: now_unix,
             },
         );
@@ -130,6 +146,8 @@ impl ConnectionRegistry {
                 let stats = value.connection.stats();
                 ConnectionSnapshot {
                     peer_eid: hex::encode(key.0),
+                    ticket_issuer_id: Some(hex::encode(value.ticket_issuer_id)),
+                    ticket_holder_id: value.ticket_holder_id.map(hex::encode),
                     connection_id: key.1 as u64,
                     path,
                     rtt_micros,
@@ -208,6 +226,25 @@ mod tests {
         assert!(reg.is_empty());
         assert!(reg.snapshot().is_empty());
         assert_eq!(reg.len(), 0);
+    }
+
+    #[test]
+    fn connection_snapshot_deserializes_legacy_json_without_auth_fields() {
+        let snapshot: ConnectionSnapshot = serde_json::from_str(
+            r#"{
+                "peer_eid":"1111111111111111111111111111111111111111111111111111111111111111",
+                "connection_id":7,
+                "path":"relay",
+                "rtt_micros":1000,
+                "bytes_rx":10,
+                "bytes_tx":20,
+                "up_since_unix":1704067199
+            }"#,
+        )
+        .expect("deserialize legacy snapshot");
+
+        assert_eq!(snapshot.ticket_issuer_id, None);
+        assert_eq!(snapshot.ticket_holder_id, None);
     }
 
     // Behavioural coverage for insert / remove / snapshot requires a

@@ -2273,6 +2273,7 @@ fn is_herdr_provider_shorthand(provider: &str) -> bool {
 fn normalize_session_provider_alias(provider: &str) -> String {
     match provider.trim() {
         "default" | "g" => "ghostty".to_owned(),
+        "h" | "hr" => "herdr".to_owned(),
         "t" => "tmux".to_owned(),
         "z" => "zmx".to_owned(),
         other => other.to_owned(),
@@ -10505,6 +10506,13 @@ mod tests {
     }
 
     #[test]
+    fn herdr_provider_aliases_normalize_to_herdr() {
+        assert_eq!(normalize_session_provider("herdr").unwrap(), "herdr");
+        assert_eq!(normalize_session_provider("hr").unwrap(), "herdr");
+        assert_eq!(normalize_session_provider("h").unwrap(), "herdr");
+    }
+
+    #[test]
     fn target_herdr_ref_defaults_to_default_session() {
         let fixture = seed_peer_and_share();
         let resolved = resolve_session_ref_with_stores(
@@ -10520,6 +10528,26 @@ mod tests {
         assert_eq!(resolved.target, "max-b265");
         assert_eq!(resolved.provider.as_deref(), Some("herdr"));
         assert_eq!(resolved.session, "default");
+    }
+
+    #[test]
+    fn target_herdr_alias_refs_default_to_default_session() {
+        for alias in ["hr", "h"] {
+            let fixture = seed_peer_and_share();
+            let resolved = resolve_session_ref_with_stores(
+                Some(&format!("max/{alias}")),
+                None,
+                None,
+                &fixture.peers,
+                &fixture.tickets,
+                &fixture.aliases,
+            )
+            .unwrap();
+
+            assert_eq!(resolved.target, "max-b265");
+            assert_eq!(resolved.provider.as_deref(), Some("herdr"));
+            assert_eq!(resolved.session, "default");
+        }
     }
 
     #[test]

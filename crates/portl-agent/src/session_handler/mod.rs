@@ -2133,6 +2133,8 @@ mod tests {
             ticket_id: [1; 16],
             ticket_chain_ids: Vec::new(),
             caller_endpoint_id: [2; 32],
+            ticket_issuer_id: [3; 32],
+            ticket_holder_id: Some([3; 32]),
             bearer: None,
         };
         let req = portl_proto::shell_v1::ShellReq {
@@ -2223,6 +2225,8 @@ mod tests {
             ticket_id: [1; 16],
             ticket_chain_ids: Vec::new(),
             caller_endpoint_id: [2; 32],
+            ticket_issuer_id: [3; 32],
+            ticket_holder_id: Some([3; 32]),
             bearer: None,
         };
         let pty = portl_proto::shell_v1::PtyCfg {

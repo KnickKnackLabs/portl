@@ -107,6 +107,8 @@ pub(crate) fn ticket_accepted(session: &Session) {
         Level::INFO,
         event = "audit.ticket_accepted",
         caller_endpoint_id = %hex::encode(session.caller_endpoint_id),
+        ticket_issuer_id = %hex::encode(session.ticket_issuer_id),
+        ticket_holder_id = %session.ticket_holder_id.map(hex::encode).unwrap_or_default(),
         ticket_id = %hex::encode(session.ticket_id),
     );
 }

@@ -67,6 +67,8 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
             caps,
             ticket_id,
             ticket_chain_ids,
+            ticket_issuer_id,
+            ticket_holder_id,
             bearer,
         } => {
             let ack = portl_proto::ticket_v1::TicketAck {
@@ -85,6 +87,8 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
                 ticket_id: *ticket_id,
                 ticket_chain_ids: ticket_chain_ids.clone(),
                 caller_endpoint_id: source_id,
+                ticket_issuer_id: *ticket_issuer_id,
+                ticket_holder_id: *ticket_holder_id,
                 bearer: bearer.clone(),
             };
             audit::ticket_accepted(&session);
@@ -131,7 +135,12 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
     };
 
     let udp_context = Arc::new(UdpConnectionContext::new(state.udp_registry.clone()));
-    let conn_key = state.connections.insert(source_id, connection.clone());
+    let conn_key = state.connections.insert(
+        source_id,
+        connection.clone(),
+        session.ticket_issuer_id,
+        session.ticket_holder_id,
+    );
     let _connection_observer =
         crate::transport_observer::spawn_connection_observer(connection.clone(), source_id);
     let _conn_registry_guard = ConnectionRegistryGuard {
