@@ -5,6 +5,17 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.11.2 — 2026-06-04
+
+### Changed
+
+- Peer-targeting CLI commands now use fresh transport endpoint identities for
+  each dial while still proving the stable ticket identity, reducing endpoint
+  identity reuse without changing ticket authorization.
+- Agent audit, status, and connection snapshots now include ticket issuer and
+  holder attribution so transport endpoint IDs can be correlated with the
+  authenticated ticket identity.
+
 ## 0.11.1 — 2026-06-03
 
 ### Added
