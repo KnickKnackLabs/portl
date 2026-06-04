@@ -47,7 +47,13 @@ impl From<InitiatorMode> for portl_core::pair_code::InitiatorMode {
     }
 }
 
-use std::{ffi::OsString, path::Path, path::PathBuf, process::ExitCode};
+use std::{
+    ffi::OsString,
+    path::Path,
+    path::PathBuf,
+    process::ExitCode,
+    sync::{Mutex, OnceLock},
+};
 
 #[cfg(feature = "ghostty-vt")]
 use anyhow::Context as _;
@@ -449,6 +455,48 @@ struct CommandLogContext {
     cwd: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CurrentCommandTelemetry {
+    pub(crate) command_id: String,
+    pub(crate) command: &'static str,
+    pub(crate) process_id: u32,
+}
+
+static CURRENT_COMMAND_TELEMETRY: OnceLock<Mutex<Option<CurrentCommandTelemetry>>> =
+    OnceLock::new();
+
+fn current_command_slot() -> &'static Mutex<Option<CurrentCommandTelemetry>> {
+    CURRENT_COMMAND_TELEMETRY.get_or_init(|| Mutex::new(None))
+}
+
+pub(crate) fn current_command_telemetry() -> Option<CurrentCommandTelemetry> {
+    current_command_slot()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+fn with_current_command_telemetry<R>(
+    command: &'static str,
+    context: &CommandLogContext,
+    run: impl FnOnce() -> R,
+) -> R {
+    let prior = current_command_slot().lock().ok().and_then(|mut guard| {
+        let prior = guard.take();
+        *guard = Some(CurrentCommandTelemetry {
+            command_id: context.command_id.clone(),
+            command,
+            process_id: std::process::id(),
+        });
+        prior
+    });
+    let result = run();
+    if let Ok(mut guard) = current_command_slot().lock() {
+        *guard = prior;
+    }
+    result
+}
+
 fn command_log_context(argv: &[OsString]) -> CommandLogContext {
     let argv_strings = argv
         .iter()
@@ -477,7 +525,8 @@ fn dispatch_command_logged(command: Command, context: &CommandLogContext) -> Exi
         argv = ?context.argv,
         cwd = %context.cwd,
     );
-    match dispatch(command) {
+    let result = with_current_command_telemetry(command_name, context, || dispatch(command));
+    match result {
         Ok(code) => {
             tracing::info!(
                 event = "cli.command.finish",
@@ -727,6 +776,24 @@ mod service_safe_upgrade_tests {
             }),
             "doctor"
         );
+    }
+
+    #[test]
+    fn current_command_telemetry_is_scoped_and_reuses_command_log_context() {
+        let context = super::CommandLogContext {
+            command_id: "123-456".to_owned(),
+            argv: Vec::new(),
+            cwd: "/tmp".to_owned(),
+        };
+
+        assert!(super::current_command_telemetry().is_none());
+        super::with_current_command_telemetry("status", &context, || {
+            let telemetry = super::current_command_telemetry().expect("telemetry context");
+            assert_eq!(telemetry.command_id, "123-456");
+            assert_eq!(telemetry.command, "status");
+            assert_eq!(telemetry.process_id, std::process::id());
+        });
+        assert!(super::current_command_telemetry().is_none());
     }
 }
 

@@ -1,85 +1,38 @@
-use std::time::Duration;
-
 use iroh::endpoint::Connection;
+use portl_core::transport_telemetry::{ObserverConfig, TransportTelemetryContext};
+
+use crate::session::Session;
 
 pub(crate) fn spawn_connection_observer(
     connection: Connection,
-    peer_eid: [u8; 32],
+    session: &Session,
+    server_endpoint_id: [u8; 32],
+    client_nonce_hash: Option<[u8; 16]>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let connection_id = connection.stable_id() as u64;
-        let peer = hex::encode(peer_eid);
-        tracing::info!(
-            event = "transport.connection.opened",
-            peer_eid = %crate::short_eid_for_log(&peer),
-            connection_id,
-            side = ?connection.side(),
-        );
-        log_current_paths(connection_id, &connection);
-        let reason = connection.closed().await;
-        tracing::info!(
-            event = "transport.connection.closed",
-            peer_eid = %crate::short_eid_for_log(&peer),
-            connection_id,
-            reason = %format!("{reason}"),
-        );
-    })
-}
-
-fn log_current_paths(connection_id: u64, connection: &Connection) {
-    let paths = connection.paths();
-    for (idx, path) in paths.iter().enumerate() {
-        let path_kind = if path.is_relay() {
-            "relay"
-        } else if path.is_ip() {
-            "direct_udp"
-        } else {
-            "unknown"
-        };
-        tracing::info!(
-            event = if path.is_selected() {
-                "transport.path.selected"
-            } else {
-                "transport.path.opened"
-            },
-            connection_id,
-            path_index = idx,
-            path = path_kind,
-            rtt_micros = rtt_micros_if_sampled(path.rtt()),
-        );
-    }
-}
-
-fn rtt_micros_if_sampled(rtt: Duration) -> Option<u64> {
-    (!rtt.is_zero()).then(|| u64::try_from(rtt.as_micros()).unwrap_or(u64::MAX))
-}
-
-#[cfg(test)]
-pub(crate) fn transport_addr_kind_for_test(kind: &str) -> &'static str {
-    match kind {
-        "relay" => "relay",
-        "ip" => "direct_udp",
-        _ => "unknown",
-    }
+    let mut context = TransportTelemetryContext::agent_default();
+    context.caller_endpoint_id = Some(session.caller_endpoint_id);
+    context.server_endpoint_id = Some(server_endpoint_id);
+    context.remote_endpoint_id = Some(*connection.remote_id().as_bytes());
+    context.ticket_id = Some(session.ticket_id);
+    context.ticket_issuer_id = Some(session.ticket_issuer_id);
+    context.ticket_holder_id = session.ticket_holder_id;
+    context.client_nonce_hash = client_nonce_hash;
+    portl_core::transport_telemetry::spawn_connection_observer(
+        connection,
+        context,
+        ObserverConfig::from_env(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use portl_core::transport_telemetry::TelemetryRole;
 
     #[test]
-    fn path_kind_labels_are_stable() {
-        assert_eq!(super::transport_addr_kind_for_test("relay"), "relay");
-        assert_eq!(super::transport_addr_kind_for_test("ip"), "direct_udp");
-        assert_eq!(super::transport_addr_kind_for_test("other"), "unknown");
-    }
-
-    #[test]
-    fn zero_rtt_is_treated_as_missing_sample() {
-        assert_eq!(super::rtt_micros_if_sampled(Duration::ZERO), None);
+    fn agent_default_context_uses_agent_role() {
         assert_eq!(
-            super::rtt_micros_if_sampled(Duration::from_micros(42)),
-            Some(42)
+            portl_core::transport_telemetry::TransportTelemetryContext::agent_default().role,
+            TelemetryRole::Agent
         );
     }
 }

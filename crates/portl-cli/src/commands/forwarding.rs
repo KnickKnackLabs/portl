@@ -535,7 +535,9 @@ mod tests {
                     unix: None,
                 },
                 server_time: 0,
+                client_nonce_hash: [0; 16],
             },
+            transport_observer: None,
         };
         (connected, accept_task)
     }

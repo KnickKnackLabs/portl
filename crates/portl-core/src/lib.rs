@@ -29,6 +29,7 @@ pub mod terminal_mode_tracker;
 pub mod ticket;
 pub mod ticket_store;
 pub mod tls;
+pub mod transport_telemetry;
 pub mod wire;
 
 pub use query_response_filter::{QueryResponseFilter, StdinResponseFilter};

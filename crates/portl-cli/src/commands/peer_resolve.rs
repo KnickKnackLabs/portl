@@ -33,14 +33,17 @@ use portl_core::endpoint::Endpoint;
 use portl_core::id::{Identity, store};
 use portl_core::net::{PeerSession, open_ticket_v1};
 use portl_core::peer_store::PeerStore;
+use portl_core::ticket::hash::ticket_id;
 use portl_core::ticket::mint::mint_root;
 use portl_core::ticket::schema::{Capabilities, PortlTicket};
 use portl_core::ticket_store::TicketStore;
+use portl_core::transport_telemetry::{ObserverConfig, TransportTelemetryContext};
 use tracing::debug;
 
 use crate::alias_store::AliasStore;
 
 const CLI_ENDPOINT_CLOSE_GRACE: Duration = Duration::from_millis(100);
+const CLI_TRANSPORT_OBSERVER_CLOSE_GRACE: Duration = Duration::from_millis(200);
 
 /// Which store a `resolve_peer` call matched in. Surfaced in
 /// `ResolvedPeer.source` for callers that want to report it, and
@@ -113,6 +116,7 @@ pub(crate) struct ConnectedPeer {
     pub(crate) endpoint: iroh::Endpoint,
     pub(crate) connection: Connection,
     pub(crate) session: PeerSession,
+    pub(crate) transport_observer: Option<tokio::task::JoinHandle<()>>,
 }
 
 pub(crate) fn resolve_identity_path(explicit: Option<&Path>) -> PathBuf {
@@ -148,8 +152,38 @@ async fn connect_peer_with_reporting(
 }
 
 pub(crate) async fn close_connected(connected: ConnectedPeer, reason: &'static [u8]) {
-    connected.connection.close(0u32.into(), reason);
-    close_client_endpoint(connected.endpoint, "connected peer").await;
+    let endpoint = close_connected_connection(connected, reason).await;
+    close_client_endpoint(endpoint, "connected peer").await;
+}
+
+pub(crate) async fn close_connected_connection(
+    connected: ConnectedPeer,
+    reason: &'static [u8],
+) -> iroh::Endpoint {
+    let ConnectedPeer {
+        endpoint,
+        connection,
+        session: _,
+        transport_observer,
+    } = connected;
+    connection.close(0u32.into(), reason);
+    if let Some(observer) = transport_observer {
+        await_transport_observer_close(observer).await;
+    }
+    endpoint
+}
+
+async fn await_transport_observer_close(mut observer: tokio::task::JoinHandle<()>) {
+    tokio::select! {
+        result = &mut observer => {
+            if let Err(err) = result {
+                debug!(?err, "transport observer task ended with error");
+            }
+        }
+        () = tokio::time::sleep(CLI_TRANSPORT_OBSERVER_CLOSE_GRACE) => {
+            observer.abort();
+        }
+    }
 }
 
 pub(crate) async fn close_client_endpoint(endpoint: iroh::Endpoint, context: &'static str) {
@@ -219,11 +253,39 @@ pub(crate) async fn connect_peer_with_endpoint(
     let (connection, session) = open_ticket_v1(&endpoint_wrapper, &resolved.ticket, &[], identity)
         .await
         .context("run ticket handshake")?;
+    let transport_observer = Some(portl_core::transport_telemetry::spawn_connection_observer(
+        connection.clone(),
+        cli_transport_context(peer_log, endpoint, &connection, &resolved.ticket, &session),
+        ObserverConfig::from_env(),
+    ));
     Ok(ConnectedPeer {
         endpoint: endpoint.clone(),
         connection,
         session,
+        transport_observer,
     })
+}
+
+fn cli_transport_context(
+    peer_log: String,
+    endpoint: &iroh::Endpoint,
+    connection: &Connection,
+    ticket: &PortlTicket,
+    session: &PeerSession,
+) -> TransportTelemetryContext {
+    let command = crate::current_command_telemetry();
+    let mut context = TransportTelemetryContext::cli_default();
+    context.process_id = command
+        .as_ref()
+        .map_or_else(std::process::id, |command| command.process_id);
+    context.command_id = command.as_ref().map(|command| command.command_id.clone());
+    context.command = command.as_ref().map(|command| command.command.to_owned());
+    context.target = Some(peer_log);
+    context.ticket_id = Some(ticket_id(&ticket.sig));
+    context.client_nonce_hash = Some(session.client_nonce_hash);
+    context.local_endpoint_id = Some(*endpoint.id().as_bytes());
+    context.remote_endpoint_id = Some(*connection.remote_id().as_bytes());
+    context
 }
 
 /// Unified resolution cascade. See module docs for the order. Emits

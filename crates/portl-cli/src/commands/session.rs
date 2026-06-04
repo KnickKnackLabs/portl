@@ -41,6 +41,7 @@ use portl_core::terminal_mode_tracker::TerminalModeTracker;
 #[cfg(test)]
 use portl_core::terminal_mode_tracker::{AltScreenMode, TerminalModeState};
 use portl_core::ticket::schema::{Capabilities, EnvPolicy, ShellCaps};
+use portl_core::transport_telemetry::{PathKind, SCHEMA_VERSION, TARGET as TRANSPORT_TARGET};
 use portl_core::wire::session::{
     ATTACH_V2_MAX_DECODED_PAYLOAD, AttachV2ClientFrame, AttachV2Config, AttachV2Payload,
     AttachV2Progress, AttachV2ServerFrame, SessionControlAction, SessionControlFrame,
@@ -51,8 +52,8 @@ use tracing::{debug, trace};
 
 use crate::commands::forwarding::{ForwardPlan, ForwardingArgs};
 use crate::commands::peer_resolve::{
-    bind_client_endpoint, close_client_endpoint, close_connected, connect_peer, connect_peer_quiet,
-    connect_peer_with_endpoint, resolve_identity_path,
+    bind_client_endpoint, close_client_endpoint, close_connected, close_connected_connection,
+    connect_peer, connect_peer_quiet, connect_peer_with_endpoint, resolve_identity_path,
 };
 use crate::commands::session_share::{
     BuiltEnvelope, EnvelopeInputs, ResolveTargetError, ShareTargetForm,
@@ -3980,6 +3981,56 @@ fn attach_path_snapshot(connection: &Connection) -> Option<AttachPathSnapshot> {
     AttachPathSnapshot::from_connection(connection)
 }
 
+fn selected_transport_path_kind(connection: &Connection) -> &'static str {
+    let paths = connection.paths();
+    paths
+        .iter()
+        .find(iroh::endpoint::Path::is_selected)
+        .or_else(|| paths.iter().next())
+        .map_or("unknown", |path| {
+            PathKind::from_flags(path.is_relay(), path.is_ip()).as_str()
+        })
+}
+
+fn log_reconnect_transport_event(
+    event_name: &'static str,
+    request: &RemoteSessionAttachRequest,
+    provider: &str,
+    attempt: u32,
+    error: Option<&anyhow::Error>,
+    connection: Option<&Connection>,
+) {
+    let command = crate::current_command_telemetry();
+    let command_id = command
+        .as_ref()
+        .map_or("", |command| command.command_id.as_str());
+    let command_name = command
+        .as_ref()
+        .map_or("session.attach", |command| command.command);
+    let process_id = command
+        .as_ref()
+        .map_or_else(std::process::id, |command| command.process_id);
+    let redacted_error = error
+        .map(|err| portl_core::diagnostics::redact_text(&format!("{err:#}")))
+        .unwrap_or_default();
+    let path_kind = connection.map_or("", selected_transport_path_kind);
+    tracing::info!(
+        target: TRANSPORT_TARGET,
+        event = event_name,
+        schema_version = SCHEMA_VERSION,
+        role = "cli",
+        process_id,
+        command_id,
+        command = command_name,
+        target_label = %request.target,
+        provider,
+        session = %request.session_name,
+        attempt,
+        path_kind,
+        error = %redacted_error,
+    );
+}
+
 fn rtt_if_sampled(rtt: Duration) -> Option<Duration> {
     (!rtt.is_zero()).then_some(rtt)
 }
@@ -4105,6 +4156,14 @@ async fn reconnect_remote_session(
                 "reconnect budget expired after {} attempts",
                 attempt.saturating_sub(1)
             ));
+            log_reconnect_transport_event(
+                "transport.reconnect.give_up",
+                request,
+                provider,
+                attempt.saturating_sub(1),
+                None,
+                None,
+            );
             #[cfg(feature = "test-reconnect-injection")]
             if matches!(
                 test_reconnect_scenario()?,
@@ -4116,6 +4175,14 @@ async fn reconnect_remote_session(
         }
         let visible = state.started.elapsed() >= policy.transparent_grace;
         let delay = reconnect_attempt_delay(attempt, &policy);
+        log_reconnect_transport_event(
+            "transport.reconnect.attempt",
+            request,
+            provider,
+            attempt,
+            None,
+            None,
+        );
         flight_recorder.record(format!(
             "reconnect attempt {attempt} scheduled after {}{}",
             format_compact_duration(delay),
@@ -4182,6 +4249,14 @@ async fn reconnect_remote_session(
             Ok(connected) => connected,
             Err(err) => {
                 debug!(%err, attempt, "session reconnect connect failed");
+                log_reconnect_transport_event(
+                    "transport.reconnect.connect_failed",
+                    request,
+                    provider,
+                    attempt,
+                    Some(&err),
+                    None,
+                );
                 flight_recorder
                     .record(format!("reconnect attempt {attempt} connect failed: {err}"));
                 continue;
@@ -4193,21 +4268,34 @@ async fn reconnect_remote_session(
                 &connected.session,
                 Some(provider.to_owned()),
             ) => groups,
-            signal = signal_watcher.next() => return Ok(ReconnectOutcome::Signal(signal)),
+            signal = signal_watcher.next() => {
+                close_connected_connection(connected, b"session reconnect signal").await;
+                return Ok(ReconnectOutcome::Signal(signal));
+            },
         } {
             Ok(groups) => groups,
-            Err(err @ SessionOpenError::Rejected { .. }) => return Err(anyhow::Error::from(err)),
+            Err(err @ SessionOpenError::Rejected { .. }) => {
+                close_connected_connection(connected, b"session reconnect preflight rejected")
+                    .await;
+                return Err(anyhow::Error::from(err));
+            }
             Err(SessionOpenError::Transport(err)) => {
                 debug!(%err, attempt, "session reconnect preflight failed");
+                log_reconnect_transport_event(
+                    "transport.reconnect.preflight_failed",
+                    request,
+                    provider,
+                    attempt,
+                    Some(&err),
+                    Some(&connected.connection),
+                );
                 let path = attach_path_snapshot(&connected.connection);
                 state.observe_path(path.as_ref());
                 flight_recorder.record_with_path(
                     format!("reconnect attempt {attempt} preflight failed: {err}"),
                     path,
                 );
-                connected
-                    .connection
-                    .close(0u32.into(), b"session reconnect preflight failed");
+                close_connected_connection(connected, b"session reconnect preflight failed").await;
                 continue;
             }
         };
@@ -4221,9 +4309,7 @@ async fn reconnect_remote_session(
                 ),
                 path,
             );
-            connected
-                .connection
-                .close(0u32.into(), b"session disappeared during reconnect");
+            close_connected_connection(connected, b"session disappeared during reconnect").await;
             anyhow::bail!(
                 "persistent session '{}' was not found on the target",
                 request.session_name
@@ -4244,9 +4330,20 @@ async fn reconnect_remote_session(
                     rows: request.rows,
                 },
             ) => session,
-            signal = signal_watcher.next() => return Ok(ReconnectOutcome::Signal(signal)),
+            signal = signal_watcher.next() => {
+                close_connected_connection(connected, b"session reconnect signal").await;
+                return Ok(ReconnectOutcome::Signal(signal));
+            },
         } {
             Ok(session) => {
+                log_reconnect_transport_event(
+                    "transport.reconnect.success",
+                    request,
+                    provider,
+                    attempt,
+                    None,
+                    Some(&connected.connection),
+                );
                 let path = attach_path_snapshot(&connected.connection);
                 state.observe_path(path.as_ref());
                 flight_recorder
@@ -4268,18 +4365,27 @@ async fn reconnect_remote_session(
                     session: Box::new(session),
                 });
             }
-            Err(err @ SessionOpenError::Rejected { .. }) => return Err(anyhow::Error::from(err)),
+            Err(err @ SessionOpenError::Rejected { .. }) => {
+                close_connected_connection(connected, b"session reconnect attach rejected").await;
+                return Err(anyhow::Error::from(err));
+            }
             Err(SessionOpenError::Transport(err)) => {
                 debug!(%err, attempt, "session reconnect attach failed");
+                log_reconnect_transport_event(
+                    "transport.reconnect.attach_failed",
+                    request,
+                    provider,
+                    attempt,
+                    Some(&err),
+                    Some(&connected.connection),
+                );
                 let path = attach_path_snapshot(&connected.connection);
                 state.observe_path(path.as_ref());
                 flight_recorder.record_with_path(
                     format!("reconnect attempt {attempt} attach failed: {err}"),
                     path,
                 );
-                connected
-                    .connection
-                    .close(0u32.into(), b"session reconnect attach failed");
+                close_connected_connection(connected, b"session reconnect attach failed").await;
             }
         }
     }
@@ -4306,9 +4412,7 @@ async fn try_same_connection_reattach(
     {
         Ok(groups) => groups,
         Err(err @ SessionOpenError::Rejected { .. }) => {
-            connected
-                .connection
-                .close(0u32.into(), b"same-connection preflight rejected");
+            close_connected_connection(connected, b"same-connection preflight rejected").await;
             return Err(anyhow::Error::from(err));
         }
         Err(SessionOpenError::Transport(err)) => {
@@ -4318,9 +4422,7 @@ async fn try_same_connection_reattach(
                 format!("same-connection reattach preflight failed: {err}"),
                 path,
             );
-            connected
-                .connection
-                .close(0u32.into(), b"same-connection preflight failed");
+            close_connected_connection(connected, b"same-connection preflight failed").await;
             return Ok(None);
         }
     };
@@ -4335,10 +4437,11 @@ async fn try_same_connection_reattach(
             ),
             path,
         );
-        connected.connection.close(
-            0u32.into(),
+        close_connected_connection(
+            connected,
             b"session disappeared during same-connection reconnect",
-        );
+        )
+        .await;
         anyhow::bail!(
             "persistent session '{}' was not found on the target",
             request.session_name
@@ -4372,9 +4475,7 @@ async fn try_same_connection_reattach(
             }))
         }
         Err(err @ SessionOpenError::Rejected { .. }) => {
-            connected
-                .connection
-                .close(0u32.into(), b"same-connection attach rejected");
+            close_connected_connection(connected, b"same-connection attach rejected").await;
             Err(anyhow::Error::from(err))
         }
         Err(SessionOpenError::Transport(err)) => {
@@ -4382,9 +4483,7 @@ async fn try_same_connection_reattach(
             state.observe_path(path.as_ref());
             flight_recorder
                 .record_with_path(format!("same-connection reattach failed: {err}"), path);
-            connected
-                .connection
-                .close(0u32.into(), b"same-connection attach failed");
+            close_connected_connection(connected, b"same-connection attach failed").await;
             Ok(None)
         }
     }

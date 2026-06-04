@@ -5,6 +5,28 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.11.3 — 2026-06-04
+
+### Added
+
+- Added shared transport telemetry file logs for CLI and agent connections,
+  including ticket-handshake outcomes, connection/path lifecycle events,
+  reconnect attempts, sparse healthy summaries, and bounded anomaly events.
+- Added privacy-preserving transport correlation fields such as ticket IDs,
+  client nonce log hashes, endpoint IDs, and connection-local IDs without
+  changing Portl's wire protocol.
+
+### Changed
+
+- Transport telemetry now stays out of default stderr and journald output while
+  remaining available in Portl's structured local log files.
+
+### Fixed
+
+- Reconnect and attach cleanup now waits briefly for transport observers to
+  flush close events, reducing missing lifecycle records during transient
+  disconnects.
+
 ## 0.11.2 — 2026-06-04
 
 ### Changed

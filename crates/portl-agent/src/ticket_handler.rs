@@ -3,6 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use iroh::endpoint::Connection;
+use portl_core::ticket::hash::client_nonce_log_hash;
+use portl_core::transport_telemetry::{SCHEMA_VERSION, TARGET as TRANSPORT_TARGET};
 use tracing::{instrument, warn};
 
 use crate::AgentState;
@@ -36,29 +38,43 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
         .context("read offer stream")?;
     let source_id = remote_node_id(&connection);
 
-    let outcome = match postcard::from_bytes::<portl_proto::ticket_v1::TicketOffer>(&offer_bytes) {
-        Ok(offer) => {
-            let revocations = state
-                .revocations
-                .read()
-                .map_err(|_| anyhow!("revocations lock poisoned"))?;
-            let trust_roots = state
-                .trust_roots
-                .read()
-                .map_err(|_| anyhow!("trust roots lock poisoned"))?;
-            evaluate_offer(&AcceptanceInput {
-                offer: &offer,
-                source_id,
-                trust_roots: &trust_roots,
-                revocations: &revocations,
-                now: unix_now_secs()?,
-                rate_limit: &state.rate_limit,
-                mode: &state.mode,
-            })
-        }
-        Err(_) => AcceptanceOutcome::Rejected {
-            reason: portl_proto::ticket_v1::AckReason::BadSignature,
-        },
+    let decoded_offer = postcard::from_bytes::<portl_proto::ticket_v1::TicketOffer>(&offer_bytes);
+    let (outcome, client_nonce_hash) = if let Ok(offer) = decoded_offer {
+        let client_nonce_hash = client_nonce_log_hash(&offer.client_nonce);
+        let revocations = state
+            .revocations
+            .read()
+            .map_err(|_| anyhow!("revocations lock poisoned"))?;
+        let trust_roots = state
+            .trust_roots
+            .read()
+            .map_err(|_| anyhow!("trust roots lock poisoned"))?;
+        let outcome = evaluate_offer(&AcceptanceInput {
+            offer: &offer,
+            source_id,
+            trust_roots: &trust_roots,
+            revocations: &revocations,
+            now: unix_now_secs()?,
+            rate_limit: &state.rate_limit,
+            mode: &state.mode,
+        });
+        (outcome, Some(client_nonce_hash))
+    } else {
+        tracing::warn!(
+            target: TRANSPORT_TARGET,
+            event = "transport.ticket_handshake.decode_failed",
+            schema_version = SCHEMA_VERSION,
+            role = "agent",
+            process_id = std::process::id(),
+            caller_endpoint_id = %hex::encode(source_id),
+            reason = "bad_signature",
+        );
+        (
+            AcceptanceOutcome::Rejected {
+                reason: portl_proto::ticket_v1::AckReason::BadSignature,
+            },
+            None,
+        )
     };
 
     let maybe_session = match &outcome {
@@ -91,6 +107,19 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
                 ticket_holder_id: *ticket_holder_id,
                 bearer: bearer.clone(),
             };
+            tracing::info!(
+                target: TRANSPORT_TARGET,
+                event = "transport.ticket_handshake.accepted",
+                schema_version = SCHEMA_VERSION,
+                role = "agent",
+                process_id = std::process::id(),
+                caller_endpoint_id = %hex::encode(source_id),
+                server_endpoint_id = %hex::encode(state.self_endpoint_id),
+                ticket_id = %hex::encode(ticket_id),
+                client_nonce_hash = %client_nonce_hash.map(hex::encode).unwrap_or_default(),
+                ticket_issuer_id = %hex::encode(ticket_issuer_id),
+                ticket_holder_id = %ticket_holder_id.map(hex::encode).unwrap_or_default(),
+            );
             audit::ticket_accepted(&session);
             if source_id != state.self_endpoint_id
                 && Some(source_id) != state.watchdog_probe_endpoint_id
@@ -108,6 +137,17 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
             Some(session)
         }
         AcceptanceOutcome::Rejected { reason } => {
+            tracing::warn!(
+                target: TRANSPORT_TARGET,
+                event = "transport.ticket_handshake.rejected",
+                schema_version = SCHEMA_VERSION,
+                role = "agent",
+                process_id = std::process::id(),
+                caller_endpoint_id = %hex::encode(source_id),
+                server_endpoint_id = %hex::encode(state.self_endpoint_id),
+                client_nonce_hash = %client_nonce_hash.map(hex::encode).unwrap_or_default(),
+                reason = ?reason,
+            );
             state
                 .metrics
                 .tickets_rejected_total
@@ -141,8 +181,12 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
         session.ticket_issuer_id,
         session.ticket_holder_id,
     );
-    let _connection_observer =
-        crate::transport_observer::spawn_connection_observer(connection.clone(), source_id);
+    let _connection_observer = crate::transport_observer::spawn_connection_observer(
+        connection.clone(),
+        &session,
+        state.self_endpoint_id,
+        client_nonce_hash,
+    );
     let _conn_registry_guard = ConnectionRegistryGuard {
         connections: state.connections.clone(),
         key: conn_key,

@@ -62,15 +62,18 @@ pub(crate) fn filter_directive(verbose: u8, explicit_filter: Option<&str>) -> St
 }
 
 fn file_log_filter() -> &'static str {
-    "portl_cli=info,portl_core=info,portl_agent=info,iroh=warn,quinn=warn,rustls=warn,h2=warn"
+    "portl_cli=info,portl_core=info,portl_agent=info,portl_transport=info,iroh=warn,quinn=warn,rustls=warn,h2=warn"
 }
 
 fn default_filter(verbose: u8) -> String {
     match verbose {
-        0 => "error,portl_cli=warn,portl_core=warn,portl_agent=warn".to_owned(),
-        1 => "warn,portl_cli=info,portl_core=info,portl_agent=info".to_owned(),
-        2 => "warn,portl_cli=debug,portl_core=debug,portl_agent=debug,iroh=info".to_owned(),
-        _ => "debug,portl_cli=trace,portl_core=trace,portl_agent=trace,iroh=debug,quinn=info"
+        0 => "error,portl_transport=off,portl_cli=warn,portl_core=warn,portl_agent=warn"
+            .to_owned(),
+        1 => "warn,portl_transport=off,portl_cli=info,portl_core=info,portl_agent=info"
+            .to_owned(),
+        2 => "warn,portl_transport=off,portl_cli=debug,portl_core=debug,portl_agent=debug,iroh=info"
+            .to_owned(),
+        _ => "debug,portl_transport=off,portl_cli=trace,portl_core=trace,portl_agent=trace,iroh=debug,quinn=info"
             .to_owned(),
     }
 }
@@ -91,7 +94,7 @@ mod tests {
     fn default_filter_keeps_dependency_warnings_quiet() {
         assert_eq!(
             filter_directive(0, None),
-            "error,portl_cli=warn,portl_core=warn,portl_agent=warn"
+            "error,portl_transport=off,portl_cli=warn,portl_core=warn,portl_agent=warn"
         );
     }
 
@@ -99,5 +102,20 @@ mod tests {
     fn cli_log_path_uses_portl_home_logs_dir() {
         let path = portl_core::diagnostics::log_path(portl_core::diagnostics::LogKind::Cli);
         assert!(path.ends_with("logs/cli.ndjson"));
+    }
+
+    #[test]
+    fn file_log_filter_includes_transport_telemetry() {
+        assert!(super::file_log_filter().contains("portl_transport=info"));
+    }
+
+    #[test]
+    fn default_filters_keep_transport_telemetry_off_stderr() {
+        for verbose in 0..=3 {
+            assert!(
+                super::default_filter(verbose).contains("portl_transport=off"),
+                "verbose {verbose} default filter should explicitly disable portl_transport"
+            );
+        }
     }
 }

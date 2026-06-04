@@ -26,12 +26,7 @@ pub(crate) fn init() {
         // Operators override via `RUST_LOG` env var as usual.
         // Without this, tracing_subscriber defaults to TRACE which
         // is unusable in production.
-        let default_filter = "info,\
-            iroh=warn,iroh_net=warn,iroh_quinn=warn,iroh_relay=warn,\
-            iroh_base=warn,iroh_dns=warn,\
-            quinn=warn,quinn_proto=warn,quinn_udp=warn,\
-            rustls=warn,h2=warn,hickory_proto=warn,hickory_resolver=warn,\
-            pkarr=warn,mainline=warn,portmapper=warn,netwatch=warn";
+        let default_filter = default_filter_directive();
         let filter = filter_directive(default_filter);
         let env_filter =
             EnvFilter::try_new(&filter).unwrap_or_else(|_| EnvFilter::new(default_filter));
@@ -92,8 +87,18 @@ fn json_file_writer(kind: portl_core::diagnostics::LogKind) -> Option<RollingFil
     Some(tracing_appender::rolling::never(parent, file_name))
 }
 
+fn default_filter_directive() -> &'static str {
+    "info,\
+            portl_transport=off,\
+            iroh=warn,iroh_net=warn,iroh_quinn=warn,iroh_relay=warn,\
+            iroh_base=warn,iroh_dns=warn,\
+            quinn=warn,quinn_proto=warn,quinn_udp=warn,\
+            rustls=warn,h2=warn,hickory_proto=warn,hickory_resolver=warn,\
+            pkarr=warn,mainline=warn,portmapper=warn,netwatch=warn"
+}
+
 fn file_filter_directive() -> &'static str {
-    "portl_agent=info,portl_core=info,portl_cli=info,iroh=warn,quinn=warn,rustls=warn,h2=warn"
+    "portl_agent=info,portl_core=info,portl_cli=info,portl_transport=info,iroh=warn,quinn=warn,rustls=warn,h2=warn"
 }
 
 fn filter_directive(default_filter: &str) -> String {
@@ -306,6 +311,16 @@ mod tests {
     fn agent_log_path_uses_portl_home_logs_dir() {
         let path = portl_core::diagnostics::log_path(portl_core::diagnostics::LogKind::Agent);
         assert!(path.ends_with("logs/agent.ndjson"));
+    }
+
+    #[test]
+    fn file_filter_includes_transport_telemetry() {
+        assert!(super::file_filter_directive().contains("portl_transport=info"));
+    }
+
+    #[test]
+    fn default_filter_disables_transport_telemetry_for_journald_and_stderr() {
+        assert!(super::default_filter_directive().contains("portl_transport=off"));
     }
 
     fn restore_env(name: &str, value: Option<OsString>) {

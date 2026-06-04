@@ -45,14 +45,6 @@ pub mod unix_handler;
 
 pub use config::{AgentConfig, AgentMode, DiscoveryConfig, RateLimitConfig};
 
-pub(crate) fn short_eid_for_log(hex: &str) -> String {
-    if hex.len() <= 16 {
-        hex.to_owned()
-    } else {
-        format!("{}…{}", &hex[..8], &hex[hex.len() - 8..])
-    }
-}
-
 #[cfg(feature = "ghostty-vt")]
 pub enum GhosttyAttachInput {
     Data(Vec<u8>),
