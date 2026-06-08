@@ -23,7 +23,7 @@ Portl releases combine deterministic mise tasks with agent judgment. Let scripts
 6. Commit with subject `Release vVERSION` and a body explaining the bump.
 7. Push `main`.
 8. For releases touching session providers, remote helpers, spawned CLIs, networking, or target deployment, run the **Provider/Remote Process Gate** below before tagging.
-9. Before tagging, verify the pushed release commit's comprehensive CI with `mise run release:watch -- VERSION --ci-only`; before the tag exists this requires local `HEAD` to match upstream, and it refuses a stale existing `vVERSION` tag unless `--allow-existing-tag` is explicit. Then run `mise run release:tag -- VERSION`.
+9. Before tagging, verify the pushed release commit's comprehensive CI with `mise run release:watch -- VERSION --ci-only`; before the tag exists this requires local `HEAD` to match upstream, and it refuses a stale existing `vVERSION` tag unless `--allow-existing-tag` is explicit. Then run `mise run release:tag -- VERSION`. Prefer the **Async CI/Release Watcher** below for steps 9-10 unless the user wants inline watching.
 10. After tagging, watch/report CI and release publishing with `mise run release:watch -- VERSION`. Avoid raw `gh run watch` unless debugging interactively; it repeats large job tables and annotations.
 
 ## Provider/Remote Process Gate
@@ -50,6 +50,48 @@ Then run a live E2E on the exact user-facing command and verify:
 - only expected long-lived services remain (for Herdr: remote `herdr server` may remain).
 
 If a GitHub release is already published and this gate finds a bug, cut the next patch release. Do not move a published tag.
+
+## Async CI/Release Watcher
+
+After `main` is pushed and any Provider/Remote Process Gate is complete, prefer delegating CI/tag/release watching to a lightweight async worker unless the user asks to keep it inline.
+
+Use `worker` (or a generic delegate) with a lightweight model such as `openai/gpt-5.4-mini:medium` and:
+
+- `async: true`
+- `progress: true`
+- `output: scratch/subagents/release-vVERSION-watch.md`
+- `outputMode: file-only`
+
+The worker must verify local/upstream `HEAD`, verify no local or remote `vVERSION` tag exists, run CI-only watch before tagging, stop without tagging on `HEAD` mismatch, existing tag, or CI failure, tag only via `mise run release:tag -- VERSION`, then watch post-tag release publishing.
+
+Do **not** let an async worker run one unbounded blocking `mise run release:watch -- VERSION` command. Blocking watches prevent periodic progress and can trigger false “needs attention” alerts even when the release is healthy.
+
+Use bounded watch chunks below the subagent no-activity window. Default to 180 seconds; use 120 seconds when the user wants tighter progress updates. Avoid values above half the no-activity window.
+
+```bash
+mise run release:watch -- VERSION --ci-only --timeout 180
+```
+
+If the command exits `124`, treat it as “still pending,” not a failure. Then snapshot and record progress before continuing:
+
+```bash
+mise run release:watch -- VERSION --ci-only --once
+```
+
+On CI success, run:
+
+```bash
+mise run release:tag -- VERSION
+```
+
+After tagging, use the same bounded pattern for publishing:
+
+```bash
+mise run release:watch -- VERSION --timeout 180
+mise run release:watch -- VERSION --once
+```
+
+On any terminal failure, gather compact evidence with `mise run release:watch -- VERSION --verbose` or focused `gh run view RUN_ID --log-failed`, report fixups, and stop. Do not move tags without explicit approval; if the GitHub release is already published, cut the next patch instead.
 
 ## Extra Local Gates
 
@@ -100,6 +142,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 - Replacing historical spec references while bumping README current-version examples.
 - Forgetting the GitHub release workflow extracts the matching changelog section.
 - Using raw `gh run watch` by default; prefer `release:watch` to avoid repeated annotations and huge transcripts.
+- Launching an async worker that runs one unbounded `release:watch`; use bounded `--timeout` chunks plus `--once` snapshots so the worker can report progress and avoid false needs-attention alerts.
 - Moving a tag after the GitHub release has been published; cut a new patch release instead.
 - Trusting `release:verify --local` alone after adding dependencies or cross-crate provider code; run the Extra Local Gates when applicable.
 - Tagging provider/helper releases without a live process cleanup audit.
