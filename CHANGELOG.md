@@ -5,6 +5,8 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.11.4 — 2026-06-10
+
 ### Added
 
 - Added a latency benchmark that measures high-priority interactive stream
