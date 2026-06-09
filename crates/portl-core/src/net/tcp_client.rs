@@ -85,6 +85,47 @@ pub async fn run_local_forward_with_listener(
     remote_host: String,
     remote_port: u16,
 ) -> Result<()> {
+    run_local_forward_with_listener_logged(
+        listener,
+        connection,
+        session,
+        local_addr,
+        remote_host,
+        remote_port,
+        true,
+    )
+    .await
+}
+
+pub async fn run_local_forward_with_listener_quiet(
+    listener: TcpListener,
+    connection: Connection,
+    session: PeerSession,
+    local_addr: String,
+    remote_host: String,
+    remote_port: u16,
+) -> Result<()> {
+    run_local_forward_with_listener_logged(
+        listener,
+        connection,
+        session,
+        local_addr,
+        remote_host,
+        remote_port,
+        false,
+    )
+    .await
+}
+
+async fn run_local_forward_with_listener_logged(
+    listener: TcpListener,
+    connection: Connection,
+    session: PeerSession,
+    local_addr: String,
+    remote_host: String,
+    remote_port: u16,
+    log_to_stderr: bool,
+) -> Result<()> {
     loop {
         let (local, client_addr) = listener
             .accept()
@@ -96,23 +137,33 @@ pub async fn run_local_forward_with_listener(
         let local_addr = local_addr.clone();
         tokio::spawn(async move {
             let started = Instant::now();
-            eprintln!(
+            let open_line = format!(
                 "[tcp -L {local_addr}] opened client={client_addr} -> remote {remote_host}:{remote_port}"
             );
+            log_forward_line(log_to_stderr, &open_line);
             match forward_one(local, connection, session, &remote_host, remote_port).await {
-                Ok(stats) => eprintln!(
-                    "{}",
-                    format_close_line(&local_addr, client_addr, started.elapsed(), stats)
+                Ok(stats) => log_forward_line(
+                    log_to_stderr,
+                    &format_close_line(&local_addr, client_addr, started.elapsed(), stats),
                 ),
                 Err(err) => {
-                    eprintln!(
+                    let close_line = format!(
                         "[tcp -L {local_addr}] closed client={client_addr} after {}, error={err}",
                         format_duration(started.elapsed())
                     );
+                    log_forward_line(log_to_stderr, &close_line);
                     tracing::debug!(%err, "tcp forwarding connection failed");
                 }
             }
         });
+    }
+}
+
+fn log_forward_line(log_to_stderr: bool, line: &str) {
+    if log_to_stderr {
+        eprintln!("{line}");
+    } else {
+        tracing::info!(message = line, "tcp forwarding event");
     }
 }
 

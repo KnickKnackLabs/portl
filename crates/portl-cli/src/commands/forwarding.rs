@@ -4,8 +4,8 @@ use anyhow::{Context, Result, bail};
 use portl_core::net::{
     LocalUdpForwardHandle, UnixListenControl, bind_local_forward_listener,
     bind_local_unix_listener, open_udp, open_unix_listen,
-    run_local_forward_with_listener as run_local_tcp_forward_with_listener,
-    run_local_unix_forward_with_listener, run_unix_reverse_forwards,
+    run_local_forward_with_listener_quiet as run_local_tcp_forward_with_listener_quiet,
+    run_local_unix_forward_with_listener_quiet, run_unix_reverse_forwards_quiet,
 };
 use portl_core::ticket::schema::{Capabilities, PortRule};
 use portl_proto::udp_v1::UdpBind;
@@ -274,7 +274,7 @@ impl ForwardPlan {
             let connection = connected.connection.clone();
             let session = connected.session.clone();
             tasks.push(tokio::spawn(async move {
-                run_local_tcp_forward_with_listener(
+                run_local_tcp_forward_with_listener_quiet(
                     listener,
                     connection,
                     session,
@@ -292,20 +292,23 @@ impl ForwardPlan {
             tasks.push(tokio::spawn(async move {
                 let opened_at = Instant::now();
                 let start_stats = forward.stats_snapshot();
-                eprintln!("{}", udp::format_open_line(&spec));
+                tracing::info!(message = %udp::format_open_line(&spec), "udp forwarding event");
                 let result = forward
                     .run_with_control(connection, control, remote_port)
                     .await;
                 let stats = forward.stats_snapshot().delta_since(start_stats);
                 match &result {
-                    Ok(()) => eprintln!(
-                        "{}",
-                        udp::format_close_line(&spec, opened_at.elapsed(), stats)
+                    Ok(()) => tracing::info!(
+                        message = %udp::format_close_line(&spec, opened_at.elapsed(), stats),
+                        "udp forwarding event"
                     ),
-                    Err(err) => eprintln!(
-                        "[udp -L {}] closed after {}, error={err}",
-                        spec.local_addr(),
-                        udp::format_duration(opened_at.elapsed())
+                    Err(err) => tracing::info!(
+                        message = %format!(
+                            "[udp -L {}] closed after {}, error={err}",
+                            spec.local_addr(),
+                            udp::format_duration(opened_at.elapsed())
+                        ),
+                        "udp forwarding event"
                     ),
                 }
                 result
@@ -313,7 +316,7 @@ impl ForwardPlan {
         }
 
         for (listener, local, remote) in unix_connects {
-            tasks.push(tokio::spawn(run_local_unix_forward_with_listener(
+            tasks.push(tokio::spawn(run_local_unix_forward_with_listener_quiet(
                 listener,
                 connected.connection.clone(),
                 connected.session.clone(),
@@ -323,7 +326,7 @@ impl ForwardPlan {
         }
 
         if !reverse_forwards.is_empty() {
-            tasks.push(tokio::spawn(run_unix_reverse_forwards(
+            tasks.push(tokio::spawn(run_unix_reverse_forwards_quiet(
                 connected.connection.clone(),
                 connected.session.clone(),
                 reverse_forwards,

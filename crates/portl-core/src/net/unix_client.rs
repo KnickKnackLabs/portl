@@ -154,6 +154,43 @@ pub async fn run_local_unix_forward_with_listener(
     local_path: String,
     remote_path: String,
 ) -> Result<()> {
+    run_local_unix_forward_with_listener_logged(
+        listener,
+        connection,
+        session,
+        local_path,
+        remote_path,
+        true,
+    )
+    .await
+}
+
+pub async fn run_local_unix_forward_with_listener_quiet(
+    listener: LocalUnixForwardListener,
+    connection: Connection,
+    session: PeerSession,
+    local_path: String,
+    remote_path: String,
+) -> Result<()> {
+    run_local_unix_forward_with_listener_logged(
+        listener,
+        connection,
+        session,
+        local_path,
+        remote_path,
+        false,
+    )
+    .await
+}
+
+async fn run_local_unix_forward_with_listener_logged(
+    listener: LocalUnixForwardListener,
+    connection: Connection,
+    session: PeerSession,
+    local_path: String,
+    remote_path: String,
+    log_to_stderr: bool,
+) -> Result<()> {
     let LocalUnixForwardListener { listener, _cleanup } = listener;
     loop {
         let (local, _) = listener
@@ -166,17 +203,21 @@ pub async fn run_local_unix_forward_with_listener(
         let local_path = local_path.clone();
         tokio::spawn(async move {
             let started = Instant::now();
-            eprintln!("[unix -L {local_path}] opened -> remote {remote_path}");
+            log_forward_line(
+                log_to_stderr,
+                &format!("[unix -L {local_path}] opened -> remote {remote_path}"),
+            );
             match forward_one(local, connection, session, remote_path).await {
-                Ok(stats) => eprintln!(
-                    "{}",
-                    format_close_line("-L", &local_path, started.elapsed(), stats)
+                Ok(stats) => log_forward_line(
+                    log_to_stderr,
+                    &format_close_line("-L", &local_path, started.elapsed(), stats),
                 ),
                 Err(err) => {
-                    eprintln!(
+                    let close_line = format!(
                         "[unix -L {local_path}] closed after {}, error={err}",
                         format_duration(started.elapsed())
                     );
+                    log_forward_line(log_to_stderr, &close_line);
                     tracing::debug!(%err, "unix forwarding connection failed");
                 }
             }
@@ -208,6 +249,23 @@ pub async fn run_unix_reverse_forwards(
     session: PeerSession,
     forwards: Vec<(String, String)>,
 ) -> Result<()> {
+    run_unix_reverse_forwards_logged(connection, session, forwards, true).await
+}
+
+pub async fn run_unix_reverse_forwards_quiet(
+    connection: Connection,
+    session: PeerSession,
+    forwards: Vec<(String, String)>,
+) -> Result<()> {
+    run_unix_reverse_forwards_logged(connection, session, forwards, false).await
+}
+
+async fn run_unix_reverse_forwards_logged(
+    connection: Connection,
+    session: PeerSession,
+    forwards: Vec<(String, String)>,
+    log_to_stderr: bool,
+) -> Result<()> {
     let forwards = forwards.into_iter().collect::<HashMap<_, _>>();
     loop {
         let Some((remote_path, local_path, local, send, recv)) =
@@ -217,21 +275,33 @@ pub async fn run_unix_reverse_forwards(
         };
         tokio::spawn(async move {
             let started = Instant::now();
-            eprintln!("[unix -R {remote_path}] opened -> local {local_path}");
+            log_forward_line(
+                log_to_stderr,
+                &format!("[unix -R {remote_path}] opened -> local {local_path}"),
+            );
             match copy_bidirectional_unix(local, send, recv).await {
-                Ok(stats) => eprintln!(
-                    "{}",
-                    format_close_line("-R", &remote_path, started.elapsed(), stats)
+                Ok(stats) => log_forward_line(
+                    log_to_stderr,
+                    &format_close_line("-R", &remote_path, started.elapsed(), stats),
                 ),
                 Err(err) => {
-                    eprintln!(
+                    let close_line = format!(
                         "[unix -R {remote_path}] closed after {}, error={err}",
                         format_duration(started.elapsed())
                     );
+                    log_forward_line(log_to_stderr, &close_line);
                     tracing::debug!(%err, "reverse unix forwarding connection failed");
                 }
             }
         });
+    }
+}
+
+fn log_forward_line(log_to_stderr: bool, line: &str) {
+    if log_to_stderr {
+        eprintln!("{line}");
+    } else {
+        tracing::info!(message = line, "unix forwarding event");
     }
 }
 

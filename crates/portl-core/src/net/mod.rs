@@ -20,6 +20,7 @@ pub use shell_client::{
 };
 pub use tcp_client::{
     bind_local_forward_listener, open_tcp, run_local_forward, run_local_forward_with_listener,
+    run_local_forward_with_listener_quiet,
 };
 pub use udp_client::{
     LocalUdpForwardHandle, UdpControl, UdpForwardStatsSnapshot, open_udp,
@@ -28,6 +29,7 @@ pub use udp_client::{
 pub use unix_client::{
     LocalUnixForwardListener, UnixListenControl, UnixListenOptions, accept_unix_reverse_once,
     bind_local_unix_listener, open_unix, open_unix_listen, open_unix_listen_with_options,
-    run_local_unix_forward, run_local_unix_forward_with_listener, run_unix_reverse_forward,
-    run_unix_reverse_forwards,
+    run_local_unix_forward, run_local_unix_forward_with_listener,
+    run_local_unix_forward_with_listener_quiet, run_unix_reverse_forward,
+    run_unix_reverse_forwards, run_unix_reverse_forwards_quiet,
 };
