@@ -1,6 +1,7 @@
 pub mod client;
 pub mod session_client;
 pub mod shell_client;
+pub mod stream_priority;
 pub mod tcp_client;
 pub mod udp_client;
 pub mod unix_client;

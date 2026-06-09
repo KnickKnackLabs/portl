@@ -17,7 +17,7 @@ use crate::wire::udp::{
     UdpDatagram, encode_datagram, udp_error_payload,
 };
 
-use super::PeerSession;
+use super::{PeerSession, stream_priority};
 
 const MAX_UDP_CTL_RESP_BYTES: usize = 64 * 1024;
 pub const CLIENT_MAX_SRC_TAGS: usize = 4096;
@@ -241,6 +241,7 @@ pub async fn open_udp(
         },
     );
     let (mut send, mut recv) = connection.open_bi().await.context("open udp stream")?;
+    stream_priority::apply(&send, stream_priority::forward());
     send.write_all(&postcard::to_stdvec(&req).context("encode udp control request")?)
         .await
         .context("write udp control request")?;

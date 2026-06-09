@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::{Connection, SendStream};
+use portl_core::net::stream_priority;
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -48,6 +49,7 @@ pub(crate) async fn serve_stream(
     mut recv: BufferedRecv,
     preamble: portl_proto::wire::StreamPreamble,
 ) -> Result<()> {
+    stream_priority::apply(&send, stream_priority::INTERACTIVE);
     let first = recv
         .read_frame::<portl_proto::shell_v1::ShellFirstFrame>(MAX_CONTROL_BYTES)
         .await?
@@ -202,6 +204,7 @@ async fn serve_substream(
     preamble: portl_proto::wire::StreamPreamble,
     tail: portl_proto::shell_v1::ShellSubTail,
 ) -> Result<()> {
+    stream_priority::apply(&send, stream_priority::shell(tail.kind));
     if preamble.peer_token != session.peer_token
         || preamble.alpn != String::from_utf8_lossy(portl_proto::shell_v1::ALPN_SHELL_V1)
     {

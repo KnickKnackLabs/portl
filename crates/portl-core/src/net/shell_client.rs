@@ -8,7 +8,7 @@ use crate::wire::shell::{
     ShellReqBody, ShellStreamKind, ShellSubTail, SignalFrame,
 };
 
-use super::PeerSession;
+use super::{PeerSession, stream_priority};
 
 pub use crate::wire::shell::PtyCfg;
 
@@ -162,6 +162,7 @@ async fn open_shell_session(
         .open_bi()
         .await
         .context("open shell control stream")?;
+    stream_priority::apply(&control_send, stream_priority::INTERACTIVE);
     control_send
         .write_all(
             &postcard::to_stdvec(&preamble(session, ALPN_SHELL_V1))
@@ -231,6 +232,7 @@ async fn open_send_stream(
         .open_bi()
         .await
         .context("open shell sub-stream")?;
+    stream_priority::apply(&send, stream_priority::shell(kind));
     send.write_all(
         &postcard::to_stdvec(&preamble(session, ALPN_SHELL_V1))
             .context("encode shell sub-stream preamble")?,

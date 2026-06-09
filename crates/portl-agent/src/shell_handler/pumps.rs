@@ -1,9 +1,11 @@
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 use iroh::endpoint::SendStream;
 use tokio::io::AsyncReadExt;
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 use crate::shell_registry::{PtyCommand, ShellOutput, ShellProcess, StdinMessage};
 use crate::stream_io::BufferedRecv;
@@ -139,24 +141,76 @@ pub(crate) async fn pump_signals(mut recv: BufferedRecv, process: &ShellProcess)
 }
 
 pub(crate) async fn pump_resizes(mut recv: BufferedRecv, process: &ShellProcess) -> Result<()> {
+    let coalescer = process
+        .pty_tx
+        .as_ref()
+        .map(|pty_tx| ResizeCoalescer::new(pty_tx.clone()));
     while let Some(frame) = recv
         .read_frame::<portl_proto::shell_v1::ResizeFrame>(MAX_RESIZE_BYTES)
         .await?
     {
-        #[cfg(unix)]
-        if let Some(pty_tx) = process.pty_tx.as_ref() {
-            pty_tx
-                .send(PtyCommand::Resize {
-                    rows: frame.rows,
-                    cols: frame.cols,
-                })
-                .map_err(|_| anyhow!("pty resize channel closed"))
-                .context("forward pty resize")?;
+        if let Some(coalescer) = coalescer.as_ref() {
+            coalescer.send(frame.rows, frame.cols).await?;
         }
-        #[cfg(not(unix))]
-        let _ = frame;
     }
     Ok(())
+}
+
+#[derive(Clone)]
+struct ResizeCoalescer {
+    tx: mpsc::UnboundedSender<PtyCommand>,
+    latest: Arc<AsyncMutex<Option<PtyCommand>>>,
+    scheduled: Arc<AtomicBool>,
+}
+
+impl ResizeCoalescer {
+    fn new(tx: mpsc::UnboundedSender<PtyCommand>) -> Self {
+        Self {
+            tx,
+            latest: Arc::new(AsyncMutex::new(None)),
+            scheduled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    async fn send(&self, rows: u16, cols: u16) -> Result<()> {
+        *self.latest.lock().await = Some(PtyCommand::Resize { rows, cols });
+        if !self.scheduled.swap(true, Ordering::AcqRel) {
+            tokio::spawn(drain_resize_coalescer(
+                self.tx.clone(),
+                Arc::clone(&self.latest),
+                Arc::clone(&self.scheduled),
+            ));
+        }
+        Ok(())
+    }
+}
+
+async fn drain_resize_coalescer(
+    tx: mpsc::UnboundedSender<PtyCommand>,
+    latest: Arc<AsyncMutex<Option<PtyCommand>>>,
+    scheduled: Arc<AtomicBool>,
+) {
+    loop {
+        tokio::task::yield_now().await;
+        let Some(command) = latest.lock().await.take() else {
+            scheduled.store(false, Ordering::Release);
+            if latest.lock().await.is_none() || scheduled.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            continue;
+        };
+        if tx.send(command).is_err() {
+            scheduled.store(false, Ordering::Release);
+            return;
+        }
+        if latest.lock().await.is_some() {
+            continue;
+        }
+        scheduled.store(false, Ordering::Release);
+        if latest.lock().await.is_none() || scheduled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -194,8 +248,8 @@ mod tests {
 
     use tokio::sync::{mpsc, watch};
 
-    use super::{ShellOutputKind, output_chunk_for_wire, pump_output};
-    use crate::shell_registry::{ShellOutput, ShellProcess, StdinMessage};
+    use super::{ResizeCoalescer, ShellOutputKind, output_chunk_for_wire, pump_output};
+    use crate::shell_registry::{PtyCommand, ShellOutput, ShellProcess, StdinMessage};
 
     const ALL_QUERY_FORMS_CHUNK: &[u8] =
         b"pre\x1b[c\x1b[>c\x1b[6n\x1b[?u\x1b[>1u\x1b[=15u\x1b[<umiddle\x1b[c\x1b[?upost";
@@ -213,6 +267,34 @@ mod tests {
     impl TestProvider {
         const ALL: [Self; 4] = [Self::Ghostty, Self::Zmx, Self::Tmux, Self::RawShell];
         const NON_GHOSTTY: [Self; 3] = [Self::Zmx, Self::Tmux, Self::RawShell];
+    }
+
+    #[tokio::test]
+    async fn resize_coalescer_emits_latest_resize() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let coalescer = ResizeCoalescer::new(tx);
+
+        coalescer.send(24, 80).await.unwrap();
+        coalescer.send(30, 100).await.unwrap();
+        coalescer.send(40, 120).await.unwrap();
+
+        let resize = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("latest resize should be delivered")
+            .expect("resize channel should remain open");
+        assert!(matches!(
+            resize,
+            PtyCommand::Resize {
+                rows: 40,
+                cols: 120
+            }
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "stale intermediate resizes should remain coalesced"
+        );
     }
 
     fn stripped_wire_capture(chunks: &[&[u8]]) -> Vec<u8> {

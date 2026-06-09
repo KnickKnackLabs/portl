@@ -10,7 +10,7 @@ use crate::io::BufferedRecv;
 use crate::wire::StreamPreamble;
 use crate::wire::tcp::{ALPN_TCP_V1, TcpAck, TcpReq};
 
-use super::PeerSession;
+use super::{PeerSession, stream_priority};
 
 const MAX_TCP_ACK_BYTES: usize = 64 * 1024;
 
@@ -29,6 +29,7 @@ pub async fn open_tcp(
         port,
     };
     let (mut send, recv) = connection.open_bi().await.context("open tcp stream")?;
+    stream_priority::apply(&send, stream_priority::forward());
     send.write_all(&postcard::to_stdvec(&req).context("encode tcp request")?)
         .await
         .context("write tcp request")?;

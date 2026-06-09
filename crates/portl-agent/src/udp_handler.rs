@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 use iroh::endpoint::{Connection, ConnectionError, SendStream};
+use portl_core::net::stream_priority;
 
 use crate::caps_enforce::udp_permits;
 use crate::session::Session;
@@ -103,6 +104,7 @@ pub(crate) async fn serve_stream(
     preamble: portl_proto::wire::StreamPreamble,
     connection_ctx: Arc<UdpConnectionContext>,
 ) -> Result<()> {
+    stream_priority::apply(&send, stream_priority::forward());
     let body = recv
         .read_frame::<portl_proto::udp_v1::UdpCtlReqTail>(MAX_UDP_CTL_REQ_BYTES)
         .await?

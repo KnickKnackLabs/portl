@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::{Connection, SendStream};
+use portl_core::net::stream_priority;
 use portl_core::terminal::zmx_control;
 use portl_proto::session_v1::{
     ALPN_SESSION_V1, SessionAck, SessionEntry, SessionFirstFrame, SessionOp,
@@ -45,6 +46,7 @@ pub(crate) async fn serve_stream(
     mut recv: BufferedRecv,
     preamble: portl_proto::wire::StreamPreamble,
 ) -> Result<()> {
+    stream_priority::apply(&send, stream_priority::CONTROL);
     let first = recv
         .read_frame::<SessionFirstFrame>(MAX_CONTROL_BYTES)
         .await?
@@ -1360,6 +1362,7 @@ async fn serve_substream(
     preamble: portl_proto::wire::StreamPreamble,
     tail: SessionSubTail,
 ) -> Result<()> {
+    stream_priority::apply(&send, stream_priority::session(tail.kind));
     if preamble.peer_token != session.peer_token
         || preamble.alpn != String::from_utf8_lossy(ALPN_SESSION_V1)
     {

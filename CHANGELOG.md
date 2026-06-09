@@ -5,6 +5,26 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Added
+
+- Added a latency benchmark that measures high-priority interactive stream
+  delivery while low-priority bulk traffic contends on the same connection.
+
+### Changed
+
+- Interactive shell, attach, and session streams now use explicit QUIC stream
+  priorities so control, input, and resize messages stay responsive while
+  output, history, and forwarding streams are busy.
+- Shell resize events are now coalesced so rapid terminal resize bursts apply
+  the latest size without flooding the remote PTY.
+- Release watching documentation now recommends bounded asynchronous polling
+  for CI and release publication status.
+
+### Fixed
+
+- Attach socket forwarding cleanup now reaps stale helper processes and keeps
+  routine forwarding shutdown logs quieter.
+
 ## 0.11.3 — 2026-06-04
 
 ### Added

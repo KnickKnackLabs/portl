@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use iroh::endpoint::{Connection, SendStream};
+use portl_core::net::stream_priority;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, copy};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::debug;
@@ -36,6 +37,15 @@ pub(crate) async fn serve_stream(
     {
         bail!("invalid unix preamble")
     }
+
+    let priority = match &req.op {
+        portl_proto::unix_v1::UnixOp::Listen {
+            ssh_agent: true, ..
+        } => stream_priority::INTERACTIVE,
+        portl_proto::unix_v1::UnixOp::Connect { .. }
+        | portl_proto::unix_v1::UnixOp::Listen { .. } => stream_priority::forward(),
+    };
+    stream_priority::apply(&send, priority);
 
     if let Err(error) = unix_permits(&session.caps, &req) {
         reject(send, error.to_owned()).await?;

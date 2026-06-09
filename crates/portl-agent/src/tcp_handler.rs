@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use iroh::endpoint::{Connection, SendStream};
+use portl_core::net::stream_priority;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncWriteExt, copy};
 use tokio::net::TcpStream;
@@ -28,6 +29,7 @@ pub(crate) async fn serve_stream(
     mut recv: BufferedRecv,
     preamble: portl_proto::wire::StreamPreamble,
 ) -> Result<()> {
+    stream_priority::apply(&send, stream_priority::forward());
     let body = recv
         .read_frame::<TcpReqBody>(MAX_TCP_REQ_BYTES)
         .await?

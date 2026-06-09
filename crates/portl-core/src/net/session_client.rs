@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 
 use crate::io::BufferedRecv;
-use crate::net::PeerSession;
+use crate::net::{PeerSession, stream_priority};
 use crate::wire::StreamPreamble;
 use crate::wire::session::{
     ALPN_SESSION_V1, ProviderReport, SessionAck, SessionControlAction, SessionControlFrame,
@@ -329,6 +329,7 @@ pub async fn open_session_attach_v2_checked(
         .open_bi()
         .await
         .context("open session attach v2 control stream")?;
+    stream_priority::apply(&control_send, stream_priority::CONTROL);
     control_send
         .write_all(&postcard::to_stdvec(&preamble(session)).context("encode session preamble")?)
         .await
@@ -457,6 +458,7 @@ pub async fn open_session_attach_herdr_checked(
         .open_bi()
         .await
         .context("open herdr session control stream")?;
+    stream_priority::apply(&control_send, stream_priority::CONTROL);
     control_send
         .write_all(&postcard::to_stdvec(&preamble(session)).context("encode session preamble")?)
         .await
@@ -565,6 +567,7 @@ pub async fn open_session_attach_checked(
         .open_bi()
         .await
         .context("open session control stream")?;
+    stream_priority::apply(&control_send, stream_priority::INTERACTIVE);
     control_send
         .write_all(&postcard::to_stdvec(&preamble(session)).context("encode session preamble")?)
         .await
@@ -641,6 +644,7 @@ async fn request_ack_checked(
         .open_bi()
         .await
         .context("open session control stream")?;
+    stream_priority::apply(&send, stream_priority::CONTROL);
     send.write_all(&postcard::to_stdvec(&preamble(session)).context("encode session preamble")?)
         .await
         .context("write session preamble")?;
@@ -736,6 +740,7 @@ async fn open_send_stream(
         .open_bi()
         .await
         .context("open session sub-stream")?;
+    stream_priority::apply(&send, stream_priority::session(kind));
     send.write_all(
         &postcard::to_stdvec(&preamble(session)).context("encode session sub preamble")?,
     )

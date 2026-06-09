@@ -77,3 +77,7 @@ tracing-subscriber = { workspace = true }
 [[bench]]
 name = "mint_verify"
 harness = false
+
+[[bench]]
+name = "stream_priority_latency"
+harness = false

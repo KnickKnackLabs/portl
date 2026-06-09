@@ -13,7 +13,7 @@ use crate::io::{BufferedRecv, read_postcard_prefix};
 use crate::wire::StreamPreamble;
 use crate::wire::unix::{ALPN_UNIX_V1, UnixAck, UnixOp, UnixReq, UnixReqTail};
 
-use super::PeerSession;
+use super::{PeerSession, stream_priority};
 
 const MAX_UNIX_ACK_BYTES: usize = 64 * 1024;
 const MAX_UNIX_REQ_BYTES: usize = 64 * 1024;
@@ -37,6 +37,7 @@ pub async fn open_unix(
         },
     );
     let (mut send, recv) = connection.open_bi().await.context("open unix stream")?;
+    stream_priority::apply(&send, stream_priority::forward());
     send.write_all(&postcard::to_stdvec(&req).context("encode unix request")?)
         .await
         .context("write unix request")?;
@@ -99,6 +100,12 @@ pub async fn open_unix_listen_with_options(
         .open_bi()
         .await
         .context("open unix listen stream")?;
+    let priority = if options.ssh_agent {
+        stream_priority::INTERACTIVE
+    } else {
+        stream_priority::forward()
+    };
+    stream_priority::apply(&send, priority);
     send.write_all(&postcard::to_stdvec(&req).context("encode unix listen request")?)
         .await
         .context("write unix listen request")?;
