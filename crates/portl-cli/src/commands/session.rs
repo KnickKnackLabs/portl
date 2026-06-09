@@ -2607,7 +2607,13 @@ async fn remote_session_attach_once_without_reconnect(
     );
     let _forward_runtime = if let Some((source_label, plan)) = request.forwarding_plan.as_ref() {
         eprint!("{}", plan.render_summary(&request.target, source_label));
-        Some(plan.start(&connected).await?)
+        match plan.start_for_attach(&connected).await {
+            Ok(runtime) => Some(runtime),
+            Err(err) => {
+                close_connected(connected, b"forward startup failed").await;
+                return Err(err);
+            }
+        }
     } else {
         None
     };

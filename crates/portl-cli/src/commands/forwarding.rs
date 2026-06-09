@@ -199,6 +199,30 @@ impl ForwardPlan {
 
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn start(&self, connected: &ConnectedPeer) -> Result<ForwardRuntime> {
+        self.start_with_options(connected, ForwardStartOptions::default())
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn start_for_attach(
+        &self,
+        connected: &ConnectedPeer,
+    ) -> Result<ForwardRuntime> {
+        self.start_with_options(
+            connected,
+            ForwardStartOptions {
+                cleanup_explicit_unix_sockets: true,
+            },
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn start_with_options(
+        &self,
+        connected: &ConnectedPeer,
+        options: ForwardStartOptions,
+    ) -> Result<ForwardRuntime> {
         let mut tcp_forwards = Vec::new();
         let mut udp_forwards = Vec::new();
         let mut unix_connects = Vec::new();
@@ -231,15 +255,21 @@ impl ForwardPlan {
                     if *generated {
                         socket::ensure_generated_socket_parent(local, "portl-to-")?;
                     }
-                    let listener = bind_local_unix_listener(local, *cleanup)?;
+                    let cleanup =
+                        *cleanup || (options.cleanup_explicit_unix_sockets && !*generated);
+                    let listener = bind_local_unix_listener(local, cleanup)?;
                     unix_connects.push((listener, local.clone(), remote.clone()));
                 }
                 socket::SocketMode::Listen {
                     remote,
                     local,
                     cleanup,
-                    ..
-                } => unix_listens.push((remote.clone(), local.clone(), *cleanup)),
+                    generated,
+                } => {
+                    let cleanup =
+                        *cleanup || (options.cleanup_explicit_unix_sockets && !*generated);
+                    unix_listens.push((remote.clone(), local.clone(), cleanup));
+                }
             }
         }
 
@@ -340,6 +370,11 @@ impl ForwardPlan {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ForwardStartOptions {
+    cleanup_explicit_unix_sockets: bool,
+}
+
 pub(crate) struct ForwardRuntime {
     tasks: Vec<tokio::task::JoinHandle<Result<()>>>,
     listen_controls: Vec<UnixListenControl>,
@@ -394,6 +429,8 @@ pub(crate) fn parse_for_target(peer: &str, args: &ForwardingArgs) -> Result<(Str
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::net::UnixListener;
+
     use super::ForwardingArgs;
     use crate::commands::peer_resolve::ConnectedPeer;
     use portl_core::net::PeerSession;
@@ -501,9 +538,48 @@ mod tests {
         finish_connected_test_peer(connected, accept_task).await;
     }
 
+    #[tokio::test]
+    async fn attach_forwarding_reaps_stale_explicit_local_unix_socket() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cua-driver.sock");
+        let stale_listener = UnixListener::bind(&path).unwrap();
+        drop(stale_listener);
+
+        let (connected, accept_task) = connected_test_peer().await;
+        let args = ForwardingArgs {
+            local: vec![format!("{}:/remote/cua-driver.sock", path.display())],
+            remote: Vec::new(),
+        };
+        let plan = args.parse("remote-dev", "local-dev").unwrap();
+
+        let Err(err) = plan.start(&connected).await else {
+            panic!("default forwarding should refuse stale explicit sockets");
+        };
+        assert!(
+            err.to_string().contains("bind local unix listener"),
+            "{err}"
+        );
+
+        let runtime = plan.start_for_attach(&connected).await.unwrap();
+        assert!(path.exists(), "attach runtime should own the socket path");
+        drop(runtime);
+        wait_for_socket_removal(&path).await;
+        finish_connected_test_peer(connected, accept_task).await;
+    }
+
     async fn unused_tcp_port() -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         listener.local_addr().unwrap().port()
+    }
+
+    async fn wait_for_socket_removal(path: &std::path::Path) {
+        for _ in 0..20 {
+            if !path.exists() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(!path.exists(), "socket path was not removed: {path:?}");
     }
 
     async fn connected_test_peer() -> (ConnectedPeer, tokio::task::JoinHandle<()>) {
