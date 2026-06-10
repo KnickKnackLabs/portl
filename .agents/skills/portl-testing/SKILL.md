@@ -92,6 +92,17 @@ Do not use fake-provider E2E as a substitute for live target validation before r
 - If unrelated untracked broken files block formatting, inspect with `git status --short`; do not silently fix unrelated tracked changes.
 - Use fresh nextest output before claiming tests pass.
 
+## Timing / DoS Smoke Tests
+
+- Timing tests on shared CI should prove asymptotic behavior, not precise microbenchmark numbers. Keep slope-ratio bounds loose enough for runner jitter and fixed per-burst overhead.
+- For linear-vs-quadratic DoS guards, phrase the assertion as “far below quadratic behavior.” A threshold around 8x is reasonable when quadratic behavior would be 100x+ across the sampled sizes; a 6x threshold has been observed to fail from CI jitter at 6.03x.
+- Reproduce Ghostty static smoke tests with the same feature set as CI when needed:
+
+```bash
+cargo nextest run -p portl-agent --features ghostty-vt-static \
+  -E 'kind(lib) & test(ghostty_process_output_dos_da1_burst_is_bounded_linear_and_wire_clean)'
+```
+
 ## Common Mistakes
 
 - Running `cargo nextest run -p portl-agent some_name` without `kind(lib)` or `binary(...)`; this can still discover unrelated binaries.

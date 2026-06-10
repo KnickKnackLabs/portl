@@ -39,8 +39,9 @@ Default sessions can be dirty after repeated probes. Use a fresh named session f
 
 - Prefer `expect` with `log_user 0`; write raw transcript to `/tmp` or `scratch/`.
 - Never put literal backticks in an unquoted shell heredoc; use Tcl `\x60` for Herdr's backtick prefix.
-- Capture the remote Herdr log line count before attach, then inspect only new lines.
+- Capture the remote Herdr log line count before attach, then inspect only new lines. Default Herdr session logs live at `~/.config/herdr/herdr-server.log`; named Herdr sessions log under `~/.config/herdr/sessions/<session>/herdr-server.log`.
 - Use marker files for text input: `echo marker > /tmp/unique-file`.
+- For named Herdr marker-file input, create/focus a pane before typing the shell command, for example send `\x60c`, optionally `\x60N`, wait for the pane/workspace log entry, then type the marker command and press Enter. Input sent before the pane exists can be lost.
 - Unset nested Herdr guard when launching from inside Herdr: `env -u HERDR_ENV ...`.
 
 ## Herdr Checks
@@ -55,6 +56,19 @@ ssh vn3 'ps -eo pid,ppid,comm,args | grep -E "[h]erdr remote-client-bridge|[p]or
 
 Expected process state: no `herdr remote-client-bridge`; `portl-agent` active; remote `herdr server` may remain.
 
+Bridge cleanup can lag after detach. Wait roughly 20–30 seconds before declaring a `herdr remote-client-bridge` stale. Extra named-session `herdr server` processes can remain after detach and are expected; the bridge helper is the process that must disappear.
+
+When validating a release candidate from macOS against a Linux target, do not upload local `target/debug/portl-agent`; it may be a Mach-O binary. `portl-agent` is the multicall `portl` binary invoked as `portl-agent`, not a separate Cargo bin target. Build on the target, use release artifacts, or cross-build with the correct Linux target/toolchain.
+
+If building on `vn3` from a temporary checkout, repo `.cargo/config.toml` may route through mise-managed `sccache`. Bypass shims by invoking the real rustup toolchain and overriding both wrapper and rustc, e.g.:
+
+```bash
+ssh vn3 'cd /tmp/portl-build && \
+  CARGO_BUILD_RUSTC_WRAPPER= \
+  RUSTC=/home/thinh/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/rustc \
+  /home/thinh/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/cargo build --release -p portl-cli --bin portl'
+```
+
 To clean stale bridge probes without matching your SSH shell:
 
 ```bash
@@ -64,6 +78,7 @@ ssh vn3 'ps -eo pid=,comm=,args= | awk '\''$2=="herdr" && index($0,"remote-clien
 ## Common Mistakes
 
 - Running live E2E with a stale `target/debug/portl`; always rebuild and print `--version`.
+- Uploading the local macOS debug binary to a Linux target; verify `file`/`--version` and build for the target architecture.
 - Checking only connect/detach and skipping process cleanup.
 - Treating a successful named-session test as proof that the exact shorthand works.
 - Letting raw TUI output flood the harness instead of logging it to a file.

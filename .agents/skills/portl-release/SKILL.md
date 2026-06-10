@@ -93,6 +93,17 @@ mise run release:watch -- VERSION --once
 
 On any terminal failure, gather compact evidence with `mise run release:watch -- VERSION --verbose` or focused `gh run view RUN_ID --log-failed`, report fixups, and stop. Do not move tags without explicit approval; if the GitHub release is already published, cut the next patch instead.
 
+If an async watcher/subagent fails because of agent/session machinery rather than a terminal release issue, continue inline with the same bounded watch chunks. Do not restart from scratch or tag until `HEAD`/upstream/tag preconditions are rechecked.
+
+When the overall workflow is still running, `gh run view RUN_ID --log-failed` may refuse logs even for a completed failed job. If `release:watch --verbose` gives a job URL or job ID, fetch that job log directly:
+
+```bash
+gh api -H 'Accept: application/vnd.github+json' \
+  /repos/KnickKnackLabs/portl/actions/jobs/JOB_ID/logs
+```
+
+New RustSec advisories can appear between local verification and CI. If `cargo deny` fails on an unavoidable transitive advisory whose RustSec entry says no safe upgrade exists, prefer a documented `deny.toml` ignore that names the dependency path and revisit condition. Still run `cargo deny --all-features check` locally before pushing the exception.
+
 ## Extra Local Gates
 
 Run these before pushing when they match the change:
@@ -143,6 +154,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 - Forgetting the GitHub release workflow extracts the matching changelog section.
 - Using raw `gh run watch` by default; prefer `release:watch` to avoid repeated annotations and huge transcripts.
 - Launching an async worker that runs one unbounded `release:watch`; use bounded `--timeout` chunks plus `--once` snapshots so the worker can report progress and avoid false needs-attention alerts.
+- Treating exit `124` from a bounded release watch as failure; it only means pending. Always follow with `--once` and continue if no terminal job failed.
 - Moving a tag after the GitHub release has been published; cut a new patch release instead.
 - Trusting `release:verify --local` alone after adding dependencies or cross-crate provider code; run the Extra Local Gates when applicable.
 - Tagging provider/helper releases without a live process cleanup audit.
