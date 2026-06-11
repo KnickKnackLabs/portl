@@ -223,6 +223,14 @@ impl ForwardPlan {
         self.start_resilient_for_attach(connected).await
     }
 
+    pub(crate) fn cleanup_attach_local_unix_sockets(&self) {
+        for mode in &self.unix {
+            if let socket::SocketMode::Connect { local, .. } = mode {
+                cleanup_unix_socket_paths(&[PathBuf::from(local)]);
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn start_resilient_for_attach(
         &self,

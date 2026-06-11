@@ -2527,6 +2527,12 @@ async fn start_attach_forwarding(
     }
 }
 
+fn cleanup_attach_forwarding(request: &RemoteSessionAttachRequest) {
+    if let Some((_source_label, plan)) = request.forwarding_plan.as_ref() {
+        plan.cleanup_attach_local_unix_sockets();
+    }
+}
+
 fn attach_disconnect_reason_for_error(error: &str) -> &'static str {
     let lower = error.to_ascii_lowercase();
     if lower.contains("early eof") || lower.contains("closed") {
@@ -2789,6 +2795,7 @@ async fn remote_session_attach_herdr_with_reconnect_on_endpoint(
         match bridge_attach_herdr(herdr_session, canonical_ref.clone()).await {
             Ok(code) => {
                 drop(forward_runtime.take());
+                cleanup_attach_forwarding(&request);
                 connected.connection.close(0u32.into(), b"session complete");
                 return Ok(exit_code_from_i32(code));
             }
@@ -2805,6 +2812,7 @@ async fn remote_session_attach_herdr_with_reconnect_on_endpoint(
                 );
                 if reason != "remote_stream_closed" {
                     drop(forward_runtime.take());
+                    cleanup_attach_forwarding(&request);
                     close_connected_connection(connected, b"herdr attach ended").await;
                     return Err(err);
                 }
