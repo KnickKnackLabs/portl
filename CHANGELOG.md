@@ -5,6 +5,8 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.11.5 — 2026-06-11
+
 ### Fixed
 
 - Remote Herdr attaches now reconnect after transient transport closures instead
