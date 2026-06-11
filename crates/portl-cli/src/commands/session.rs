@@ -2792,14 +2792,20 @@ async fn remote_session_attach_herdr_with_reconnect_on_endpoint(
                 return Ok(exit_code_from_i32(code));
             }
             Err(err) => {
+                let error = format!("{err:#}");
+                let reason = attach_disconnect_reason_for_error(&error);
                 tracing::warn!(
                     event = "cli.session.attach.closed",
                     target = %request.target,
                     provider = %provider,
                     session = %request.session_name,
-                    reason = attach_disconnect_reason_for_error(&format!("{err:#}")),
-                    error = %format!("{err:#}"),
+                    reason,
+                    error = %error,
                 );
+                if reason != "remote_stream_closed" {
+                    close_connected_connection(connected, b"herdr attach ended").await;
+                    return Err(err);
+                }
                 close_connected_connection(connected, b"herdr attach disconnected").await;
                 if attach_started.elapsed() >= Duration::from_secs(30) {
                     reconnect_state = ReconnectAttemptState::new();
