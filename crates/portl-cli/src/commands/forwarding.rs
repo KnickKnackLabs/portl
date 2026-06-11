@@ -1,17 +1,29 @@
+use std::path::PathBuf;
+use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use iroh::endpoint::Connection;
+use portl_core::net::PeerSession;
 use portl_core::net::{
-    LocalUdpForwardHandle, UnixListenControl, bind_local_forward_listener,
-    bind_local_unix_listener, open_udp, open_unix_listen,
+    LocalUdpForwardHandle, LocalUnixForwardListener, UnixListenControl,
+    bind_local_forward_listener, bind_local_unix_listener, open_tcp, open_udp, open_unix,
+    open_unix_listen,
     run_local_forward_with_listener_quiet as run_local_tcp_forward_with_listener_quiet,
     run_local_unix_forward_with_listener_quiet, run_unix_reverse_forwards_quiet,
 };
 use portl_core::ticket::schema::{Capabilities, PortRule};
 use portl_proto::udp_v1::UdpBind;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UnixStream};
+use tokio::sync::watch;
 
 use crate::commands::peer_resolve::ConnectedPeer;
 use crate::commands::{socket, tcp, udp};
+
+const ATTACH_FORWARD_LISTENER_HOLD: Duration = Duration::from_mins(2);
+const ATTACH_FORWARD_STREAM_HOLD: Duration = Duration::from_mins(1);
+const ATTACH_FORWARD_UDP_HOLD: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ForwardingArgs {
@@ -208,13 +220,86 @@ impl ForwardPlan {
         &self,
         connected: &ConnectedPeer,
     ) -> Result<ForwardRuntime> {
-        self.start_with_options(
-            connected,
-            ForwardStartOptions {
-                cleanup_explicit_unix_sockets: true,
-            },
-        )
-        .await
+        self.start_resilient_for_attach(connected).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn start_resilient_for_attach(
+        &self,
+        connected: &ConnectedPeer,
+    ) -> Result<ForwardRuntime> {
+        let mut tasks = Vec::new();
+        let mut cleanup_unix_paths = Vec::new();
+        let (peer_tx, peer_rx) = watch::channel(ForwardPeer::new(connected, 0));
+
+        for spec in &self.tcp {
+            let local_addr = spec.local_addr();
+            let listener = bind_local_forward_listener(&local_addr).await?;
+            tasks.push(tokio::spawn(run_resilient_tcp_forward_listener(
+                listener,
+                peer_rx.clone(),
+                local_addr,
+                spec.remote_host.clone(),
+                spec.remote_port,
+            )));
+        }
+
+        for spec in &self.udp {
+            let forward = LocalUdpForwardHandle::bind(&spec.local_addr())?;
+            tasks.push(tokio::spawn(run_resilient_udp_forward(
+                forward,
+                peer_rx.clone(),
+                spec.clone(),
+            )));
+        }
+
+        for mode in &self.unix {
+            match mode {
+                socket::SocketMode::Connect {
+                    local,
+                    remote,
+                    cleanup,
+                    generated,
+                } => {
+                    if *generated {
+                        socket::ensure_generated_socket_parent(local, "portl-to-")?;
+                    }
+                    let cleanup = *cleanup || !*generated;
+                    if cleanup {
+                        cleanup_unix_paths.push(PathBuf::from(local));
+                    }
+                    let listener = bind_local_unix_listener(local, cleanup)?;
+                    tasks.push(tokio::spawn(run_resilient_unix_forward_listener(
+                        listener,
+                        peer_rx.clone(),
+                        local.clone(),
+                        remote.clone(),
+                    )));
+                }
+                socket::SocketMode::Listen {
+                    remote,
+                    local,
+                    cleanup,
+                    generated,
+                } => {
+                    let cleanup = *cleanup || !*generated;
+                    tasks.push(tokio::spawn(run_resilient_unix_reverse_forward(
+                        peer_rx.clone(),
+                        remote.clone(),
+                        local.clone(),
+                        cleanup,
+                    )));
+                }
+            }
+        }
+
+        Ok(ForwardRuntime {
+            tasks,
+            listen_controls: Vec::new(),
+            peer_tx: Some(peer_tx),
+            generation: 0,
+            cleanup_unix_paths,
+        })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -366,6 +451,9 @@ impl ForwardPlan {
         Ok(ForwardRuntime {
             tasks,
             listen_controls,
+            peer_tx: None,
+            generation: 0,
+            cleanup_unix_paths: Vec::new(),
         })
     }
 }
@@ -375,12 +463,304 @@ struct ForwardStartOptions {
     cleanup_explicit_unix_sockets: bool,
 }
 
+#[derive(Clone)]
+struct ForwardPeer {
+    connection: Connection,
+    session: PeerSession,
+    generation: u64,
+}
+
+impl ForwardPeer {
+    fn new(connected: &ConnectedPeer, generation: u64) -> Self {
+        Self {
+            connection: connected.connection.clone(),
+            session: connected.session.clone(),
+            generation,
+        }
+    }
+}
+
+async fn wait_for_forward_peer_update(
+    rx: &mut watch::Receiver<ForwardPeer>,
+    seen_generation: u64,
+    hold: Duration,
+) -> Option<ForwardPeer> {
+    if rx.borrow().generation != seen_generation {
+        return Some(rx.borrow().clone());
+    }
+    match tokio::time::timeout(hold, rx.changed()).await {
+        Ok(Ok(())) => Some(rx.borrow().clone()),
+        Ok(Err(_)) | Err(_) => None,
+    }
+}
+
+async fn run_resilient_tcp_forward_listener(
+    listener: TcpListener,
+    peer_rx: watch::Receiver<ForwardPeer>,
+    local_addr: String,
+    remote_host: String,
+    remote_port: u16,
+) -> Result<()> {
+    loop {
+        let (local, client_addr) = listener
+            .accept()
+            .await
+            .context("accept local tcp connection")?;
+        let peer_rx = peer_rx.clone();
+        let local_addr = local_addr.clone();
+        let remote_host = remote_host.clone();
+        tokio::spawn(async move {
+            let started = Instant::now();
+            tracing::info!(
+                message = %format!(
+                    "[tcp -L {local_addr}] opened client={client_addr} -> remote {remote_host}:{remote_port}"
+                ),
+                "tcp forwarding event"
+            );
+            match forward_resilient_tcp_client(local, peer_rx, &remote_host, remote_port).await {
+                Ok(stats) => tracing::info!(
+                    message = %portl_core::net::tcp_client::format_close_line(&local_addr, client_addr, started.elapsed(), stats),
+                    "tcp forwarding event"
+                ),
+                Err(err) => tracing::info!(
+                    message = %format!(
+                        "[tcp -L {local_addr}] closed client={client_addr} after {}, error={err}",
+                        udp::format_duration(started.elapsed())
+                    ),
+                    "tcp forwarding event"
+                ),
+            }
+        });
+    }
+}
+
+async fn forward_resilient_tcp_client(
+    local: TcpStream,
+    mut peer_rx: watch::Receiver<ForwardPeer>,
+    remote_host: &str,
+    remote_port: u16,
+) -> Result<portl_core::net::tcp_client::TcpForwardStats> {
+    let (mut local_read, mut local_write) = local.into_split();
+    let mut stats = portl_core::net::tcp_client::TcpForwardStats::default();
+    let mut peer = peer_rx.borrow().clone();
+    loop {
+        let (mut send, mut recv) =
+            open_tcp(&peer.connection, &peer.session, remote_host, remote_port).await?;
+        let mut upstream_buf = vec![0_u8; 16 * 1024];
+        let mut downstream_buf = vec![0_u8; 16 * 1024];
+        let disconnected_generation = loop {
+            tokio::select! {
+                read = local_read.read(&mut upstream_buf) => {
+                    let read = read.context("read local tcp")?;
+                    if read == 0 {
+                        let _ = send.finish();
+                        return Ok(stats);
+                    }
+                    if let Err(err) = send.write_all(&upstream_buf[..read]).await {
+                        tracing::debug!(%err, "tcp forward remote write failed; pausing local client");
+                        break peer.generation;
+                    }
+                    stats.upstream_bytes = stats.upstream_bytes.saturating_add(read as u64);
+                }
+                read = recv.read(&mut downstream_buf) => {
+                    let read = match read {
+                        Ok(read) => read,
+                        Err(err) => {
+                            tracing::debug!(%err, "tcp forward remote read failed; pausing local client");
+                            break peer.generation;
+                        }
+                    };
+                    if read == 0 {
+                        local_write.shutdown().await.context("shutdown local tcp")?;
+                        return Ok(stats);
+                    }
+                    local_write.write_all(&downstream_buf[..read]).await.context("write local tcp")?;
+                    stats.downstream_bytes = stats.downstream_bytes.saturating_add(read as u64);
+                }
+            }
+        };
+        peer = wait_for_forward_peer_update(
+            &mut peer_rx,
+            disconnected_generation,
+            ATTACH_FORWARD_STREAM_HOLD,
+        )
+        .await
+        .context("forwarded tcp client timed out waiting for reconnect")?;
+    }
+}
+
+async fn run_resilient_unix_forward_listener(
+    listener: LocalUnixForwardListener,
+    peer_rx: watch::Receiver<ForwardPeer>,
+    local_path: String,
+    remote_path: String,
+) -> Result<()> {
+    loop {
+        let (local, _) = listener
+            .accept()
+            .await
+            .context("accept local unix connection")?;
+        let peer_rx = peer_rx.clone();
+        let local_path = local_path.clone();
+        let remote_path = remote_path.clone();
+        tokio::spawn(async move {
+            let started = Instant::now();
+            tracing::info!(
+                message = %format!("[unix -L {local_path}] opened -> remote {remote_path}"),
+                "unix forwarding event"
+            );
+            match forward_resilient_unix_client(local, peer_rx, &remote_path).await {
+                Ok(stats) => tracing::info!(
+                    message = %portl_core::net::unix_client::format_close_line("-L", &local_path, started.elapsed(), stats),
+                    "unix forwarding event"
+                ),
+                Err(err) => tracing::info!(
+                    message = %format!(
+                        "[unix -L {local_path}] closed after {}, error={err}",
+                        udp::format_duration(started.elapsed())
+                    ),
+                    "unix forwarding event"
+                ),
+            }
+        });
+    }
+}
+
+async fn forward_resilient_unix_client(
+    local: UnixStream,
+    mut peer_rx: watch::Receiver<ForwardPeer>,
+    remote_path: &str,
+) -> Result<portl_core::net::unix_client::UnixForwardStats> {
+    let (mut local_read, mut local_write) = local.into_split();
+    let mut stats = portl_core::net::unix_client::UnixForwardStats::default();
+    let mut peer = peer_rx.borrow().clone();
+    loop {
+        let (mut send, mut recv) = open_unix(&peer.connection, &peer.session, remote_path).await?;
+        let mut upstream_buf = vec![0_u8; 16 * 1024];
+        let mut downstream_buf = vec![0_u8; 16 * 1024];
+        let disconnected_generation = loop {
+            tokio::select! {
+                read = local_read.read(&mut upstream_buf) => {
+                    let read = read.context("read local unix")?;
+                    if read == 0 {
+                        let _ = send.finish();
+                        return Ok(stats);
+                    }
+                    if let Err(err) = send.write_all(&upstream_buf[..read]).await {
+                        tracing::debug!(%err, "unix forward remote write failed; pausing local client");
+                        break peer.generation;
+                    }
+                    stats.upstream_bytes = stats.upstream_bytes.saturating_add(read as u64);
+                }
+                read = recv.read(&mut downstream_buf) => {
+                    let read = match read {
+                        Ok(read) => read,
+                        Err(err) => {
+                            tracing::debug!(%err, "unix forward remote read failed; pausing local client");
+                            break peer.generation;
+                        }
+                    };
+                    if read == 0 {
+                        local_write.shutdown().await.context("shutdown local unix")?;
+                        return Ok(stats);
+                    }
+                    local_write.write_all(&downstream_buf[..read]).await.context("write local unix")?;
+                    stats.downstream_bytes = stats.downstream_bytes.saturating_add(read as u64);
+                }
+            }
+        };
+        peer = wait_for_forward_peer_update(
+            &mut peer_rx,
+            disconnected_generation,
+            ATTACH_FORWARD_STREAM_HOLD,
+        )
+        .await
+        .context("forwarded unix client timed out waiting for reconnect")?;
+    }
+}
+
+async fn run_resilient_udp_forward(
+    forward: LocalUdpForwardHandle,
+    mut peer_rx: watch::Receiver<ForwardPeer>,
+    spec: udp::LocalForwardSpec,
+) -> Result<()> {
+    let mut peer = peer_rx.borrow().clone();
+    loop {
+        let control = open_udp(
+            &peer.connection,
+            &peer.session,
+            forward.session_id(),
+            vec![UdpBind {
+                local_port_range: (spec.local_port, spec.local_port),
+                target_host: spec.remote_host.clone(),
+                target_port_range: (spec.remote_port, spec.remote_port),
+            }],
+        )
+        .await?;
+        let disconnected_generation = peer.generation;
+        let result = forward
+            .run_with_control(peer.connection.clone(), control, spec.remote_port)
+            .await;
+        if let Err(err) = result {
+            tracing::debug!(%err, "udp forward paused waiting for reconnect");
+        }
+        peer = wait_for_forward_peer_update(
+            &mut peer_rx,
+            disconnected_generation,
+            ATTACH_FORWARD_UDP_HOLD,
+        )
+        .await
+        .context("udp forward timed out waiting for reconnect")?;
+    }
+}
+
+async fn run_resilient_unix_reverse_forward(
+    mut peer_rx: watch::Receiver<ForwardPeer>,
+    remote_path: String,
+    local_path: String,
+    cleanup: bool,
+) -> Result<()> {
+    let mut peer = peer_rx.borrow().clone();
+    loop {
+        let control =
+            open_unix_listen(&peer.connection, &peer.session, &remote_path, cleanup).await?;
+        let disconnected_generation = peer.generation;
+        let result = run_unix_reverse_forwards_quiet(
+            peer.connection.clone(),
+            peer.session.clone(),
+            vec![(remote_path.clone(), local_path.clone())],
+        )
+        .await;
+        let _ = control.close();
+        if let Err(err) = result {
+            tracing::debug!(%err, "reverse unix forward paused waiting for reconnect");
+        }
+        peer = wait_for_forward_peer_update(
+            &mut peer_rx,
+            disconnected_generation,
+            ATTACH_FORWARD_LISTENER_HOLD,
+        )
+        .await
+        .context("reverse unix forward timed out waiting for reconnect")?;
+    }
+}
+
 pub(crate) struct ForwardRuntime {
     tasks: Vec<tokio::task::JoinHandle<Result<()>>>,
     listen_controls: Vec<UnixListenControl>,
+    peer_tx: Option<watch::Sender<ForwardPeer>>,
+    generation: u64,
+    cleanup_unix_paths: Vec<PathBuf>,
 }
 
 impl ForwardRuntime {
+    pub(crate) fn reconnect(&mut self, connected: &ConnectedPeer) {
+        if let Some(peer_tx) = &self.peer_tx {
+            self.generation = self.generation.saturating_add(1);
+            let _ = peer_tx.send(ForwardPeer::new(connected, self.generation));
+        }
+    }
+
     pub(crate) fn abort(&mut self) {
         for control in self.listen_controls.drain(..) {
             let _ = control.close();
@@ -388,8 +768,19 @@ impl ForwardRuntime {
         for task in &self.tasks {
             task.abort();
         }
+        cleanup_unix_socket_paths(&self.cleanup_unix_paths);
     }
 }
+
+#[cfg(unix)]
+fn cleanup_unix_socket_paths(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(not(unix))]
+fn cleanup_unix_socket_paths(_paths: &[PathBuf]) {}
 
 impl Drop for ForwardRuntime {
     fn drop(&mut self) {
@@ -432,12 +823,28 @@ mod tests {
     use std::os::unix::net::UnixListener;
 
     use super::ForwardingArgs;
+    use super::{
+        ATTACH_FORWARD_LISTENER_HOLD, ATTACH_FORWARD_STREAM_HOLD, ATTACH_FORWARD_UDP_HOLD,
+    };
     use crate::commands::peer_resolve::ConnectedPeer;
     use portl_core::net::PeerSession;
     use portl_core::test_util::pair;
     use portl_core::ticket::schema::{Capabilities, ShellCaps};
 
     const TEST_ALPN: &[u8] = b"portl/forwarding-plan-start-test/v1";
+
+    #[test]
+    fn attach_forwarding_hold_timeouts_match_interactive_defaults() {
+        assert_eq!(
+            ATTACH_FORWARD_LISTENER_HOLD,
+            std::time::Duration::from_mins(2)
+        );
+        assert_eq!(
+            ATTACH_FORWARD_STREAM_HOLD,
+            std::time::Duration::from_mins(1)
+        );
+        assert_eq!(ATTACH_FORWARD_UDP_HOLD, std::time::Duration::from_secs(30));
+    }
 
     #[test]
     fn parses_mixed_local_and_remote_forwarding_flags() {

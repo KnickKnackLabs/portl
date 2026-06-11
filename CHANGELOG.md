@@ -5,6 +5,14 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Fixed
+
+- Remote Herdr attaches now reconnect after transient transport closures instead
+  of exiting with a `remote_stream_closed` error.
+- `portl attach` now keeps local TCP, UDP, and Unix socket forwards alive during
+  attach reconnects so forwarded SSH, VNC, and local socket clients see a brief
+  pause instead of an immediate disconnect.
+
 ## 0.11.4 — 2026-06-10
 
 ### Added

@@ -1904,14 +1904,11 @@ pub fn attach(
             rows,
             forwarding_plan,
         };
-        if request.forwarding_plan.is_some() {
-            remote_session_attach_once_without_reconnect(request).await
-        } else if should_reconnect_remote_attach(request.provider.as_deref())
-            && std::io::stdin().is_terminal()
-        {
-            remote_session_attach_with_reconnect(request).await
-        } else {
-            remote_session_attach_once_without_reconnect(request).await
+        match remote_attach_execution(request.provider.as_deref(), std::io::stdin().is_terminal()) {
+            RemoteAttachExecution::Reconnect => remote_session_attach_with_reconnect(request).await,
+            RemoteAttachExecution::Once => {
+                remote_session_attach_once_without_reconnect(request).await
+            }
         }
     });
     runtime.shutdown_background();
@@ -2474,8 +2471,60 @@ fn should_try_attach_v2(provider: Option<&str>) -> bool {
     !matches!(provider, Some("herdr" | "zmx" | "tmux" | "raw"))
 }
 
-fn should_reconnect_remote_attach(provider: Option<&str>) -> bool {
-    provider != Some("herdr") && session_reconnect_enabled()
+fn should_reconnect_remote_attach(_provider: Option<&str>) -> bool {
+    session_reconnect_enabled()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteAttachExecution {
+    Once,
+    Reconnect,
+}
+
+fn remote_attach_execution(
+    provider: Option<&str>,
+    stdin_is_terminal: bool,
+) -> RemoteAttachExecution {
+    remote_attach_execution_with_reconnect_enabled(
+        provider,
+        stdin_is_terminal,
+        should_reconnect_remote_attach(provider),
+    )
+}
+
+fn remote_attach_execution_with_reconnect_enabled(
+    _provider: Option<&str>,
+    stdin_is_terminal: bool,
+    reconnect_enabled: bool,
+) -> RemoteAttachExecution {
+    if stdin_is_terminal && reconnect_enabled {
+        RemoteAttachExecution::Reconnect
+    } else {
+        RemoteAttachExecution::Once
+    }
+}
+
+fn attach_session_caps(request: &RemoteSessionAttachRequest) -> Capabilities {
+    let mut caps = session_caps();
+    if let Some((_source_label, plan)) = request.forwarding_plan.as_ref() {
+        plan.augment_caps(&mut caps);
+    }
+    caps
+}
+
+async fn start_attach_forwarding(
+    request: &RemoteSessionAttachRequest,
+    connected: &crate::commands::peer_resolve::ConnectedPeer,
+    render_summary: bool,
+) -> Result<Option<crate::commands::forwarding::ForwardRuntime>> {
+    if let Some((source_label, plan)) = request.forwarding_plan.as_ref() {
+        if render_summary {
+            eprint!("{}", plan.render_summary(&request.target, source_label));
+        }
+        plan.start_for_attach(connected).await.map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 fn attach_disconnect_reason_for_error(error: &str) -> &'static str {
@@ -2588,10 +2637,7 @@ fn session_reconnect_enabled() -> bool {
 async fn remote_session_attach_once_without_reconnect(
     request: RemoteSessionAttachRequest,
 ) -> Result<ExitCode> {
-    let mut caps = session_caps();
-    if let Some((_source_label, plan)) = request.forwarding_plan.as_ref() {
-        plan.augment_caps(&mut caps);
-    }
+    let caps = attach_session_caps(&request);
     log_attach_state(
         "connecting",
         &request.target,
@@ -2605,17 +2651,12 @@ async fn remote_session_attach_once_without_reconnect(
         request.provider.as_deref(),
         &request.session_name,
     );
-    let _forward_runtime = if let Some((source_label, plan)) = request.forwarding_plan.as_ref() {
-        eprint!("{}", plan.render_summary(&request.target, source_label));
-        match plan.start_for_attach(&connected).await {
-            Ok(runtime) => Some(runtime),
-            Err(err) => {
-                close_connected(connected, b"forward startup failed").await;
-                return Err(err);
-            }
+    let _forward_runtime = match start_attach_forwarding(&request, &connected, true).await {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            close_connected(connected, b"forward startup failed").await;
+            return Err(err);
         }
-    } else {
-        None
     };
     print_remote_attach_start(&request, request.provider.as_deref());
     log_attach_state(
@@ -2681,6 +2722,9 @@ async fn remote_session_attach_once_without_reconnect(
 async fn remote_session_attach_with_reconnect(
     request: RemoteSessionAttachRequest,
 ) -> Result<ExitCode> {
+    if request.provider.as_deref() == Some("herdr") {
+        return remote_session_attach_herdr_with_reconnect(request).await;
+    }
     let identity_path = resolve_identity_path(None);
     let identity = identity_store::load(&identity_path).context("load local identity")?;
     let endpoint = bind_client_endpoint(&identity).await?;
@@ -2690,6 +2734,185 @@ async fn remote_session_attach_with_reconnect(
     result
 }
 
+async fn remote_session_attach_herdr_with_reconnect(
+    request: RemoteSessionAttachRequest,
+) -> Result<ExitCode> {
+    let identity_path = resolve_identity_path(None);
+    let identity = identity_store::load(&identity_path).context("load local identity")?;
+    let endpoint = bind_client_endpoint(&identity).await?;
+    let result =
+        remote_session_attach_herdr_with_reconnect_on_endpoint(request, &identity, &endpoint).await;
+    close_client_endpoint(endpoint, "herdr session reconnect").await;
+    result
+}
+
+async fn remote_session_attach_herdr_with_reconnect_on_endpoint(
+    request: RemoteSessionAttachRequest,
+    identity: &portl_core::id::Identity,
+    endpoint: &iroh::Endpoint,
+) -> Result<ExitCode> {
+    print_remote_attach_start(&request, request.provider.as_deref());
+    let caps = attach_session_caps(&request);
+    let mut connected =
+        connect_peer_with_endpoint(&request.target, caps, identity, endpoint, false).await?;
+    let mut forward_runtime = match start_attach_forwarding(&request, &connected, true).await {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            close_connected_connection(connected, b"forward startup failed").await;
+            return Err(err);
+        }
+    };
+    let mut session = open_remote_attach_session_checked(
+        &connected.connection,
+        &connected.session,
+        request.provider.clone(),
+        request.session_name.clone(),
+        (!request.argv.is_empty()).then_some(request.argv.clone()),
+        request.user.clone(),
+        request.cwd.clone(),
+        portl_core::net::shell_client::PtyCfg {
+            term: request.term.clone(),
+            cols: request.cols,
+            rows: request.rows,
+        },
+    )
+    .await?;
+    let provider = session.provider().to_owned();
+    let canonical_ref = canonical_session_ref(&request.target, &provider, &request.session_name);
+    let mut reconnect_state = ReconnectAttemptState::new();
+    let mut attach_started = Instant::now();
+
+    loop {
+        let RemoteAttachSession::Herdr(herdr_session) = session else {
+            anyhow::bail!("expected herdr attach session, got provider '{provider}'");
+        };
+        match bridge_attach_herdr(herdr_session, canonical_ref.clone()).await {
+            Ok(code) => {
+                connected.connection.close(0u32.into(), b"session complete");
+                return Ok(exit_code_from_i32(code));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    event = "cli.session.attach.closed",
+                    target = %request.target,
+                    provider = %provider,
+                    session = %request.session_name,
+                    reason = attach_disconnect_reason_for_error(&format!("{err:#}")),
+                    error = %format!("{err:#}"),
+                );
+                close_connected_connection(connected, b"herdr attach disconnected").await;
+                if attach_started.elapsed() >= Duration::from_secs(30) {
+                    reconnect_state = ReconnectAttemptState::new();
+                }
+                let reattached = reconnect_remote_herdr_session(
+                    &request,
+                    &provider,
+                    identity,
+                    endpoint,
+                    &canonical_ref,
+                    &mut reconnect_state,
+                )
+                .await?;
+                connected = reattached.connected;
+                if let Some(runtime) = &mut forward_runtime {
+                    runtime.reconnect(&connected);
+                }
+                session = RemoteAttachSession::Herdr(reattached.session);
+                attach_started = Instant::now();
+            }
+        }
+    }
+}
+
+struct ReattachedHerdrSession {
+    connected: crate::commands::peer_resolve::ConnectedPeer,
+    session: HerdrSessionClient,
+}
+
+async fn reconnect_remote_herdr_session(
+    request: &RemoteSessionAttachRequest,
+    provider: &str,
+    identity: &portl_core::id::Identity,
+    endpoint: &iroh::Endpoint,
+    canonical_ref: &str,
+    state: &mut ReconnectAttemptState,
+) -> Result<ReattachedHerdrSession> {
+    loop {
+        let policy = reconnect_policy_for_environment(ReconnectPolicy::default_interactive())
+            .with_observed_rtt(state.last_rtt);
+        let attempt = state.next_attempt();
+        if !policy.retry_budget_remaining(state.started.elapsed()) {
+            anyhow::bail!("could not reconnect to session \"{canonical_ref}\" after 2m");
+        }
+        let delay = reconnect_attempt_delay(attempt, &policy);
+        tracing::info!(
+            event = "transport.reconnect.attempt",
+            target = %request.target,
+            provider,
+            session = %request.session_name,
+            attempt,
+        );
+        tokio::time::sleep(delay).await;
+        let connected = match connect_peer_with_endpoint(
+            &request.target,
+            attach_session_caps(request),
+            identity,
+            endpoint,
+            true,
+        )
+        .await
+        {
+            Ok(connected) => connected,
+            Err(err) => {
+                debug!(%err, attempt, "herdr reconnect connect failed");
+                continue;
+            }
+        };
+        match open_remote_attach_session_checked(
+            &connected.connection,
+            &connected.session,
+            Some(provider.to_owned()),
+            request.session_name.clone(),
+            None,
+            request.user.clone(),
+            request.cwd.clone(),
+            portl_core::net::shell_client::PtyCfg {
+                term: request.term.clone(),
+                cols: request.cols,
+                rows: request.rows,
+            },
+        )
+        .await
+        {
+            Ok(RemoteAttachSession::Herdr(session)) => {
+                tracing::info!(
+                    event = "transport.reconnect.success",
+                    target = %request.target,
+                    provider,
+                    session = %request.session_name,
+                    attempt,
+                );
+                return Ok(ReattachedHerdrSession { connected, session });
+            }
+            Ok(other) => {
+                close_connected_connection(connected, b"herdr reconnect provider changed").await;
+                anyhow::bail!(
+                    "expected herdr attach session, got provider '{}'",
+                    other.provider()
+                );
+            }
+            Err(err @ SessionOpenError::Rejected { .. }) => {
+                close_connected_connection(connected, b"herdr reconnect attach rejected").await;
+                return Err(anyhow::Error::from(err));
+            }
+            Err(SessionOpenError::Transport(err)) => {
+                debug!(%err, attempt, "herdr reconnect attach failed");
+                close_connected_connection(connected, b"herdr reconnect attach failed").await;
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn remote_session_attach_with_reconnect_on_endpoint(
     request: RemoteSessionAttachRequest,
@@ -2697,9 +2920,16 @@ async fn remote_session_attach_with_reconnect_on_endpoint(
     endpoint: &iroh::Endpoint,
 ) -> Result<ExitCode> {
     print_remote_attach_start(&request, request.provider.as_deref());
+    let caps = attach_session_caps(&request);
     let mut connected =
-        connect_peer_with_endpoint(&request.target, session_caps(), identity, endpoint, false)
-            .await?;
+        connect_peer_with_endpoint(&request.target, caps, identity, endpoint, false).await?;
+    let mut forward_runtime = match start_attach_forwarding(&request, &connected, true).await {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            close_connected_connection(connected, b"forward startup failed").await;
+            return Err(err);
+        }
+    };
     let mut session = open_remote_attach_session_checked(
         &connected.connection,
         &connected.session,
@@ -2835,6 +3065,9 @@ async fn remote_session_attach_with_reconnect_on_endpoint(
                         session: next_session,
                     } => {
                         connected = *next_connected;
+                        if let Some(runtime) = &mut forward_runtime {
+                            runtime.reconnect(&connected);
+                        }
                         session = *next_session;
                         attach_started = Instant::now();
                     }
@@ -4243,7 +4476,7 @@ async fn reconnect_remote_session(
                 test_reconnect_block_connect_attempt(display, attempt).await?;
                 connect_peer_with_endpoint(
                     &request.target,
-                    session_caps(),
+                    attach_session_caps(request),
                     identity,
                     endpoint,
                     true,
@@ -8533,6 +8766,26 @@ mod tests {
     }
 
     #[test]
+    fn herdr_remote_attach_uses_reconnect_when_terminal() {
+        assert_eq!(
+            remote_attach_execution_with_reconnect_enabled(Some("herdr"), true, true),
+            RemoteAttachExecution::Reconnect
+        );
+    }
+
+    #[test]
+    fn remote_attach_reconnect_still_requires_terminal_and_enabled_flag() {
+        assert_eq!(
+            remote_attach_execution_with_reconnect_enabled(Some("herdr"), false, true),
+            RemoteAttachExecution::Once
+        );
+        assert_eq!(
+            remote_attach_execution_with_reconnect_enabled(Some("tmux"), true, false),
+            RemoteAttachExecution::Once
+        );
+    }
+
+    #[test]
     fn attach_output_gate_buffers_while_control_bar_is_visible() {
         let mut gate = AttachOutputGate::default();
 
@@ -10682,8 +10935,8 @@ mod tests {
     }
 
     #[test]
-    fn herdr_attach_disables_reconnect_wrapper() {
-        assert!(!should_reconnect_remote_attach(Some("herdr")));
+    fn herdr_attach_enables_reconnect_wrapper() {
+        assert!(should_reconnect_remote_attach(Some("herdr")));
     }
 
     #[test]

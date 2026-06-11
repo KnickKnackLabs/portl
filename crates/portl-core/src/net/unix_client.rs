@@ -19,10 +19,10 @@ const MAX_UNIX_ACK_BYTES: usize = 64 * 1024;
 const MAX_UNIX_REQ_BYTES: usize = 64 * 1024;
 const MAX_UNIX_PREAMBLE_BYTES: usize = 8 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct UnixForwardStats {
-    upstream_bytes: u64,
-    downstream_bytes: u64,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UnixForwardStats {
+    pub upstream_bytes: u64,
+    pub downstream_bytes: u64,
 }
 
 pub async fn open_unix(
@@ -121,6 +121,12 @@ pub async fn open_unix_listen_with_options(
 pub struct LocalUnixForwardListener {
     listener: UnixListener,
     _cleanup: UnixSocketCleanup,
+}
+
+impl LocalUnixForwardListener {
+    pub async fn accept(&self) -> std::io::Result<(UnixStream, tokio::net::unix::SocketAddr)> {
+        self.listener.accept().await
+    }
 }
 
 pub fn bind_local_unix_listener(
@@ -495,7 +501,7 @@ async fn copy_bidirectional_unix(
     })
 }
 
-fn format_close_line(
+pub fn format_close_line(
     direction: &str,
     listen_path: &str,
     elapsed: Duration,

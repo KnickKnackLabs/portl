@@ -47,10 +47,10 @@ pub async fn open_tcp(
     Ok((send, recv))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TcpForwardStats {
-    upstream_bytes: u64,
-    downstream_bytes: u64,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TcpForwardStats {
+    pub upstream_bytes: u64,
+    pub downstream_bytes: u64,
 }
 
 pub async fn bind_local_forward_listener(local_addr: &str) -> Result<TcpListener> {
@@ -203,7 +203,7 @@ async fn forward_one(
     })
 }
 
-fn format_close_line(
+pub fn format_close_line(
     local_addr: &str,
     client_addr: SocketAddr,
     elapsed: Duration,
