@@ -2788,6 +2788,7 @@ async fn remote_session_attach_herdr_with_reconnect_on_endpoint(
         };
         match bridge_attach_herdr(herdr_session, canonical_ref.clone()).await {
             Ok(code) => {
+                drop(forward_runtime.take());
                 connected.connection.close(0u32.into(), b"session complete");
                 return Ok(exit_code_from_i32(code));
             }
@@ -2803,6 +2804,7 @@ async fn remote_session_attach_herdr_with_reconnect_on_endpoint(
                     error = %error,
                 );
                 if reason != "remote_stream_closed" {
+                    drop(forward_runtime.take());
                     close_connected_connection(connected, b"herdr attach ended").await;
                     return Err(err);
                 }
