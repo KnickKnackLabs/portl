@@ -191,7 +191,6 @@ async fn drain_resize_coalescer(
     scheduled: Arc<AtomicBool>,
 ) {
     loop {
-        tokio::task::yield_now().await;
         let Some(command) = latest.lock().await.take() else {
             scheduled.store(false, Ordering::Release);
             if latest.lock().await.is_none() || scheduled.swap(true, Ordering::AcqRel) {
