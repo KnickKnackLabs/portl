@@ -5,6 +5,25 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.11.6 — 2026-06-12
+
+### Added
+
+- Added `--term` to `portl shell` and `portl attach` so users can require a
+  specific terminal type and, when run interactively, install missing user-scoped
+  terminfo on the target from the local `infocmp` definition.
+
+### Fixed
+
+- Interactive PTY entry points now probe target terminfo before requesting the
+  local terminal type. `portl shell`, generated OpenSSH `ProxyCommand` sessions
+  backed by `portl ssh --stdio`, and remote `portl attach` providers fall back
+  to `xterm-256color` when the target lacks entries such as `xterm-kitty`,
+  avoiding visible shell echo and cursor-sequence corruption.
+- Generated native SSH configs now preserve the OpenSSH user through
+  `portl ssh --stdio`, keeping `ssh HOST` behavior aligned with direct
+  `portl ssh HOST` connections.
+
 ## 0.11.5 — 2026-06-11
 
 ### Fixed

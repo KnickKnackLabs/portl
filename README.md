@@ -15,7 +15,7 @@ used for NAT traversal when direct paths are unavailable.
 
 ## Status
 
-**v0.11.5** — Forwarding UX release. Portl has SSH-style TCP, UDP, and
+**v0.11.6** — Forwarding UX release. Portl has SSH-style TCP, UDP, and
 Unix socket forwarding with grouped startup summaries and lifecycle logs,
 plus shared `-L`/`-R` forwarding flags on `portl shell`, `portl attach`,
 `portl ssh`, and `portl ssh-proxy`. Persistent terminal sessions remain
@@ -66,7 +66,7 @@ curl -fsSL \
 
 The installer is idempotent. Re-run it to upgrade; by default it preserves
 whether this machine was already configured as a client or agent. Set
-`PORTL_VERSION=0.11.5` to pin a release. Use `--agent=off` to disable the
+`PORTL_VERSION=0.11.6` to pin a release. Use `--agent=off` to disable the
 service, or `--uninstall` to remove binaries and service while keeping
 `$PORTL_HOME`. By default, Portl stores local state under `~/.portl` on
 all operating systems (`config/`, `data/`, `state/`, and `run/` subdirs).
@@ -86,7 +86,7 @@ portl-agent down            # stop/disable service, keeping state
 
 ```bash
 # mise
-mise use -g github:KnickKnackLabs/portl@0.11.5
+mise use -g github:KnickKnackLabs/portl@0.11.6
 # mise only shims `portl`; run install.sh with PORTL_AGENT=1 if this machine should be shared.
 
 # cargo
