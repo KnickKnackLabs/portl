@@ -5,6 +5,8 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.11.7 — 2026-06-12
+
 ### Fixed
 
 - OpenSSH commands that request a PTY through generated `portl ssh --stdio`
