@@ -5,6 +5,15 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.11.8 — 2026-06-12
+
+### Fixed
+
+- Linux PTY and exec sessions now inherit the target system's process-count
+  limit instead of forcing a small Portl-specific `RLIMIT_NPROC` cap, avoiding
+  fork failures on busy desktop or media-server targets while matching sshd-like
+  host policy.
+
 ## 0.11.7 — 2026-06-12
 
 ### Fixed

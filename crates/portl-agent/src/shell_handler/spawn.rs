@@ -442,8 +442,9 @@ pub fn spawn_pty_for_test(
 /// - `RLIMIT_CORE`   = 0       (no core dumps)
 /// - `RLIMIT_CPU`    = 86400 s
 /// - `RLIMIT_FSIZE`  = 10 GiB
-/// - `RLIMIT_NPROC`  = 512     (Linux only; Darwin `RLIMIT_NPROC`
-///   is per-process and cannot contain a fork bomb at the uid level)
+///
+/// `RLIMIT_NPROC` is intentionally inherited from the agent's service/user
+/// context so process-count policy matches the host's system defaults.
 #[cfg(unix)]
 pub(super) fn apply_rlimits() -> std::io::Result<()> {
     // Use nix::sys::resource::setrlimit so nix's Resource enum handles
@@ -464,8 +465,6 @@ pub(super) fn apply_rlimits() -> std::io::Result<()> {
     set(Resource::RLIMIT_CORE, 0)?;
     set(Resource::RLIMIT_CPU, 86_400)?;
     set(Resource::RLIMIT_FSIZE, 10 * 1024 * 1024 * 1024)?;
-    #[cfg(target_os = "linux")]
-    set(Resource::RLIMIT_NPROC, 512)?;
     Ok(())
 }
 

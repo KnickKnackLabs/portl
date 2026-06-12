@@ -313,7 +313,40 @@ mod rlimits {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn exec_path_applies_nproc_linux() {
+    async fn exec_path_preserves_inherited_nproc_linux() {
+        use nix::sys::resource::{Resource, getrlimit, setrlimit};
+
+        let (original_soft, original_hard) =
+            getrlimit(Resource::RLIMIT_NPROC).expect("read original RLIMIT_NPROC");
+        let inherited_soft = if original_hard > 4096 {
+            4097
+        } else if original_hard > 2048 {
+            original_hard - 1
+        } else {
+            eprintln!(
+                "skipping inherited NPROC check: hard limit {original_hard} is too low to safely adjust"
+            );
+            return;
+        };
+
+        struct RestoreNproc {
+            soft: u64,
+            hard: u64,
+        }
+
+        impl Drop for RestoreNproc {
+            fn drop(&mut self) {
+                let _ = setrlimit(Resource::RLIMIT_NPROC, self.soft, self.hard);
+            }
+        }
+
+        let _restore = RestoreNproc {
+            soft: original_soft,
+            hard: original_hard,
+        };
+        setrlimit(Resource::RLIMIT_NPROC, inherited_soft, original_hard)
+            .expect("set inherited RLIMIT_NPROC soft limit");
+
         // `ulimit -u` is a bash-ism: dash (which is /bin/sh on Debian /
         // Ubuntu) rejects it with "Illegal option -u". Use bash explicitly
         // so this test runs on both Alpine-like and Debian-like distros.
@@ -322,41 +355,6 @@ mod rlimits {
             .await
             .expect("run exec");
         assert!(out.status.success(), "exec exited non-zero: {out:?}");
-        assert_eq!(out.stdout.trim(), "512");
-    }
-
-    // Inherently antisocial to parallel test execution: it intentionally
-    // exhausts the agent's uid-wide NPROC budget with 512 sleeping
-    // children, which blocks every other test in the same binary that
-    // needs to fork. Marked #[ignore]; run manually with:
-    //   cargo nextest run -p portl-agent --test agent_misc \
-    //     --run-ignored only rlimits::fork_bomb_killed_by_nproc
-    //
-    // The cheaper `exec_path_applies_nproc_linux` test (above) already
-    // verifies `ulimit -u` reports 512, which is the real correctness
-    // signal. This test only adds the live fork-bomb verification that
-    // the cap is actually enforced at fork-time, which is an OS guarantee
-    // we trust without CI signal.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    #[ignore = "exhausts uid NPROC budget; run with --ignored --test-threads=1"]
-    async fn fork_bomb_killed_by_nproc() {
-        // Spawn a shell that forks 10k children; RLIMIT_NPROC=512 caps
-        // the tree. Agent stays responsive.
-        //
-        // The `wait` at the end reaps children so we don't leak 512
-        // sleeping processes into the test environment on manual runs.
-        let _ = run_exec_capture(
-            "/bin/sh",
-            &[
-                "-c",
-                "i=0; while [ $i -lt 10000 ]; do (true) & i=$((i+1)); done; wait",
-            ],
-            vec![],
-        )
-        .await;
-        // We don't assert on exit code — the shell hits NPROC cap and errors.
-        // What we assert: this process's own fork budget is still healthy.
-        assert!(std::process::Command::new("true").spawn().is_ok());
+        assert_eq!(out.stdout.trim(), inherited_soft.to_string());
     }
 }
