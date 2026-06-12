@@ -25,6 +25,7 @@ pub mod ssh_proxy;
 pub mod ssh_stdio;
 pub mod status;
 pub mod tcp;
+pub mod terminal_compat;
 pub mod ticket;
 pub mod udp;
 pub mod whoami;

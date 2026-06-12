@@ -327,6 +327,20 @@ fn help_documents_session_environment_overrides() {
 }
 
 #[test]
+fn attach_help_documents_terminal_type_override() {
+    for args in [
+        &["attach", "--help"][..],
+        &["session", "attach", "--help"][..],
+    ] {
+        let help = help_output(args);
+        assert!(
+            help.contains("--term <TERM>"),
+            "attach help should document --term override for {args:?}:\n{help}"
+        );
+    }
+}
+
+#[test]
 fn top_level_help_snapshots_match() {
     let cases = [
         (
@@ -424,6 +438,7 @@ Options:
   -v, --verbose...    Increase logging; in doctor, also show passing checks
       --log <FILTER>  RUST_LOG-style tracing filter. Overrides -v and `PORTL_LOG`
       --user <USER>   
+      --term <TERM>   Terminal type to request. Defaults to auto-detect with xterm-256color fallback
   -h, --help          Print help
 "#,
         ),

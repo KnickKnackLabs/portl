@@ -102,6 +102,7 @@ pub enum Command {
         peer: String,
         cwd: Option<String>,
         user: Option<String>,
+        term: Option<String>,
         forward_l: Vec<String>,
         forward_r: Vec<String>,
     },
@@ -115,6 +116,7 @@ pub enum Command {
         provider: Option<String>,
         user: Option<String>,
         cwd: Option<String>,
+        term: Option<String>,
         forward_l: Vec<String>,
         forward_r: Vec<String>,
         argv: Vec<String>,
@@ -1003,12 +1005,14 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             peer,
             cwd,
             user,
+            term,
             forward_l,
             forward_r,
         } => commands::shell::run(
             &peer,
             cwd.as_deref(),
             user.as_deref(),
+            term.as_deref(),
             commands::forwarding::ForwardingArgs {
                 local: forward_l,
                 remote: forward_r,
@@ -1033,21 +1037,23 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             provider,
             user,
             cwd,
+            term,
             forward_l,
             forward_r,
             argv,
-        } => commands::session::attach(
-            session.as_deref(),
-            target.as_deref(),
-            provider.as_deref(),
-            user.as_deref(),
-            cwd.as_deref(),
-            &argv,
-            commands::forwarding::ForwardingArgs {
+        } => commands::session::attach(commands::session::AttachRunOptions {
+            session: session.as_deref(),
+            target: target.as_deref(),
+            provider: provider.as_deref(),
+            user: user.as_deref(),
+            cwd: cwd.as_deref(),
+            term: term.as_deref(),
+            argv: &argv,
+            forwarding: commands::forwarding::ForwardingArgs {
                 local: forward_l,
                 remote: forward_r,
             },
-        ),
+        }),
         Command::SessionLs {
             target_ref,
             target,
@@ -1773,6 +1779,9 @@ enum SessionTopLevel {
         user: Option<String>,
         #[arg(long)]
         cwd: Option<String>,
+        /// Terminal type to request. Defaults to auto-detect with xterm-256color fallback.
+        #[arg(long)]
+        term: Option<String>,
         /// Forward from the current machine to the target. Accepts TCP, UDP (/udp), or Unix socket specs.
         #[arg(short = 'L', value_name = "SPEC")]
         forward_l: Vec<String>,
@@ -1877,6 +1886,9 @@ enum ConnectTopLevel {
         cwd: Option<String>,
         #[arg(long)]
         user: Option<String>,
+        /// Terminal type to request. Defaults to auto-detect with xterm-256color fallback.
+        #[arg(long)]
+        term: Option<String>,
         /// Forward from the current machine to the target. Accepts TCP, UDP (/udp), or Unix socket specs.
         #[arg(short = 'L', value_name = "SPEC")]
         forward_l: Vec<String>,
@@ -2113,6 +2125,9 @@ enum SessionAction {
         user: Option<String>,
         #[arg(long)]
         cwd: Option<String>,
+        /// Terminal type to request. Defaults to auto-detect with xterm-256color fallback.
+        #[arg(long)]
+        term: Option<String>,
         /// Forward from the current machine to the target. Accepts TCP, UDP (/udp), or Unix socket specs.
         #[arg(short = 'L', value_name = "SPEC")]
         forward_l: Vec<String>,
@@ -2699,6 +2714,7 @@ fn session_top_level_into_command(action: SessionTopLevel) -> Command {
             provider,
             user,
             cwd,
+            term,
             forward_l,
             forward_r,
             argv,
@@ -2708,6 +2724,7 @@ fn session_top_level_into_command(action: SessionTopLevel) -> Command {
             provider,
             user,
             cwd,
+            term,
             forward_l,
             forward_r,
             argv,
@@ -2771,6 +2788,7 @@ fn session_action_into_command(action: SessionAction) -> Command {
             provider,
             user,
             cwd,
+            term,
             forward_l,
             forward_r,
             argv,
@@ -2780,6 +2798,7 @@ fn session_action_into_command(action: SessionAction) -> Command {
             provider,
             user,
             cwd,
+            term,
             forward_l,
             forward_r,
             argv,
@@ -2872,12 +2891,14 @@ fn connect_into_command(action: ConnectTopLevel, log_verbose: u8) -> Command {
             peer,
             cwd,
             user,
+            term,
             forward_l,
             forward_r,
         } => Command::Shell {
             peer,
             cwd,
             user,
+            term,
             forward_l,
             forward_r,
         },

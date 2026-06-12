@@ -164,6 +164,7 @@ fn run_with_agent_forwarding(
         };
         let result = run_agent_forwarded_session(
             &connected,
+            peer,
             user,
             stdin_null,
             remote_command,
@@ -180,6 +181,7 @@ fn run_with_agent_forwarding(
 
 async fn run_agent_forwarded_session(
     connected: &ConnectedPeer,
+    target_label: &str,
     user: Option<&str>,
     stdin_null: bool,
     remote_command: &[String],
@@ -203,7 +205,14 @@ async fn run_agent_forwarded_session(
         local_agent_path,
     ));
     let env_patch = vec![("SSH_AUTH_SOCK".to_owned(), EnvValue::Set(remote_agent_path))];
-    let session = run_remote_session(connected, user, stdin_null, remote_command, env_patch);
+    let session = run_remote_session(
+        connected,
+        target_label,
+        user,
+        stdin_null,
+        remote_command,
+        env_patch,
+    );
     tokio::pin!(session);
 
     let session_result = tokio::select! {
@@ -223,6 +232,7 @@ async fn run_agent_forwarded_session(
 
 async fn run_remote_session(
     connected: &ConnectedPeer,
+    target_label: &str,
     user: Option<&str>,
     stdin_null: bool,
     remote_command: &[String],
@@ -231,6 +241,7 @@ async fn run_remote_session(
     if remote_command.is_empty() {
         return shell::run_on_connected(
             connected,
+            target_label,
             None,
             user,
             shell::ShellRunOptions {

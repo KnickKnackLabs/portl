@@ -32,6 +32,9 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::commands::peer_resolve::{close_connected, connect_peer_quiet};
+use crate::commands::terminal_compat::{
+    TermInstallPrompt, auto_candidate_term_request, resolve_pty_term_on_session,
+};
 
 pub fn run(
     peer: &str,
@@ -95,6 +98,7 @@ async fn run_stdio_on_connected(
         Arc::new(PortlSshBackend {
             connection: connected.connection.clone(),
             session: connected.session.clone(),
+            target_label: peer.to_owned(),
             user,
             remote_agent_path,
         }),
@@ -346,6 +350,7 @@ impl AsyncWrite for StdioStream {
 struct PortlSshBackend {
     connection: Connection,
     session: PeerSession,
+    target_label: String,
     user: Option<String>,
     remote_agent_path: String,
 }
@@ -503,9 +508,25 @@ impl server::Handler for PortlSshServer {
         _modes: &[(russh::Pty, u32)],
         session: &mut RusshSession,
     ) -> Result<(), Self::Error> {
+        if !self.channels.contains_key(&channel) {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
+
+        let resolved_term = resolve_pty_term_on_session(
+            &self.backend.connection,
+            &self.backend.session,
+            &self.backend.target_label,
+            self.backend.user.as_deref(),
+            auto_candidate_term_request(term),
+            TermInstallPrompt::Never,
+            None,
+        )
+        .await?;
+
         if let Some(pending) = self.channels.get_mut(&channel) {
             pending.pty = Some(PtyCfg {
-                term: term.to_owned(),
+                term: resolved_term,
                 cols: ssh_dimension(col_width),
                 rows: ssh_dimension(row_height),
             });

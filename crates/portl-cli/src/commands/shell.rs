@@ -1,4 +1,4 @@
-use std::io::IsTerminal;
+use std::io::{self, IsTerminal};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -18,11 +18,13 @@ use crate::commands::peer_resolve::{
     ConnectedPeer, close_connected, connect_peer, connect_peer_quiet,
 };
 use crate::commands::session::{AttachSignalWatcher, RawModeExitVariant, RawModeGuard};
+use crate::commands::terminal_compat::{TermInstallPrompt, resolve_pty_term, term_request};
 
 pub fn run(
     peer: &str,
     cwd: Option<&str>,
     user: Option<&str>,
+    term: Option<&str>,
     forwarding: ForwardingArgs,
 ) -> Result<ExitCode> {
     run_with_options(
@@ -30,6 +32,7 @@ pub fn run(
         cwd,
         user,
         ShellRunOptions {
+            requested_term: term.map(ToOwned::to_owned),
             forwarding,
             ..Default::default()
         },
@@ -40,6 +43,7 @@ pub fn run(
 pub(crate) struct ShellRunOptions {
     pub(crate) quiet_resolve: bool,
     pub(crate) close_stdin: bool,
+    pub(crate) requested_term: Option<String>,
     pub(crate) env_patch: Vec<(String, EnvValue)>,
     pub(crate) forwarding: ForwardingArgs,
     pub(crate) forwarding_plan: Option<(String, String, ForwardPlan)>,
@@ -66,7 +70,7 @@ pub(crate) fn run_with_options(
         } else {
             connect_peer(peer, caps).await?
         };
-        let result = run_on_connected(&connected, cwd, user, options).await;
+        let result = run_on_connected(&connected, peer, cwd, user, options).await;
         close_connected(connected, b"shell complete").await;
         result
     });
@@ -76,6 +80,7 @@ pub(crate) fn run_with_options(
 
 pub(crate) async fn run_on_connected(
     connected: &ConnectedPeer,
+    target_label: &str,
     cwd: Option<&str>,
     user: Option<&str>,
     options: ShellRunOptions,
@@ -88,7 +93,13 @@ pub(crate) async fn run_on_connected(
             None
         };
     let (cols, rows) = size().unwrap_or((80, 24));
-    let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_owned());
+    let term = resolve_shell_term(
+        connected,
+        target_label,
+        user,
+        options.requested_term.as_deref(),
+    )
+    .await?;
     let shell = open_shell_with_env(
         &connected.connection,
         &connected.session,
@@ -99,7 +110,7 @@ pub(crate) async fn run_on_connected(
     )
     .await?;
 
-    let raw_guard = if std::io::stdin().is_terminal() {
+    let raw_guard = if io::stdin().is_terminal() {
         Some(RawModeGuard::new()?)
     } else {
         None
@@ -179,6 +190,32 @@ pub(crate) async fn run_on_connected(
     }
     let code = finish_shell_completion(completion, raw_guard, stdout_task, stderr_task).await?;
     Ok(exit_code_from_i32(code))
+}
+
+async fn resolve_shell_term(
+    connected: &ConnectedPeer,
+    target_label: &str,
+    user: Option<&str>,
+    requested_term: Option<&str>,
+) -> Result<String> {
+    let request = term_request(requested_term)?;
+    let install_hint_term = requested_term
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| std::env::var("TERM").ok());
+    let install_hint =
+        install_hint_term.map(|term| format!("portl shell --term {term} {target_label}"));
+    resolve_pty_term(
+        connected,
+        target_label,
+        user,
+        request,
+        TermInstallPrompt::AllowIfInteractive,
+        install_hint.as_deref(),
+    )
+    .await
+    .context("resolve remote terminal type")
 }
 
 fn shell_caps() -> Capabilities {
@@ -273,7 +310,7 @@ fn close_remote_stdin(mut send: SendStream) {
 }
 
 fn should_close_idle_stdin() -> Result<bool> {
-    if std::io::stdin().is_terminal() {
+    if io::stdin().is_terminal() {
         return Ok(false);
     }
 
@@ -293,7 +330,7 @@ fn stdin_ready_within(timeout: Duration) -> Result<bool> {
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     use std::os::fd::AsFd;
 
-    let stdin = std::io::stdin();
+    let stdin = io::stdin();
     let mut pollfds = [PollFd::new(stdin.as_fd(), PollFlags::POLLIN)];
     let ready = poll(
         &mut pollfds,

@@ -386,6 +386,7 @@ fn session_surface_matches_spec() {
             provider: Some("zmx".to_owned()),
             user: Some("root".to_owned()),
             cwd: Some("/work".to_owned()),
+            term: None,
             forward_l: Vec::new(),
             forward_r: Vec::new(),
             argv: vec!["zellij".to_owned(), "a".to_owned()],
@@ -483,6 +484,7 @@ fn top_level_session_aliases_parse_like_session_subcommands() {
             provider: Some("zmx".to_owned()),
             user: None,
             cwd: None,
+            term: None,
             forward_l: Vec::new(),
             forward_r: Vec::new(),
             argv: Vec::new(),
@@ -504,6 +506,7 @@ fn top_level_session_aliases_parse_like_session_subcommands() {
             provider: None,
             user: None,
             cwd: None,
+            term: None,
             forward_l: vec!["8080:3000".to_owned()],
             forward_r: vec!["/tmp/local-agent.sock".to_owned()],
             argv: Vec::new(),
@@ -560,6 +563,24 @@ fn top_level_session_aliases_parse_like_session_subcommands() {
             target: None,
             session: Some("dotfiles".to_owned()),
             provider: None,
+        }
+    );
+}
+
+#[test]
+fn top_level_attach_term_option_parses() {
+    assert_eq!(
+        parse_args(&["attach", "--term", "xterm-kitty", "remote-dev/work"]).expect("parse"),
+        ParsedCommand::SessionAttach {
+            target: None,
+            session: Some("remote-dev/work".to_owned()),
+            provider: None,
+            user: None,
+            cwd: None,
+            term: Some("xterm-kitty".to_owned()),
+            forward_l: Vec::new(),
+            forward_r: Vec::new(),
+            argv: Vec::new(),
         }
     );
 }

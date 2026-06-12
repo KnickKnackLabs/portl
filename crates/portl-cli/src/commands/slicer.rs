@@ -295,6 +295,7 @@ pub fn vm_shell(name: &str) -> Result<ExitCode> {
         name,
         None,
         None,
+        None,
         crate::commands::forwarding::ForwardingArgs::default(),
     )
 }

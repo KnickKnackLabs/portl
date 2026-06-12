@@ -60,6 +60,7 @@ use crate::commands::session_share::{
     build_session_share_envelope, classify_share_target, fresh_workspace_handles, load_identity,
     resolve_rendezvous_url, run_offer_against_transport, unix_now,
 };
+use crate::commands::terminal_compat::{TermInstallPrompt, resolve_pty_term, term_request};
 use portl_core::id::store as identity_store;
 use portl_core::peer_store::PeerStore;
 use portl_core::rendezvous::ws::WsRendezvousBackend;
@@ -1844,15 +1845,28 @@ fn attach_session_defaults_from_store(
     )
 }
 
-pub fn attach(
-    session: Option<&str>,
-    target: Option<&str>,
-    provider: Option<&str>,
-    user: Option<&str>,
-    cwd: Option<&str>,
-    argv: &[String],
-    forwarding: ForwardingArgs,
-) -> Result<ExitCode> {
+pub(crate) struct AttachRunOptions<'a> {
+    pub(crate) session: Option<&'a str>,
+    pub(crate) target: Option<&'a str>,
+    pub(crate) provider: Option<&'a str>,
+    pub(crate) user: Option<&'a str>,
+    pub(crate) cwd: Option<&'a str>,
+    pub(crate) term: Option<&'a str>,
+    pub(crate) argv: &'a [String],
+    pub(crate) forwarding: ForwardingArgs,
+}
+
+pub(crate) fn attach(options: AttachRunOptions<'_>) -> Result<ExitCode> {
+    let AttachRunOptions {
+        session,
+        target,
+        provider,
+        user,
+        cwd,
+        term,
+        argv,
+        forwarding,
+    } = options;
     let provider = effective_provider(provider);
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async move {
@@ -1899,7 +1913,8 @@ pub fn attach(
             user: user.map(ToOwned::to_owned),
             cwd: cwd.map(ToOwned::to_owned),
             argv: argv.to_vec(),
-            term: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_owned()),
+            requested_term: term.map(ToOwned::to_owned),
+            term: None,
             cols,
             rows,
             forwarding_plan,
@@ -2428,10 +2443,60 @@ struct RemoteSessionAttachRequest {
     user: Option<String>,
     cwd: Option<String>,
     argv: Vec<String>,
-    term: String,
+    requested_term: Option<String>,
+    term: Option<String>,
     cols: u16,
     rows: u16,
     forwarding_plan: Option<(String, ForwardPlan)>,
+}
+
+async fn resolve_remote_attach_term(
+    request: &mut RemoteSessionAttachRequest,
+    connected: &crate::commands::peer_resolve::ConnectedPeer,
+) -> Result<()> {
+    if request.term.is_some() {
+        return Ok(());
+    }
+    let term_request = term_request(request.requested_term.as_deref())?;
+    let install_hint_term = request
+        .requested_term
+        .as_deref()
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| std::env::var("TERM").ok());
+    let install_hint = install_hint_term.map(|term| {
+        format!(
+            "portl attach --term {term} {}",
+            target_session_ref(&request.target, &request.session_name)
+        )
+    });
+    let term = resolve_pty_term(
+        connected,
+        &request.target,
+        request.user.as_deref(),
+        term_request,
+        TermInstallPrompt::AllowIfInteractive,
+        install_hint.as_deref(),
+    )
+    .await
+    .context("resolve remote terminal type")?;
+    request.term = Some(term);
+    Ok(())
+}
+
+fn remote_attach_pty(
+    request: &RemoteSessionAttachRequest,
+) -> Result<portl_core::net::shell_client::PtyCfg> {
+    let term = request
+        .term
+        .clone()
+        .context("remote attach terminal type was not resolved")?;
+    Ok(portl_core::net::shell_client::PtyCfg {
+        term,
+        cols: request.cols,
+        rows: request.rows,
+    })
 }
 
 enum RemoteAttachSession {
@@ -2641,7 +2706,7 @@ fn session_reconnect_enabled() -> bool {
 }
 
 async fn remote_session_attach_once_without_reconnect(
-    request: RemoteSessionAttachRequest,
+    mut request: RemoteSessionAttachRequest,
 ) -> Result<ExitCode> {
     let caps = attach_session_caps(&request);
     log_attach_state(
@@ -2651,6 +2716,10 @@ async fn remote_session_attach_once_without_reconnect(
         &request.session_name,
     );
     let connected = connect_peer(&request.target, caps).await?;
+    if let Err(err) = resolve_remote_attach_term(&mut request, &connected).await {
+        close_connected(connected, b"terminal type resolution failed").await;
+        return Err(err);
+    }
     log_attach_state(
         "connected",
         &request.target,
@@ -2679,11 +2748,7 @@ async fn remote_session_attach_once_without_reconnect(
         (!request.argv.is_empty()).then_some(request.argv.clone()),
         request.user.clone(),
         request.cwd.clone(),
-        portl_core::net::shell_client::PtyCfg {
-            term: request.term.clone(),
-            cols: request.cols,
-            rows: request.rows,
-        },
+        remote_attach_pty(&request)?,
     )
     .await
     {
@@ -2753,7 +2818,7 @@ async fn remote_session_attach_herdr_with_reconnect(
 }
 
 async fn remote_session_attach_herdr_with_reconnect_on_endpoint(
-    request: RemoteSessionAttachRequest,
+    mut request: RemoteSessionAttachRequest,
     identity: &portl_core::id::Identity,
     endpoint: &iroh::Endpoint,
 ) -> Result<ExitCode> {
@@ -2761,6 +2826,10 @@ async fn remote_session_attach_herdr_with_reconnect_on_endpoint(
     let caps = attach_session_caps(&request);
     let mut connected =
         connect_peer_with_endpoint(&request.target, caps, identity, endpoint, false).await?;
+    if let Err(err) = resolve_remote_attach_term(&mut request, &connected).await {
+        close_connected_connection(connected, b"terminal type resolution failed").await;
+        return Err(err);
+    }
     let mut forward_runtime = match start_attach_forwarding(&request, &connected, true).await {
         Ok(runtime) => runtime,
         Err(err) => {
@@ -2776,11 +2845,7 @@ async fn remote_session_attach_herdr_with_reconnect_on_endpoint(
         (!request.argv.is_empty()).then_some(request.argv.clone()),
         request.user.clone(),
         request.cwd.clone(),
-        portl_core::net::shell_client::PtyCfg {
-            term: request.term.clone(),
-            cols: request.cols,
-            rows: request.rows,
-        },
+        remote_attach_pty(&request)?,
     )
     .await?;
     let provider = session.provider().to_owned();
@@ -2892,11 +2957,7 @@ async fn reconnect_remote_herdr_session(
             None,
             request.user.clone(),
             request.cwd.clone(),
-            portl_core::net::shell_client::PtyCfg {
-                term: request.term.clone(),
-                cols: request.cols,
-                rows: request.rows,
-            },
+            remote_attach_pty(request)?,
         )
         .await
         {
@@ -2931,7 +2992,7 @@ async fn reconnect_remote_herdr_session(
 
 #[allow(clippy::too_many_lines)]
 async fn remote_session_attach_with_reconnect_on_endpoint(
-    request: RemoteSessionAttachRequest,
+    mut request: RemoteSessionAttachRequest,
     identity: &portl_core::id::Identity,
     endpoint: &iroh::Endpoint,
 ) -> Result<ExitCode> {
@@ -2939,6 +3000,10 @@ async fn remote_session_attach_with_reconnect_on_endpoint(
     let caps = attach_session_caps(&request);
     let mut connected =
         connect_peer_with_endpoint(&request.target, caps, identity, endpoint, false).await?;
+    if let Err(err) = resolve_remote_attach_term(&mut request, &connected).await {
+        close_connected_connection(connected, b"terminal type resolution failed").await;
+        return Err(err);
+    }
     let mut forward_runtime = match start_attach_forwarding(&request, &connected, true).await {
         Ok(runtime) => runtime,
         Err(err) => {
@@ -2954,11 +3019,7 @@ async fn remote_session_attach_with_reconnect_on_endpoint(
         (!request.argv.is_empty()).then_some(request.argv.clone()),
         request.user.clone(),
         request.cwd.clone(),
-        portl_core::net::shell_client::PtyCfg {
-            term: request.term.clone(),
-            cols: request.cols,
-            rows: request.rows,
-        },
+        remote_attach_pty(&request)?,
     )
     .await?;
     let provider = session.provider().to_owned();
@@ -4579,11 +4640,7 @@ async fn reconnect_remote_session(
                 None,
                 request.user.clone(),
                 request.cwd.clone(),
-                portl_core::net::shell_client::PtyCfg {
-                    term: request.term.clone(),
-                    cols: request.cols,
-                    rows: request.rows,
-                },
+                remote_attach_pty(request)?,
             ) => session,
             signal = signal_watcher.next() => {
                 close_connected_connection(connected, b"session reconnect signal").await;
@@ -4711,11 +4768,7 @@ async fn try_same_connection_reattach(
         None,
         request.user.clone(),
         request.cwd.clone(),
-        portl_core::net::shell_client::PtyCfg {
-            term: request.term.clone(),
-            cols: request.cols,
-            rows: request.rows,
-        },
+        remote_attach_pty(request)?,
     )
     .await
     {

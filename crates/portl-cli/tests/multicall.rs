@@ -162,6 +162,7 @@ fn shell_exec_tcp_and_udp_subcommands_parse() {
             peer: "peer-ticket".to_owned(),
             cwd: Some("/tmp".to_owned()),
             user: Some("alice".to_owned()),
+            term: None,
             forward_l: Vec::new(),
             forward_r: Vec::new(),
         }
@@ -185,6 +186,7 @@ fn shell_exec_tcp_and_udp_subcommands_parse() {
             peer: "peer-ticket".to_owned(),
             cwd: None,
             user: None,
+            term: None,
             forward_l: vec!["8080:3000".to_owned(), "/run/herdr.sock".to_owned()],
             forward_r: vec!["/tmp/local-agent.sock".to_owned()],
         }
@@ -321,6 +323,29 @@ fn socket_subcommands_parse() {
 }
 
 #[test]
+fn shell_term_option_parses() {
+    let shell_with_term = parse(argv(&[
+        "portl",
+        "shell",
+        "--term",
+        "xterm-kitty",
+        "peer-ticket",
+    ]))
+    .expect("shell --term parse should succeed");
+    assert_eq!(
+        shell_with_term,
+        Command::Shell {
+            peer: "peer-ticket".to_owned(),
+            cwd: None,
+            user: None,
+            term: Some("xterm-kitty".to_owned()),
+            forward_l: Vec::new(),
+            forward_r: Vec::new(),
+        }
+    );
+}
+
+#[test]
 fn portl_ssh_subcommands_parse() {
     let ssh_shell = parse(argv(&["portl", "ssh", "remote-dev"])).expect("ssh shell parse");
     assert_eq!(
@@ -389,15 +414,6 @@ fn portl_ssh_subcommands_parse() {
         }
     );
 
-    let ssh_stdio = parse(argv(&["portl-ssh", "--stdio", "remote-dev"])).expect("stdio parse");
-    match ssh_stdio {
-        Command::Ssh { peer, user, .. } => {
-            assert_eq!(peer, "remote-dev");
-            assert_eq!(user, None);
-        }
-        other => panic!("unexpected command: {other:?}"),
-    }
-
     let ssh_git = parse(argv(&[
         "portl-ssh",
         "-l",
@@ -427,6 +443,18 @@ fn portl_ssh_subcommands_parse() {
             remote_command: vec!["git-upload-pack".to_owned(), "repo.git".to_owned()],
         }
     );
+}
+
+#[test]
+fn portl_ssh_stdio_parses_without_user() {
+    let ssh_stdio = parse(argv(&["portl-ssh", "--stdio", "remote-dev"])).expect("stdio parse");
+    match ssh_stdio {
+        Command::Ssh { peer, user, .. } => {
+            assert_eq!(peer, "remote-dev");
+            assert_eq!(user, None);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
 }
 
 #[test]
