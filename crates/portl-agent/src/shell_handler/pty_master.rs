@@ -394,10 +394,13 @@ mod tests {
     async fn pty_master_echoes_large_input_without_deadlock() {
         // Use `stty raw -echo; cat` so the PTY passes bytes through without
         // line-buffering or local echo, and cat reflects every byte back.
-        let mut harness =
-            spawn_pty_task_harness(&["-c", "stty raw -echo; cat"], Duration::from_secs(2));
-        // Give stty a moment to configure the terminal.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let ready_marker = b"PORTL-PTY-READY\n";
+        let mut harness = spawn_pty_task_harness(
+            &["-c", "stty raw -echo; printf 'PORTL-PTY-READY\\n'; cat"],
+            Duration::from_secs(2),
+        );
+        let mut observed =
+            wait_for_marker(&mut harness.stdout_rx, ready_marker, Duration::from_secs(5)).await;
 
         // Build a non-uniform input so we can assert exact content rather than
         // just length.  Pattern: repeating 0x00..0xFF.
@@ -409,7 +412,6 @@ mod tests {
             .await
             .expect("send large input");
 
-        let mut observed = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         while observed.len() < input.len() {
             let remaining = deadline
@@ -661,5 +663,35 @@ mod tests {
         let fd_dir = "/dev/fd";
 
         Path::new(fd_dir).join(fd.to_string()).exists()
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_marker(
+        stdout_rx: &mut mpsc::Receiver<Vec<u8>>,
+        marker: &[u8],
+        timeout: Duration,
+    ) -> Vec<u8> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut buffer = Vec::new();
+        loop {
+            if let Some(index) = find_subslice(&buffer, marker) {
+                return buffer.split_off(index + marker.len());
+            }
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .expect("timed out waiting for pty readiness marker");
+            let chunk = tokio::time::timeout(remaining, stdout_rx.recv())
+                .await
+                .expect("wait for pty readiness marker")
+                .expect("pty output channel open before readiness marker");
+            buffer.extend_from_slice(&chunk);
+        }
+    }
+
+    #[cfg(unix)]
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
     }
 }
