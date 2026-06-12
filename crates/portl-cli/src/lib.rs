@@ -166,6 +166,7 @@ pub enum Command {
         forward_agent: bool,
         stdin_null: bool,
         stdio: bool,
+        map_ssh_user: bool,
         quiet: bool,
         verbose: u8,
         forward_l: Vec<String>,
@@ -186,6 +187,7 @@ pub enum Command {
         remote_host: String,
         remote_port: u16,
         portl_bin: String,
+        ssh_user: Option<String>,
     },
     Tcp {
         peer: String,
@@ -1118,6 +1120,7 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             forward_agent,
             stdin_null,
             stdio,
+            map_ssh_user,
             quiet,
             verbose,
             forward_l,
@@ -1130,6 +1133,7 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             forward_agent,
             stdin_null,
             stdio,
+            map_ssh_user,
             quiet,
             verbose,
             &remote_command,
@@ -1160,6 +1164,7 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             remote_host,
             remote_port,
             portl_bin,
+            ssh_user,
         } => commands::ssh_config::print_config(
             mode,
             &target,
@@ -1167,6 +1172,7 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             &remote_host,
             remote_port,
             &portl_bin,
+            ssh_user.as_deref(),
         ),
         Command::Tcp { peer, local } => commands::tcp::run(&peer, &local),
         Command::Udp { peer, local } => commands::udp::run(&peer, &local),
@@ -1914,6 +1920,9 @@ enum ConnectTopLevel {
         /// Serve one SSH protocol connection on stdin/stdout for OpenSSH `ProxyCommand`.
         #[arg(long)]
         stdio: bool,
+        /// In stdio mode, map the OpenSSH auth user to the Portl remote user.
+        #[arg(long, hide = true)]
+        map_ssh_user: bool,
         /// Quiet mode. Parsed for SSH argv compatibility.
         #[arg(short = 'q')]
         quiet: bool,
@@ -1981,6 +1990,9 @@ enum ConnectTopLevel {
         /// Portl executable name/path to use in `ProxyCommand`.
         #[arg(long = "portl", default_value = "portl")]
         portl_bin: String,
+        /// OpenSSH user to emit. Native stdio configs also map this SSH user into Portl.
+        #[arg(long = "user", value_name = "USER")]
+        ssh_user: Option<String>,
     },
     /// Set up one or more local TCP forwards.
     #[command(display_order = 180, after_long_help = TCP_AFTER_HELP)]
@@ -2896,6 +2908,7 @@ fn connect_into_command(action: ConnectTopLevel, log_verbose: u8) -> Command {
             forward_r,
             target,
             remote_command,
+            map_ssh_user,
         } => {
             let (target_user, peer) = split_ssh_target(&target);
             let user = login_name.or(target_user);
@@ -2913,6 +2926,7 @@ fn connect_into_command(action: ConnectTopLevel, log_verbose: u8) -> Command {
                 forward_agent: forward_agent && !disable_agent,
                 stdin_null,
                 stdio,
+                map_ssh_user,
                 quiet,
                 verbose: log_verbose,
                 forward_l,
@@ -2940,6 +2954,7 @@ fn connect_into_command(action: ConnectTopLevel, log_verbose: u8) -> Command {
             remote_host,
             remote_port,
             portl_bin,
+            ssh_user,
         } => Command::SshConfig {
             mode,
             target,
@@ -2947,6 +2962,7 @@ fn connect_into_command(action: ConnectTopLevel, log_verbose: u8) -> Command {
             remote_host,
             remote_port,
             portl_bin,
+            ssh_user,
         },
         ConnectTopLevel::Tcp { local, peer } => Command::Tcp { peer, local },
         ConnectTopLevel::Udp { local, peer } => Command::Udp { peer, local },

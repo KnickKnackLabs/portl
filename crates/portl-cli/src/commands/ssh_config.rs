@@ -14,6 +14,7 @@ pub fn print_config(
     remote_host: &str,
     remote_port: u16,
     portl_bin: &str,
+    ssh_user: Option<&str>,
 ) -> Result<ExitCode> {
     print!(
         "{}",
@@ -24,6 +25,7 @@ pub fn print_config(
             remote_host,
             remote_port,
             portl_bin,
+            ssh_user,
         )?
     );
     Ok(ExitCode::SUCCESS)
@@ -36,17 +38,22 @@ pub(crate) fn render_config(
     remote_host: &str,
     remote_port: u16,
     portl_bin: &str,
+    ssh_user: Option<&str>,
 ) -> Result<String> {
     match mode {
-        SshConfigMode::NativeProxycommand => {
-            render_native_proxycommand_config(target, host_alias.unwrap_or(target), portl_bin)
-        }
+        SshConfigMode::NativeProxycommand => render_native_proxycommand_config(
+            target,
+            host_alias.unwrap_or(target),
+            portl_bin,
+            ssh_user,
+        ),
         SshConfigMode::SshdProxy => render_sshd_proxy_config(
             target,
             host_alias.unwrap_or(target),
             remote_host,
             remote_port,
             portl_bin,
+            ssh_user,
         ),
     }
 }
@@ -55,18 +62,25 @@ fn render_native_proxycommand_config(
     target: &str,
     host_alias: &str,
     portl_bin: &str,
+    ssh_user: Option<&str>,
 ) -> Result<String> {
     validate_ssh_config_token("target", target)?;
     validate_ssh_config_token("host alias", host_alias)?;
     validate_ssh_config_token("portl binary", portl_bin)?;
+    if let Some(user) = ssh_user {
+        validate_ssh_config_token("user", user)?;
+    }
 
     let mut output = String::new();
     writeln!(&mut output, "Host {host_alias}")?;
+    if let Some(user) = ssh_user {
+        writeln!(&mut output, "  User {user}")?;
+    }
     writeln!(&mut output, "  HostName {target}")?;
     writeln!(
         &mut output,
         "  ProxyCommand {}",
-        native_proxy_command(portl_bin)
+        native_proxy_command(portl_bin, ssh_user.is_some())
     )?;
     writeln!(&mut output, "  HostKeyAlias portl-{target}")?;
     writeln!(&mut output, "  UserKnownHostsFile ~/.portl/ssh/known_hosts")?;
@@ -79,15 +93,22 @@ fn render_sshd_proxy_config(
     remote_host: &str,
     remote_port: u16,
     portl_bin: &str,
+    ssh_user: Option<&str>,
 ) -> Result<String> {
     validate_exact_tcp_target(remote_host, remote_port)?;
     validate_ssh_config_token("target", target)?;
     validate_ssh_config_token("host alias", host_alias)?;
     validate_ssh_config_token("remote host", remote_host)?;
     validate_ssh_config_token("portl binary", portl_bin)?;
+    if let Some(user) = ssh_user {
+        validate_ssh_config_token("user", user)?;
+    }
 
     let mut output = String::new();
     writeln!(&mut output, "Host {host_alias}")?;
+    if let Some(user) = ssh_user {
+        writeln!(&mut output, "  User {user}")?;
+    }
     writeln!(&mut output, "  HostName {target}")?;
     writeln!(&mut output, "  Port {remote_port}")?;
     writeln!(
@@ -97,15 +118,16 @@ fn render_sshd_proxy_config(
     Ok(output)
 }
 
-fn native_proxy_command(portl_bin: &str) -> String {
+fn native_proxy_command(portl_bin: &str, map_ssh_user: bool) -> String {
+    let map_user_arg = if map_ssh_user { " --map-ssh-user" } else { "" };
     if Path::new(portl_bin)
         .file_name()
         .and_then(|name| name.to_str())
         == Some("portl-ssh")
     {
-        format!("{portl_bin} --stdio %h")
+        format!("{portl_bin} --stdio{map_user_arg} %h")
     } else {
-        format!("{portl_bin} ssh --stdio %h")
+        format!("{portl_bin} ssh --stdio{map_user_arg} %h")
     }
 }
 
@@ -157,11 +179,30 @@ mod tests {
             "ignored",
             22,
             "portl",
+            None,
         )
         .expect("render native config");
         assert_eq!(
             config,
             "Host vn3\n  HostName vn3\n  ProxyCommand portl ssh --stdio %h\n  HostKeyAlias portl-vn3\n  UserKnownHostsFile ~/.portl/ssh/known_hosts\n"
+        );
+    }
+
+    #[test]
+    fn ssh_config_native_proxycommand_can_pin_target_user() {
+        let config = render_config(
+            SshConfigMode::NativeProxycommand,
+            "onyx",
+            None,
+            "ignored",
+            22,
+            "portl",
+            Some("thinh_nguyen"),
+        )
+        .expect("render native config");
+        assert_eq!(
+            config,
+            "Host onyx\n  User thinh_nguyen\n  HostName onyx\n  ProxyCommand portl ssh --stdio --map-ssh-user %h\n  HostKeyAlias portl-onyx\n  UserKnownHostsFile ~/.portl/ssh/known_hosts\n"
         );
     }
 
@@ -174,6 +215,7 @@ mod tests {
             "ignored",
             22,
             "portl",
+            None,
         )
         .expect("render native config");
         assert!(config.starts_with("Host prod-shell\n  HostName vn3\n"));
@@ -182,12 +224,19 @@ mod tests {
 
     #[test]
     fn ssh_config_native_proxycommand_accepts_portl_ssh_shim() {
-        assert_eq!(native_proxy_command("portl-ssh"), "portl-ssh --stdio %h");
         assert_eq!(
-            native_proxy_command("/usr/local/bin/portl-ssh"),
+            native_proxy_command("portl-ssh", false),
+            "portl-ssh --stdio %h"
+        );
+        assert_eq!(
+            native_proxy_command("/usr/local/bin/portl-ssh", false),
             "/usr/local/bin/portl-ssh --stdio %h"
         );
-        assert_eq!(native_proxy_command("portl"), "portl ssh --stdio %h");
+        assert_eq!(native_proxy_command("portl", false), "portl ssh --stdio %h");
+        assert_eq!(
+            native_proxy_command("portl", true),
+            "portl ssh --stdio --map-ssh-user %h"
+        );
     }
 
     #[test]
@@ -199,6 +248,7 @@ mod tests {
             "127.0.0.1",
             2222,
             "portl",
+            None,
         )
         .expect("render config");
         assert_eq!(
@@ -209,15 +259,31 @@ mod tests {
 
     #[test]
     fn ssh_config_rejects_wildcard_remote_host() {
-        let err = render_config(SshConfigMode::SshdProxy, "vn3", None, "*", 22, "portl")
-            .expect_err("wildcard remote host must fail");
+        let err = render_config(
+            SshConfigMode::SshdProxy,
+            "vn3",
+            None,
+            "*",
+            22,
+            "portl",
+            None,
+        )
+        .expect_err("wildcard remote host must fail");
         assert!(err.to_string().contains("wildcards"));
     }
 
     #[test]
     fn ssh_config_rejects_openssh_percent_tokens() {
-        let err = render_config(SshConfigMode::SshdProxy, "vn3", None, "%n", 22, "portl")
-            .expect_err("percent tokens must fail");
+        let err = render_config(
+            SshConfigMode::SshdProxy,
+            "vn3",
+            None,
+            "%n",
+            22,
+            "portl",
+            None,
+        )
+        .expect_err("percent tokens must fail");
         assert!(err.to_string().contains("unsafe"));
     }
 
@@ -231,6 +297,7 @@ mod tests {
                 "127.0.0.1",
                 22,
                 value,
+                None,
             )
             .expect_err("glob metacharacters must fail");
             assert!(err.to_string().contains("unsafe"));
@@ -246,6 +313,7 @@ mod tests {
             "ignored",
             22,
             "portl",
+            None,
         )
         .expect_err("wildcard target must fail");
         assert!(target_err.to_string().contains("unsafe"));
@@ -257,6 +325,7 @@ mod tests {
             "ignored",
             22,
             "portl",
+            None,
         )
         .expect_err("wildcard host alias must fail");
         assert!(alias_err.to_string().contains("unsafe"));
@@ -271,6 +340,7 @@ mod tests {
             "127.0.0.1",
             22,
             "portl",
+            None,
         )
         .expect_err("unsafe target must fail");
         assert!(err.to_string().contains("unsafe"));

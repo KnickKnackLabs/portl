@@ -332,6 +332,7 @@ fn portl_ssh_subcommands_parse() {
             forward_agent: false,
             stdin_null: false,
             stdio: false,
+            map_ssh_user: false,
             quiet: false,
             verbose: 0,
             forward_l: Vec::new(),
@@ -359,6 +360,7 @@ fn portl_ssh_subcommands_parse() {
             forward_agent: false,
             stdin_null: false,
             stdio: false,
+            map_ssh_user: false,
             quiet: false,
             verbose: 0,
             forward_l: vec!["8025:localhost:8025".to_owned()],
@@ -378,6 +380,7 @@ fn portl_ssh_subcommands_parse() {
             forward_agent: false,
             stdin_null: false,
             stdio: false,
+            map_ssh_user: false,
             quiet: false,
             verbose: 0,
             forward_l: Vec::new(),
@@ -416,6 +419,7 @@ fn portl_ssh_subcommands_parse() {
             forward_agent: true,
             stdin_null: false,
             stdio: false,
+            map_ssh_user: false,
             quiet: false,
             verbose: 0,
             forward_l: Vec::new(),
@@ -495,6 +499,7 @@ fn portl_ssh_proxy_subcommands_parse() {
             remote_host: "127.0.0.1".to_owned(),
             remote_port: 22,
             portl_bin: "portl".to_owned(),
+            ssh_user: None,
         }
     );
 
@@ -521,6 +526,7 @@ fn portl_ssh_proxy_subcommands_parse() {
             remote_host: "127.0.0.1".to_owned(),
             remote_port: 2222,
             portl_bin: "/usr/local/bin/portl".to_owned(),
+            ssh_user: None,
         }
     );
 }
@@ -551,6 +557,7 @@ fn portl_ssh_compatibility_options_parse() {
             forward_agent: false,
             stdin_null: true,
             stdio: false,
+            map_ssh_user: false,
             quiet: true,
             verbose: 0,
             forward_l: Vec::new(),
@@ -569,6 +576,7 @@ fn portl_ssh_compatibility_options_parse() {
             forward_agent: false,
             stdin_null: false,
             stdio: false,
+            map_ssh_user: false,
             quiet: false,
             verbose: 0,
             forward_l: Vec::new(),
@@ -587,6 +595,7 @@ fn portl_ssh_compatibility_options_parse() {
             forward_agent: false,
             stdin_null: false,
             stdio: false,
+            map_ssh_user: false,
             quiet: false,
             verbose: 2,
             forward_l: Vec::new(),

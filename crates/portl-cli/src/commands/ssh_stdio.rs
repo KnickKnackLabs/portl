@@ -33,18 +33,40 @@ use tracing::debug;
 
 use crate::commands::peer_resolve::{close_connected, connect_peer_quiet};
 
-pub fn run(peer: &str, user: Option<&str>, forward_agent: bool) -> Result<ExitCode> {
+pub fn run(
+    peer: &str,
+    user: Option<&str>,
+    forward_agent: bool,
+    map_ssh_user: bool,
+) -> Result<ExitCode> {
     let runtime = tokio::runtime::Runtime::new()?;
-    let result = runtime.block_on(run_stdio(peer, user.map(ToOwned::to_owned), forward_agent));
+    let result = runtime.block_on(run_stdio(
+        peer,
+        user.map(ToOwned::to_owned),
+        forward_agent,
+        map_ssh_user,
+    ));
     runtime.shutdown_background();
     result
 }
 
-async fn run_stdio(peer: &str, user: Option<String>, forward_agent: bool) -> Result<ExitCode> {
+async fn run_stdio(
+    peer: &str,
+    user: Option<String>,
+    forward_agent: bool,
+    map_ssh_user: bool,
+) -> Result<ExitCode> {
     let remote_agent_path = remote_agent_socket_path(rand::random());
     let connected = connect_peer_quiet(peer, ssh_stdio_connect_caps(&remote_agent_path)).await?;
-    let result =
-        run_stdio_on_connected(peer, user, forward_agent, remote_agent_path, &connected).await;
+    let result = run_stdio_on_connected(
+        peer,
+        user,
+        forward_agent,
+        remote_agent_path,
+        map_ssh_user,
+        &connected,
+    )
+    .await;
     close_connected(connected, b"ssh stdio complete").await;
     result
 }
@@ -54,6 +76,7 @@ async fn run_stdio_on_connected(
     user: Option<String>,
     forward_agent: bool,
     remote_agent_path: String,
+    map_ssh_user: bool,
     connected: &crate::commands::peer_resolve::ConnectedPeer,
 ) -> Result<ExitCode> {
     let host_key = load_or_generate_host_key(peer)?;
@@ -76,6 +99,7 @@ async fn run_stdio_on_connected(
             remote_agent_path,
         }),
         initial_agent,
+        map_ssh_user,
     );
     let running = server::run_stream(config, StdioStream::new(), handler)
         .await
@@ -381,16 +405,22 @@ struct PortlSshServer {
     controls: HashMap<ChannelId, mpsc::Sender<ControlMessage>>,
     agent_forward: Option<AgentForwardRequest>,
     auth_user: Option<String>,
+    map_ssh_user: bool,
 }
 
 impl PortlSshServer {
-    fn new(backend: Arc<PortlSshBackend>, agent_forward: Option<AgentForwardRequest>) -> Self {
+    fn new(
+        backend: Arc<PortlSshBackend>,
+        agent_forward: Option<AgentForwardRequest>,
+        map_ssh_user: bool,
+    ) -> Self {
         Self {
             backend,
             channels: HashMap::new(),
             controls: HashMap::new(),
             agent_forward,
             auth_user: None,
+            map_ssh_user,
         }
     }
 
@@ -520,7 +550,11 @@ impl server::Handler for PortlSshServer {
         spawn_remote_session_bridge(
             pending.channel,
             Arc::clone(&self.backend),
-            effective_portl_user(self.backend.user.as_ref(), self.auth_user.as_ref()),
+            effective_portl_user(
+                self.backend.user.as_ref(),
+                self.auth_user.as_ref(),
+                self.map_ssh_user,
+            ),
             pending.env_patch,
             RemoteSessionRequest::Shell { pty },
             self.agent_forward.clone(),
@@ -544,7 +578,11 @@ impl server::Handler for PortlSshServer {
         spawn_remote_session_bridge(
             pending.channel,
             Arc::clone(&self.backend),
-            effective_portl_user(self.backend.user.as_ref(), self.auth_user.as_ref()),
+            effective_portl_user(
+                self.backend.user.as_ref(),
+                self.auth_user.as_ref(),
+                self.map_ssh_user,
+            ),
             pending.env_patch,
             RemoteSessionRequest::Exec { argv },
             self.agent_forward.clone(),
@@ -766,12 +804,22 @@ async fn bridge_remote_session(
     result
 }
 
-fn effective_portl_user(cli_user: Option<&String>, auth_user: Option<&String>) -> Option<String> {
-    cli_user.cloned().or_else(|| auth_user.cloned())
+fn effective_portl_user(
+    cli_user: Option<&String>,
+    auth_user: Option<&String>,
+    map_ssh_user: bool,
+) -> Option<String> {
+    cli_user
+        .cloned()
+        .or_else(|| map_ssh_user.then(|| auth_user.cloned()).flatten())
+}
+
+fn format_open_failure_message(err: &anyhow::Error) -> String {
+    format!("portl-ssh --stdio failed to open Portl session: {err:#}\n")
 }
 
 async fn finish_channel_with_error(channel: Channel<Msg>, err: anyhow::Error) -> Result<()> {
-    let message = format!("portl-ssh --stdio failed to open Portl session: {err}\n");
+    let message = format_open_failure_message(&err);
     let mut stderr = channel.make_writer_ext(Some(1));
     stderr
         .write_all(message.as_bytes())
@@ -1073,18 +1121,36 @@ mod tests {
 
     use super::{
         EnvPolicy, InstallOutcome, effective_portl_user, ensure_agent_unix_listen_allowed,
-        host_key_path_for_target, install_private_file_no_overwrite, sanitized_target_key_name,
-        signal_number, ssh_dimension, ssh_env_request_allowed, ssh_stdio_caps,
-        ssh_stdio_connect_caps,
+        format_open_failure_message, host_key_path_for_target, install_private_file_no_overwrite,
+        sanitized_target_key_name, signal_number, ssh_dimension, ssh_env_request_allowed,
+        ssh_stdio_caps, ssh_stdio_connect_caps,
     };
 
     #[test]
-    fn ssh_stdio_uses_cli_user_before_ssh_auth_user() {
+    fn ssh_stdio_open_failure_message_includes_error_chain() {
+        let err = anyhow::anyhow!("user_switch_refused").context("shell request rejected");
+        let message = format_open_failure_message(&err);
+
+        assert!(message.contains("shell request rejected"));
+        assert!(message.contains("user_switch_refused"));
+    }
+
+    #[test]
+    fn ssh_stdio_ignores_ssh_auth_user_by_default() {
+        let auth = "auth-user".to_owned();
+        assert_eq!(effective_portl_user(None, Some(&auth), false), None);
+    }
+
+    #[test]
+    fn ssh_stdio_can_map_ssh_auth_user_when_requested() {
         let cli = "cli-user".to_owned();
         let auth = "auth-user".to_owned();
-        assert_eq!(effective_portl_user(Some(&cli), Some(&auth)), Some(cli));
-        assert_eq!(effective_portl_user(None, Some(&auth)), Some(auth));
-        assert_eq!(effective_portl_user(None, None), None);
+        assert_eq!(
+            effective_portl_user(Some(&cli), Some(&auth), true),
+            Some(cli)
+        );
+        assert_eq!(effective_portl_user(None, Some(&auth), true), Some(auth));
+        assert_eq!(effective_portl_user(None, None, true), None);
     }
 
     #[test]

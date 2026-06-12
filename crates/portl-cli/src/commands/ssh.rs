@@ -41,6 +41,7 @@ pub fn run(
     forward_agent: bool,
     stdin_null: bool,
     stdio: bool,
+    map_ssh_user: bool,
     _quiet: bool,
     _verbose: u8,
     remote_command: &[String],
@@ -53,7 +54,10 @@ pub fn run(
                 "portl ssh --stdio cannot combine with -L/-R; let OpenSSH own forwarding for ProxyCommand use"
             );
         }
-        return crate::commands::ssh_stdio::run(peer, user, forward_agent);
+        return crate::commands::ssh_stdio::run(peer, user, forward_agent, map_ssh_user);
+    }
+    if map_ssh_user {
+        bail!("portl ssh --map-ssh-user requires --stdio");
     }
 
     validate_native_options(tty, remote_command)?;
