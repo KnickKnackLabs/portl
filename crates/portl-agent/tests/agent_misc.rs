@@ -316,6 +316,17 @@ mod rlimits {
     async fn exec_path_preserves_inherited_nproc_linux() {
         use nix::sys::resource::{Resource, getrlimit, setrlimit};
 
+        struct RestoreNproc {
+            soft: u64,
+            hard: u64,
+        }
+
+        impl Drop for RestoreNproc {
+            fn drop(&mut self) {
+                let _ = setrlimit(Resource::RLIMIT_NPROC, self.soft, self.hard);
+            }
+        }
+
         let (original_soft, original_hard) =
             getrlimit(Resource::RLIMIT_NPROC).expect("read original RLIMIT_NPROC");
         let inherited_soft = if original_hard > 4096 {
@@ -328,17 +339,6 @@ mod rlimits {
             );
             return;
         };
-
-        struct RestoreNproc {
-            soft: u64,
-            hard: u64,
-        }
-
-        impl Drop for RestoreNproc {
-            fn drop(&mut self) {
-                let _ = setrlimit(Resource::RLIMIT_NPROC, self.soft, self.hard);
-            }
-        }
 
         let _restore = RestoreNproc {
             soft: original_soft,
