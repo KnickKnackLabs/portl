@@ -31,10 +31,10 @@ pub(crate) fn spawn_process(
     audit_session_id: &str,
 ) -> Result<Arc<ShellProcess>, SpawnReject> {
     match req.mode {
-        portl_proto::shell_v1::ShellMode::Exec => {
+        portl_proto::shell_v1::ShellMode::Exec if req.pty.is_none() => {
             spawn_exec_process(session, req, requested_user, audit_session_id)
         }
-        portl_proto::shell_v1::ShellMode::Shell => {
+        portl_proto::shell_v1::ShellMode::Exec | portl_proto::shell_v1::ShellMode::Shell => {
             spawn_pty_process(session, req, requested_user, audit_session_id)
         }
     }

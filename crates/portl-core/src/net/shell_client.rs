@@ -132,6 +132,26 @@ pub async fn open_exec_with_env_and_controls(
     open_exec_session_with_env(connection, session, user, cwd, argv, env_patch, true).await
 }
 
+pub async fn open_pty_exec_with_env_and_controls(
+    connection: &Connection,
+    session: &PeerSession,
+    user: Option<String>,
+    cwd: Option<String>,
+    argv: Vec<String>,
+    pty: PtyCfg,
+    env_patch: Vec<(String, EnvValue)>,
+) -> Result<ShellClient> {
+    let req = ShellReqBody {
+        mode: ShellMode::Exec,
+        argv: Some(argv),
+        env_patch,
+        cwd,
+        pty: Some(pty),
+        user,
+    };
+    open_shell_session(connection, session, req, true).await
+}
+
 async fn open_exec_session_with_env(
     connection: &Connection,
     session: &PeerSession,

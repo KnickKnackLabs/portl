@@ -20,7 +20,8 @@ use portl_agent::{AgentConfig, DiscoveryConfig, run_task};
 use portl_core::id::Identity;
 use portl_core::net::shell_client::PtyCfg;
 use portl_core::net::{
-    TicketHandshakeError, open_exec, open_exec_with_env, open_shell, open_ticket_v1,
+    TicketHandshakeError, open_exec, open_exec_with_env, open_pty_exec_with_env_and_controls,
+    open_shell, open_ticket_v1,
 };
 use portl_core::test_util::pair;
 use portl_core::ticket::mint::mint_root;
@@ -130,6 +131,47 @@ async fn shell_with_pty_resize_mid_session_applies_winsz() -> Result<()> {
     assert!(output.contains("__PORTL__"), "output was: {output:?}");
     assert!(output.contains("40 120"), "output was: {output:?}");
     assert_eq!(shell.wait_exit().await?, 0);
+
+    shutdown(connection, client, server, agent).await
+}
+
+#[tokio::test]
+async fn shell_exec_with_pty_preserves_term_and_window_size() -> Result<()> {
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator).await?;
+    let ticket = root_ticket(&operator, server.addr(), shell_caps(true, true));
+
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let mut exec = open_pty_exec_with_env_and_controls(
+        &connection,
+        &session,
+        None,
+        None,
+        vec![
+            "/bin/sh".to_owned(),
+            "-lc".to_owned(),
+            "printf 'TERM=%s\\n' \"$TERM\"; stty size".to_owned(),
+        ],
+        PtyCfg {
+            term: "xterm-kitty".to_owned(),
+            cols: 132,
+            rows: 43,
+        },
+        Vec::new(),
+    )
+    .await?;
+    exec.stdin.finish()?;
+
+    let mut stdout = Vec::new();
+    AsyncReadExt::read_to_end(&mut exec.stdout, &mut stdout).await?;
+    let output = String::from_utf8_lossy(&stdout);
+    assert!(
+        output.contains("TERM=xterm-kitty"),
+        "output was: {output:?}"
+    );
+    assert!(output.contains("43 132"), "output was: {output:?}");
+    assert_eq!(exec.wait_exit().await?, 0);
 
     shutdown(connection, client, server, agent).await
 }

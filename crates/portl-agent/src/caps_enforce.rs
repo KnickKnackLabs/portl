@@ -15,6 +15,10 @@ pub fn shell_permits(caps: &Capabilities, req: &ShellReq) -> Result<(), ShellRea
         _ => {}
     }
 
+    if req.pty.is_some() && !shell_caps.pty_allowed {
+        return Err(ShellReason::CapDenied);
+    }
+
     if req.mode == ShellMode::Shell && req.pty.is_none() {
         return Err(ShellReason::InvalidPty);
     }
@@ -165,6 +169,14 @@ mod tests {
     #[test]
     fn shell_rejects_exec_when_not_allowed() {
         let caps = shell_caps(true, false, None, None);
+        let req = shell_req(ShellMode::Exec, Some(vec!["echo".to_owned()]));
+
+        assert_eq!(shell_permits(&caps, &req), Err(ShellReason::CapDenied));
+    }
+
+    #[test]
+    fn shell_rejects_exec_with_pty_when_pty_not_allowed() {
+        let caps = shell_caps(false, true, None, None);
         let req = shell_req(ShellMode::Exec, Some(vec!["echo".to_owned()]));
 
         assert_eq!(shell_permits(&caps, &req), Err(ShellReason::CapDenied));

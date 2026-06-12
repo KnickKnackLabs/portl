@@ -5,6 +5,12 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Fixed
+
+- OpenSSH commands that request a PTY through generated `portl ssh --stdio`
+  ProxyCommand configs now preserve the requested terminal type and window size
+  instead of falling back to non-PTY exec behavior with `TERM=dumb`.
+
 ## 0.11.6 — 2026-06-12
 
 ### Added

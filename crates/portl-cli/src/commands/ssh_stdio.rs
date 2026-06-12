@@ -15,8 +15,8 @@ use iroh::endpoint::{Connection, SendStream};
 use portl_core::io::BufferedRecv;
 use portl_core::net::{
     PeerSession, ShellClient, UnixListenControl, UnixListenOptions,
-    open_exec_with_env_and_controls, open_shell_with_env, open_tcp, open_unix_listen_with_options,
-    run_unix_reverse_forward,
+    open_exec_with_env_and_controls, open_pty_exec_with_env_and_controls, open_shell_with_env,
+    open_tcp, open_unix_listen_with_options, run_unix_reverse_forward,
 };
 use portl_core::ticket::schema::{
     Capabilities, EnvPolicy, PortRule, ShellCaps, UnixCaps, UnixPathRule,
@@ -402,6 +402,15 @@ enum ControlMessage {
 enum RemoteSessionRequest {
     Shell { pty: PtyCfg },
     Exec { argv: Vec<String> },
+    PtyExec { pty: PtyCfg, argv: Vec<String> },
+}
+
+fn exec_remote_session_request(command: String, pty: Option<PtyCfg>) -> RemoteSessionRequest {
+    let argv = vec!["/bin/sh".to_owned(), "-lc".to_owned(), command];
+    match pty {
+        Some(pty) => RemoteSessionRequest::PtyExec { pty, argv },
+        None => RemoteSessionRequest::Exec { argv },
+    }
 }
 
 struct PortlSshServer {
@@ -592,7 +601,7 @@ impl server::Handler for PortlSshServer {
     ) -> Result<(), Self::Error> {
         let pending = self.remove_channel(channel)?;
         let command = String::from_utf8_lossy(data).into_owned();
-        let argv = vec!["/bin/sh".to_owned(), "-lc".to_owned(), command];
+        let request = exec_remote_session_request(command, pending.pty);
         let (control_tx, control_rx) = mpsc::channel(32);
         self.controls.insert(channel, control_tx);
         session.channel_success(channel)?;
@@ -605,7 +614,7 @@ impl server::Handler for PortlSshServer {
                 self.map_ssh_user,
             ),
             pending.env_patch,
-            RemoteSessionRequest::Exec { argv },
+            request,
             self.agent_forward.clone(),
             control_rx,
         );
@@ -808,6 +817,17 @@ async fn bridge_remote_session(
         )
         .await
         .context("open Portl exec for SSH channel"),
+        RemoteSessionRequest::PtyExec { pty, argv } => open_pty_exec_with_env_and_controls(
+            &backend.connection,
+            &backend.session,
+            user,
+            None,
+            argv,
+            pty,
+            env_patch,
+        )
+        .await
+        .context("open Portl PTY exec for SSH channel"),
     } {
         Ok(shell) => shell,
         Err(err) => {
@@ -1141,10 +1161,11 @@ mod tests {
     use russh::Sig;
 
     use super::{
-        EnvPolicy, InstallOutcome, effective_portl_user, ensure_agent_unix_listen_allowed,
-        format_open_failure_message, host_key_path_for_target, install_private_file_no_overwrite,
-        sanitized_target_key_name, signal_number, ssh_dimension, ssh_env_request_allowed,
-        ssh_stdio_caps, ssh_stdio_connect_caps,
+        EnvPolicy, InstallOutcome, RemoteSessionRequest, effective_portl_user,
+        ensure_agent_unix_listen_allowed, exec_remote_session_request, format_open_failure_message,
+        host_key_path_for_target, install_private_file_no_overwrite, sanitized_target_key_name,
+        signal_number, ssh_dimension, ssh_env_request_allowed, ssh_stdio_caps,
+        ssh_stdio_connect_caps,
     };
 
     #[test]
@@ -1231,6 +1252,28 @@ mod tests {
 
         caps.shell.as_mut().expect("shell caps").env_policy = EnvPolicy::Deny;
         assert!(!ssh_env_request_allowed(&caps, "TERM"));
+    }
+
+    #[test]
+    fn ssh_stdio_exec_with_prior_pty_uses_pty_shell_request() {
+        let pty = super::PtyCfg {
+            term: "xterm-kitty".to_owned(),
+            cols: 132,
+            rows: 43,
+        };
+
+        match exec_remote_session_request("printf ok".to_owned(), Some(pty)) {
+            RemoteSessionRequest::PtyExec { pty: actual, argv } => {
+                assert_eq!(actual.term, "xterm-kitty");
+                assert_eq!(argv, vec!["/bin/sh", "-lc", "printf ok"]);
+            }
+            RemoteSessionRequest::Exec { .. } => {
+                panic!("PTY exec must not discard the PTY request")
+            }
+            RemoteSessionRequest::Shell { .. } => {
+                panic!("PTY exec must preserve the exec command, not open a login shell")
+            }
+        }
     }
 
     #[test]
