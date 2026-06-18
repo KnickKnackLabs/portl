@@ -19,10 +19,6 @@ pub fn shell_permits(caps: &Capabilities, req: &ShellReq) -> Result<(), ShellRea
         return Err(ShellReason::CapDenied);
     }
 
-    if req.mode == ShellMode::Shell && req.pty.is_none() {
-        return Err(ShellReason::InvalidPty);
-    }
-
     if let Some(allowlist) = shell_caps.user_allowlist.as_ref() {
         let requested_user = req.user.as_deref().unwrap_or_default();
         if !allowlist
@@ -145,6 +141,14 @@ mod tests {
             user: None,
             preamble: preamble("portl/shell/v1"),
         };
+
+        assert_eq!(shell_permits(&caps, &req), Ok(()));
+    }
+
+    #[test]
+    fn shell_permits_raw_session_when_shell_caps_allow_shell() {
+        let caps = shell_caps(true, false, None, None);
+        let req = shell_req(ShellMode::Shell, None);
 
         assert_eq!(shell_permits(&caps, &req), Ok(()));
     }

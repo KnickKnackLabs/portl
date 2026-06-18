@@ -150,9 +150,11 @@ async fn serve_control_stream(
         session_id,
         ticket_chain_ids: session.ticket_chain_ids.clone(),
     };
-    let mode_str: &'static str = match req.mode {
-        portl_proto::shell_v1::ShellMode::Exec => "exec",
-        portl_proto::shell_v1::ShellMode::Shell => "pty",
+    let mode_str: &'static str = match (req.mode, req.pty.as_ref()) {
+        (portl_proto::shell_v1::ShellMode::Exec, None) => "exec",
+        (portl_proto::shell_v1::ShellMode::Exec, Some(_)) => "pty-exec",
+        (portl_proto::shell_v1::ShellMode::Shell, None) => "shell",
+        (portl_proto::shell_v1::ShellMode::Shell, Some(_)) => "pty",
     };
     process.set_started_at(Instant::now());
     audit::shell_start(

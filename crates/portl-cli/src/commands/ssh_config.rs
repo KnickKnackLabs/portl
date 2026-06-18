@@ -82,6 +82,9 @@ fn render_native_proxycommand_config(
         "  ProxyCommand {}",
         native_proxy_command(portl_bin, ssh_user.is_some())
     )?;
+    writeln!(&mut output, "  ForwardAgent yes")?;
+    writeln!(&mut output, "  ServerAliveInterval 30")?;
+    writeln!(&mut output, "  ServerAliveCountMax 3")?;
     writeln!(&mut output, "  HostKeyAlias portl-{target}")?;
     writeln!(&mut output, "  UserKnownHostsFile ~/.portl/ssh/known_hosts")?;
     Ok(output)
@@ -184,7 +187,7 @@ mod tests {
         .expect("render native config");
         assert_eq!(
             config,
-            "Host vn3\n  HostName vn3\n  ProxyCommand portl ssh --stdio %h\n  HostKeyAlias portl-vn3\n  UserKnownHostsFile ~/.portl/ssh/known_hosts\n"
+            "Host vn3\n  HostName vn3\n  ProxyCommand portl ssh --stdio %h\n  ForwardAgent yes\n  ServerAliveInterval 30\n  ServerAliveCountMax 3\n  HostKeyAlias portl-vn3\n  UserKnownHostsFile ~/.portl/ssh/known_hosts\n"
         );
     }
 
@@ -202,7 +205,7 @@ mod tests {
         .expect("render native config");
         assert_eq!(
             config,
-            "Host onyx\n  User thinh_nguyen\n  HostName onyx\n  ProxyCommand portl ssh --stdio --map-ssh-user %h\n  HostKeyAlias portl-onyx\n  UserKnownHostsFile ~/.portl/ssh/known_hosts\n"
+            "Host onyx\n  User thinh_nguyen\n  HostName onyx\n  ProxyCommand portl ssh --stdio --map-ssh-user %h\n  ForwardAgent yes\n  ServerAliveInterval 30\n  ServerAliveCountMax 3\n  HostKeyAlias portl-onyx\n  UserKnownHostsFile ~/.portl/ssh/known_hosts\n"
         );
     }
 

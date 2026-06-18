@@ -118,6 +118,9 @@ def nextest_env(*, temp_home: bool) -> dict[str, str]:
 
 def run_local_checks() -> None:
     require_tool("cargo-nextest", "Run `mise install` or `cargo install cargo-nextest`.")
+    # The manifest checker shells out to a workspace all-features inventory,
+    # which pulls in the optional Ghostty Zig build. Keep the fast local
+    # release gate focused; CI/--ci still runs the checker.
     run(
         [
             "cargo",
@@ -128,6 +131,8 @@ def run_local_checks() -> None:
             "-p",
             "portl-cli",
             "--lib",
+            "--filter-expr",
+            "not test(skipped_test_manifest)",
             "--status-level",
             "slow",
             "--final-status-level",

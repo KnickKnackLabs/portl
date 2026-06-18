@@ -34,6 +34,9 @@ pub(crate) fn spawn_process(
         portl_proto::shell_v1::ShellMode::Exec if req.pty.is_none() => {
             spawn_exec_process(session, req, requested_user, audit_session_id)
         }
+        portl_proto::shell_v1::ShellMode::Shell if req.pty.is_none() => {
+            spawn_raw_shell_process(session, req, requested_user, audit_session_id)
+        }
         portl_proto::shell_v1::ShellMode::Exec | portl_proto::shell_v1::ShellMode::Shell => {
             spawn_pty_process(session, req, requested_user, audit_session_id)
         }
@@ -124,6 +127,123 @@ fn spawn_exec_process(
             Ok(status) => status.code().unwrap_or(1),
             Err(err) => {
                 warn!(?err, "wait on exec child failed");
+                1
+            }
+        };
+        if let Ok(mut guard) = exit_code_wait.lock() {
+            *guard = Some(code);
+        }
+        let duration_ms = started_at_wait
+            .lock()
+            .ok()
+            .and_then(|guard| *guard)
+            .map_or(0, |instant| {
+                u64::try_from(instant.elapsed().as_millis()).unwrap_or(u64::MAX)
+            });
+        audit::shell_exit_raw(
+            ticket_id,
+            caller_endpoint_id,
+            &audit_session_id,
+            pid,
+            code,
+            duration_ms,
+        );
+        let _ = exit_tx_wait.send(Some(code));
+    });
+
+    Ok(Arc::new(ShellProcess {
+        pid,
+        stdin_tx,
+        stdout: ShellOutput::channel(stdout_rx),
+        stderr: ShellOutput::channel(stderr_rx),
+        exit_code,
+        exit_tx,
+        signal_target: Some(process_group_signal_target_from_pid(pid)?),
+        strip_stdout_queries: std::sync::atomic::AtomicBool::new(false),
+        pty_tx: None,
+        started_at,
+    }))
+}
+
+#[allow(clippy::too_many_lines)]
+fn spawn_raw_shell_process(
+    session: &Session,
+    req: &portl_proto::shell_v1::ShellReq,
+    requested_user: Option<&RequestedUser>,
+    audit_session_id: &str,
+) -> Result<Arc<ShellProcess>, SpawnReject> {
+    let context = TargetProcessContext::new(session.caps.shell.as_ref(), req, requested_user);
+    let mut command = StdCommand::new(&context.shell_program);
+    command.arg("-l");
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    if let Some(cwd) = context.cwd.as_deref() {
+        command.current_dir(cwd);
+    }
+    command.env_clear();
+    command.envs(context.env);
+    #[cfg(unix)]
+    install_exec_session_pre_exec(&mut command);
+    #[cfg(unix)]
+    if let Some(user) = requested_user {
+        install_exec_user_switch(&mut command, user);
+    }
+
+    let mut child = TokioCommand::from(command)
+        .spawn()
+        .map_err(|err| SpawnReject::path_probe_failed(err.to_string()))?;
+    let pid = child
+        .id()
+        .ok_or_else(|| SpawnReject::path_probe_failed("missing child pid"))?;
+
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| SpawnReject::path_probe_failed("missing child stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| SpawnReject::path_probe_failed("missing child stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| SpawnReject::path_probe_failed("missing child stderr"))?;
+
+    let (stdin_tx, stdin_rx) = mpsc::channel(32);
+    let (stdout_tx, stdout_rx) = mpsc::channel(32);
+    let (stderr_tx, stderr_rx) = mpsc::channel(32);
+    let exit_code = Arc::new(Mutex::new(None));
+    let (exit_tx, _) = watch::channel(None);
+
+    tokio::spawn(async move {
+        if let Err(err) = exec_stdin_task(stdin, stdin_rx).await {
+            debug!(%err, "raw shell stdin task ended with error");
+        }
+    });
+    tokio::spawn(async move {
+        if let Err(err) = output_reader_task(stdout, stdout_tx).await {
+            debug!(%err, "raw shell stdout task ended with error");
+        }
+    });
+    tokio::spawn(async move {
+        if let Err(err) = output_reader_task(stderr, stderr_tx).await {
+            debug!(%err, "raw shell stderr task ended with error");
+        }
+    });
+
+    let exit_code_wait = Arc::clone(&exit_code);
+    let exit_tx_wait = exit_tx.clone();
+    let ticket_id = session.ticket_id;
+    let caller_endpoint_id = session.caller_endpoint_id;
+    let audit_session_id = audit_session_id.to_owned();
+    let started_at = Arc::new(Mutex::new(None::<Instant>));
+    let started_at_wait = Arc::clone(&started_at);
+    tokio::spawn(async move {
+        let code = match child.wait().await {
+            Ok(status) => status.code().unwrap_or(1),
+            Err(err) => {
+                warn!(?err, "wait on raw shell child failed");
                 1
             }
         };

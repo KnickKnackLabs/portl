@@ -100,6 +100,24 @@ pub async fn open_shell_with_env(
     open_shell_session(connection, session, req, true).await
 }
 
+pub async fn open_raw_shell_with_env_and_controls(
+    connection: &Connection,
+    session: &PeerSession,
+    user: Option<String>,
+    cwd: Option<String>,
+    env_patch: Vec<(String, EnvValue)>,
+) -> Result<ShellClient> {
+    let req = ShellReqBody {
+        mode: ShellMode::Shell,
+        argv: None,
+        env_patch,
+        cwd,
+        pty: None,
+        user,
+    };
+    open_shell_session(connection, session, req, true).await
+}
+
 pub async fn open_exec(
     connection: &Connection,
     session: &PeerSession,

@@ -17,7 +17,8 @@ pub use session_client::{
 };
 pub use shell_client::{
     ShellClient, open_exec, open_exec_with_env, open_exec_with_env_and_controls,
-    open_pty_exec_with_env_and_controls, open_shell, open_shell_with_env,
+    open_pty_exec_with_env_and_controls, open_raw_shell_with_env_and_controls, open_shell,
+    open_shell_with_env,
 };
 pub use tcp_client::{
     bind_local_forward_listener, open_tcp, run_local_forward, run_local_forward_with_listener,

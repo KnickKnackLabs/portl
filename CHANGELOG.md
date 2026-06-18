@@ -5,6 +5,27 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.11.9 — 2026-06-19
+
+### Added
+
+- Native `portl ssh --stdio` OpenSSH configs now work as the no-sshd route for
+  raw no-PTY shells (`ssh -T`), normal exec, PTY shell/exec, agent forwarding,
+  local/dynamic TCP forwarding (`ssh -L`/`ssh -D`), and direct Unix socket
+  forwarding when the ticket grants the requested Unix socket path.
+
+### Changed
+
+- Generated native SSH configs now include agent forwarding and bounded
+  server-alive probes for VS Code Remote-SSH and other OpenSSH clients.
+
+### Fixed
+
+- OpenSSH no-command shell requests that do not send `pty-req` now stay on raw
+  stdin/stdout/stderr pipes instead of being forced into a default PTY.
+- Unsupported SFTP requests through native `portl ssh --stdio` now fail with an
+  explicit `portl/fs/v1` backend message instead of a generic subsystem error.
+
 ## 0.11.8 — 2026-06-12
 
 ### Fixed

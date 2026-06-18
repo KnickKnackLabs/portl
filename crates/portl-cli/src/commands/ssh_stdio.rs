@@ -15,8 +15,9 @@ use iroh::endpoint::{Connection, SendStream};
 use portl_core::io::BufferedRecv;
 use portl_core::net::{
     PeerSession, ShellClient, UnixListenControl, UnixListenOptions,
-    open_exec_with_env_and_controls, open_pty_exec_with_env_and_controls, open_shell_with_env,
-    open_tcp, open_unix_listen_with_options, run_unix_reverse_forward,
+    open_exec_with_env_and_controls, open_pty_exec_with_env_and_controls,
+    open_raw_shell_with_env_and_controls, open_shell_with_env, open_tcp, open_unix,
+    open_unix_listen_with_options, run_unix_reverse_forward,
 };
 use portl_core::ticket::schema::{
     Capabilities, EnvPolicy, PortRule, ShellCaps, UnixCaps, UnixPathRule,
@@ -400,9 +401,13 @@ enum ControlMessage {
 
 #[derive(Debug)]
 enum RemoteSessionRequest {
-    Shell { pty: PtyCfg },
+    Shell { pty: Option<PtyCfg> },
     Exec { argv: Vec<String> },
     PtyExec { pty: PtyCfg, argv: Vec<String> },
+}
+
+fn shell_remote_session_request(pty: Option<PtyCfg>) -> RemoteSessionRequest {
+    RemoteSessionRequest::Shell { pty }
 }
 
 fn exec_remote_session_request(command: String, pty: Option<PtyCfg>) -> RemoteSessionRequest {
@@ -522,6 +527,9 @@ impl server::Handler for PortlSshServer {
             return Ok(());
         }
 
+        // Portl's shell wire PTY shape currently carries terminal name and
+        // window size only. OpenSSH terminal modes stay at the target host's
+        // pty defaults until `PtyCfg` grows a capability-scoped mode field.
         let resolved_term = resolve_pty_term_on_session(
             &self.backend.connection,
             &self.backend.session,
@@ -573,7 +581,7 @@ impl server::Handler for PortlSshServer {
         session: &mut RusshSession,
     ) -> Result<(), Self::Error> {
         let pending = self.remove_channel(channel)?;
-        let pty = pending.pty.unwrap_or_else(default_pty);
+        let request = shell_remote_session_request(pending.pty);
         let (control_tx, control_rx) = mpsc::channel(32);
         self.controls.insert(channel, control_tx);
         session.channel_success(channel)?;
@@ -586,7 +594,7 @@ impl server::Handler for PortlSshServer {
                 self.map_ssh_user,
             ),
             pending.env_patch,
-            RemoteSessionRequest::Shell { pty },
+            request,
             self.agent_forward.clone(),
             control_rx,
         );
@@ -628,7 +636,7 @@ impl server::Handler for PortlSshServer {
         session: &mut RusshSession,
     ) -> Result<(), Self::Error> {
         let _ = self.channels.remove(&channel);
-        let message = format!("portl-ssh --stdio does not implement subsystem {name}\n");
+        let message = unsupported_subsystem_message(name);
         session.extended_data(channel, 1, message.into_bytes())?;
         session.exit_status_request(channel, 1)?;
         session.channel_failure(channel)?;
@@ -729,6 +737,24 @@ impl server::Handler for PortlSshServer {
         }
     }
 
+    async fn channel_open_direct_streamlocal(
+        &mut self,
+        channel: Channel<Msg>,
+        socket_path: &str,
+        _session: &mut RusshSession,
+    ) -> Result<bool, Self::Error> {
+        match open_unix(&self.backend.connection, &self.backend.session, socket_path).await {
+            Ok((send, recv)) => {
+                spawn_direct_streamlocal_bridge(channel, send, recv, socket_path.to_owned());
+                Ok(true)
+            }
+            Err(err) => {
+                debug!(%err, socket_path, "rejecting direct-streamlocal channel");
+                Ok(false)
+            }
+        }
+    }
+
     async fn tcpip_forward(
         &mut self,
         address: &str,
@@ -738,7 +764,7 @@ impl server::Handler for PortlSshServer {
         debug!(
             address,
             port = *port,
-            "rejecting remote tcpip-forward request"
+            "rejecting remote tcpip-forward request; Portl has no TCP listen/reverse-forward primitive"
         );
         Ok(false)
     }
@@ -750,6 +776,27 @@ impl server::Handler for PortlSshServer {
         _session: &mut RusshSession,
     ) -> Result<bool, Self::Error> {
         debug!(address, port, "rejecting cancel-tcpip-forward request");
+        Ok(false)
+    }
+
+    async fn streamlocal_forward(
+        &mut self,
+        socket_path: &str,
+        _session: &mut RusshSession,
+    ) -> Result<bool, Self::Error> {
+        debug!(
+            socket_path,
+            "rejecting remote streamlocal-forward request; server-originated forwarded-streamlocal bridge is not implemented"
+        );
+        Ok(false)
+    }
+
+    async fn cancel_streamlocal_forward(
+        &mut self,
+        socket_path: &str,
+        _session: &mut RusshSession,
+    ) -> Result<bool, Self::Error> {
+        debug!(socket_path, "rejecting cancel-streamlocal-forward request");
         Ok(false)
     }
 }
@@ -797,7 +844,7 @@ async fn bridge_remote_session(
         };
     env_patch.extend(agent_env_patch);
     let shell = match match request {
-        RemoteSessionRequest::Shell { pty } => open_shell_with_env(
+        RemoteSessionRequest::Shell { pty: Some(pty) } => open_shell_with_env(
             &backend.connection,
             &backend.session,
             user.clone(),
@@ -806,7 +853,16 @@ async fn bridge_remote_session(
             env_patch,
         )
         .await
-        .context("open Portl shell for SSH channel"),
+        .context("open Portl PTY shell for SSH channel"),
+        RemoteSessionRequest::Shell { pty: None } => open_raw_shell_with_env_and_controls(
+            &backend.connection,
+            &backend.session,
+            user.clone(),
+            None,
+            env_patch,
+        )
+        .await
+        .context("open Portl raw shell for SSH channel"),
         RemoteSessionRequest::Exec { argv } => open_exec_with_env_and_controls(
             &backend.connection,
             &backend.session,
@@ -1046,6 +1102,38 @@ fn spawn_direct_tcpip_bridge(
     });
 }
 
+fn spawn_direct_streamlocal_bridge(
+    channel: Channel<Msg>,
+    mut send: SendStream,
+    mut recv: BufferedRecv,
+    socket_path: String,
+) {
+    tokio::spawn(async move {
+        let mut stream = channel.into_stream();
+        let (mut stream_read, mut stream_write) = tokio::io::split(&mut stream);
+        let upstream = async {
+            tokio::io::copy(&mut stream_read, &mut send)
+                .await
+                .context("copy SSH direct-streamlocal to Portl unix")?;
+            send.finish().context("finish Portl unix send")?;
+            Ok::<_, anyhow::Error>(())
+        };
+        let downstream = async {
+            tokio::io::copy(&mut recv, &mut stream_write)
+                .await
+                .context("copy Portl unix to SSH direct-streamlocal")?;
+            stream_write
+                .shutdown()
+                .await
+                .context("shutdown SSH direct-streamlocal")?;
+            Ok::<_, anyhow::Error>(())
+        };
+        if let Err(err) = tokio::try_join!(upstream, downstream) {
+            debug!(%err, socket_path, "SSH direct-streamlocal bridge failed");
+        }
+    });
+}
+
 async fn read_remote_exit(recv: &mut BufferedRecv) -> Result<i32> {
     let frame = recv
         .read_frame::<portl_core::wire::shell::ExitFrame>(128)
@@ -1124,12 +1212,12 @@ fn ensure_agent_env_allowed(caps: &Capabilities) -> Result<()> {
     }
 }
 
-fn default_pty() -> PtyCfg {
-    PtyCfg {
-        term: "xterm-256color".to_owned(),
-        cols: 80,
-        rows: 24,
+fn unsupported_subsystem_message(name: &str) -> String {
+    if name == "sftp" {
+        return "portl-ssh --stdio does not implement subsystem sftp; Portl filesystem capability portl/fs/v1 is deferred and no SFTP backend is available\n"
+            .to_owned();
     }
+    format!("portl-ssh --stdio does not implement subsystem {name}\n")
 }
 
 fn ssh_dimension(value: u32) -> u16 {
@@ -1157,16 +1245,340 @@ fn signal_number(signal: &Sig) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use russh::Sig;
+    use anyhow::{Context, Result};
+    use portl_agent::{AgentConfig, DiscoveryConfig, run_task};
+    use portl_core::id::Identity;
+    use portl_core::net::open_ticket_v1;
+    use portl_core::test_util::pair;
+    use portl_core::ticket::mint::mint_root;
+    use portl_core::ticket::schema::{Capabilities, PortlTicket};
+    use russh::client::{self, AuthResult, Handle, Msg as ClientMsg};
+    use russh::keys::ssh_key;
+    use russh::{Channel, ChannelMsg, Disconnect, Sig};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, UnixListener};
 
     use super::{
-        EnvPolicy, InstallOutcome, RemoteSessionRequest, effective_portl_user,
-        ensure_agent_unix_listen_allowed, exec_remote_session_request, format_open_failure_message,
-        host_key_path_for_target, install_private_file_no_overwrite, sanitized_target_key_name,
-        signal_number, ssh_dimension, ssh_env_request_allowed, ssh_stdio_caps,
-        ssh_stdio_connect_caps,
+        AgentForwardRequest, EnvPolicy, InstallOutcome, PortlSshBackend, PortlSshServer,
+        RemoteSessionRequest, SshKeyOsRng, effective_portl_user, ensure_agent_unix_listen_allowed,
+        exec_remote_session_request, format_open_failure_message, host_key_path_for_target,
+        install_private_file_no_overwrite, remote_agent_socket_path, sanitized_target_key_name,
+        shell_remote_session_request, signal_number, ssh_dimension, ssh_env_request_allowed,
+        ssh_stdio_caps, ssh_stdio_connect_caps, unsupported_subsystem_message,
     };
+
+    #[derive(Clone)]
+    struct AcceptAnyServerKey;
+
+    impl client::Handler for AcceptAnyServerKey {
+        type Error = anyhow::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _server_public_key: &ssh_key::PublicKey,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    struct SshProtocolHarness {
+        client: Handle<AcceptAnyServerKey>,
+        server_task: tokio::task::JoinHandle<Result<()>>,
+        connection: iroh::endpoint::Connection,
+        client_endpoint: portl_core::endpoint::Endpoint,
+        server_endpoint: portl_core::endpoint::Endpoint,
+        agent_task: tokio::task::JoinHandle<Result<()>>,
+    }
+
+    impl SshProtocolHarness {
+        async fn shutdown(mut self) -> Result<()> {
+            let _ = self
+                .client
+                .disconnect(Disconnect::ByApplication, "test complete", "")
+                .await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), &mut self.server_task).await;
+            if !self.server_task.is_finished() {
+                self.server_task.abort();
+                let _ = self.server_task.await;
+            }
+            self.connection
+                .close(0u32.into(), b"ssh stdio test complete");
+            self.client_endpoint.inner().close().await;
+            self.server_endpoint.inner().close().await;
+            let join_result = tokio::time::timeout(Duration::from_secs(5), self.agent_task)
+                .await
+                .context("agent join timeout")?;
+            join_result.context("agent join error")??;
+            Ok(())
+        }
+    }
+
+    async fn ssh_protocol_harness(
+        caps: Capabilities,
+        remote_agent_path: String,
+        initial_agent: Option<AgentForwardRequest>,
+    ) -> Result<SshProtocolHarness> {
+        let (client_endpoint, server_endpoint) = pair().await?;
+        let operator = Identity::new();
+        let agent_task = start_agent(server_endpoint.clone(), &operator).await?;
+        let ticket = root_ticket(&operator, server_endpoint.addr(), caps);
+
+        let endpoint = portl_core::endpoint::Endpoint::from(client_endpoint.inner().clone());
+        let (connection, session) = open_ticket_v1(&endpoint, &ticket, &[], &operator).await?;
+
+        let mut rng = rand_core_010::UnwrapErr(SshKeyOsRng);
+        let host_key = russh::keys::PrivateKey::random(&mut rng, ssh_key::Algorithm::Ed25519)
+            .context("generate test host key")?;
+        let server_config = Arc::new(russh::server::Config {
+            auth_rejection_time: Duration::from_millis(0),
+            auth_rejection_time_initial: Some(Duration::from_millis(0)),
+            keys: vec![host_key],
+            ..Default::default()
+        });
+        let backend = Arc::new(PortlSshBackend {
+            connection: connection.clone(),
+            session,
+            target_label: "ssh-stdio-test".to_owned(),
+            user: None,
+            remote_agent_path,
+        });
+        let handler = PortlSshServer::new(backend, initial_agent, false);
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let server_task = tokio::spawn(async move {
+            let running = russh::server::run_stream(server_config, server_io, handler)
+                .await
+                .context("start test SSH server")?;
+            running.await.context("run test SSH server")?;
+            Ok(())
+        });
+
+        let mut client = client::connect_stream(
+            Arc::new(client::Config::default()),
+            client_io,
+            AcceptAnyServerKey,
+        )
+        .await
+        .context("connect test SSH client")?;
+        match client.authenticate_none("tester").await? {
+            AuthResult::Success => {}
+            other @ AuthResult::Failure { .. } => {
+                anyhow::bail!("test SSH auth failed: {other:?}");
+            }
+        }
+
+        Ok(SshProtocolHarness {
+            client,
+            server_task,
+            connection,
+            client_endpoint,
+            server_endpoint,
+            agent_task,
+        })
+    }
+
+    async fn start_agent(
+        server: portl_core::endpoint::Endpoint,
+        operator: &Identity,
+    ) -> Result<tokio::task::JoinHandle<Result<()>>> {
+        let revocations_path = std::env::temp_dir().join(format!(
+            "portl-cli-ssh-stdio-revocations-{}.json",
+            rand::random::<u64>()
+        ));
+        run_task(AgentConfig {
+            discovery: DiscoveryConfig::in_process(),
+            trust_roots: vec![operator.verifying_key()],
+            revocations_path: Some(revocations_path),
+            endpoint: Some(server),
+            ..AgentConfig::default()
+        })
+        .await
+    }
+
+    fn root_ticket(
+        operator: &Identity,
+        addr: iroh_base::EndpointAddr,
+        caps: Capabilities,
+    ) -> PortlTicket {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("unix time")
+            .as_secs();
+        mint_root(operator.signing_key(), addr, caps, now, now + 300, None).expect("mint root")
+    }
+
+    async fn channel_output(mut channel: Channel<ClientMsg>) -> Result<(String, String, u32)> {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut exit_status = None;
+        while let Some(message) = channel.wait().await {
+            match message {
+                ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
+                ChannelMsg::ExtendedData { data, ext: 1 } => stderr.extend_from_slice(&data),
+                ChannelMsg::ExitStatus { exit_status: code } => exit_status = Some(code),
+                ChannelMsg::Eof | ChannelMsg::Close if exit_status.is_some() => break,
+                _ => {}
+            }
+        }
+        Ok((
+            String::from_utf8(stdout).context("stdout utf8")?,
+            String::from_utf8(stderr).context("stderr utf8")?,
+            exit_status.context("missing SSH exit status")?,
+        ))
+    }
+
+    async fn spawn_tcp_echo() -> Result<(TcpListener, u16)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        Ok((listener, port))
+    }
+
+    #[tokio::test]
+    async fn ssh_stdio_protocol_smoke_raw_shell_and_exec() -> Result<()> {
+        let harness = ssh_protocol_harness(
+            ssh_stdio_caps(false),
+            remote_agent_socket_path(rand::random()),
+            None,
+        )
+        .await?;
+
+        let raw = harness.client.channel_open_session().await?;
+        raw.request_shell(true).await?;
+        raw.data_bytes("printf 'raw-shell:%s\\n' \"$TERM\"; exit\n")
+            .await?;
+        raw.eof().await?;
+        let (stdout, stderr, status) = channel_output(raw).await?;
+        assert_eq!(stdout, "raw-shell:\n");
+        assert_eq!(stderr, "");
+        assert_eq!(status, 0);
+
+        let exec = harness.client.channel_open_session().await?;
+        exec.exec(true, "printf 'exec-ok\\n'").await?;
+        exec.eof().await?;
+        let (stdout, stderr, status) = channel_output(exec).await?;
+        assert_eq!(stdout, "exec-ok\n");
+        assert_eq!(stderr, "");
+        assert_eq!(status, 0);
+
+        harness.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn ssh_stdio_protocol_smoke_direct_tcpip_and_rejects_remote_tcp_forward() -> Result<()> {
+        let harness = ssh_protocol_harness(
+            ssh_stdio_caps(false),
+            remote_agent_socket_path(rand::random()),
+            None,
+        )
+        .await?;
+        let (listener, port) = spawn_tcp_echo().await?;
+        let echo_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut buf = Vec::new();
+            socket.read_to_end(&mut buf).await?;
+            socket.write_all(&buf).await?;
+            socket.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let mut channel = harness
+            .client
+            .channel_open_direct_tcpip("127.0.0.1", u32::from(port), "127.0.0.1", 0)
+            .await?;
+        channel.data_bytes("tcp-through-direct-tcpip").await?;
+        channel.eof().await?;
+        let mut echoed = Vec::new();
+        while let Some(message) = channel.wait().await {
+            match message {
+                ChannelMsg::Data { data } => echoed.extend_from_slice(&data),
+                ChannelMsg::Eof | ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        assert_eq!(echoed, b"tcp-through-direct-tcpip");
+        echo_task.await??;
+
+        let err = harness
+            .client
+            .tcpip_forward("127.0.0.1", 0)
+            .await
+            .expect_err("remote TCP forwarding remains unsupported");
+        assert!(
+            matches!(err, russh::Error::RequestDenied),
+            "unexpected error: {err:?}"
+        );
+
+        harness.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn ssh_stdio_protocol_smoke_streamlocal_and_agent_forward_raw_shell() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let unix_path = temp.path().join("echo.sock");
+        let unix_listener = UnixListener::bind(&unix_path)?;
+        let unix_echo_task = tokio::spawn(async move {
+            let (mut socket, _) = unix_listener.accept().await?;
+            let mut buf = Vec::new();
+            socket.read_to_end(&mut buf).await?;
+            socket.write_all(&buf).await?;
+            socket.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let local_agent_path = temp.path().join("local-agent.sock");
+        let _local_agent = UnixListener::bind(&local_agent_path)?;
+
+        let remote_agent_path = remote_agent_socket_path(rand::random());
+        let mut caps = ssh_stdio_connect_caps(&remote_agent_path);
+        caps.presence |= 0b0100_0000;
+        let unix = caps.unix.as_mut().context("unix caps for agent")?;
+        unix.connect.push(portl_core::ticket::schema::UnixPathRule {
+            path: unix_path.to_string_lossy().into_owned(),
+        });
+        unix.connect.sort_by(|a, b| a.path.cmp(&b.path));
+
+        let harness = ssh_protocol_harness(
+            caps,
+            remote_agent_path.clone(),
+            Some(AgentForwardRequest {
+                local_agent_path: local_agent_path.to_string_lossy().into_owned(),
+                remote_agent_path,
+            }),
+        )
+        .await?;
+        let mut channel = harness
+            .client
+            .channel_open_direct_streamlocal(unix_path.to_string_lossy().into_owned())
+            .await?;
+        channel.data_bytes("unix-through-streamlocal").await?;
+        channel.eof().await?;
+        let mut echoed = Vec::new();
+        while let Some(message) = channel.wait().await {
+            match message {
+                ChannelMsg::Data { data } => echoed.extend_from_slice(&data),
+                ChannelMsg::Eof | ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        assert_eq!(echoed, b"unix-through-streamlocal");
+        unix_echo_task.await??;
+
+        let raw = harness.client.channel_open_session().await?;
+        raw.request_shell(true).await?;
+        raw.data_bytes(
+            "[ -S \"$SSH_AUTH_SOCK\" ] && printf 'agent:%s\\n' \"$SSH_AUTH_SOCK\"; exit\n",
+        )
+        .await?;
+        raw.eof().await?;
+        let (stdout, stderr, status) = channel_output(raw).await?;
+        assert!(stdout.starts_with("agent:/tmp/portl-agent-"));
+        assert_eq!(stderr, "");
+        assert_eq!(status, 0);
+
+        harness.shutdown().await
+    }
 
     #[test]
     fn ssh_stdio_open_failure_message_includes_error_chain() {
@@ -1277,6 +1689,19 @@ mod tests {
     }
 
     #[test]
+    fn ssh_stdio_shell_without_prior_pty_stays_raw() {
+        match shell_remote_session_request(None) {
+            RemoteSessionRequest::Shell { pty: None } => {}
+            RemoteSessionRequest::Shell { pty: Some(_) } => {
+                panic!("no-command OpenSSH shell without pty-req must stay raw")
+            }
+            RemoteSessionRequest::Exec { .. } | RemoteSessionRequest::PtyExec { .. } => {
+                panic!("shell request must not become exec")
+            }
+        }
+    }
+
+    #[test]
     fn ssh_stdio_agent_forward_requires_effective_unix_listen_cap() {
         let path = "/tmp/portl-agent-0123456789abcdef/agent.sock";
         let denied = ssh_stdio_caps(false);
@@ -1286,6 +1711,15 @@ mod tests {
 
         let allowed = super::ssh_stdio_caps_for_agent_path(Some(path));
         ensure_agent_unix_listen_allowed(&allowed, path).expect("exact unix listen cap passes");
+    }
+
+    #[test]
+    fn ssh_stdio_sftp_rejection_names_missing_fs_backend() {
+        let message = unsupported_subsystem_message("sftp");
+
+        assert!(message.contains("subsystem sftp"));
+        assert!(message.contains("portl/fs/v1"));
+        assert!(message.contains("no SFTP backend"));
     }
 
     #[test]
