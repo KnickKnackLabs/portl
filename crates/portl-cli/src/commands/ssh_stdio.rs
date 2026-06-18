@@ -1446,11 +1446,13 @@ mod tests {
 
         let raw = harness.client.channel_open_session().await?;
         raw.request_shell(true).await?;
-        raw.data_bytes("printf 'raw-shell:%s\\n' \"$TERM\"; exit\n")
-            .await?;
+        raw.data_bytes(
+            "if test -t 0; then echo raw-shell:tty; else echo raw-shell:no-tty; fi; exit\n",
+        )
+        .await?;
         raw.eof().await?;
         let (stdout, stderr, status) = channel_output(raw).await?;
-        assert_eq!(stdout, "raw-shell:\n");
+        assert_eq!(stdout, "raw-shell:no-tty\n");
         assert_eq!(stderr, "");
         assert_eq!(status, 0);
 
