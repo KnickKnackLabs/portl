@@ -259,9 +259,10 @@ QUIC handles flow-control and head-of-line isolation per-stream, so
 stdout back-pressure can never block the client from sending a resize
 event or a SIGINT.
 
-## 4. `portl/tcp/v1` — TCP port forward
+## 4. `portl/tcp/v1` and `portl/tcp/v2` — TCP port forward
 
-One stream **per forwarded TCP connection**. Simple, stateless on the agent.
+`portl/tcp/v1` uses one stream **per forwarded TCP connection**. It is
+connect-only, simple, and stateless on the agent.
 
 ### 4.1 Sequence
 
@@ -304,6 +305,51 @@ QUIC stream backpressure propagates end-to-end. When the remote TCP peer
 can't drain fast enough, the local `portl-cli` sees the stream back off
 and in turn applies TCP backpressure on the local socket. No explicit
 windowing frames needed.
+
+### 4.3 `portl/tcp/v2`
+
+`portl/tcp/v2` keeps the `tcp/v1` connect behavior and adds a long-lived
+listen control stream for reverse forwarding. Clients should prefer
+`tcp/v2` only when `portl/meta/v1` `Info.supported_alpns` advertises it;
+otherwise they should continue opening `tcp/v1` connect streams.
+
+```
+TcpReqV2 {
+    preamble,
+    op: TcpOp,
+}
+
+TcpOp =
+    Connect  { host: Text, port: u16 }
+  | Listen   { bind_host: Text, bind_port: u16 }
+  | Accepted {
+        bind_host: Text,
+        bind_port: u16,
+        originator_host: Text,
+        originator_port: u16,
+    }
+
+TcpListenAck {
+    ok: bool,
+    error: Nullable<Text>,
+    bound_port: Nullable<u16>,
+}
+```
+
+`Connect` is client-originated and uses the same `TcpAck` response as
+`tcp/v1`. `Listen` is client-originated, keeps its control stream open, and
+returns `TcpListenAck`; when `bind_port` is zero the agent fills
+`bound_port` with the kernel-assigned port. Each accepted socket on the
+agent opens an agent-originated `tcp/v2` stream with `TcpOp::Accepted`, then
+waits for `TcpAck { ok:true }` before duplex byte copying.
+
+The ticket `Capabilities.presence` bit 7 (`TCP_LISTEN_CAP_BIT`) grants TCP
+listen permission for the existing `tcp` `PortRule` list. This preserves the
+postcard field layout of `Capabilities`: old tickets with `tcp` but without
+bit 7 remain connect-only, and delegation cannot add listen permission
+because child presence bits must stay within the parent's presence bits.
+Wildcard listen rules only permit loopback bind hosts (`localhost`,
+`127.0.0.1`, `::1`); explicit host rules are required for non-loopback binds.
 
 ## 5. `portl/udp/v1` — UDP port forward
 
@@ -564,6 +610,7 @@ not support every ALPN. If/when that happens, the full
 | `portl/meta/v1` | ✓ | — | no | ping, info, revocation push |
 | `portl/shell/v1` | ✓ (many) | — | yes | PTY latency matters; multi-stream |
 | `portl/tcp/v1` | ✓ | — | no | one stream per forwarded conn |
+| `portl/tcp/v2` | ✓ | — | no | connect plus reverse TCP listen/accepted streams |
 | `portl/udp/v1` | ✓ control | ✓ data | often | needs datagrams |
 | `portl/fs/v1` | ✓ | — | no | v0.2; deferred |
 | `portl/vpn/v1` | ✓ control | ✓ data | depends | needs datagrams |

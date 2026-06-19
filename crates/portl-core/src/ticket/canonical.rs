@@ -24,8 +24,8 @@
 
 use crate::error::{PortlError, Result};
 use crate::ticket::schema::{
-    Capabilities, EnvPolicy, PortRule, PortlBody, PortlTicket, ShellCaps, UnixPathRule,
-    validate_unix_path_rule,
+    Capabilities, EnvPolicy, PortRule, PortlBody, PortlTicket, ShellCaps, TCP_LISTEN_CAP_BIT,
+    UnixPathRule, validate_unix_path_rule,
 };
 
 /// One year in seconds (365 × 86 400).
@@ -152,11 +152,15 @@ fn check_presence_bitmap(caps: &Capabilities) -> Result<()> {
         | (u8::from(caps.fs.is_some()) << 3)
         | (u8::from(caps.vpn.is_some()) << 4)
         | (u8::from(caps.meta.is_some()) << 5)
-        | (u8::from(caps.unix.is_some()) << 6);
+        | (u8::from(caps.unix.is_some()) << 6)
+        | (caps.presence & TCP_LISTEN_CAP_BIT);
     if caps.presence != expected {
         return Err(PortlError::Canonical(
             "presence bitmap does not match Some-set",
         ));
+    }
+    if caps.presence & TCP_LISTEN_CAP_BIT != 0 && caps.tcp.is_none() {
+        return Err(PortlError::Canonical("tcp listen flag requires tcp caps"));
     }
     Ok(())
 }
@@ -274,4 +278,65 @@ fn check_shell_caps_sorted(s: &ShellCaps) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_check;
+    use crate::ticket::schema::{Capabilities, PortRule, PortlBody, TCP_LISTEN_CAP_BIT};
+
+    #[test]
+    fn tcp_listen_presence_bit_is_canonical_when_tcp_caps_exist() {
+        let body = body_with_caps(Capabilities {
+            presence: 0b0000_0010 | TCP_LISTEN_CAP_BIT,
+            shell: None,
+            tcp: Some(vec![PortRule {
+                host_glob: "127.0.0.1".to_owned(),
+                port_min: 1,
+                port_max: 65535,
+            }]),
+            udp: None,
+            fs: None,
+            vpn: None,
+            meta: None,
+            unix: None,
+        });
+
+        canonical_check(&body).expect("tcp listen bit with tcp caps should be canonical");
+    }
+
+    #[test]
+    fn tcp_listen_presence_bit_requires_tcp_caps() {
+        let body = body_with_caps(Capabilities {
+            presence: TCP_LISTEN_CAP_BIT,
+            shell: None,
+            tcp: None,
+            udp: None,
+            fs: None,
+            vpn: None,
+            meta: None,
+            unix: None,
+        });
+
+        let err = canonical_check(&body).expect_err("tcp listen bit without tcp must be invalid");
+        assert_eq!(
+            err.to_string(),
+            "canonical form violated: tcp listen flag requires tcp caps"
+        );
+    }
+
+    fn body_with_caps(caps: Capabilities) -> PortlBody {
+        PortlBody {
+            caps,
+            target: [1; 32],
+            alpns_extra: Vec::new(),
+            not_before: 10,
+            not_after: 20,
+            issuer: None,
+            parent: None,
+            nonce: [1; 8],
+            bearer: None,
+            to: None,
+        }
+    }
 }

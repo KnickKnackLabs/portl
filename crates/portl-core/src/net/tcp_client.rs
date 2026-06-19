@@ -6,15 +6,31 @@ use iroh::endpoint::{Connection, SendStream};
 use tokio::io::{AsyncWriteExt, copy};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::io::BufferedRecv;
+use crate::io::{BufferedRecv, read_postcard_prefix};
 use crate::wire::StreamPreamble;
-use crate::wire::tcp::{ALPN_TCP_V1, TcpAck, TcpReq};
+use crate::wire::tcp::{
+    ALPN_TCP_V1, ALPN_TCP_V2, TcpAck, TcpListenAck, TcpOp, TcpReq, TcpReqV2, TcpReqV2Tail,
+};
 
 use super::{PeerSession, stream_priority};
 
 const MAX_TCP_ACK_BYTES: usize = 64 * 1024;
+const MAX_TCP_REQ_BYTES: usize = 64 * 1024;
+const MAX_TCP_PREAMBLE_BYTES: usize = 8 * 1024;
 
 pub async fn open_tcp(
+    connection: &Connection,
+    session: &PeerSession,
+    host: &str,
+    port: u16,
+) -> Result<(SendStream, BufferedRecv)> {
+    if session.supports_alpn(ALPN_TCP_V2) {
+        return open_tcp_v2_connect(connection, session, host, port).await;
+    }
+    open_tcp_v1_connect(connection, session, host, port).await
+}
+
+async fn open_tcp_v1_connect(
     connection: &Connection,
     session: &PeerSession,
     host: &str,
@@ -45,6 +61,187 @@ pub async fn open_tcp(
         );
     }
     Ok((send, recv))
+}
+
+async fn open_tcp_v2_connect(
+    connection: &Connection,
+    session: &PeerSession,
+    host: &str,
+    port: u16,
+) -> Result<(SendStream, BufferedRecv)> {
+    let req = tcp_v2_req(
+        session,
+        TcpOp::Connect {
+            host: host.to_owned(),
+            port,
+        },
+    );
+    let (mut send, recv) = connection.open_bi().await.context("open tcp v2 stream")?;
+    stream_priority::apply(&send, stream_priority::forward());
+    send.write_all(&postcard::to_stdvec(&req).context("encode tcp v2 request")?)
+        .await
+        .context("write tcp v2 request")?;
+    let mut recv = BufferedRecv::new(recv, Vec::new());
+    let ack: TcpAck = recv
+        .read_frame(MAX_TCP_ACK_BYTES)
+        .await?
+        .context("missing tcp v2 ack")?;
+    if !ack.ok {
+        bail!(
+            "tcp v2 request rejected: {}",
+            ack.error.unwrap_or_else(|| "unknown error".to_owned())
+        );
+    }
+    Ok((send, recv))
+}
+
+#[derive(Debug)]
+pub struct TcpListenControl {
+    pub bind_host: String,
+    pub bound_port: u16,
+    send: SendStream,
+}
+
+impl TcpListenControl {
+    pub fn close(mut self) -> Result<()> {
+        self.send.finish().context("finish tcp listen control")
+    }
+}
+
+pub async fn open_tcp_listen(
+    connection: &Connection,
+    session: &PeerSession,
+    bind_host: &str,
+    bind_port: u16,
+) -> Result<TcpListenControl> {
+    let req = tcp_v2_req(
+        session,
+        TcpOp::Listen {
+            bind_host: bind_host.to_owned(),
+            bind_port,
+        },
+    );
+    let (mut send, recv) = connection
+        .open_bi()
+        .await
+        .context("open tcp listen stream")?;
+    stream_priority::apply(&send, stream_priority::forward());
+    send.write_all(&postcard::to_stdvec(&req).context("encode tcp listen request")?)
+        .await
+        .context("write tcp listen request")?;
+    let mut recv = BufferedRecv::new(recv, Vec::new());
+    let ack: TcpListenAck = recv
+        .read_frame(MAX_TCP_ACK_BYTES)
+        .await?
+        .context("missing tcp listen ack")?;
+    if !ack.ok {
+        bail!(
+            "tcp listen request rejected: {}",
+            ack.error.unwrap_or_else(|| "unknown error".to_owned())
+        );
+    }
+    let bound_port = ack
+        .bound_port
+        .context("tcp listen ack missing bound port")?;
+    Ok(TcpListenControl {
+        bind_host: bind_host.to_owned(),
+        bound_port,
+        send,
+    })
+}
+
+#[derive(Debug)]
+pub struct AcceptedTcpReverse {
+    pub bind_host: String,
+    pub bind_port: u16,
+    pub originator_host: String,
+    pub originator_port: u16,
+    pub send: SendStream,
+    pub recv: BufferedRecv,
+}
+
+pub async fn accept_tcp_reverse_once(
+    connection: &Connection,
+    session: &PeerSession,
+    bind_host: &str,
+    bind_port: u16,
+) -> Result<AcceptedTcpReverse> {
+    let (mut send, recv) = connection
+        .accept_bi()
+        .await
+        .context("accept reverse tcp stream")?;
+    let (preamble, mut recv) = read_postcard_prefix::<StreamPreamble>(recv, MAX_TCP_PREAMBLE_BYTES)
+        .await
+        .context("read reverse tcp preamble")?;
+    let tail = recv
+        .read_frame::<TcpReqV2Tail>(MAX_TCP_REQ_BYTES)
+        .await?
+        .context("missing reverse tcp request")?;
+    let req = TcpReqV2::new(preamble, tail);
+    if req.preamble.peer_token != session.peer_token
+        || req.preamble.alpn != String::from_utf8_lossy(ALPN_TCP_V2)
+    {
+        write_tcp_ack(&mut send, false, Some("invalid tcp v2 preamble".to_owned())).await?;
+        send.finish().context("finish invalid reverse tcp ack")?;
+        bail!("invalid reverse tcp preamble")
+    }
+
+    let TcpOp::Accepted {
+        bind_host: accepted_host,
+        bind_port: accepted_port,
+        originator_host,
+        originator_port,
+    } = req.op
+    else {
+        write_tcp_ack(
+            &mut send,
+            false,
+            Some("unexpected reverse tcp operation".to_owned()),
+        )
+        .await?;
+        send.finish().context("finish unexpected reverse tcp ack")?;
+        bail!("unexpected reverse tcp operation")
+    };
+    if accepted_host != bind_host || accepted_port != bind_port {
+        write_tcp_ack(
+            &mut send,
+            false,
+            Some(format!(
+                "unexpected reverse tcp listener {accepted_host}:{accepted_port}"
+            )),
+        )
+        .await?;
+        send.finish()
+            .context("finish unexpected reverse tcp listener ack")?;
+        bail!("unexpected reverse tcp listener {accepted_host}:{accepted_port}")
+    }
+
+    write_tcp_ack(&mut send, true, None).await?;
+    Ok(AcceptedTcpReverse {
+        bind_host: accepted_host,
+        bind_port: accepted_port,
+        originator_host,
+        originator_port,
+        send,
+        recv,
+    })
+}
+
+async fn write_tcp_ack(send: &mut SendStream, ok: bool, error: Option<String>) -> Result<()> {
+    let ack = TcpAck { ok, error };
+    send.write_all(&postcard::to_stdvec(&ack).context("encode tcp ack")?)
+        .await
+        .context("write tcp ack")
+}
+
+fn tcp_v2_req(session: &PeerSession, op: TcpOp) -> TcpReqV2 {
+    TcpReqV2 {
+        preamble: StreamPreamble {
+            peer_token: session.peer_token,
+            alpn: String::from_utf8_lossy(ALPN_TCP_V2).into_owned(),
+        },
+        op,
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

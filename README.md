@@ -15,13 +15,14 @@ used for NAT traversal when direct paths are unavailable.
 
 ## Status
 
-**v0.11.9** — OpenSSH compatibility release for native `portl ssh --stdio`
+**v0.12.0** — OpenSSH compatibility release for native `portl ssh --stdio`
 configs. Generated no-sshd SSH configs now support raw no-PTY shells,
 normal exec, PTY shell/exec, agent forwarding, local/dynamic TCP forwarding,
-and direct Unix socket forwarding when tickets grant the requested socket path.
-Portl also has SSH-style TCP, UDP, and Unix socket forwarding with grouped
-startup summaries and lifecycle logs, plus shared `-L`/`-R` forwarding flags on
-`portl shell`, `portl attach`, `portl ssh`, and `portl ssh-proxy`. Persistent
+remote TCP forwarding, and direct Unix socket forwarding when tickets grant the
+requested socket path. Portl also has SSH-style TCP, UDP, and Unix socket
+forwarding with grouped startup summaries and lifecycle logs, plus shared
+`-L`/`-R` forwarding flags on `portl shell`, `portl attach`, `portl ssh`, and
+`portl ssh-proxy`. Persistent
 terminal sessions remain available via
 `portl/session/v1`, provider discovery, Herdr bridge attach, zmx-control
 support, tmux `-CC` compatibility, `PORTL-S-*` short codes for importing shared
@@ -70,7 +71,7 @@ curl -fsSL \
 
 The installer is idempotent. Re-run it to upgrade; by default it preserves
 whether this machine was already configured as a client or agent. Set
-`PORTL_VERSION=0.11.9` to pin a release. Use `--agent=off` to disable the
+`PORTL_VERSION=0.12.0` to pin a release. Use `--agent=off` to disable the
 service, or `--uninstall` to remove binaries and service while keeping
 `$PORTL_HOME`. By default, Portl stores local state under `~/.portl` on
 all operating systems (`config/`, `data/`, `state/`, and `run/` subdirs).
@@ -90,7 +91,7 @@ portl-agent down            # stop/disable service, keeping state
 
 ```bash
 # mise
-mise use -g github:KnickKnackLabs/portl@0.11.9
+mise use -g github:KnickKnackLabs/portl@0.12.0
 # mise only shims `portl`; run install.sh with PORTL_AGENT=1 if this machine should be shared.
 
 # cargo
@@ -247,6 +248,7 @@ ssh -T demo <<'EOF'
 printf 'raw stdin works on %s\n' "$(hostname)"
 EOF
 ssh -N -D 127.0.0.1:1080 demo
+ssh -N -R 127.0.0.1:8022:127.0.0.1:22 demo
 
 # OpenSSH ProxyCommand passthrough when a real sshd runs on the target.
 portl ssh-config --mode sshd-proxy demo --host demo-sshd
@@ -259,11 +261,13 @@ Native `portl ssh --stdio` config is intended for OpenSSH clients such as VS
 Code Remote-SSH. It accepts OpenSSH auth, maps `User` to the Portl remote user
 when generated with `User`, supports raw no-PTY shells (`ssh -T`), normal exec,
 PTY shell/exec, agent forwarding, and local/dynamic TCP forwarding (`-L`/`-D`)
-through Portl TCP capabilities. Direct Unix socket forwarding
-(`direct-streamlocal@openssh.com`) is supported when the ticket grants the exact
-Unix connect path. SFTP is rejected because `portl/fs/v1` is still deferred;
-remote TCP forwarding (`ssh -R`), remote Unix socket forwarding, and OpenSSH PTY
-terminal modes are not implemented yet.
+through Portl TCP capabilities. Remote TCP forwarding (`ssh -R`) uses
+`portl/tcp/v2` when the target advertises it; generated stdio tickets permit
+loopback binds by default, while non-loopback binds require explicit ticket
+rules. Direct Unix socket forwarding (`direct-streamlocal@openssh.com`) is
+supported when the ticket grants the exact Unix connect path. SFTP is rejected
+because `portl/fs/v1` is still deferred; remote Unix socket forwarding and
+OpenSSH PTY terminal modes are not implemented yet.
 
 To require zmx provisioning for a Docker target:
 

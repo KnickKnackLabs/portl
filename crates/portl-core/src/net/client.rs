@@ -22,6 +22,17 @@ pub struct PeerSession {
     pub effective_caps: Capabilities,
     pub server_time: u64,
     pub client_nonce_hash: [u8; 16],
+    pub supported_alpns: Vec<String>,
+}
+
+impl PeerSession {
+    #[must_use]
+    pub fn supports_alpn(&self, alpn: &[u8]) -> bool {
+        let alpn = String::from_utf8_lossy(alpn);
+        self.supported_alpns
+            .iter()
+            .any(|candidate| candidate == alpn.as_ref())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,6 +249,7 @@ pub async fn open_ticket_v1(
             effective_caps,
             server_time: ack.server_time,
             client_nonce_hash,
+            supported_alpns: Vec::new(),
         },
     ))
 }

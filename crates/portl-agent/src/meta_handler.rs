@@ -49,13 +49,7 @@ pub(crate) async fn serve_stream(
             if meta_caps(&session).is_some_and(|caps| caps.info) {
                 portl_proto::meta_v1::MetaResp::Info {
                     agent_version: env!("CARGO_PKG_VERSION").to_owned(),
-                    supported_alpns: vec![
-                        String::from_utf8_lossy(portl_proto::ticket_v1::ALPN_TICKET_V1).into(),
-                        String::from_utf8_lossy(portl_proto::meta_v1::ALPN_META_V1).into(),
-                        String::from_utf8_lossy(portl_proto::shell_v1::ALPN_SHELL_V1).into(),
-                        String::from_utf8_lossy(portl_proto::tcp_v1::ALPN_TCP_V1).into(),
-                        String::from_utf8_lossy(portl_proto::udp_v1::ALPN_UDP_V1).into(),
-                    ],
+                    supported_alpns: supported_alpns(&state.mode),
                     uptime_s: state.started_at.elapsed().as_secs(),
                     hostname: hostname(),
                     os: std::env::consts::OS.to_owned(),
@@ -78,6 +72,20 @@ pub(crate) async fn serve_stream(
         .context("write meta response")?;
     send.finish().context("finish meta response")?;
     Ok(())
+}
+
+fn supported_alpns(mode: &crate::AgentMode) -> Vec<String> {
+    let mut alpns = vec![
+        String::from_utf8_lossy(portl_proto::ticket_v1::ALPN_TICKET_V1).into(),
+        String::from_utf8_lossy(portl_proto::meta_v1::ALPN_META_V1).into(),
+        String::from_utf8_lossy(portl_proto::shell_v1::ALPN_SHELL_V1).into(),
+        String::from_utf8_lossy(portl_proto::tcp_v1::ALPN_TCP_V1).into(),
+        String::from_utf8_lossy(portl_proto::udp_v1::ALPN_UDP_V1).into(),
+    ];
+    if matches!(mode, crate::AgentMode::Listener) {
+        alpns.push(String::from_utf8_lossy(portl_proto::tcp_v2::ALPN_TCP_V2).into());
+    }
+    alpns
 }
 
 fn meta_req_name(req: &portl_proto::meta_v1::MetaReq) -> &'static str {

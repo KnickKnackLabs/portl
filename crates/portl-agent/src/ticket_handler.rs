@@ -278,6 +278,21 @@ pub(crate) async fn serve_connection(connection: Connection, state: Arc<AgentSta
                         }
                         value
                             if value
+                                == String::from_utf8_lossy(portl_proto::tcp_v2::ALPN_TCP_V2) =>
+                        {
+                            if let Err(error) = crate::alpn_allowed_in_mode(&state.mode, value) {
+                                connection.close(0x1004u32.into(), error.as_bytes());
+                                Ok(())
+                            } else {
+                                state.metrics.tcp_streams_opened.inc();
+                                tcp_handler::serve_stream(
+                                    connection, session, state, send, recv, preamble,
+                                )
+                                .await
+                            }
+                        }
+                        value
+                            if value
                                 == String::from_utf8_lossy(portl_proto::udp_v1::ALPN_UDP_V1) =>
                         {
                             if let Err(error) = crate::alpn_allowed_in_mode(&state.mode, value) {

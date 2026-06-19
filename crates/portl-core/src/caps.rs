@@ -155,7 +155,9 @@ fn unix_rules_narrow(
 #[cfg(test)]
 mod tests {
     use super::is_narrowing;
-    use crate::ticket::schema::{Capabilities, UnixCaps, UnixPathRule};
+    use crate::ticket::schema::{
+        Capabilities, PortRule, TCP_LISTEN_CAP_BIT, UnixCaps, UnixPathRule,
+    };
 
     #[test]
     fn unix_connect_child_must_stay_within_parent_rules() {
@@ -173,6 +175,22 @@ mod tests {
         let child = unix_caps(vec!["/tmp/portl-agent.sock"], vec!["/tmp/portl-agent.sock"]);
 
         assert!(!is_narrowing(&parent, &child));
+    }
+
+    #[test]
+    fn tcp_child_cannot_add_listen_capability() {
+        let parent = tcp_caps(false, vec![port_rule("127.0.0.1", 1, 65535)]);
+        let child = tcp_caps(true, vec![port_rule("127.0.0.1", 1, 65535)]);
+
+        assert!(!is_narrowing(&parent, &child));
+    }
+
+    #[test]
+    fn tcp_listen_child_can_narrow_parent_rules() {
+        let parent = tcp_caps(true, vec![port_rule("127.0.0.1", 1, 65535)]);
+        let child = tcp_caps(true, vec![port_rule("127.0.0.1", 2200, 2299)]);
+
+        assert!(is_narrowing(&parent, &child));
     }
 
     fn unix_caps(connect: Vec<&str>, listen: Vec<&str>) -> Capabilities {
@@ -194,6 +212,27 @@ mod tests {
     fn rule(path: &str) -> UnixPathRule {
         UnixPathRule {
             path: path.to_owned(),
+        }
+    }
+
+    fn tcp_caps(listen: bool, rules: Vec<PortRule>) -> Capabilities {
+        Capabilities {
+            presence: 0b0000_0010 | if listen { TCP_LISTEN_CAP_BIT } else { 0 },
+            shell: None,
+            tcp: Some(rules),
+            udp: None,
+            fs: None,
+            vpn: None,
+            meta: None,
+            unix: None,
+        }
+    }
+
+    fn port_rule(host_glob: &str, port_min: u16, port_max: u16) -> PortRule {
+        PortRule {
+            host_glob: host_glob.to_owned(),
+            port_min,
+            port_max,
         }
     }
 }

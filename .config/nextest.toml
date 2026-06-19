@@ -79,9 +79,17 @@ slow-timeout = { period = "30s", terminate-after = 2 }
 filter = 'test(skipped_test_manifest)'
 slow-timeout = { period = "120s", terminate-after = 2 }
 
+[[profile.default.overrides]]
+filter = 'test(commands::ssh_stdio::tests::ssh_stdio_protocol_)'
+slow-timeout = { period = "45s", terminate-after = 2 }
+
 [[profile.ci.overrides]]
 filter = 'test(skipped_test_manifest)'
 slow-timeout = { period = "120s", terminate-after = 2 }
+
+[[profile.ci.overrides]]
+filter = 'test(commands::ssh_stdio::tests::ssh_stdio_protocol_)'
+slow-timeout = { period = "45s", terminate-after = 2 }
 
 [profile.ci.junit]
 path = "junit.xml"

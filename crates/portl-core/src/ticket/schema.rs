@@ -82,6 +82,12 @@ pub struct Capabilities {
     pub unix: Option<UnixCaps>,
 }
 
+/// Bit 7. When set, the `tcp` port rules also grant TCP listen
+/// permission for `portl/tcp/v2` reverse forwarding. Leaving this
+/// as a signed presence-bit flag avoids changing the postcard field
+/// layout of `Capabilities`.
+pub const TCP_LISTEN_CAP_BIT: u8 = 0b1000_0000;
+
 /// Port-range rule for `tcp` / `udp` caps.
 ///
 /// Canonical form requires these to be lexicographically sorted

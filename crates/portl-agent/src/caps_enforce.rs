@@ -1,4 +1,4 @@
-use portl_core::ticket::schema::{Capabilities, ShellCaps};
+use portl_core::ticket::schema::{Capabilities, ShellCaps, TCP_LISTEN_CAP_BIT};
 use portl_proto::shell_v1::{ShellMode, ShellReason, ShellReq};
 use portl_proto::tcp_v1::TcpReq;
 use portl_proto::udp_v1::UdpBind;
@@ -61,6 +61,29 @@ pub fn tcp_permits(caps: &Capabilities, req: &TcpReq) -> Result<(), &'static str
         .ok_or("destination not permitted by ticket")
 }
 
+pub fn tcp_listen_permits(
+    caps: &Capabilities,
+    bind_host: &str,
+    bind_port: u16,
+) -> Result<(), &'static str> {
+    if caps.presence & TCP_LISTEN_CAP_BIT == 0 {
+        return Err("tcp listen forwarding not allowed");
+    }
+    let Some(rules) = caps.tcp.as_ref() else {
+        return Err("tcp listen forwarding not allowed");
+    };
+
+    rules
+        .iter()
+        .any(|rule| {
+            listen_host_matches(&rule.host_glob, bind_host)
+                && rule.port_min <= bind_port
+                && bind_port <= rule.port_max
+        })
+        .then_some(())
+        .ok_or("listen address not permitted by ticket")
+}
+
 pub fn unix_permits(caps: &Capabilities, req: &UnixReq) -> Result<(), &'static str> {
     let Some(unix_caps) = caps.unix.as_ref() else {
         return Err("unix forwarding not allowed");
@@ -107,6 +130,13 @@ fn host_matches(pattern: &str, host: &str) -> bool {
     pattern == host
 }
 
+fn listen_host_matches(pattern: &str, host: &str) -> bool {
+    if pattern == "*" {
+        return matches!(host, "localhost" | "127.0.0.1" | "::1");
+    }
+    host_matches(pattern, host)
+}
+
 pub fn shell_caps(caps: &Capabilities) -> Option<&ShellCaps> {
     caps.shell.as_ref()
 }
@@ -114,12 +144,12 @@ pub fn shell_caps(caps: &Capabilities) -> Option<&ShellCaps> {
 #[cfg(test)]
 mod tests {
     use portl_core::ticket::schema::{
-        Capabilities, EnvPolicy, PortRule, ShellCaps, UnixCaps, UnixPathRule,
+        Capabilities, EnvPolicy, PortRule, ShellCaps, TCP_LISTEN_CAP_BIT, UnixCaps, UnixPathRule,
     };
     use portl_proto::shell_v1::{EnvValue, PtyCfg};
     use portl_proto::wire::StreamPreamble;
 
-    use super::{shell_permits, tcp_permits, udp_permits, unix_permits};
+    use super::{shell_permits, tcp_listen_permits, tcp_permits, udp_permits, unix_permits};
     use portl_proto::shell_v1::{ShellMode, ShellReason, ShellReq};
     use portl_proto::tcp_v1::TcpReq;
     use portl_proto::udp_v1::UdpBind;
@@ -326,6 +356,58 @@ mod tests {
         assert_eq!(
             tcp_permits(&caps, &req),
             Err("destination not permitted by ticket")
+        );
+    }
+
+    #[test]
+    fn tcp_listen_requires_explicit_listen_cap_bit() {
+        let caps = tcp_caps(vec![PortRule {
+            host_glob: "127.0.0.1".to_owned(),
+            port_min: 1,
+            port_max: 65535,
+        }]);
+
+        assert_eq!(
+            tcp_listen_permits(&caps, "127.0.0.1", 2222),
+            Err("tcp listen forwarding not allowed")
+        );
+    }
+
+    #[test]
+    fn tcp_listen_uses_existing_tcp_port_rules_when_flagged() {
+        let mut caps = tcp_caps(vec![PortRule {
+            host_glob: "127.0.0.1".to_owned(),
+            port_min: 2000,
+            port_max: 3000,
+        }]);
+        caps.presence |= TCP_LISTEN_CAP_BIT;
+
+        assert_eq!(tcp_listen_permits(&caps, "127.0.0.1", 2222), Ok(()));
+        assert_eq!(
+            tcp_listen_permits(&caps, "0.0.0.0", 2222),
+            Err("listen address not permitted by ticket")
+        );
+        assert_eq!(
+            tcp_listen_permits(&caps, "127.0.0.1", 4000),
+            Err("listen address not permitted by ticket")
+        );
+    }
+
+    #[test]
+    fn tcp_listen_wildcard_rule_only_allows_loopback_binds() {
+        let mut caps = tcp_caps(vec![PortRule {
+            host_glob: "*".to_owned(),
+            port_min: 0,
+            port_max: 65535,
+        }]);
+        caps.presence |= TCP_LISTEN_CAP_BIT;
+
+        assert_eq!(tcp_listen_permits(&caps, "127.0.0.1", 0), Ok(()));
+        assert_eq!(tcp_listen_permits(&caps, "localhost", 2222), Ok(()));
+        assert_eq!(tcp_listen_permits(&caps, "::1", 2222), Ok(()));
+        assert_eq!(
+            tcp_listen_permits(&caps, "0.0.0.0", 2222),
+            Err("listen address not permitted by ticket")
         );
     }
 

@@ -14,13 +14,14 @@ use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::{Connection, SendStream};
 use portl_core::io::BufferedRecv;
 use portl_core::net::{
-    PeerSession, ShellClient, UnixListenControl, UnixListenOptions,
-    open_exec_with_env_and_controls, open_pty_exec_with_env_and_controls,
-    open_raw_shell_with_env_and_controls, open_shell_with_env, open_tcp, open_unix,
-    open_unix_listen_with_options, run_unix_reverse_forward,
+    PeerSession, ShellClient, TcpListenControl, UnixListenControl, UnixListenOptions,
+    accept_tcp_reverse_once, open_exec_with_env_and_controls, open_pty_exec_with_env_and_controls,
+    open_raw_shell_with_env_and_controls, open_shell_with_env, open_tcp, open_tcp_listen,
+    open_unix, open_unix_listen_with_options, run_unix_reverse_forward,
 };
 use portl_core::ticket::schema::{
-    Capabilities, EnvPolicy, PortRule, ShellCaps, UnixCaps, UnixPathRule,
+    Capabilities, EnvPolicy, MetaCaps, PortRule, ShellCaps, TCP_LISTEN_CAP_BIT, UnixCaps,
+    UnixPathRule,
 };
 use portl_core::wire::shell::{EnvValue, PtyCfg, ResizeFrame, SignalFrame};
 use rand_core_010::{TryCryptoRng, TryRng, UnwrapErr};
@@ -61,7 +62,20 @@ async fn run_stdio(
     map_ssh_user: bool,
 ) -> Result<ExitCode> {
     let remote_agent_path = remote_agent_socket_path(rand::random());
-    let connected = connect_peer_quiet(peer, ssh_stdio_connect_caps(&remote_agent_path)).await?;
+    let mut connected =
+        connect_peer_quiet(peer, ssh_stdio_connect_caps(&remote_agent_path)).await?;
+    if connected
+        .session
+        .supports_alpn(portl_proto::tcp_v2::ALPN_TCP_V2)
+        && connected.session.effective_caps.presence & TCP_LISTEN_CAP_BIT == 0
+    {
+        close_connected(connected, b"ssh stdio tcp v2 reconnect").await;
+        connected = connect_peer_quiet(
+            peer,
+            ssh_stdio_connect_caps_with_tcp_listen(&remote_agent_path),
+        )
+        .await?;
+    }
     let result = run_stdio_on_connected(
         peer,
         user,
@@ -119,16 +133,23 @@ fn ssh_stdio_connect_caps(remote_agent_path: &str) -> Capabilities {
     // the exact future listen path up front. Stored tickets that do not
     // grant it still connect; `agent_request` checks the effective caps
     // before accepting forwarding and rejects cleanly when missing.
-    ssh_stdio_caps_for_agent_path(Some(remote_agent_path))
+    ssh_stdio_caps_for_agent_path(Some(remote_agent_path), false)
+}
+
+fn ssh_stdio_connect_caps_with_tcp_listen(remote_agent_path: &str) -> Capabilities {
+    ssh_stdio_caps_for_agent_path(Some(remote_agent_path), true)
 }
 
 #[cfg(test)]
 fn ssh_stdio_caps(forward_agent: bool) -> Capabilities {
     let remote_agent_path = forward_agent.then(|| remote_agent_socket_path(rand::random()));
-    ssh_stdio_caps_for_agent_path(remote_agent_path.as_deref())
+    ssh_stdio_caps_for_agent_path(remote_agent_path.as_deref(), false)
 }
 
-fn ssh_stdio_caps_for_agent_path(remote_agent_path: Option<&str>) -> Capabilities {
+fn ssh_stdio_caps_for_agent_path(
+    remote_agent_path: Option<&str>,
+    tcp_listen: bool,
+) -> Capabilities {
     let unix = remote_agent_path.map(|path| UnixCaps {
         connect: Vec::new(),
         listen: vec![UnixPathRule {
@@ -136,7 +157,9 @@ fn ssh_stdio_caps_for_agent_path(remote_agent_path: Option<&str>) -> Capabilitie
         }],
     });
     Capabilities {
-        presence: 0b0000_0011 | (u8::from(unix.is_some()) << 6),
+        presence: 0b0010_0011
+            | (u8::from(unix.is_some()) << 6)
+            | if tcp_listen { TCP_LISTEN_CAP_BIT } else { 0 },
         shell: Some(ShellCaps {
             user_allowlist: None,
             pty_allowed: true,
@@ -146,13 +169,16 @@ fn ssh_stdio_caps_for_agent_path(remote_agent_path: Option<&str>) -> Capabilitie
         }),
         tcp: Some(vec![PortRule {
             host_glob: "*".to_owned(),
-            port_min: 1,
+            port_min: u16::from(!tcp_listen),
             port_max: u16::MAX,
         }]),
         udp: None,
         fs: None,
         vpn: None,
-        meta: None,
+        meta: Some(MetaCaps {
+            ping: false,
+            info: true,
+        }),
         unix,
     }
 }
@@ -422,9 +448,15 @@ struct PortlSshServer {
     backend: Arc<PortlSshBackend>,
     channels: HashMap<ChannelId, PendingSessionChannel>,
     controls: HashMap<ChannelId, mpsc::Sender<ControlMessage>>,
+    remote_tcp_forwards: HashMap<(String, u32), RemoteTcpForward>,
     agent_forward: Option<AgentForwardRequest>,
     auth_user: Option<String>,
     map_ssh_user: bool,
+}
+
+struct RemoteTcpForward {
+    control: TcpListenControl,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl PortlSshServer {
@@ -437,6 +469,7 @@ impl PortlSshServer {
             backend,
             channels: HashMap::new(),
             controls: HashMap::new(),
+            remote_tcp_forwards: HashMap::new(),
             agent_forward,
             auth_user: None,
             map_ssh_user,
@@ -759,14 +792,57 @@ impl server::Handler for PortlSshServer {
         &mut self,
         address: &str,
         port: &mut u32,
-        _session: &mut RusshSession,
+        session: &mut RusshSession,
     ) -> Result<bool, Self::Error> {
-        debug!(
+        let Ok(requested_port) = u16::try_from(*port) else {
+            debug!(
+                address,
+                port = *port,
+                "rejecting remote tcpip-forward with out-of-range port"
+            );
+            return Ok(false);
+        };
+        if !self
+            .backend
+            .session
+            .supports_alpn(portl_proto::tcp_v2::ALPN_TCP_V2)
+        {
+            debug!(
+                address,
+                port = *port,
+                "rejecting remote tcpip-forward request; target agent does not advertise portl/tcp/v2"
+            );
+            return Ok(false);
+        }
+        match open_tcp_listen(
+            &self.backend.connection,
+            &self.backend.session,
             address,
-            port = *port,
-            "rejecting remote tcpip-forward request; Portl has no TCP listen/reverse-forward primitive"
-        );
-        Ok(false)
+            requested_port,
+        )
+        .await
+        {
+            Ok(control) => {
+                let bound_port = control.bound_port;
+                let handle = session.handle();
+                let task = spawn_remote_tcp_forward_accept_loop(
+                    handle,
+                    Arc::clone(&self.backend),
+                    address.to_owned(),
+                    bound_port,
+                );
+                *port = u32::from(bound_port);
+                self.remote_tcp_forwards.insert(
+                    (address.to_owned(), *port),
+                    RemoteTcpForward { control, task },
+                );
+                Ok(true)
+            }
+            Err(err) => {
+                debug!(%err, address, port = *port, "rejecting remote tcpip-forward request");
+                Ok(false)
+            }
+        }
     }
 
     async fn cancel_tcpip_forward(
@@ -775,8 +851,19 @@ impl server::Handler for PortlSshServer {
         port: u32,
         _session: &mut RusshSession,
     ) -> Result<bool, Self::Error> {
-        debug!(address, port, "rejecting cancel-tcpip-forward request");
-        Ok(false)
+        if let Some(forward) = self.remote_tcp_forwards.remove(&(address.to_owned(), port)) {
+            if let Err(err) = forward.control.close() {
+                debug!(%err, address, port, "failed to close remote tcpip-forward control");
+            }
+            forward.task.abort();
+            Ok(true)
+        } else {
+            debug!(
+                address,
+                port, "rejecting unknown cancel-tcpip-forward request"
+            );
+            Ok(false)
+        }
     }
 
     async fn streamlocal_forward(
@@ -1102,6 +1189,54 @@ fn spawn_direct_tcpip_bridge(
     });
 }
 
+fn spawn_remote_tcp_forward_accept_loop(
+    handle: server::Handle,
+    backend: Arc<PortlSshBackend>,
+    bind_host: String,
+    bind_port: u16,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let accepted = match accept_tcp_reverse_once(
+                &backend.connection,
+                &backend.session,
+                &bind_host,
+                bind_port,
+            )
+            .await
+            {
+                Ok(accepted) => accepted,
+                Err(err) => {
+                    debug!(%err, bind_host, bind_port, "remote tcp forward accept loop ended");
+                    break;
+                }
+            };
+            match handle
+                .channel_open_forwarded_tcpip(
+                    accepted.bind_host.clone(),
+                    u32::from(accepted.bind_port),
+                    accepted.originator_host.clone(),
+                    u32::from(accepted.originator_port),
+                )
+                .await
+            {
+                Ok(channel) => {
+                    spawn_direct_tcpip_bridge(
+                        channel,
+                        accepted.send,
+                        accepted.recv,
+                        accepted.bind_host,
+                        accepted.bind_port,
+                    );
+                }
+                Err(err) => {
+                    debug!(%err, bind_host, bind_port, "failed to open forwarded-tcpip channel");
+                }
+            }
+        }
+    })
+}
+
 fn spawn_direct_streamlocal_bridge(
     channel: Channel<Msg>,
     mut send: SendStream,
@@ -1254,12 +1389,13 @@ mod tests {
     use portl_core::net::open_ticket_v1;
     use portl_core::test_util::pair;
     use portl_core::ticket::mint::mint_root;
-    use portl_core::ticket::schema::{Capabilities, PortlTicket};
+    use portl_core::ticket::schema::{Capabilities, PortRule, PortlTicket, TCP_LISTEN_CAP_BIT};
     use russh::client::{self, AuthResult, Handle, Msg as ClientMsg};
     use russh::keys::ssh_key;
     use russh::{Channel, ChannelMsg, Disconnect, Sig};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, UnixListener};
+    use tokio::net::{TcpListener, TcpStream, UnixListener};
+    use tokio::sync::mpsc;
 
     use super::{
         AgentForwardRequest, EnvPolicy, InstallOutcome, PortlSshBackend, PortlSshServer,
@@ -1284,8 +1420,8 @@ mod tests {
         }
     }
 
-    struct SshProtocolHarness {
-        client: Handle<AcceptAnyServerKey>,
+    struct SshProtocolHarness<H: client::Handler> {
+        client: Handle<H>,
         server_task: tokio::task::JoinHandle<Result<()>>,
         connection: iroh::endpoint::Connection,
         client_endpoint: portl_core::endpoint::Endpoint,
@@ -1293,7 +1429,7 @@ mod tests {
         agent_task: tokio::task::JoinHandle<Result<()>>,
     }
 
-    impl SshProtocolHarness {
+    impl<H: client::Handler> SshProtocolHarness<H> {
         async fn shutdown(mut self) -> Result<()> {
             let _ = self
                 .client
@@ -1320,14 +1456,51 @@ mod tests {
         caps: Capabilities,
         remote_agent_path: String,
         initial_agent: Option<AgentForwardRequest>,
-    ) -> Result<SshProtocolHarness> {
+    ) -> Result<SshProtocolHarness<AcceptAnyServerKey>> {
+        ssh_protocol_harness_with_supported_alpns(
+            caps,
+            remote_agent_path,
+            initial_agent,
+            vec![String::from_utf8_lossy(portl_proto::tcp_v2::ALPN_TCP_V2).into_owned()],
+        )
+        .await
+    }
+
+    async fn ssh_protocol_harness_with_supported_alpns(
+        caps: Capabilities,
+        remote_agent_path: String,
+        initial_agent: Option<AgentForwardRequest>,
+        supported_alpns: Vec<String>,
+    ) -> Result<SshProtocolHarness<AcceptAnyServerKey>> {
+        ssh_protocol_harness_with_handler(
+            caps,
+            remote_agent_path,
+            initial_agent,
+            AcceptAnyServerKey,
+            supported_alpns,
+        )
+        .await
+    }
+
+    async fn ssh_protocol_harness_with_handler<H>(
+        caps: Capabilities,
+        remote_agent_path: String,
+        initial_agent: Option<AgentForwardRequest>,
+        client_handler: H,
+        supported_alpns: Vec<String>,
+    ) -> Result<SshProtocolHarness<H>>
+    where
+        H: client::Handler + Send + 'static,
+        H::Error: Into<anyhow::Error>,
+    {
         let (client_endpoint, server_endpoint) = pair().await?;
         let operator = Identity::new();
         let agent_task = start_agent(server_endpoint.clone(), &operator).await?;
         let ticket = root_ticket(&operator, server_endpoint.addr(), caps);
 
         let endpoint = portl_core::endpoint::Endpoint::from(client_endpoint.inner().clone());
-        let (connection, session) = open_ticket_v1(&endpoint, &ticket, &[], &operator).await?;
+        let (connection, mut session) = open_ticket_v1(&endpoint, &ticket, &[], &operator).await?;
+        session.supported_alpns = supported_alpns;
 
         let mut rng = rand_core_010::UnwrapErr(SshKeyOsRng);
         let host_key = russh::keys::PrivateKey::random(&mut rng, ssh_key::Algorithm::Ed25519)
@@ -1345,10 +1518,10 @@ mod tests {
             user: None,
             remote_agent_path,
         });
-        let handler = PortlSshServer::new(backend, initial_agent, false);
+        let server_handler = PortlSshServer::new(backend, initial_agent, false);
         let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
         let server_task = tokio::spawn(async move {
-            let running = russh::server::run_stream(server_config, server_io, handler)
+            let running = russh::server::run_stream(server_config, server_io, server_handler)
                 .await
                 .context("start test SSH server")?;
             running.await.context("run test SSH server")?;
@@ -1358,9 +1531,10 @@ mod tests {
         let mut client = client::connect_stream(
             Arc::new(client::Config::default()),
             client_io,
-            AcceptAnyServerKey,
+            client_handler,
         )
         .await
+        .map_err(Into::<anyhow::Error>::into)
         .context("connect test SSH client")?;
         match client.authenticate_none("tester").await? {
             AuthResult::Success => {}
@@ -1377,6 +1551,80 @@ mod tests {
             server_endpoint,
             agent_task,
         })
+    }
+
+    #[derive(Clone)]
+    struct ForwardingClient {
+        local_target: std::net::SocketAddr,
+        opened_tx: mpsc::UnboundedSender<ForwardedTcpipOpen>,
+    }
+
+    #[derive(Debug)]
+    struct ForwardedTcpipOpen {
+        connected_address: String,
+        connected_port: u32,
+        originator_address: String,
+        originator_port: u32,
+    }
+
+    impl client::Handler for ForwardingClient {
+        type Error = anyhow::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _server_public_key: &ssh_key::PublicKey,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        async fn server_channel_open_forwarded_tcpip(
+            &mut self,
+            channel: Channel<ClientMsg>,
+            connected_address: &str,
+            connected_port: u32,
+            originator_address: &str,
+            originator_port: u32,
+            _session: &mut client::Session,
+        ) -> Result<(), Self::Error> {
+            let _ = self.opened_tx.send(ForwardedTcpipOpen {
+                connected_address: connected_address.to_owned(),
+                connected_port,
+                originator_address: originator_address.to_owned(),
+                originator_port,
+            });
+            let local_target = self.local_target;
+            tokio::spawn(async move {
+                if let Err(err) = bridge_forwarded_tcpip_to_local(channel, local_target).await {
+                    tracing::debug!(%err, "forwarded tcpip test bridge failed");
+                }
+            });
+            Ok(())
+        }
+    }
+
+    async fn bridge_forwarded_tcpip_to_local(
+        mut channel: Channel<ClientMsg>,
+        local_target: std::net::SocketAddr,
+    ) -> Result<()> {
+        let mut request = Vec::new();
+        while let Some(message) = channel.wait().await {
+            match message {
+                ChannelMsg::Data { data } => request.extend_from_slice(&data),
+                ChannelMsg::Eof | ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+
+        let mut local = TcpStream::connect(local_target)
+            .await
+            .context("connect local forwarded tcp target")?;
+        local.write_all(&request).await?;
+        local.shutdown().await?;
+        let mut response = Vec::new();
+        local.read_to_end(&mut response).await?;
+        channel.data(response.as_slice()).await?;
+        channel.eof().await?;
+        Ok(())
     }
 
     async fn start_agent(
@@ -1507,6 +1755,94 @@ mod tests {
             .tcpip_forward("127.0.0.1", 0)
             .await
             .expect_err("remote TCP forwarding remains unsupported");
+        assert!(
+            matches!(err, russh::Error::RequestDenied),
+            "unexpected error: {err:?}"
+        );
+
+        harness.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn ssh_stdio_protocol_smoke_remote_tcp_forwarding() -> Result<()> {
+        let local_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let local_target = local_listener.local_addr()?;
+        let local_echo_task = tokio::spawn(async move {
+            let (mut socket, _) = local_listener.accept().await?;
+            let mut buf = Vec::new();
+            socket.read_to_end(&mut buf).await?;
+            socket.write_all(&buf).await?;
+            socket.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let (opened_tx, mut opened_rx) = mpsc::unbounded_channel();
+        let mut caps = ssh_stdio_caps(false);
+        caps.presence |= TCP_LISTEN_CAP_BIT;
+        let tcp = caps.tcp.as_mut().context("tcp caps")?;
+        tcp.clear();
+        tcp.push(PortRule {
+            host_glob: "127.0.0.1".to_owned(),
+            port_min: 0,
+            port_max: u16::MAX,
+        });
+        let harness = ssh_protocol_harness_with_handler(
+            caps,
+            remote_agent_socket_path(rand::random()),
+            None,
+            ForwardingClient {
+                local_target,
+                opened_tx,
+            },
+            vec![String::from_utf8_lossy(portl_proto::tcp_v2::ALPN_TCP_V2).into_owned()],
+        )
+        .await?;
+
+        let remote_port = harness.client.tcpip_forward("127.0.0.1", 0).await?;
+        assert_ne!(remote_port, 0);
+        let remote_port_u16 = u16::try_from(remote_port).context("remote forward port is u16")?;
+        let mut remote = TcpStream::connect(("127.0.0.1", remote_port_u16)).await?;
+        remote.write_all(b"through-remote-forward").await?;
+        remote.shutdown().await?;
+        let mut echoed = Vec::new();
+        remote.read_to_end(&mut echoed).await?;
+        assert_eq!(echoed, b"through-remote-forward");
+
+        let opened = tokio::time::timeout(Duration::from_secs(5), opened_rx.recv())
+            .await?
+            .context("missing forwarded-tcpip open")?;
+        assert_eq!(opened.connected_address, "127.0.0.1");
+        assert_eq!(opened.connected_port, remote_port);
+        assert_eq!(opened.originator_address, "127.0.0.1");
+        assert_ne!(opened.originator_port, 0);
+        harness
+            .client
+            .cancel_tcpip_forward("127.0.0.1", remote_port)
+            .await?;
+        local_echo_task.await??;
+
+        harness.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn ssh_stdio_protocol_rejects_remote_tcp_forward_without_tcp_v2() -> Result<()> {
+        let mut caps = ssh_stdio_caps(false);
+        caps.presence |= TCP_LISTEN_CAP_BIT;
+        let tcp = caps.tcp.as_mut().context("tcp caps")?;
+        tcp[0].port_min = 0;
+        let harness = ssh_protocol_harness_with_supported_alpns(
+            caps,
+            remote_agent_socket_path(rand::random()),
+            None,
+            Vec::new(),
+        )
+        .await?;
+
+        let err = harness
+            .client
+            .tcpip_forward("127.0.0.1", 0)
+            .await
+            .expect_err("remote TCP forwarding requires advertised tcp/v2");
         assert!(
             matches!(err, russh::Error::RequestDenied),
             "unexpected error: {err:?}"
@@ -1711,7 +2047,7 @@ mod tests {
             .expect_err("missing unix listen cap must fail");
         assert!(err.to_string().contains("Unix listen"));
 
-        let allowed = super::ssh_stdio_caps_for_agent_path(Some(path));
+        let allowed = super::ssh_stdio_caps_for_agent_path(Some(path), false);
         ensure_agent_unix_listen_allowed(&allowed, path).expect("exact unix listen cap passes");
     }
 

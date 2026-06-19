@@ -48,6 +48,7 @@ async fn handshake_pair_accepts_and_serves_meta() -> Result<()> {
         } => {
             assert_eq!(agent_version, env!("CARGO_PKG_VERSION"));
             assert!(supported_alpns.contains(&"portl/meta/v1".to_owned()));
+            assert!(supported_alpns.contains(&"portl/tcp/v2".to_owned()));
             assert!(uptime_s <= 5);
         }
         other => panic!("unexpected info response: {other:?}"),

@@ -1030,6 +1030,7 @@ mod tests {
                 },
                 server_time: 0,
                 client_nonce_hash: [0; 16],
+                supported_alpns: Vec::new(),
             },
             transport_observer: None,
         };

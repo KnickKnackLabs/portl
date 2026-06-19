@@ -21,7 +21,8 @@ pub use shell_client::{
     open_shell_with_env,
 };
 pub use tcp_client::{
-    bind_local_forward_listener, open_tcp, run_local_forward, run_local_forward_with_listener,
+    AcceptedTcpReverse, TcpListenControl, accept_tcp_reverse_once, bind_local_forward_listener,
+    open_tcp, open_tcp_listen, run_local_forward, run_local_forward_with_listener,
     run_local_forward_with_listener_quiet,
 };
 pub use udp_client::{

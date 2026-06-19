@@ -12,6 +12,7 @@ pub mod pair_v1;
 pub mod session_v1;
 pub mod shell_v1;
 pub mod tcp_v1;
+pub mod tcp_v2;
 pub mod ticket_v1;
 pub mod udp_v1;
 pub mod unix_v1;

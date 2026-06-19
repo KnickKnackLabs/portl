@@ -5,6 +5,22 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.12.0 — 2026-06-19
+
+### Added
+
+- Added `portl/tcp/v2` for TCP connect/listen operations while preserving
+  `portl/tcp/v1` as the connect-only fallback for older agents.
+- Native `portl ssh --stdio` now supports OpenSSH remote TCP forwarding
+  (`ssh -R`) when the target agent advertises `portl/tcp/v2` and the effective
+  ticket grants the signed TCP listen presence bit.
+
+### Changed
+
+- Native `portl ssh --stdio` now queries peer ALPN support through `meta.info`
+  and only reconnects with TCP listen permissions when the peer advertises
+  `portl/tcp/v2`, keeping older agents on the `tcp/v1` path.
+
 ## 0.11.9 — 2026-06-19
 
 ### Added

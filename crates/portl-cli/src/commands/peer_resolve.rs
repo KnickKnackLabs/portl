@@ -38,6 +38,9 @@ use portl_core::ticket::mint::mint_root;
 use portl_core::ticket::schema::{Capabilities, PortlTicket};
 use portl_core::ticket_store::TicketStore;
 use portl_core::transport_telemetry::{ObserverConfig, TransportTelemetryContext};
+use portl_proto::meta_v1::{MetaReq, MetaResp};
+use portl_proto::wire::StreamPreamble;
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::alias_store::AliasStore;
@@ -250,9 +253,23 @@ pub(crate) async fn connect_peer_with_endpoint(
         discovery = %resolved.discovery,
         force_relay = false,
     );
-    let (connection, session) = open_ticket_v1(&endpoint_wrapper, &resolved.ticket, &[], identity)
-        .await
-        .context("run ticket handshake")?;
+    let (connection, mut session) =
+        open_ticket_v1(&endpoint_wrapper, &resolved.ticket, &[], identity)
+            .await
+            .context("run ticket handshake")?;
+    if session
+        .effective_caps
+        .meta
+        .as_ref()
+        .is_some_and(|meta| meta.info)
+    {
+        match supported_alpns(&connection, &session).await {
+            Ok(supported_alpns) => session.supported_alpns = supported_alpns,
+            Err(err) => {
+                debug!(%err, "failed to query peer supported ALPNs");
+            }
+        }
+    }
     let transport_observer = Some(portl_core::transport_telemetry::spawn_connection_observer(
         connection.clone(),
         cli_transport_context(peer_log, endpoint, &connection, &resolved.ticket, &session),
@@ -264,6 +281,42 @@ pub(crate) async fn connect_peer_with_endpoint(
         session,
         transport_observer,
     })
+}
+
+async fn supported_alpns(connection: &Connection, session: &PeerSession) -> Result<Vec<String>> {
+    let envelope = MetaEnvelope {
+        preamble: StreamPreamble {
+            peer_token: session.peer_token,
+            alpn: String::from_utf8_lossy(portl_proto::meta_v1::ALPN_META_V1).into_owned(),
+        },
+        req: MetaReq::Info,
+    };
+    let bytes = postcard::to_stdvec(&envelope).context("encode meta info request")?;
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .context("open meta info stream")?;
+    send.write_all(&bytes)
+        .await
+        .context("write meta info request")?;
+    send.finish().context("finish meta info request")?;
+    let response_bytes = recv
+        .read_to_end(64 * 1024)
+        .await
+        .context("read meta info response")?;
+    match postcard::from_bytes::<MetaResp>(&response_bytes).context("decode meta info response")? {
+        MetaResp::Info {
+            supported_alpns, ..
+        } => Ok(supported_alpns),
+        MetaResp::Error(error) => bail!("meta info failed: {} ({:?})", error.message, error.kind),
+        other => bail!("unexpected meta info response: {other:?}"),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct MetaEnvelope {
+    preamble: StreamPreamble,
+    req: MetaReq,
 }
 
 fn cli_transport_context(

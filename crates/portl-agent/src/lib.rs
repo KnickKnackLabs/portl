@@ -230,7 +230,8 @@ pub use revocations::{RevocationRecord, RevocationSet};
 /// Listener mode serves every wire-level ALPN. Gateway mode is
 /// strictly a master-ticket-backed HTTP forwarder (see
 /// `src/gateway.rs`), so only `meta/v1` and `tcp/v1` streams are
-/// dispatched; `shell/v1`, `session/v1`, `udp/v1`, and `unix/v1` are closed at dispatch time.
+/// dispatched; `shell/v1`, `session/v1`, `tcp/v2`, `udp/v1`, and
+/// `unix/v1` are closed at dispatch time.
 pub(crate) fn alpn_allowed_in_mode(mode: &AgentMode, alpn: &str) -> Result<(), &'static str> {
     match mode {
         AgentMode::Listener => Ok(()),
@@ -265,6 +266,7 @@ mod mode_dispatch_tests {
             String::from_utf8_lossy(portl_proto::shell_v1::ALPN_SHELL_V1),
             String::from_utf8_lossy(portl_proto::session_v1::ALPN_SESSION_V1),
             String::from_utf8_lossy(portl_proto::tcp_v1::ALPN_TCP_V1),
+            String::from_utf8_lossy(portl_proto::tcp_v2::ALPN_TCP_V2),
             String::from_utf8_lossy(portl_proto::udp_v1::ALPN_UDP_V1),
             String::from_utf8_lossy(portl_proto::unix_v1::ALPN_UNIX_V1),
         ] {
@@ -288,7 +290,7 @@ mod mode_dispatch_tests {
     }
 
     #[test]
-    fn gateway_rejects_shell_session_udp_and_unix() {
+    fn gateway_rejects_shell_session_tcp_v2_udp_and_unix() {
         let err = alpn_allowed_in_mode(
             &gateway(),
             String::from_utf8_lossy(portl_proto::shell_v1::ALPN_SHELL_V1).as_ref(),
@@ -300,6 +302,12 @@ mod mode_dispatch_tests {
             String::from_utf8_lossy(portl_proto::session_v1::ALPN_SESSION_V1).as_ref(),
         )
         .expect_err("session/v1 must be rejected in gateway mode");
+        assert!(err.contains("gateway mode only serves"));
+        let err = alpn_allowed_in_mode(
+            &gateway(),
+            String::from_utf8_lossy(portl_proto::tcp_v2::ALPN_TCP_V2).as_ref(),
+        )
+        .expect_err("tcp/v2 must be rejected in gateway mode");
         assert!(err.contains("gateway mode only serves"));
         let err = alpn_allowed_in_mode(
             &gateway(),
