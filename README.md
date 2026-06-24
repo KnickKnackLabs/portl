@@ -15,19 +15,18 @@ used for NAT traversal when direct paths are unavailable.
 
 ## Status
 
-**v0.12.0** — OpenSSH compatibility release for native `portl ssh --stdio`
-configs. Generated no-sshd SSH configs now support raw no-PTY shells,
-normal exec, PTY shell/exec, agent forwarding, local/dynamic TCP forwarding,
-remote TCP forwarding, and direct Unix socket forwarding when tickets grant the
-requested socket path. Portl also has SSH-style TCP, UDP, and Unix socket
-forwarding with grouped startup summaries and lifecycle logs, plus shared
-`-L`/`-R` forwarding flags on `portl shell`, `portl attach`, `portl ssh`, and
-`portl ssh-proxy`. Persistent
-terminal sessions remain available via
-`portl/session/v1`, provider discovery, Herdr bridge attach, zmx-control
-support, tmux `-CC` compatibility, `PORTL-S-*` short codes for importing shared
-session access through `portl accept`, and stable host-suffixed labels for
-paired machines and saved access.
+**v0.13.0** — Apple embedding release. Tagged releases now include a
+`PortlFFI-<tag>-apple.xcframework.zip` asset for iOS device, iOS Simulator,
+and macOS arm64 app embedding, with a C ABI for identity creation, saved
+access import, peer invites, shell opening, session attach, input, resize,
+close, and callback event delivery. Portl also has SSH-style TCP, UDP, and
+Unix socket forwarding with grouped startup summaries and lifecycle logs,
+plus shared `-L`/`-R` forwarding flags on `portl shell`, `portl attach`,
+`portl ssh`, and `portl ssh-proxy`. Persistent terminal sessions remain
+available via `portl/session/v1`, provider discovery, Herdr bridge attach,
+zmx-control support, tmux `-CC` compatibility, `PORTL-S-*` short codes for
+importing shared session access through `portl accept`, and stable
+host-suffixed labels for paired machines and saved access.
 
 OSC and escape-sequence leaks across attach, reload, and
 multi-attach scenarios are mitigated by four defense layers: a
@@ -71,7 +70,7 @@ curl -fsSL \
 
 The installer is idempotent. Re-run it to upgrade; by default it preserves
 whether this machine was already configured as a client or agent. Set
-`PORTL_VERSION=0.12.0` to pin a release. Use `--agent=off` to disable the
+`PORTL_VERSION=0.13.0` to pin a release. Use `--agent=off` to disable the
 service, or `--uninstall` to remove binaries and service while keeping
 `$PORTL_HOME`. By default, Portl stores local state under `~/.portl` on
 all operating systems (`config/`, `data/`, `state/`, and `run/` subdirs).
@@ -94,7 +93,7 @@ portl-agent down            # stop/disable service, keeping state
 
 ```bash
 # mise
-mise use -g github:KnickKnackLabs/portl@0.12.0
+mise use -g github:KnickKnackLabs/portl@0.13.0
 # mise only shims `portl`; run install.sh with PORTL_AGENT=1 if this machine should be shared.
 
 # cargo

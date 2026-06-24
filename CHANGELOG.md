@@ -5,6 +5,8 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.13.0 — 2026-06-24
+
 ### Added
 
 - Added `PortlFFI` as a C ABI crate for embedding Portl client flows in Apple
