@@ -5,6 +5,22 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Added
+
+- Added `PortlFFI` as a C ABI crate for embedding Portl client flows in Apple
+  apps, including identity creation, ticket/session-share import, peer invite
+  acceptance, shell opening, session attach, stdin, resize, close, and callback
+  event delivery.
+- Added Apple embedding release assets named
+  `PortlFFI-<tag>-apple.xcframework.zip`, containing arm64 iOS device, arm64
+  iOS Simulator, and arm64 macOS static-library slices with `PortlFFI.h`.
+
+### Changed
+
+- Release CI now builds and publishes the PortlFFI Apple xcframework alongside
+  the existing CLI assets, and macOS release validation verifies the downloaded
+  zip, checksums, headers, slices, and link smoke.
+
 ## 0.12.0 — 2026-06-19
 
 ### Added

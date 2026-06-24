@@ -20,6 +20,7 @@ jobs:
     permissions:
       contents: read
     steps:
+      - uses: actions/checkout@v5
       - name: Install validation tools
         run: |
           set -euo pipefail
@@ -41,8 +42,27 @@ jobs:
             --pattern '*-apple-darwin.tar.gz.sha256' \
             --pattern '*-apple-darwin.tar.zst' \
             --pattern '*-apple-darwin.tar.zst.sha256' \
+            --pattern 'PortlFFI-*-apple.xcframework.zip' \
+            --pattern 'PortlFFI-*-apple.xcframework.zip.sha256' \
             --dir dist
           ls -la dist
+      - name: Validate Apple embedding xcframework
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          xcframework_zips=(dist/PortlFFI-*-apple.xcframework.zip)
+          if [ "${#xcframework_zips[@]}" -ne 1 ]; then
+            echo "::error ::expected 1 PortlFFI xcframework zip, found ${#xcframework_zips[@]}"
+            printf 'found: %s\n' "${xcframework_zips[@]}"
+            exit 1
+          fi
+
+          archive="${xcframework_zips[0]}"
+          (cd "$(dirname "$archive")" && shasum -a 256 -c "$(basename "$archive").sha256")
+
+          extract_dir="$(mktemp -d)"
+          ditto -x -k "$archive" "$extract_dir"
+          scripts/verify-portl-ffi-xcframework.sh "$extract_dir/PortlFFI.xcframework"
       - name: Validate tarball signatures and native launch
         env:
           TAG: ${{ inputs.tag }}

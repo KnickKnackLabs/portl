@@ -76,6 +76,9 @@ service, or `--uninstall` to remove binaries and service while keeping
 `$PORTL_HOME`. By default, Portl stores local state under `~/.portl` on
 all operating systems (`config/`, `data/`, `state/`, and `run/` subdirs).
 Release artifacts cover macOS and Linux on arm64 / x86_64.
+Apple app embedding releases also include
+`PortlFFI-<tag>-apple.xcframework.zip` with arm64 iOS device, arm64 iOS
+Simulator, and arm64 macOS slices.
 
 Daemon lifecycle commands live on `portl-agent`:
 

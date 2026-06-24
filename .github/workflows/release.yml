@@ -51,6 +51,7 @@ jobs:
           - ghostty musl smoke (aarch64-unknown-linux-musl)
           - cargo deny
           - dep-guard
+          - portl ffi Apple xcframework
           - docker integration smoke
     steps:
       - id: wait
@@ -168,9 +169,45 @@ jobs:
           name: raw-macos-${{ matrix.target }}
           path: dist/portl
 
+  release-apple-ffi-build:
+    name: release Apple PortlFFI xcframework
+    needs: [ci-gate]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-shared-key: "release-portl-ffi-apple"
+          cache-save-if: true
+          cache-on-failure: true
+      - name: Install Apple Rust targets
+        run: |
+          rustup target add \
+            aarch64-apple-ios \
+            aarch64-apple-ios-sim \
+            aarch64-apple-darwin
+      - name: Build PortlFFI Apple xcframework
+        run: ./scripts/build-portl-ffi-xcframework.sh --out dist/apple
+      - name: Package PortlFFI release asset
+        run: |
+          set -euo pipefail
+          asset="PortlFFI-${{ github.ref_name }}-apple.xcframework.zip"
+          (
+            cd dist/apple
+            ditto -c -k --sequesterRsrc --keepParent PortlFFI.xcframework "../${asset}"
+          )
+          (cd dist && shasum -a 256 "${asset}" > "${asset}.sha256")
+      - uses: actions/upload-artifact@v5
+        with:
+          name: release-apple-portlffi
+          path: |
+            dist/PortlFFI-*.xcframework.zip
+            dist/PortlFFI-*.xcframework.zip.sha256
+
   release-publish:
     name: publish GitHub release
-    needs: [release-linux-build]
+    needs: [release-linux-build, release-apple-ffi-build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -181,6 +218,10 @@ jobs:
           pattern: release-linux-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@v5
+        with:
+          name: release-apple-portlffi
+          path: dist
       # Extract only the CHANGELOG section matching this tag's version
       # so the GitHub release body shows what's new in this release,
       # not the full file. CHANGELOG.md uses Keep-a-Changelog style
@@ -331,10 +372,12 @@ jobs:
             "$signing_dir"/portl/developer_id_installer.p12 \
             "$signing_dir"/portl/installer-p12-password
 
-          echo "PORTL_SIGNING_P12=$signing_dir/portl/developer_id_application.p12" >> "$GITHUB_ENV"
-          echo "PORTL_SIGNING_P12_PASSWORD_FILE=$signing_dir/portl/p12-password" >> "$GITHUB_ENV"
-          echo "PORTL_INSTALLER_P12=$signing_dir/portl/developer_id_installer.p12" >> "$GITHUB_ENV"
-          echo "PORTL_INSTALLER_P12_PASSWORD_FILE=$signing_dir/portl/installer-p12-password" >> "$GITHUB_ENV"
+          {
+            echo "PORTL_SIGNING_P12=$signing_dir/portl/developer_id_application.p12"
+            echo "PORTL_SIGNING_P12_PASSWORD_FILE=$signing_dir/portl/p12-password"
+            echo "PORTL_INSTALLER_P12=$signing_dir/portl/developer_id_installer.p12"
+            echo "PORTL_INSTALLER_P12_PASSWORD_FILE=$signing_dir/portl/installer-p12-password"
+          } >> "$GITHUB_ENV"
 
           echo "Developer ID Application certificate:"
           rcodesign analyze-certificate \

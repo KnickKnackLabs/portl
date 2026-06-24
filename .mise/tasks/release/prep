@@ -18,6 +18,7 @@ FIRST_PARTY = {
     "portl-agent",
     "portl-cli",
     "portl-core",
+    "portl-ffi",
     "portl-proto",
     "slicer-portl",
 }
@@ -26,6 +27,7 @@ MANIFESTS = [
     "crates/portl-agent/Cargo.toml",
     "crates/portl-cli/Cargo.toml",
     "crates/portl-core/Cargo.toml",
+    "crates/portl-ffi/Cargo.toml",
     "crates/portl-proto/Cargo.toml",
     "adapters/docker-portl/Cargo.toml",
     "adapters/slicer-portl/Cargo.toml",

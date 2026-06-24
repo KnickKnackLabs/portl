@@ -271,6 +271,31 @@ jobs:
           fi
           echo "OK: rusqlite absent from workspace"
 
+  portl-ffi-apple:
+    name: portl ffi Apple xcframework
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-shared-key: "portl-ffi-apple"
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+      - name: Install Apple Rust targets
+        run: |
+          rustup target add \
+            aarch64-apple-ios \
+            aarch64-apple-ios-sim \
+            aarch64-apple-darwin
+      - name: Build PortlFFI Apple xcframework
+        run: ./scripts/build-portl-ffi-xcframework.sh --out dist/apple
+      - uses: actions/upload-artifact@v5
+        with:
+          name: portl-ffi-apple-xcframework
+          path: dist/apple/PortlFFI.xcframework
+
   docker-smoke:
     name: docker integration smoke
     # Only run after the fast unit checks pass. No point rebuilding
@@ -307,7 +332,8 @@ jobs:
         env:
           PORTL_HOME: /tmp/portl-home
         run: |
-          export PORTL_HOME=$(mktemp -d)
+          PORTL_HOME="$(mktemp -d)"
+          export PORTL_HOME
           ./target/release/portl init
           ./target/release/portl docker run portl-agent:ci --name t1 --env PORTL_REFERENCE_MODE=idle
           ./target/release/portl docker run portl-agent:ci --name t2 --env PORTL_REFERENCE_MODE=idle

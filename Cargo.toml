@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/portl-core",
     "crates/portl-proto",
+    "crates/portl-ffi",
     "crates/portl-agent",
     "crates/portl-cli",
     "adapters/docker-portl",
