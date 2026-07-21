@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+echo "[setup] checking native build dependencies"
+packages=(
+  build-essential
+  ca-certificates
+  clang
+  cmake
+  curl
+  git
+  libssl-dev
+  pkg-config
+  python3
+  tmux
+)
+missing=()
+for package in "${packages[@]}"; do
+  if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'ok installed'; then
+    missing+=("$package")
+  fi
+done
+if ((${#missing[@]})); then
+  sudo apt-get update
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+fi
+
+mise_bin="$HOME/.local/bin/mise"
+if [[ ! -x "$mise_bin" ]]; then
+  echo "[setup] installing mise"
+  curl https://mise.run | sh
+fi
+
+profile_marker="# portl mise environment"
+touch "$HOME/.bash_profile"
+if ! grep -Fqx "$profile_marker" "$HOME/.bash_profile"; then
+  cat >> "$HOME/.bash_profile" <<EOF
+
+$profile_marker
+case "\$PWD" in
+  "$repo_root"|"$repo_root"/*)
+    eval "\$($mise_bin activate bash)"
+    ;;
+esac
+EOF
+fi
+
+echo "[setup] installing mise-managed toolchains and tools"
+eval "$("$mise_bin" activate bash)"
+mise trust "$repo_root/mise.toml"
+mise install --yes
+
+echo "[setup] fetching locked Cargo dependencies"
+cargo fetch --locked
+
+echo "[setup] ready"
+rustc --version
+cargo nextest --version
+sccache --version
+uv --version
+zig version

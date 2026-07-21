@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+mise_bin="$HOME/.local/bin/mise"
+if [[ ! -x "$mise_bin" ]]; then
+  echo "[resume] mise is missing; rerun .agents/setup" >&2
+  exit 1
+fi
+
+eval "$("$mise_bin" activate bash)"
+for command in cargo cargo-nextest sccache uv zig; do
+  if ! command -v "$command" >/dev/null 2>&1; then
+    echo "[resume] $command is missing; rerun .agents/setup" >&2
+    exit 1
+  fi
+done
+
+echo "[resume] development environment ready"

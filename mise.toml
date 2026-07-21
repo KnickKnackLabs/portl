@@ -1,6 +1,9 @@
 [tools]
-"cargo:cargo-nextest" = "latest"
+rust = "1.93.0"
+uv = "0.11.30"
+zig = "0.15.2"
+"github:nextest-rs/nextest" = "cargo-nextest-0.9.140"
 # sccache: compiler-output caching wrapper. Activated workspace-wide via
 # RUSTC_WRAPPER in .cargo/config.toml; biggest wins are on fresh target
 # dirs, branch switches, and CI runners.
-"cargo:sccache" = "latest"
+"github:mozilla/sccache" = "0.16.0"
