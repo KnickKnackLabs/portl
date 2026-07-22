@@ -83,6 +83,13 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
+      - name: Test nextest thread selection
+        run: scripts/tests/nextest-threads-test.sh
+      - name: Select nextest threads
+        run: |
+          threads=$(scripts/nextest-threads.sh)
+          echo "NEXTEST_TEST_THREADS=${threads}" >> "$GITHUB_ENV"
+          echo "Selected nextest threads: ${threads}"
       - run: cargo nextest run --profile ci --workspace --lib --bins --tests
 
   fmt:
@@ -159,7 +166,15 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --profile ci -p portl-agent --features ghostty-vt-static --lib --tests
+      - name: Select nextest threads
+        run: |
+          threads=$(scripts/nextest-threads.sh)
+          echo "NEXTEST_TEST_THREADS=${threads}" >> "$GITHUB_ENV"
+          echo "Selected nextest threads: ${threads}"
+      # Only session_e2e has Ghostty-gated integration coverage. Keep --tests so
+      # every integration target still compiles with the feature without rerunning
+      # the feature-independent suite already covered by the primary test job.
+      - run: cargo nextest run --profile ci -p portl-agent --features ghostty-vt-static --lib --tests -E '(kind(lib) + binary(=session_e2e))'
       - run: cargo nextest run --profile ci -p portl-cli --features ghostty-vt-static -E 'binary(=ghostty_smoke)'
       - run: cargo clippy -p portl-agent -p portl-cli --features ghostty-vt-static --all-targets -- -D warnings
 
