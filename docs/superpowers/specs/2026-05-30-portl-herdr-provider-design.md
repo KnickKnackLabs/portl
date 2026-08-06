@@ -30,6 +30,20 @@ Portl. Portl parses Herdr's length-prefixed bincode protocol around that bridge
 so that future optimizations can use separate Iroh streams for input, resize,
 render, control, and bulk payloads.
 
+Framing is validated centrally before body allocation. Ordinary and unknown
+top-level tags are capped at 2 MiB. Client `ClipboardImage` (tag 2), server
+`Frame` (tag 1), and server `Graphics` (tag 3) may have a 32 MiB outer payload,
+while decoded clipboard image data is capped at 16 MiB. Each attach direction
+shares independent 8 MiB normal and 64 MiB large queued-byte budgets across all
+lanes; permits follow reference-counted frame bytes through coalescers and
+queues and time out after 10 seconds of slow-consumer backpressure. The budget
+counts the complete four-byte-prefixed frame. Partial prefixes and bodies,
+non-canonical tags and lengths, wrong-lane frames, and oversized unknown tags
+fail closed. Portl preserves render and bulk frames opaquely in FIFO order rather
+than deserializing protocol-19 nested collections with its protocol-12 model;
+bounded priority bursts prevent FIFO bulk traffic from starving behind sustained
+control, input, or render traffic.
+
 ## Current Problem
 
 Herdr's built-in `--remote` path is SSH-specific in lifecycle/bootstrap code,
@@ -304,18 +318,37 @@ This rule applies to known provider names only, so ordinary sessions named
 
 ## Herdr Wire Compatibility
 
-Portl needs a minimal copy of Herdr protocol version 11 message types so it can
-deserialize and classify frames. The copy should live in Portl protocol code and
-be explicitly version-named, for example:
+Portl started with a minimal copy of Herdr protocol version 11 message types so
+it could deserialize and classify frames. The implemented model was extended
+through the protocol 12 `Hello`, while preserving a protocol 11 compatibility
+decoder.
+
+Current compatibility note (verified 2026-08-06): Herdr v0.8.0, tag object
+`857196dee1ce98df53efdd3f437aa2ac8a75b608` and peeled commit
+`346411fa21afd297f5ed3b3fa56f9e3fbf7654b7`, uses protocol 19. The current
+default branch at `fc824b99aba9389ffda75f19b3a4aee0ff6ca8b5` also uses
+protocol 19. The authoritative schema is
+[`src/protocol/wire.rs`](https://github.com/herdrdev/herdr/blob/346411fa21afd297f5ed3b3fa56f9e3fbf7654b7/src/protocol/wire.rs).
+
+Portl does not negotiate a Herdr version or rewrite messages. It forwards the
+real `Hello` and `Welcome` unchanged; Herdr requires the client and server
+protocol versions to match exactly. Portl only inspects stable top-level enum
+tags to select transport lanes. Render and unknown/newer control frames remain
+opaque and are preserved FIFO so protocol-19 payloads are never decoded using
+the selective protocol-12 model. Routing is tested through protocol 19,
+including structured input tag 7.
+
+The selective model lives in:
 
 ```text
-portl-core/src/herdr_wire/v11.rs
+crates/portl-core/src/herdr_wire.rs
 ```
 
 Constants:
 
 ```text
-HERDR_PROTOCOL_VERSION = 11
+HERDR_PROTOCOL_VERSION = 12              # modeled fixture layout, not negotiation
+HERDR_LATEST_VERIFIED_PROTOCOL_VERSION = 19
 MAX_FRAME_SIZE = 2 MiB
 MAX_GRAPHICS_FRAME_SIZE = 32 MiB
 MAX_CLIPBOARD_IMAGE_PAYLOAD = 16 MiB
@@ -327,9 +360,10 @@ Portl preserves Herdr's outer framing exactly:
 [u32 little-endian payload length][bincode v2 serde payload]
 ```
 
-If Portl cannot decode a Herdr frame, the attach fails clearly rather than
-silently forwarding partially parsed data. That is safer for a protocol-aware
-transport than degrading to raw bytes after state has diverged.
+Portl rejects malformed framing and unsafe lengths. A well-framed message with
+an unknown additive enum tag is forwarded opaquely on the conservative control
+lane. This avoids requiring a Portl release for every additive Herdr event while
+leaving compatibility acceptance to Herdr's exact-version handshake.
 
 ## Portl Session Wire Extensions
 

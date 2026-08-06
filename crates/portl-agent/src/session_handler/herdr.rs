@@ -4,8 +4,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use iroh::endpoint::SendStream;
 use portl_core::herdr_wire::{
-    ClientLane, FrameDirection, HerdrFrameError, MAX_FRAME_SIZE, RawHerdrFrame, ServerLane,
-    ServerMessage,
+    ClientLane, FrameDirection, HerdrFrameBudget, HerdrReadLimits, RawHerdrFrame, ServerLane,
+    read_herdr_frame,
 };
 use portl_core::wire::session::{SessionAck, SessionStreamKind, SessionSubTail};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -19,42 +19,12 @@ use crate::target_context::TargetProcessContext;
 const HERDR_LANE_BUFFER: usize = 64;
 const HERDR_RESIZE_BUFFER: usize = 1;
 const HERDR_RENDER_PENDING_LIMIT: usize = 16;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HerdrRenderFrameMeta {
-    SemanticFrame { has_graphics: bool },
-    Terminal { full: bool },
-    Unknown,
-}
-
-impl HerdrRenderFrameMeta {
-    fn from_frame(frame: &RawHerdrFrame) -> Result<Self> {
-        Ok(match frame.server_variant_tag()? {
-            1 => match frame.decode_server() {
-                Ok(ServerMessage::Frame(frame)) => Self::SemanticFrame {
-                    has_graphics: !frame.graphics.is_empty(),
-                },
-                _ => Self::Unknown,
-            },
-            2 => match frame.decode_server() {
-                Ok(ServerMessage::Terminal(frame)) => Self::Terminal { full: frame.full },
-                _ => Self::Unknown,
-            },
-            _ => anyhow::bail!("non-render Herdr frame sent through render coalescer"),
-        })
-    }
-}
-
-#[derive(Debug)]
-struct HerdrRenderPendingFrame {
-    meta: HerdrRenderFrameMeta,
-    frame: RawHerdrFrame,
-}
+const HERDR_CLIENT_LANE_WEIGHTS: [u8; 4] = [4, 8, 1, 1];
 
 #[derive(Debug)]
 struct HerdrRenderPendingFrames {
     max: usize,
-    frames: VecDeque<HerdrRenderPendingFrame>,
+    frames: VecDeque<RawHerdrFrame>,
 }
 
 impl HerdrRenderPendingFrames {
@@ -66,30 +36,16 @@ impl HerdrRenderPendingFrames {
     }
 
     fn push_or_return(&mut self, frame: RawHerdrFrame) -> Result<Option<RawHerdrFrame>> {
-        let meta = HerdrRenderFrameMeta::from_frame(&frame)?;
-        match meta {
-            HerdrRenderFrameMeta::SemanticFrame {
-                has_graphics: false,
-            } => self.frames.retain(|pending| {
-                !matches!(
-                    pending.meta,
-                    HerdrRenderFrameMeta::SemanticFrame {
-                        has_graphics: false
-                    }
-                )
-            }),
-            HerdrRenderFrameMeta::Terminal { full: true } => self
-                .frames
-                .retain(|pending| !matches!(pending.meta, HerdrRenderFrameMeta::Terminal { .. })),
-            HerdrRenderFrameMeta::SemanticFrame { has_graphics: true }
-            | HerdrRenderFrameMeta::Terminal { full: false }
-            | HerdrRenderFrameMeta::Unknown => {}
+        if !matches!(frame.server_lane()?, ServerLane::Render) {
+            anyhow::bail!("non-render Herdr frame sent through render queue");
         }
         if self.frames.len() >= self.max {
             return Ok(Some(frame));
         }
-        self.frames
-            .push_back(HerdrRenderPendingFrame { meta, frame });
+        // Portl only models protocol 12, so decoding a protocol-19 Frame just
+        // to coalesce it can allocate attacker-controlled nested collections.
+        // Preserve opaque render frames FIFO instead.
+        self.frames.push_back(frame);
         Ok(None)
     }
 
@@ -98,7 +54,7 @@ impl HerdrRenderPendingFrames {
     }
 
     fn pop_front(&mut self) -> Option<RawHerdrFrame> {
-        self.frames.pop_front().map(|pending| pending.frame)
+        self.frames.pop_front()
     }
 }
 
@@ -195,10 +151,11 @@ pub(crate) struct HerdrAttach {
     client_input_tx: mpsc::Sender<RawHerdrFrame>,
     client_resize: ResizeCoalescer,
     client_bulk_tx: mpsc::Sender<RawHerdrFrame>,
+    client_budget: HerdrFrameBudget,
     server_control_rx: AsyncMutex<Option<mpsc::Receiver<RawHerdrFrame>>>,
     server_render_rx: AsyncMutex<Option<mpsc::Receiver<RawHerdrFrame>>>,
     server_bulk_rx: AsyncMutex<Option<mpsc::Receiver<RawHerdrFrame>>>,
-    _tasks: Vec<JoinHandle<()>>,
+    tasks: Vec<JoinHandle<()>>,
 }
 
 pub(crate) fn is_herdr_stream_kind(kind: SessionStreamKind) -> bool {
@@ -287,16 +244,39 @@ pub(crate) async fn serve_substream(
         .ok_or_else(|| anyhow!("herdr attach session not found"))?;
     match tail.kind {
         SessionStreamKind::HerdrClientControl => {
-            pump_herdr_client_frames(recv, attach.client_control_tx.clone()).await
+            pump_herdr_client_frames(
+                recv,
+                attach.client_control_tx.clone(),
+                attach.client_budget.clone(),
+                ClientLane::Control,
+            )
+            .await
         }
         SessionStreamKind::HerdrClientInput => {
-            pump_herdr_client_frames(recv, attach.client_input_tx.clone()).await
+            pump_herdr_client_frames(
+                recv,
+                attach.client_input_tx.clone(),
+                attach.client_budget.clone(),
+                ClientLane::Input,
+            )
+            .await
         }
         SessionStreamKind::HerdrClientResize => {
-            pump_herdr_resize_frames(recv, attach.client_resize.clone()).await
+            pump_herdr_resize_frames(
+                recv,
+                attach.client_resize.clone(),
+                attach.client_budget.clone(),
+            )
+            .await
         }
         SessionStreamKind::HerdrClientBulk => {
-            pump_herdr_client_frames(recv, attach.client_bulk_tx.clone()).await
+            pump_herdr_client_frames(
+                recv,
+                attach.client_bulk_tx.clone(),
+                attach.client_budget.clone(),
+                ClientLane::Bulk,
+            )
+            .await
         }
         SessionStreamKind::HerdrServerControl => {
             let rx = take_receiver(
@@ -349,6 +329,8 @@ fn spawn_herdr_attach(
     let (server_render_tx, server_render_rx) = mpsc::channel(HERDR_LANE_BUFFER);
     let (server_bulk_tx, server_bulk_rx) = mpsc::channel(HERDR_LANE_BUFFER);
     let (exit_tx, exit_rx) = watch::channel(None);
+    let client_budget = HerdrFrameBudget::default();
+    let server_budget = HerdrFrameBudget::default();
 
     let mut tasks = Vec::new();
     tasks.push(tokio::spawn(async move {
@@ -370,6 +352,7 @@ fn spawn_herdr_attach(
             server_control_tx,
             server_render_tx,
             server_bulk_tx,
+            server_budget,
         )
         .await
         {
@@ -403,10 +386,11 @@ fn spawn_herdr_attach(
         client_input_tx,
         client_resize: ResizeCoalescer::new(client_resize_tx),
         client_bulk_tx,
+        client_budget,
         server_control_rx: AsyncMutex::new(Some(server_control_rx)),
         server_render_rx: AsyncMutex::new(Some(server_render_rx)),
         server_bulk_rx: AsyncMutex::new(Some(server_bulk_rx)),
-        _tasks: tasks,
+        tasks,
     }))
 }
 
@@ -431,6 +415,9 @@ impl HerdrAttach {
 impl Drop for HerdrAttach {
     fn drop(&mut self) {
         self.terminate_bridge();
+        for task in &self.tasks {
+            task.abort();
+        }
     }
 }
 
@@ -454,13 +441,24 @@ async fn take_receiver(
 async fn pump_herdr_client_frames(
     mut recv: BufferedRecv,
     tx: mpsc::Sender<RawHerdrFrame>,
+    budget: HerdrFrameBudget,
+    expected_lane: ClientLane,
 ) -> Result<()> {
-    while let Some(frame) = read_next_raw_frame(&mut recv, FrameDirection::ClientToServer).await? {
-        match frame.client_lane()? {
-            ClientLane::Control | ClientLane::Input | ClientLane::Bulk | ClientLane::Resize => {
-                tx.send(frame).await.context("send herdr client frame")?;
-            }
+    while let Some(frame) = read_herdr_frame(
+        &mut recv,
+        FrameDirection::ClientToServer,
+        &budget,
+        &HerdrReadLimits::default(),
+    )
+    .await?
+    {
+        let actual_lane = frame.client_lane()?;
+        if actual_lane != expected_lane {
+            anyhow::bail!(
+                "Herdr {actual_lane:?} frame received on {expected_lane:?} client stream"
+            );
         }
+        tx.send(frame).await.context("send herdr client frame")?;
     }
     Ok(())
 }
@@ -468,8 +466,19 @@ async fn pump_herdr_client_frames(
 async fn pump_herdr_resize_frames(
     mut recv: BufferedRecv,
     coalescer: ResizeCoalescer,
+    budget: HerdrFrameBudget,
 ) -> Result<()> {
-    while let Some(frame) = read_next_raw_frame(&mut recv, FrameDirection::ClientToServer).await? {
+    while let Some(frame) = read_herdr_frame(
+        &mut recv,
+        FrameDirection::ClientToServer,
+        &budget,
+        &HerdrReadLimits::default(),
+    )
+    .await?
+    {
+        if frame.client_lane()? != ClientLane::Resize {
+            anyhow::bail!("non-resize Herdr frame received on resize client stream");
+        }
         coalescer.send(frame).await?;
     }
     Ok(())
@@ -505,63 +514,109 @@ where
     if !hello.is_client_hello()? {
         anyhow::bail!("first Herdr client control frame must be Hello");
     }
-    stdin
-        .write_all(hello.framed_bytes())
-        .await
-        .context("write herdr Hello to bridge")?;
-    stdin.flush().await.context("flush herdr bridge stdin")?;
+    write_herdr_bridge_frame(&mut stdin, &hello).await?;
 
-    let mut control_open = true;
-    let mut input_open = true;
-    let mut resize_open = true;
-    let mut bulk_open = true;
-    while control_open || input_open || resize_open || bulk_open {
-        let frame = tokio::select! {
+    // Weighted round robin is work-conserving but bounds starvation: control
+    // and input receive larger bursts while resize and bulk each get a turn.
+    let mut open = [true; 4];
+    let mut cursor = 0_usize;
+    let mut remaining = HERDR_CLIENT_LANE_WEIGHTS[cursor];
+    while open.iter().any(|is_open| *is_open) {
+        let mut selected = None;
+        for _ in 0..4 {
+            if remaining == 0 || !open[cursor] {
+                cursor = (cursor + 1) % 4;
+                remaining = HERDR_CLIENT_LANE_WEIGHTS[cursor];
+            }
+            let result = match cursor {
+                0 => control_rx.try_recv(),
+                1 => input_rx.try_recv(),
+                2 => resize_rx.try_recv(),
+                3 => bulk_rx.try_recv(),
+                _ => unreachable!(),
+            };
+            match result {
+                Ok(frame) => {
+                    selected = Some((frame, cursor));
+                    break;
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => open[cursor] = false,
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+            cursor = (cursor + 1) % 4;
+            remaining = HERDR_CLIENT_LANE_WEIGHTS[cursor];
+        }
+        if selected.is_none() && !open.iter().any(|is_open| *is_open) {
+            break;
+        }
+
+        let (frame, lane) = if let Some(selected) = selected {
+            selected
+        } else {
+            let selected = tokio::select! {
             biased;
-            frame = control_rx.recv(), if control_open => {
+            frame = control_rx.recv(), if open[0] => {
                 if let Some(frame) = frame {
-                    Some(frame)
+                    Some((frame, 0))
                 } else {
-                    control_open = false;
+                    open[0] = false;
                     None
                 }
             }
-            frame = input_rx.recv(), if input_open => {
+            frame = input_rx.recv(), if open[1] => {
                 if let Some(frame) = frame {
-                    Some(frame)
+                    Some((frame, 1))
                 } else {
-                    input_open = false;
+                    open[1] = false;
                     None
                 }
             }
-            frame = resize_rx.recv(), if resize_open => {
+            frame = resize_rx.recv(), if open[2] => {
                 if let Some(frame) = frame {
-                    Some(frame)
+                    Some((frame, 2))
                 } else {
-                    resize_open = false;
+                    open[2] = false;
                     None
                 }
             }
-            frame = bulk_rx.recv(), if bulk_open => {
+            frame = bulk_rx.recv(), if open[3] => {
                 if let Some(frame) = frame {
-                    Some(frame)
+                    Some((frame, 3))
                 } else {
-                    bulk_open = false;
+                    open[3] = false;
                     None
                 }
             }
+            };
+            let Some(selected) = selected else {
+                continue;
+            };
+            selected
         };
-        let Some(frame) = frame else {
-            continue;
-        };
-        stdin
-            .write_all(frame.framed_bytes())
-            .await
-            .context("write herdr frame to bridge")?;
-        stdin.flush().await.context("flush herdr bridge stdin")?;
+        if lane != cursor {
+            cursor = lane;
+            remaining = HERDR_CLIENT_LANE_WEIGHTS[cursor];
+        }
+        remaining = remaining.saturating_sub(1);
+        if remaining == 0 {
+            cursor = (cursor + 1) % 4;
+            remaining = HERDR_CLIENT_LANE_WEIGHTS[cursor];
+        }
+        write_herdr_bridge_frame(&mut stdin, &frame).await?;
     }
     let _ = stdin.shutdown().await;
     Ok(())
+}
+
+async fn write_herdr_bridge_frame<W>(writer: &mut W, frame: &RawHerdrFrame) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer
+        .write_all(frame.framed_bytes())
+        .await
+        .context("write herdr frame to bridge")?;
+    writer.flush().await.context("flush herdr bridge stdin")
 }
 
 async fn pump_bridge_stdout_to_server_lanes<R>(
@@ -569,12 +624,19 @@ async fn pump_bridge_stdout_to_server_lanes<R>(
     control_tx: mpsc::Sender<RawHerdrFrame>,
     render_tx: mpsc::Sender<RawHerdrFrame>,
     bulk_tx: mpsc::Sender<RawHerdrFrame>,
+    budget: HerdrFrameBudget,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
 {
     let render_sender = HerdrRenderSender::new(render_tx);
-    while let Some(frame) = read_next_raw_frame(&mut stdout, FrameDirection::ServerToClient).await?
+    while let Some(frame) = read_herdr_frame(
+        &mut stdout,
+        FrameDirection::ServerToClient,
+        &budget,
+        &HerdrReadLimits::default(),
+    )
+    .await?
     {
         match frame.server_lane()? {
             ServerLane::Control => control_tx
@@ -586,43 +648,6 @@ where
         }
     }
     Ok(())
-}
-
-async fn read_next_raw_frame<R>(
-    reader: &mut R,
-    direction: FrameDirection,
-) -> Result<Option<RawHerdrFrame>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut len_buf = [0_u8; 4];
-    match reader.read_exact(&mut len_buf).await {
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(err) => return Err(err).context("read herdr frame length"),
-    }
-    let claimed = u32::from_le_bytes(len_buf) as usize;
-    if claimed > MAX_FRAME_SIZE {
-        return Err(HerdrFrameError::Oversized {
-            claimed,
-            max: MAX_FRAME_SIZE,
-        })
-        .context("decode herdr frame");
-    }
-    let mut framed = Vec::with_capacity(4 + claimed);
-    framed.extend_from_slice(&len_buf);
-    let mut payload = vec![0_u8; claimed];
-    reader
-        .read_exact(&mut payload)
-        .await
-        .context("read herdr frame payload")?;
-    framed.extend_from_slice(&payload);
-    match direction {
-        FrameDirection::ClientToServer => RawHerdrFrame::decode_client_from_bytes(&framed),
-        FrameDirection::ServerToClient => RawHerdrFrame::decode_server_from_bytes(&framed),
-    }
-    .map(Some)
-    .context("decode herdr frame")
 }
 
 #[derive(Clone)]
@@ -773,7 +798,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn herdr_bridge_sender_coalesces_semantic_render_backlog() {
+    async fn herdr_bridge_sender_preserves_semantic_render_fifo() {
         let (mut stdout_writer, stdout_reader) = tokio::io::duplex(8192);
         let (control_tx, _control_rx) = mpsc::channel(4);
         let (render_tx, mut render_rx) = mpsc::channel(1);
@@ -787,6 +812,7 @@ mod tests {
             control_tx,
             render_tx,
             bulk_tx,
+            HerdrFrameBudget::default(),
         ));
         write_server_frames(&mut stdout_writer, &frames).await;
         drop(stdout_writer);
@@ -803,13 +829,7 @@ mod tests {
         {
             delivered.push(frame);
         }
-        assert!(
-            delivered.len() < frames.len(),
-            "expected stale semantic frames to be coalesced; delivered {} of {}",
-            delivered.len(),
-            frames.len()
-        );
-        assert_eq!(delivered.last(), frames.last());
+        assert_eq!(delivered, frames);
     }
 
     #[tokio::test]
@@ -827,6 +847,7 @@ mod tests {
             control_tx,
             render_tx,
             bulk_tx,
+            HerdrFrameBudget::default(),
         ));
         write_server_frames(&mut stdout_writer, &frames).await;
         drop(stdout_writer);
@@ -870,6 +891,7 @@ mod tests {
             control_tx,
             render_tx,
             bulk_tx,
+            HerdrFrameBudget::default(),
         ));
         write_server_frames(&mut stdout_writer, &frames).await;
         drop(stdout_writer);
@@ -880,6 +902,88 @@ mod tests {
             delivered.push(frame);
         }
         assert_eq!(delivered, frames);
+    }
+
+    #[tokio::test]
+    async fn client_lane_scheduler_prioritizes_without_starving_any_lane() {
+        let (writer, mut reader) = tokio::io::duplex(65_536);
+        let (control_tx, control_rx) = mpsc::channel(32);
+        let (input_tx, input_rx) = mpsc::channel(32);
+        let (resize_tx, resize_rx) = mpsc::channel(32);
+        let (bulk_tx, bulk_rx) = mpsc::channel(32);
+        control_tx.send(hello_frame()).await.unwrap();
+        for _ in 0..16 {
+            control_tx
+                .send(RawHerdrFrame::encode_client(&ClientMessage::Detach).unwrap())
+                .await
+                .unwrap();
+        }
+        let input =
+            RawHerdrFrame::encode_client(&ClientMessage::Input { data: vec![b'x'] }).unwrap();
+        for _ in 0..8 {
+            input_tx.send(input.clone()).await.unwrap();
+        }
+        let resize = RawHerdrFrame::encode_client(&ClientMessage::Resize {
+            cols: 100,
+            rows: 40,
+            cell_width_px: 0,
+            cell_height_px: 0,
+        })
+        .unwrap();
+        for _ in 0..2 {
+            resize_tx.send(resize.clone()).await.unwrap();
+        }
+        let bulk = RawHerdrFrame::encode_client(&ClientMessage::ClipboardImage {
+            extension: "png".to_owned(),
+            data: vec![1, 2, 3],
+        })
+        .unwrap();
+        for _ in 0..2 {
+            bulk_tx.send(bulk.clone()).await.unwrap();
+        }
+        drop(control_tx);
+        drop(input_tx);
+        drop(resize_tx);
+        drop(bulk_tx);
+
+        let pump = tokio::spawn(pump_client_lanes_to_bridge(
+            writer, control_rx, input_rx, resize_rx, bulk_rx,
+        ));
+        let budget = HerdrFrameBudget::default();
+        let mut seen_input_at = None;
+        let mut seen_resize_at = None;
+        let mut seen_bulk_at = None;
+        for index in 0..29 {
+            let frame = read_herdr_frame(
+                &mut reader,
+                FrameDirection::ClientToServer,
+                &budget,
+                &HerdrReadLimits::default(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            if frame == input && seen_input_at.is_none() {
+                seen_input_at = Some(index);
+            } else if frame == resize && seen_resize_at.is_none() {
+                seen_resize_at = Some(index);
+            } else if frame == bulk && seen_bulk_at.is_none() {
+                seen_bulk_at = Some(index);
+            }
+        }
+        pump.await.unwrap().unwrap();
+        assert!(
+            seen_input_at.is_some_and(|index| index <= 5),
+            "input frame starved behind control traffic: {seen_input_at:?}"
+        );
+        assert!(
+            seen_resize_at.is_some_and(|index| index <= 13),
+            "resize frame starved behind high-priority traffic: {seen_resize_at:?}"
+        );
+        assert!(
+            seen_bulk_at.is_some_and(|index| index <= 14),
+            "bulk frame starved behind other lanes: {seen_bulk_at:?}"
+        );
     }
 
     #[tokio::test]
@@ -899,6 +1003,7 @@ mod tests {
             control_tx,
             render_tx,
             bulk_tx,
+            HerdrFrameBudget::default(),
         ));
         write_server_frames(&mut stdout_writer, &frames).await;
 
@@ -935,18 +1040,29 @@ mod tests {
         drop(resize_tx);
         drop(bulk_tx);
 
-        let first = read_next_raw_frame(&mut reader, FrameDirection::ClientToServer)
-            .await
-            .unwrap()
-            .unwrap();
+        let budget = HerdrFrameBudget::default();
+        let first = read_herdr_frame(
+            &mut reader,
+            FrameDirection::ClientToServer,
+            &budget,
+            &HerdrReadLimits::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(matches!(
             first.decode_client().unwrap(),
             ClientMessage::Hello { .. }
         ));
-        let second = read_next_raw_frame(&mut reader, FrameDirection::ClientToServer)
-            .await
-            .unwrap()
-            .unwrap();
+        let second = read_herdr_frame(
+            &mut reader,
+            FrameDirection::ClientToServer,
+            &budget,
+            &HerdrReadLimits::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(second, input);
         pump.await.unwrap().unwrap();
     }

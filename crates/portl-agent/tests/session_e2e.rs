@@ -8,8 +8,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use portl_agent::{AgentConfig, DiscoveryConfig, run_task};
 use portl_core::herdr_wire::{
-    ClientKeybindings, ClientLaunchMode, ClientMessage, FrameDirection, HERDR_PROTOCOL_VERSION,
-    RawHerdrFrame, RenderEncoding, ServerMessage,
+    ClientKeybindings, ClientLaunchMode, ClientMessage, FrameDirection,
+    HERDR_LATEST_VERIFIED_PROTOCOL_VERSION, RawHerdrFrame, RenderEncoding, ServerMessage,
 };
 use portl_core::id::Identity;
 use portl_core::net::shell_client::PtyCfg;
@@ -124,7 +124,7 @@ async fn session_herdr_provider_bridges_protocol_lanes() -> Result<()> {
     let fake_herdr = temp.path().join("herdr");
     let log = temp.path().join("herdr.log");
     let welcome = RawHerdrFrame::encode_server(&ServerMessage::Welcome {
-        version: HERDR_PROTOCOL_VERSION,
+        version: HERDR_LATEST_VERIFIED_PROTOCOL_VERSION,
         encoding: RenderEncoding::SemanticFrame,
         error: None,
     })?;
@@ -152,7 +152,7 @@ async fn session_herdr_provider_bridges_protocol_lanes() -> Result<()> {
 
     assert_eq!(attach.provider, "herdr");
     let hello = RawHerdrFrame::encode_client(&ClientMessage::Hello {
-        version: HERDR_PROTOCOL_VERSION,
+        version: HERDR_LATEST_VERIFIED_PROTOCOL_VERSION,
         cols: 80,
         rows: 24,
         cell_width_px: 0,
@@ -171,7 +171,7 @@ async fn session_herdr_provider_bridges_protocol_lanes() -> Result<()> {
     assert!(matches!(
         received_welcome.decode_server()?,
         ServerMessage::Welcome {
-            version: HERDR_PROTOCOL_VERSION,
+            version: HERDR_LATEST_VERIFIED_PROTOCOL_VERSION,
             ..
         }
     ));
@@ -226,7 +226,7 @@ async fn session_herdr_bridge_exits_when_attach_control_closes() -> Result<()> {
     let fake_herdr = temp.path().join("herdr");
     let log = temp.path().join("herdr.log");
     let welcome = RawHerdrFrame::encode_server(&ServerMessage::Welcome {
-        version: HERDR_PROTOCOL_VERSION,
+        version: HERDR_LATEST_VERIFIED_PROTOCOL_VERSION,
         encoding: RenderEncoding::SemanticFrame,
         error: None,
     })?;
@@ -253,7 +253,7 @@ async fn session_herdr_bridge_exits_when_attach_control_closes() -> Result<()> {
     .await?;
 
     let hello = RawHerdrFrame::encode_client(&ClientMessage::Hello {
-        version: HERDR_PROTOCOL_VERSION,
+        version: HERDR_LATEST_VERIFIED_PROTOCOL_VERSION,
         cols: 80,
         rows: 24,
         cell_width_px: 0,

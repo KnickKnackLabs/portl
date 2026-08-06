@@ -5,6 +5,20 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Changed
+
+- Verified Herdr transport routing against Herdr v0.8.0 protocol 19, route its
+  structured input events on the input lane, and preserve newer control events
+  opaquely instead of applying stale protocol-12 coalescing semantics.
+- Hardened Herdr framing before allocation: ordinary and unknown messages are
+  limited to 2 MiB, client clipboard images and server frame/graphics messages
+  may use a 32 MiB outer frame, and clipboard image data is limited to 16 MiB.
+  All attach lanes now share separate 8 MiB normal and 64 MiB large queued-byte
+  budgets with a 10-second slow-consumer timeout; frame clones share both bytes
+  and accounting permits. Partial prefixes and bodies, malformed tags, wrong-lane
+  frames, and oversized unknown messages now fail closed; bounded priority bursts
+  keep input, control, and render responsive without starving FIFO bulk traffic.
+
 ## 0.13.0 — 2026-06-24
 
 ### Added
