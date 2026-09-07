@@ -1414,7 +1414,7 @@ mod tests {
 
         async fn check_server_key(
             &mut self,
-            _server_public_key: &ssh_key::PublicKey,
+            _server_public_key: &russh::cert::PublicKeyOrCertificate,
         ) -> Result<bool, Self::Error> {
             Ok(true)
         }
@@ -1572,7 +1572,7 @@ mod tests {
 
         async fn check_server_key(
             &mut self,
-            _server_public_key: &ssh_key::PublicKey,
+            _server_public_key: &russh::cert::PublicKeyOrCertificate,
         ) -> Result<bool, Self::Error> {
             Ok(true)
         }
