@@ -178,6 +178,10 @@ deprovision   → remove node from flake; nixos-rebuild; the agent secret
 
 ### 4.5 `manual-portl`
 
+> Historical proposal, not a supported adapter. The crate only ever printed
+> an M0 placeholder and has been removed. For manual hosts, follow the
+> [README quickstart](../../README.md#quickstart-share-this-machine).
+
 A "do it yourself" adapter. `provision` just prints:
 
 ```

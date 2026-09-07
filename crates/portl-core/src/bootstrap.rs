@@ -2,10 +2,9 @@
 //!
 //! The core protocol only needs a small lifecycle surface: provision a
 //! target, register the target's endpoint locally, query its runtime
-//! status, and tear it down. Concrete adapters (docker, slicer, manual,
-//! future cloud backends) keep any adapter-specific state inside the
-//! opaque [`Handle::inner`] JSON blob so the trait stays object-safe and
-//! non-generic.
+//! status, and tear it down. Concrete adapters (docker and slicer) keep
+//! any adapter-specific state inside the opaque [`Handle::inner`] JSON
+//! blob so the trait stays object-safe and non-generic.
 
 use anyhow::Result;
 use async_trait::async_trait;

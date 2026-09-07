@@ -8,7 +8,6 @@ members = [
     "crates/portl-cli",
     "adapters/docker-portl",
     "adapters/slicer-portl",
-    "adapters/manual-portl",
 ]
 
 [workspace.package]
