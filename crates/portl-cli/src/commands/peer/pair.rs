@@ -2,15 +2,17 @@
 //! the inviter-chosen peer relationship.
 
 use std::io::{self, IsTerminal, Write as _};
+use std::path::Path;
 use std::process::ExitCode;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use iroh::EndpointAddr;
 use iroh_base::EndpointId;
-use portl_core::id::{Identity, store};
+use portl_core::id::store;
+use portl_core::pair_accept::{SaveAcceptedPeerOptions, save_accepted_peer};
 use portl_core::pair_code::InviteCode;
-use portl_core::peer_store::{PeerEntry, PeerOrigin, PeerStore};
+use portl_core::peer_store::PeerStore;
 use portl_proto::pair_v1::{ALPN_PAIR_V1, PairRequest, PairResponse, PairResult};
 const PAIR_RESPONSE_MAX_BYTES: usize = 8 * 1024;
 
@@ -58,21 +60,14 @@ async fn run_async(invite: &InviteCode) -> Result<ExitCode> {
     let endpoint =
         crate::client_endpoint::bind_pairing_client_endpoint_with_config(&identity, &client_cfg)
             .await?;
-    let result = run_async_with_endpoint(
-        invite,
-        &identity,
-        &our_eid_hex,
-        caller_relay_hint,
-        &endpoint,
-    )
-    .await;
+    let result =
+        run_async_with_endpoint(invite, &our_eid_hex, caller_relay_hint, &endpoint).await;
     crate::commands::peer_resolve::close_client_endpoint(endpoint, "pair command").await;
     result
 }
 
 async fn run_async_with_endpoint(
     invite: &InviteCode,
-    identity: &Identity,
     our_eid_hex: &str,
     caller_relay_hint: Option<String>,
     endpoint: &iroh::Endpoint,
@@ -147,46 +142,29 @@ async fn run_async_with_endpoint(
 
     connection.close(0u32.into(), b"pair complete");
 
-    apply_response(identity, invite, our_eid_hex, &response)
+    apply_response(invite, &response, &PeerStore::default_path())
 }
 
 fn apply_response(
-    identity: &Identity,
     invite: &InviteCode,
-    _our_eid_hex: &str,
     response: &PairResponse,
+    peers_path: &Path,
 ) -> Result<ExitCode> {
-    let (their_accepts_from_me, they_accept_from_us) =
-        invite.initiator.relationship().acceptor_peer_flags();
-
     match &response.result {
         PairResult::Ok => {
-            let inviter_eid_hex = hex::encode(invite.inviter_eid);
-            let peers_path = PeerStore::default_path();
-            let mut peers = PeerStore::load(&peers_path)?;
-            let label = choose_local_label(
-                &peers,
-                response.responder_self_label.as_deref(),
-                &inviter_eid_hex,
-            );
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
-            peers
-                .insert_or_update(PeerEntry {
-                    label: label.clone(),
-                    endpoint_id_hex: inviter_eid_hex,
-                    accepts_from_them: their_accepts_from_me,
-                    they_accept_from_me: they_accept_from_us,
-                    since: now,
-                    origin: PeerOrigin::Paired,
-                    last_hold_at: None,
-                    is_self: false,
-                    relay_hint: response.responder_relay_hint.clone(),
-                    schema_version: 2,
-                })
-                .context("insert paired peer locally")?;
-            peers.save(&peers_path).context("save peer store")?;
+            let accepted = save_accepted_peer(
+                invite,
+                SaveAcceptedPeerOptions {
+                    responder_self_label: response.responder_self_label.as_deref(),
+                    responder_relay_hint: response.responder_relay_hint.clone(),
+                    now_unix: now,
+                },
+                peers_path,
+            )?;
+            let label = accepted.label;
             tracing::info!(
                 label = %label,
                 initiator = ?invite.initiator,
@@ -203,7 +181,6 @@ fn apply_response(
                 invite.initiator,
             );
             println!("paired with {label}. {relationship}{relay_note}");
-            let _ = identity; // consumed for side-effect binding above
             Ok(ExitCode::SUCCESS)
         }
         PairResult::NonceExpired => {
@@ -287,23 +264,86 @@ fn acceptor_relationship_sentence(
     }
 }
 
-fn choose_local_label(
-    peers: &PeerStore,
-    responder_self_label: Option<&str>,
-    inviter_eid_hex: &str,
-) -> String {
-    let candidate =
-        responder_self_label.unwrap_or(&inviter_eid_hex[..8.min(inviter_eid_hex.len())]);
-    if !peers.iter().any(|e| e.label == candidate) {
-        return candidate.to_owned();
-    }
-    format!(
-        "{candidate}-{suffix}",
-        suffix = &inviter_eid_hex[..4.min(inviter_eid_hex.len())]
-    )
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use portl_core::pair_code::InitiatorMode;
 
-#[allow(dead_code)]
-fn _keep_imports_alive() {
-    let _ = Duration::from_secs(1);
+    fn response(result: PairResult) -> PairResponse {
+        PairResponse {
+            version: 1,
+            result,
+            responder_relay_hint: Some("https://relay.example/".to_owned()),
+            responder_chosen_label: None,
+            responder_self_label: Some("devbox".to_owned()),
+        }
+    }
+
+    #[test]
+    fn accepted_response_preserves_relationship_and_label_selection() {
+        for (mode, inbound, outbound) in [
+            (InitiatorMode::Mutual, true, true),
+            (InitiatorMode::Me, true, false),
+            (InitiatorMode::Them, false, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let peers_path = dir.path().join("peers.json");
+            let invite = InviteCode::new([7; 32], [9; 16], 4_000, mode, None);
+            let mut reply = response(PairResult::Ok);
+            assert_eq!(
+                apply_response(&invite, &reply, &peers_path).unwrap(),
+                ExitCode::SUCCESS
+            );
+            let peers = PeerStore::load(&peers_path).unwrap();
+            let original = peers.get_by_label("devbox").unwrap();
+            assert_eq!(original.endpoint_id_hex, hex::encode([7; 32]));
+            assert_eq!(original.accepts_from_them, inbound);
+            assert_eq!(original.they_accept_from_me, outbound);
+            assert_eq!(original.relay_hint, reply.responder_relay_hint);
+
+            let mut another = invite.clone();
+            another.inviter_eid = [8; 32];
+            apply_response(&another, &reply, &peers_path).unwrap();
+            let updated = PeerStore::load(&peers_path).unwrap();
+            assert_eq!(updated.get_by_label("devbox"), Some(original));
+            assert_eq!(
+                updated.get_by_label("devbox-0808").unwrap().endpoint_id_hex,
+                hex::encode([8; 32])
+            );
+
+            another.inviter_eid = [9; 32];
+            reply.responder_self_label = None;
+            apply_response(&another, &reply, &peers_path).unwrap();
+            assert!(
+                PeerStore::load(&peers_path)
+                    .unwrap()
+                    .get_by_label("09090909")
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_response_leaves_peer_store_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let peers_path = dir.path().join("peers.json");
+        let invite = InviteCode::new([7; 32], [9; 16], 4_000, InitiatorMode::Them, None);
+        apply_response(&invite, &response(PairResult::Ok), &peers_path).unwrap();
+        let before = std::fs::read(&peers_path).unwrap();
+
+        for result in [
+            PairResult::NonceExpired,
+            PairResult::NonceUnknown,
+            PairResult::AlreadyPaired {
+                existing_label: "devbox".to_owned(),
+            },
+            PairResult::PolicyRejected("disabled".to_owned()),
+        ] {
+            assert_eq!(
+                apply_response(&invite, &response(result), &peers_path).unwrap(),
+                ExitCode::FAILURE
+            );
+            assert_eq!(std::fs::read(&peers_path).unwrap(), before);
+        }
+    }
 }
