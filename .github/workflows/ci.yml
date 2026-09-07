@@ -21,10 +21,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  # CI checks release compilation and linking without expensive cross-crate LTO.
-  # Published artifacts still use Cargo.toml's full release profile.
-  CARGO_PROFILE_RELEASE_LTO: "false"
-  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
   # .cargo/config.toml sets `rustc-wrapper = "sccache"`. Every cargo
   # invocation below needs sccache on PATH; mozilla-actions/sccache-
   # action installs it and wires the GitHub Actions cache backend via
