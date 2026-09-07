@@ -20,15 +20,15 @@ rust-version = "1.93"
 
 [workspace.dependencies]
 # transport
-iroh         = "1.0.0-rc.1"
-iroh-base    = "1.0.0-rc.1"
-iroh-relay   = { version = "1.0.0-rc.1", default-features = false, features = ["server"] }
-iroh-tickets = "1.0.0-rc.1"
-iroh-mdns-address-lookup = "0.3.0"
+iroh         = "1.1.0"
+iroh-base    = "1.1.0"
+iroh-relay   = { version = "1.1.0", default-features = false, features = ["server"] }
+iroh-tickets = "1.0.0"
+iroh-mdns-address-lookup = "0.5.0"
 # Keep russh default-features off: upstream defaults enable aws-lc-rs;
 # Portl standardises on rustls/ring to avoid mixed-provider link/runtime
 # surprises on macOS and static Linux builds.
-russh        = { version = "0.61.1", default-features = false, features = ["ring"] }
+russh        = { version = "0.63.2", default-features = false, features = ["ring"] }
 # TLS for the embedded relay server. Feature set matches Portl's ring-only
 # provider policy; no aws-lc-rs.
 rustls          = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
@@ -41,7 +41,6 @@ bytes        = "1"
 socket2      = "0.6"
 futures-util = "0.3"
 http         = "1"
-portable-pty = "0.8"
 dashmap      = "6"
 
 # crypto
@@ -88,7 +87,6 @@ governor          = "0.8"
 zip               = { version = "2", default-features = false, features = ["deflate"] }
 
 # testing
-tokio-test = "0.4"
 prometheus-client = "0.23"
 proptest   = "1.5"
 criterion  = { version = "0.5", features = ["html_reports"] }

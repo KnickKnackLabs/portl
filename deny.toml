@@ -16,6 +16,9 @@ yanked  = "warn"
 # no safe alternative on the iroh side yet; the upstream migration
 # to `pastey` or similar is tracked by netlink-packet-*.
 # Revisit when iroh updates its netwatch dep chain.
+# `bincode` 2 is retained for Herdr protocol 19 byte compatibility. Version 3
+# is a retirement marker that intentionally fails to compile; replacing the
+# codec requires an interoperability migration, not a version bump.
 # `proc-macro-error2` is unmaintained but still pulled in transitively
 # through `age -> i18n-embed-fl`; the RustSec advisory reports no safe
 # upgrade. Revisit when age/i18n-embed migrates away from it.
