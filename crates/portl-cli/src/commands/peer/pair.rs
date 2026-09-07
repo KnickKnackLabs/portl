@@ -60,8 +60,7 @@ async fn run_async(invite: &InviteCode) -> Result<ExitCode> {
     let endpoint =
         crate::client_endpoint::bind_pairing_client_endpoint_with_config(&identity, &client_cfg)
             .await?;
-    let result =
-        run_async_with_endpoint(invite, &our_eid_hex, caller_relay_hint, &endpoint).await;
+    let result = run_async_with_endpoint(invite, &our_eid_hex, caller_relay_hint, &endpoint).await;
     crate::commands::peer_resolve::close_client_endpoint(endpoint, "pair command").await;
     result
 }
@@ -301,7 +300,7 @@ mod tests {
             assert_eq!(original.they_accept_from_me, outbound);
             assert_eq!(original.relay_hint, reply.responder_relay_hint);
 
-            let mut another = invite.clone();
+            let mut another = invite;
             another.inviter_eid = [8; 32];
             apply_response(&another, &reply, &peers_path).unwrap();
             let updated = PeerStore::load(&peers_path).unwrap();

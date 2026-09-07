@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use assert_cmd::cargo::CommandCargoExt;
 use ed25519_dalek::SigningKey;
@@ -13,7 +14,13 @@ use portl_core::target_resolve::interactive_shell_caps;
 use portl_core::ticket::mint::mint_root;
 use portl_core::ticket_store::TicketStore;
 
-const EXPIRES: u64 = 4_000_000_000;
+fn expires_at() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3_600
+}
 
 fn identity(byte: u8) -> Identity {
     Identity::from_signing_key(SigningKey::from_bytes(&[byte; 32]))
@@ -24,7 +31,7 @@ fn ticket(issuer: &Identity, expires: u64) -> String {
         issuer.signing_key(),
         EndpointAddr::new(issuer.endpoint_id()),
         interactive_shell_caps(),
-        0,
+        expires.saturating_sub(7_200),
         expires,
         Some(issuer.verifying_key()),
     )
@@ -53,7 +60,7 @@ fn assert_success(output: &Output) {
 #[test]
 fn ticket_save_normalizes_labels_and_rejects_empty_labels() {
     let dir = tempfile::tempdir().unwrap();
-    let ticket = ticket(&identity(1), EXPIRES);
+    let ticket = ticket(&identity(1), expires_at());
     let output = save(dir.path(), &["  work  ", &ticket]);
     assert_success(&output);
     assert!(String::from_utf8_lossy(&output.stdout).contains("saved ticket 'work'"));
@@ -75,15 +82,19 @@ fn ticket_save_normalizes_labels_and_rejects_empty_labels() {
 fn ticket_save_only_renews_with_later_access_for_the_same_endpoint() {
     let dir = tempfile::tempdir().unwrap();
     let issuer = identity(2);
-    let original = ticket(&issuer, EXPIRES);
+    let expires = expires_at();
+    let original = ticket(&issuer, expires);
     assert_success(&save(dir.path(), &["work", &original]));
     let path = dir.path().join("data/tickets.json");
     let before = fs::read(&path).unwrap();
 
     for (candidate, message) in [
-        (original.clone(), "expires later or at the same time"),
-        (ticket(&issuer, EXPIRES - 1), "expires later or at the same time"),
-        (ticket(&identity(3), EXPIRES + 1), "different endpoint"),
+        (original, "expires later or at the same time"),
+        (
+            ticket(&issuer, expires - 1),
+            "expires later or at the same time",
+        ),
+        (ticket(&identity(3), expires + 1), "different endpoint"),
         (ticket(&issuer, 1), "ticket expired"),
         ("not-a-ticket".to_owned(), "parse ticket"),
     ] {
@@ -93,21 +104,28 @@ fn ticket_save_only_renews_with_later_access_for_the_same_endpoint() {
         assert_eq!(fs::read(&path).unwrap(), before);
     }
 
-    let renewed = ticket(&issuer, EXPIRES + 1);
+    let renewed = ticket(&issuer, expires + 1);
     assert_success(&save(dir.path(), &["work", &renewed]));
     let stored = TicketStore::load(&path).unwrap();
     assert_eq!(stored.len(), 1);
     assert_eq!(stored.get("work").unwrap().ticket_string, renewed);
-    assert_eq!(stored.get("work").unwrap().expires_at, EXPIRES + 1);
+    assert_eq!(stored.get("work").unwrap().expires_at, expires + 1);
 }
 
 #[test]
 fn ticket_save_uses_peer_name_without_overwriting_peer_labels() {
     let dir = tempfile::tempdir().unwrap();
     let issuer = identity(4);
+    let expires = expires_at();
     let peers_path = dir.path().join("data/peers.json");
     save_accepted_peer(
-        &InviteCode::new(issuer.verifying_key(), [9; 16], EXPIRES, InitiatorMode::Them, None),
+        &InviteCode::new(
+            issuer.verifying_key(),
+            [9; 16],
+            expires,
+            InitiatorMode::Them,
+            None,
+        ),
         SaveAcceptedPeerOptions {
             responder_self_label: Some("devbox"),
             responder_relay_hint: None,
@@ -117,13 +135,16 @@ fn ticket_save_uses_peer_name_without_overwriting_peer_labels() {
     )
     .unwrap();
     let peers_before = fs::read(&peers_path).unwrap();
-    let ticket = ticket(&issuer, EXPIRES);
+    let ticket = ticket(&issuer, expires);
     let output = save(dir.path(), &[&ticket]);
     assert_success(&output);
     assert!(String::from_utf8_lossy(&output.stdout).contains("saved ticket 'devbox-ticket-shell'"));
     let path = dir.path().join("data/tickets.json");
     let stored = TicketStore::load(&path).unwrap();
-    assert_eq!(stored.get("devbox-ticket-shell").unwrap().ticket_string, ticket);
+    assert_eq!(
+        stored.get("devbox-ticket-shell").unwrap().ticket_string,
+        ticket
+    );
 
     let before = fs::read(&path).unwrap();
     let output = save(dir.path(), &["devbox", &ticket]);
