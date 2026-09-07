@@ -521,8 +521,9 @@ impl server::Handler for PortlSshServer {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: server::ChannelOpenHandle,
         _session: &mut RusshSession,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         self.channels.insert(
             channel.id(),
             PendingSessionChannel {
@@ -531,7 +532,8 @@ impl server::Handler for PortlSshServer {
                 env_patch: Vec::new(),
             },
         );
-        Ok(true)
+        reply.accept().await;
+        Ok(())
     }
 
     async fn channel_close(
@@ -746,10 +748,12 @@ impl server::Handler for PortlSshServer {
         port_to_connect: u32,
         _originator_address: &str,
         _originator_port: u32,
+        reply: server::ChannelOpenHandle,
         _session: &mut RusshSession,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         let Ok(port) = u16::try_from(port_to_connect) else {
-            return Ok(false);
+            // Dropping an unaccepted reply rejects the channel.
+            return Ok(());
         };
         match open_tcp(
             &self.backend.connection,
@@ -760,32 +764,33 @@ impl server::Handler for PortlSshServer {
         .await
         {
             Ok((send, recv)) => {
+                reply.accept().await;
                 spawn_direct_tcpip_bridge(channel, send, recv, host_to_connect.to_owned(), port);
-                Ok(true)
             }
             Err(err) => {
                 debug!(%err, host = host_to_connect, port, "rejecting direct-tcpip channel");
-                Ok(false)
             }
         }
+        Ok(())
     }
 
     async fn channel_open_direct_streamlocal(
         &mut self,
         channel: Channel<Msg>,
         socket_path: &str,
+        reply: server::ChannelOpenHandle,
         _session: &mut RusshSession,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         match open_unix(&self.backend.connection, &self.backend.session, socket_path).await {
             Ok((send, recv)) => {
+                reply.accept().await;
                 spawn_direct_streamlocal_bridge(channel, send, recv, socket_path.to_owned());
-                Ok(true)
             }
             Err(err) => {
                 debug!(%err, socket_path, "rejecting direct-streamlocal channel");
-                Ok(false)
             }
         }
+        Ok(())
     }
 
     async fn tcpip_forward(
@@ -1414,7 +1419,7 @@ mod tests {
 
         async fn check_server_key(
             &mut self,
-            _server_public_key: &ssh_key::PublicKey,
+            _server_public_key: &russh::keys::PublicKeyOrCertificate,
         ) -> Result<bool, Self::Error> {
             Ok(true)
         }
@@ -1572,7 +1577,7 @@ mod tests {
 
         async fn check_server_key(
             &mut self,
-            _server_public_key: &ssh_key::PublicKey,
+            _server_public_key: &russh::keys::PublicKeyOrCertificate,
         ) -> Result<bool, Self::Error> {
             Ok(true)
         }
@@ -1584,8 +1589,10 @@ mod tests {
             connected_port: u32,
             originator_address: &str,
             originator_port: u32,
+            reply: client::ChannelOpenHandle,
             _session: &mut client::Session,
         ) -> Result<(), Self::Error> {
+            reply.accept().await;
             let _ = self.opened_tx.send(ForwardedTcpipOpen {
                 connected_address: connected_address.to_owned(),
                 connected_port,

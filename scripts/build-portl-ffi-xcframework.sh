@@ -62,7 +62,7 @@ targets=(
 )
 
 for target in "${targets[@]}"; do
-  cargo build -p portl-ffi --release --target "$target"
+  cargo build --locked -p portl-ffi --release --target "$target"
 done
 
 rm -rf "$header_stage"

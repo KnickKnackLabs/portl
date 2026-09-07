@@ -14,13 +14,6 @@ workspace = true
 [lib]
 path = "src/lib.rs"
 
-[[bin]]
-name = "portl-slicer-adapter"
-path = "src/main.rs"
-# bin/main.rs has no #[test] functions; skip the empty test target
-# (~500 ms macOS syspolicyd first-exec scan per nextest run).
-test = false
-
 [dependencies]
 portl-core  = { version = "0.13.0", path = "../../crates/portl-core" }
 portl-agent = { version = "0.13.0", path = "../../crates/portl-agent" }

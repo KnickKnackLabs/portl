@@ -19,7 +19,6 @@ from pathlib import Path
 
 FIRST_PARTY = {
     "docker-portl",
-    "manual-portl",
     "portl-agent",
     "portl-cli",
     "portl-core",

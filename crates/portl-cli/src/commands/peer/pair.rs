@@ -287,7 +287,7 @@ mod tests {
         ] {
             let dir = tempfile::tempdir().unwrap();
             let peers_path = dir.path().join("peers.json");
-            let invite = InviteCode::new([7; 32], [9; 16], 4_000, mode, None);
+            let invite = InviteCode::new([7; 32], rand::random(), 4_000, mode, None);
             let mut reply = response(PairResult::Ok);
             assert_eq!(
                 apply_response(&invite, &reply, &peers_path).unwrap(),
@@ -326,7 +326,7 @@ mod tests {
     fn rejected_response_leaves_peer_store_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let peers_path = dir.path().join("peers.json");
-        let invite = InviteCode::new([7; 32], [9; 16], 4_000, InitiatorMode::Them, None);
+        let invite = InviteCode::new([7; 32], rand::random(), 4_000, InitiatorMode::Them, None);
         apply_response(&invite, &response(PairResult::Ok), &peers_path).unwrap();
         let before = std::fs::read(&peers_path).unwrap();
 

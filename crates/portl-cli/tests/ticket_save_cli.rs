@@ -121,7 +121,7 @@ fn ticket_save_uses_peer_name_without_overwriting_peer_labels() {
     save_accepted_peer(
         &InviteCode::new(
             issuer.verifying_key(),
-            [9; 16],
+            rand::random(),
             expires,
             InitiatorMode::Them,
             None,
