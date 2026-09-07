@@ -7,6 +7,11 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Cancel obsolete PR runs; keep every main commit available to the release gate.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # Release is a separate workflow (.github/workflows/release.yml) that
 # fires on `v*` tag pushes. It gates on this workflow's conclusion
 # for the tagged SHA via a `gh run watch` preflight, so we never
@@ -64,8 +69,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: actions/checkout@v7
+      - uses: mozilla-actions/sccache-action@v0.0.11
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -83,20 +88,29 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - name: Test nextest thread selection
-        run: scripts/tests/nextest-threads-test.sh
+      - name: Test CI helper scripts
+        run: |
+          scripts/tests/nextest-threads-test.sh
+          python3 -m unittest discover -s scripts/tests -p 'test_*.py'
       - name: Select nextest threads
         run: |
           threads=$(scripts/nextest-threads.sh)
           echo "NEXTEST_TEST_THREADS=${threads}" >> "$GITHUB_ENV"
           echo "Selected nextest threads: ${threads}"
-      - run: cargo nextest run --profile ci --workspace --lib --bins --tests
+      - run: cargo nextest run --locked --profile ci --workspace --lib --bins --tests
+      - uses: actions/upload-artifact@v7
+        with:
+          name: portl-ci-cli
+          path: target/debug/portl
+          if-no-files-found: error
+          compression-level: 1
+          retention-days: 1
 
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # cargo fmt does not invoke rustc; skip the cache entirely and
       # only install rustfmt. Job finishes in ~15 s cold.
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -110,19 +124,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: actions/checkout@v7
+      - uses: mozilla-actions/sccache-action@v0.0.11
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Check non-Ghostty optional features
         run: |
           set -euo pipefail
-          cargo check -p portl-agent --features test-panic-trigger --all-targets
-          cargo check -p portl-core --features test-util --all-targets
+          cargo check --locked -p portl-agent --features test-panic-trigger --all-targets
+          cargo check --locked -p portl-core --features test-util --all-targets
       - name: Forbid unwrapped spawn_blocking in portl-agent
         run: |
           set -u
@@ -152,8 +166,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v5
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: actions/checkout@v7
+      - uses: mozilla-actions/sccache-action@v0.0.11
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache-shared-key: "ghostty-smoke"
@@ -174,9 +188,9 @@ jobs:
       # Only session_e2e has Ghostty-gated integration coverage. Keep --tests so
       # every integration target still compiles with the feature without rerunning
       # the feature-independent suite already covered by the primary test job.
-      - run: cargo nextest run --profile ci -p portl-agent --features ghostty-vt-static --lib --tests -E '(kind(lib) + binary(=session_e2e))'
-      - run: cargo nextest run --profile ci -p portl-cli --features ghostty-vt-static -E 'binary(=ghostty_smoke)'
-      - run: cargo clippy -p portl-agent -p portl-cli --features ghostty-vt-static --all-targets -- -D warnings
+      - run: cargo nextest run --locked --profile ci -p portl-agent --features ghostty-vt-static --lib --tests -E '(kind(lib) + binary(=session_e2e))'
+      - run: cargo nextest run --locked --profile ci -p portl-cli --features ghostty-vt-static -E 'binary(=ghostty_smoke)'
+      - run: cargo clippy --locked -p portl-agent -p portl-cli --features ghostty-vt-static --all-targets -- -D warnings
 
   ghostty-musl-smoke:
     name: ghostty musl smoke (${{ matrix.target }})
@@ -191,11 +205,11 @@ jobs:
           - target: aarch64-unknown-linux-musl
             platform: linux/arm64
     steps:
-      - uses: actions/checkout@v5
-      - uses: docker/setup-qemu-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/setup-qemu-action@v4
         with:
           platforms: arm64,amd64
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: mozilla-actions/sccache-action@v0.0.11
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache-shared-key: "ghostty-musl-smoke-${{ matrix.target }}"
@@ -211,7 +225,7 @@ jobs:
       - run: rustup target add ${{ matrix.target }}
       - name: Build static musl binary
         run: |
-          cargo zigbuild \
+          cargo zigbuild --locked \
             --release \
             --package portl-cli \
             --target "${{ matrix.target }}" \
@@ -257,7 +271,7 @@ jobs:
       CARGO_BUILD_RUSTC_WRAPPER: ""
       RUSTC_WRAPPER: ""
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
@@ -266,33 +280,15 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
-      - run: cargo deny --all-features check
-
-  dep-guard:
-    name: dep-guard
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: stable
-      - name: Forbid rusqlite / libsqlite3-sys
-        run: |
-          set -u
-          if cargo tree --workspace -e normal \
-               | grep -iE 'rusqlite|libsqlite3-sys'; then
-            echo "::error ::rusqlite / libsqlite3-sys must not be in the workspace dep tree (v0.1.2 carve-out)"
-            exit 1
-          fi
-          echo "OK: rusqlite absent from workspace"
+      - run: cargo deny --locked --all-features check
 
   portl-ffi-apple:
     name: portl ffi Apple xcframework
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: actions/checkout@v7
+      - uses: mozilla-actions/sccache-action@v0.0.11
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache-shared-key: "portl-ffi-apple"
@@ -306,37 +302,28 @@ jobs:
             aarch64-apple-darwin
       - name: Build PortlFFI Apple xcframework
         run: ./scripts/build-portl-ffi-xcframework.sh --out dist/apple
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: portl-ffi-apple-xcframework
           path: dist/apple/PortlFFI.xcframework
 
   docker-smoke:
     name: docker integration smoke
-    # Only run after the fast unit checks pass. No point rebuilding
-    # a release binary + a Docker image if test or clippy is red;
-    # this `needs:` makes e2e serial after the cheap gates.
     needs: [test, clippy]
     runs-on: ubuntu-latest
-    env:
-      SCCACHE_GHA_ENABLED: "true"
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
-      - uses: mozilla-actions/sccache-action@v0.0.9
-      # Shared with the `test` / `clippy` jobs via the same Cargo.lock
-      # + rustc key — this job only rebuilds what's missing for
-      # --release (release-profile artifacts).
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@v7
+      # nextest already built the real CLI for its subprocess integration tests.
+      - uses: actions/download-artifact@v8
         with:
-          cache-shared-key: "linux-native"
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-          cache-on-failure: true
-      - name: Build portl (release)
-        run: cargo build --release --bin portl
+          name: portl-ci-cli
+          path: ci-bin
       - name: Build reference Docker image
         run: |
+          chmod +x ci-bin/portl
           mkdir -p adapters/docker-portl/images/bin
-          cp target/release/portl adapters/docker-portl/images/bin/portl-amd64
+          cp ci-bin/portl adapters/docker-portl/images/bin/portl-amd64
           docker build \
             --platform linux/amd64 \
             -t portl-agent:ci \
@@ -344,23 +331,18 @@ jobs:
             -f adapters/docker-portl/images/Dockerfile.reference \
             adapters/docker-portl/images/
       - name: Docker adapter end-to-end smoke
-        env:
-          PORTL_HOME: /tmp/portl-home
         run: |
           PORTL_HOME="$(mktemp -d)"
           export PORTL_HOME
-          ./target/release/portl init
-          ./target/release/portl docker run portl-agent:ci --name t1 --env PORTL_REFERENCE_MODE=idle
-          ./target/release/portl docker run portl-agent:ci --name t2 --env PORTL_REFERENCE_MODE=idle
+          ./ci-bin/portl init
+          ./ci-bin/portl docker run portl-agent:ci --name t1 --env PORTL_REFERENCE_MODE=idle
+          ./ci-bin/portl docker run portl-agent:ci --name t2 --env PORTL_REFERENCE_MODE=idle
 
-          # adapter-surface smoke: validate the orchestrate lifecycle
-          # without depending on discovery timing inside a CI runner.
           docker exec t1 sh -c 'test -x /usr/local/bin/portl-agent'
           docker exec t2 sh -c 'test -x /usr/local/bin/portl-agent'
 
-          ./target/release/portl docker detach t1
-          ./target/release/portl docker attach t1
+          ./ci-bin/portl docker detach t1
+          ./ci-bin/portl docker attach t1
 
-          # cleanup
-          ./target/release/portl docker rm t1 --force
-          ./target/release/portl docker rm t2 --force
+          ./ci-bin/portl docker rm t1 --force
+          ./ci-bin/portl docker rm t2 --force

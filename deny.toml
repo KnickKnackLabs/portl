@@ -45,6 +45,8 @@ allow = [
 ]
 
 [bans]
+# Keep SQLite out of Portl; this replaces the standalone cargo-tree CI job.
+deny = [{ name = "rusqlite" }, { name = "libsqlite3-sys" }]
 multiple-versions = "warn"
 wildcards         = "deny"
 
