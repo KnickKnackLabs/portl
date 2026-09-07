@@ -12,16 +12,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-FIRST_PARTY = {
-    "docker-portl",
-    "manual-portl",
-    "portl-agent",
-    "portl-cli",
-    "portl-core",
-    "portl-ffi",
-    "portl-proto",
-    "slicer-portl",
-}
 MANIFESTS = [
     "Cargo.toml",
     "crates/portl-agent/Cargo.toml",
@@ -31,7 +21,6 @@ MANIFESTS = [
     "crates/portl-proto/Cargo.toml",
     "adapters/docker-portl/Cargo.toml",
     "adapters/slicer-portl/Cargo.toml",
-    "adapters/manual-portl/Cargo.toml",
 ]
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 
