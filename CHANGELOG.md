@@ -5,19 +5,47 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.14.0 — 2026-09-08
+
 ### Changed
 
-- Verified Herdr transport routing against Herdr v0.8.0 protocol 19, route its
-  structured input events on the input lane, and preserve newer control events
-  opaquely instead of applying stale protocol-12 coalescing semantics.
-- Hardened Herdr framing before allocation: ordinary and unknown messages are
-  limited to 2 MiB, client clipboard images and server frame/graphics messages
-  may use a 32 MiB outer frame, and clipboard image data is limited to 16 MiB.
-  All attach lanes now share separate 8 MiB normal and 64 MiB large queued-byte
-  budgets with a 10-second slow-consumer timeout; frame clones share both bytes
-  and accounting permits. Partial prefixes and bodies, malformed tags, wrong-lane
-  frames, and oversized unknown messages now fail closed; bounded priority bursts
-  keep input, control, and render responsive without starving FIFO bulk traffic.
+- Upgraded the peer-to-peer transport to stable Iroh 1.1.0, including its stable
+  relay defaults and connection recovery fixes.
+- Updated Herdr transport routing for Herdr v0.8.0 / protocol 19. Structured
+  input uses the input lane, and newer control events pass through intact.
+- CLI ticket saving and peer pairing now share the same storage rules as Apple
+  embedding. Ticket labels have surrounding whitespace removed; empty labels
+  are rejected without changing saved access.
+- CI reuses the tested CLI for Docker integration and removes duplicate release
+  waiting jobs while retaining Linux, macOS, Apple embedding, and security checks.
+
+### Fixed
+
+- Updated russh to 0.63.2 for SSH security and correctness fixes. Forwarded
+  channels are accepted only after the existing remote permission checks succeed.
+- Patched vulnerable archive, cryptography, transport, and serialization
+  dependencies; see the [dependency audit](https://github.com/KnickKnackLabs/portl/blob/v0.14.0/docs/dependency-audit-2026-09-07.md)
+  for the reviewed versions and deliberately deferred upgrades.
+- Bounded Herdr frame allocation and queued data, rejected malformed or
+  incomplete frames, and added slow-consumer timeouts. Input, control, and
+  rendering remain responsive while bulk traffic makes progress.
+
+### Removed
+
+- Removed the placeholder `portl-manual-adapter` and `portl-slicer-adapter`
+  executables. Manual setup uses the README quickstart; Slicer provisioning
+  continues through `portl slicer`.
+
+### Upgrade notes
+
+- Upgrade clients, agents, and self-hosted relays together when moving from
+  Portl 0.13.0's Iroh 1.0.0-rc.1 transport. Compatibility between that release
+  candidate and stable Iroh 1.1 has not been verified; Iroh's stable 1.x wire
+  guarantee starts at 1.0.0. Public relay support for the release candidates
+  ends on September 30, 2026. Review explicitly configured or saved relay URLs
+  when upgrading. See [Iroh's support announcement](https://www.iroh.computer/blog/v1).
+- Existing identity, peer-store, and ticket formats are retained. Herdr clients
+  and servers still need matching Herdr protocol versions.
 
 ## 0.13.0 — 2026-06-24
 
