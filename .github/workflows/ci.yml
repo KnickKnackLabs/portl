@@ -185,6 +185,13 @@ jobs:
           threads=$(scripts/nextest-threads.sh)
           echo "NEXTEST_TEST_THREADS=${threads}" >> "$GITHUB_ENV"
           echo "Selected nextest threads: ${threads}"
+      - name: Rebuild CPU-specific Ghostty native output
+        # The pinned libghostty-vt-sys uses Zig's host CPU for native builds.
+        # Rust's restored target cache does not distinguish runner CPU features;
+        # a library built on another CPU can SIGILL before any test starts.
+        run: |
+          lscpu
+          cargo clean -p libghostty-vt-sys
       # Only session_e2e has Ghostty-gated integration coverage. Keep --tests so
       # every integration target still compiles with the feature without rerunning
       # the feature-independent suite already covered by the primary test job.

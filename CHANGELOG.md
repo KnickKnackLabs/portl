@@ -16,6 +16,8 @@ All notable changes land here. This project follows
 - Check all 11 release assets and their SHA-256 files before publication and
   after download. Automatically validate macOS signatures, notarization,
   installer payloads, Apple embedding, and native CLI launch on both architectures.
+- Rebuild CPU-specific Ghostty native output before Linux smoke tests instead
+  of reusing a library cached on a different runner CPU.
 - Retain the macOS 15 / Xcode 16.4 CLI builds and Ghostty smoke checks from 0.14.0.
 
 ## 0.14.0 — 2026-09-08
