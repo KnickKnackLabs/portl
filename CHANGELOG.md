@@ -21,6 +21,10 @@ All notable changes land here. This project follows
 
 ### Fixed
 
+- Pin macOS CLI builds to macOS 15 and Xcode 16.4 while Ghostty requires
+  Zig 0.15.2, avoiding build-runner link failures on the macOS 26 image.
+- Build and smoke-test both macOS CLI architectures in CI before release
+  tagging, including a small Zig build-runner link check.
 - Updated russh to 0.63.2 for SSH security and correctness fixes. Forwarded
   channels are accepted only after the existing remote permission checks succeed.
 - Patched vulnerable archive, cryptography, transport, and serialization

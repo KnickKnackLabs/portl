@@ -1,0 +1,26 @@
+name: Set up Ghostty macOS build tools
+description: Select the macOS 15 SDK toolchain and verify Zig can link its build runner
+runs:
+  using: composite
+  steps:
+    - name: Select Xcode 16.4
+      shell: bash
+      run: |
+        set -euo pipefail
+        developer_dir=/Applications/Xcode_16.4.app/Contents/Developer
+        test -d "$developer_dir"
+        sudo xcode-select --switch "$developer_dir"
+        echo "DEVELOPER_DIR=$developer_dir" >> "$GITHUB_ENV"
+        echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+        xcodebuild -version
+    - uses: mlugg/setup-zig@v2
+      with:
+        version: 0.15.2
+    - name: Check Zig build-runner linking
+      shell: bash
+      run: |
+        set -euo pipefail
+        tmpdir=$(mktemp -d)
+        trap 'rm -rf "$tmpdir"' EXIT
+        printf 'const std = @import("std");\npub fn build(_: *std.Build) void {}\n' > "$tmpdir/build.zig"
+        (cd "$tmpdir" && zig build)

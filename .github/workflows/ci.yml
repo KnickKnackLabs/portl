@@ -256,6 +256,37 @@ jobs:
           docker run --rm --platform "${{ matrix.platform }}" "${image}" --version
           docker run --rm --platform "${{ matrix.platform }}" "${image}" __ghostty-smoke
 
+  ghostty-macos-smoke:
+    name: ghostty macOS smoke (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+          cache-shared-key: "release-${{ matrix.target }}"
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+      - uses: ./.github/actions/setup-ghostty-macos
+      # Build the same static Ghostty CLI as Release, not just the Apple FFI.
+      - run: cargo build --locked --release --package portl-cli --target ${{ matrix.target }} --features ghostty-vt-static --bin portl
+      - name: Run native CLI smoke checks
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          "target/$TARGET/release/portl" --version
+          "target/$TARGET/release/portl" __ghostty-smoke
+
   deny:
     name: cargo deny
     runs-on: ubuntu-latest

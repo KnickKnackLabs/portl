@@ -97,13 +97,17 @@ jobs:
   release-macos-build:
     name: release macOS build (${{ matrix.target }})
     needs: [ci-gate]
-    runs-on: macos-latest
+    # Zig 0.15.2 cannot link its build runner on the macOS 26 image.
+    # Keep this matrix aligned with ghostty-macos-smoke in ci.yml.
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-apple-darwin
-          - aarch64-apple-darwin
+        include:
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-15
     steps:
       - uses: actions/checkout@v7
       - uses: mozilla-actions/sccache-action@v0.0.11
@@ -113,10 +117,7 @@ jobs:
           cache-shared-key: "release-${{ matrix.target }}"
           cache-save-if: true
           cache-on-failure: true
-      - name: Install zig for Ghostty static link
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
+      - uses: ./.github/actions/setup-ghostty-macos
       - name: Build macOS native
         run: cargo build --locked --release --package portl-cli --target ${{ matrix.target }} --features ghostty-vt-static --bin portl
       - name: Upload raw macOS binary
