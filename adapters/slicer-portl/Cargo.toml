@@ -15,8 +15,8 @@ workspace = true
 path = "src/lib.rs"
 
 [dependencies]
-portl-core  = { version = "0.14.0", path = "../../crates/portl-core" }
-portl-agent = { version = "0.14.0", path = "../../crates/portl-agent" }
+portl-core  = { version = "0.14.1", path = "../../crates/portl-core" }
+portl-agent = { version = "0.14.1", path = "../../crates/portl-agent" }
 anyhow      = { workspace = true }
 async-trait = { workspace = true }
 base64      = { workspace = true }

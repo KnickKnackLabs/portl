@@ -5,6 +5,19 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.14.1 — 2026-09-10
+
+### Fixed
+
+- Install the configured Rust toolchain before mise builds the macOS signing
+  tools, including on runners with an empty cache.
+- Require both macOS signing and notarization jobs to succeed before publishing
+  the release. Signing failures can no longer produce a successful release run.
+- Check all 11 release assets and their SHA-256 files before publication and
+  after download. Automatically validate macOS signatures, notarization,
+  installer payloads, Apple embedding, and native CLI launch on both architectures.
+- Retain the macOS 15 / Xcode 16.4 CLI builds and Ghostty smoke checks from 0.14.0.
+
 ## 0.14.0 — 2026-09-08
 
 ### Changed

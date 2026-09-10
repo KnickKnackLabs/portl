@@ -15,9 +15,10 @@ used for NAT traversal when direct paths are unavailable.
 
 ## Status
 
-**v0.14.0** — Stable Iroh transport, patched SSH and dependencies, consistent
-saved-access rules, and simpler CI. This release also includes updated Herdr
-protocol 19 routing and bounded frame handling. Upgrade clients, agents, and
+**v0.14.1** — Repairs macOS signing tool setup and requires signed, notarized
+macOS assets before release publication, with automatic download validation.
+Includes v0.14.0's stable Iroh transport, SSH and dependency fixes, saved-access
+rules, and Herdr protocol 19 routing. Upgrade clients, agents, and
 self-hosted relays together when moving off the old Iroh release candidate;
 see the [release notes](CHANGELOG.md) for compatibility and relay guidance.
 
@@ -76,7 +77,7 @@ curl -fsSL \
 
 The installer is idempotent. Re-run it to upgrade; by default it preserves
 whether this machine was already configured as a client or agent. Set
-`PORTL_VERSION=0.14.0` to pin a release. Use `--agent=off` to disable the
+`PORTL_VERSION=0.14.1` to pin a release. Use `--agent=off` to disable the
 service, or `--uninstall` to remove binaries and service while keeping
 `$PORTL_HOME`. By default, Portl stores local state under `~/.portl` on
 all operating systems (`config/`, `data/`, `state/`, and `run/` subdirs).
@@ -99,7 +100,7 @@ portl-agent down            # stop/disable service, keeping state
 
 ```bash
 # mise
-mise use -g github:KnickKnackLabs/portl@0.14.0
+mise use -g github:KnickKnackLabs/portl@0.14.1
 # mise only shims `portl`; run install.sh with PORTL_AGENT=1 if this machine should be shared.
 
 # cargo

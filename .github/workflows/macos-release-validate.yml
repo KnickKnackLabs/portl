@@ -1,6 +1,15 @@
 name: Validate macOS Release Assets
 
 on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+      install_current_user:
+        required: false
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       tag:
@@ -15,8 +24,12 @@ on:
 
 jobs:
   validate-macos-assets:
-    name: validate macOS release assets
-    runs-on: macos-latest
+    name: validate macOS release assets (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-latest, macos-15-intel]
     permissions:
       contents: read
     steps:
@@ -144,7 +157,12 @@ jobs:
         if: inputs.install_current_user
         run: |
           set -euo pipefail
-          for pkg in dist/*.pkg; do
+          case "$(uname -m)" in
+            arm64) target="aarch64-apple-darwin" ;;
+            x86_64) target="x86_64-apple-darwin" ;;
+            *) echo "unsupported architecture" >&2; exit 1 ;;
+          esac
+          for pkg in dist/*-"$target".pkg; do
             echo "installing $pkg into CurrentUserHomeDirectory"
             installer -pkg "$pkg" -target CurrentUserHomeDirectory -verboseR
           done

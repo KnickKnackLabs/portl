@@ -168,7 +168,12 @@ jobs:
 
   release-publish:
     name: publish GitHub release
-    needs: [release-linux-build, release-apple-ffi-build]
+    needs:
+      [
+        release-linux-build,
+        release-apple-ffi-build,
+        release-macos-sign-notarize,
+      ]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -183,6 +188,15 @@ jobs:
         with:
           name: release-apple-portlffi
           path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: signed-macos-*
+          path: dist
+          merge-multiple: true
+      - name: Require all release assets and checksums
+        env:
+          TAG: ${{ github.ref_name }}
+        run: python3 scripts/verify-release-assets.py "$TAG" dist
       # Extract only the CHANGELOG section matching this tag's version
       # so the GitHub release body shows what's new in this release,
       # not the full file. CHANGELOG.md uses Keep-a-Changelog style
@@ -219,18 +233,35 @@ jobs:
           files: dist/*
           body_path: release-notes.md
           fail_on_unmatched_files: true
+      - name: Verify downloadable release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir downloaded
+          python3 scripts/verify-release-assets.py "$TAG" downloaded
+
+  release-macos-validate:
+    name: validate published macOS assets
+    needs: [release-publish]
+    uses: ./.github/workflows/macos-release-validate.yml
+    permissions:
+      contents: read
+    with:
+      tag: ${{ github.ref_name }}
 
   release-macos-sign-notarize:
     name: sign/notarize macOS (${{ matrix.target }})
-    needs: [release-macos-build, release-publish]
+    needs: [release-macos-build]
     # Keep the cheap/default GitHub-hosted Linux runner architecture (x64), but
     # run the job inside Alpine so xar is available as a prebuilt apk package.
     runs-on: ubuntu-latest
     container:
       image: node:24-alpine3.23
-    continue-on-error: true
+    timeout-minutes: 150
     permissions:
-      contents: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -246,7 +277,6 @@ jobs:
             bash \
             build-base \
             ca-certificates \
-            cargo \
             coreutils \
             cpio \
             curl \
@@ -255,7 +285,6 @@ jobs:
             gzip \
             openssh-client \
             openssl \
-            rust \
             tar \
             xar \
             xz \
@@ -271,11 +300,19 @@ jobs:
         with:
           install: false
           cache: true
-          cache_key: "mise-release-signing-{{platform}}-{{version}}-stuckliste-0.4.0-apple-codesign-${{ env.APPLE_CODESIGN_VERSION }}"
+          cache_key: "mise-release-signing-v2-{{platform}}-{{version}}-${{ hashFiles('mise.toml') }}-stuckliste-0.4.0-apple-codesign-${{ env.APPLE_CODESIGN_VERSION }}"
       - name: Install release signing tools
         shell: bash
+        env:
+          # Signing tools do not use the workspace's sccache or warning policy.
+          RUSTC_WRAPPER: ""
+          RUSTFLAGS: ""
         run: |
           set -euo pipefail
+          # The cargo backend requires the configured Rust, not Alpine's Rust.
+          # Install it first, including on a cold mise cache.
+          mise install -y rust
+          mise exec rust -- rustc --version
           rcodesign_tool="github:indygreg/apple-platform-rs@apple-codesign/${APPLE_CODESIGN_VERSION}"
           mise install -y cargo:stuckliste-cli@0.4.0 "$rcodesign_tool"
 
@@ -416,16 +453,6 @@ jobs:
           tar -C staging -czf "dist/${NAME}.tar.gz" "${NAME}"
           (cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
           echo "PORTL_SIGNED_BINARY=$signed_dir/portl" >> "$GITHUB_ENV"
-      - name: Attach signed notarized macOS tarballs
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          files: |
-            dist/*.tar.gz
-            dist/*.tar.gz.sha256
-            dist/*.tar.zst
-            dist/*.tar.zst.sha256
-          fail_on_unmatched_files: true
       - name: Build signed notarized home pkg
         shell: bash
         run: |
@@ -451,17 +478,8 @@ jobs:
             --max-wait-seconds 3600 \
             "dist/${NAME}.pkg"
           (cd dist && sha256sum "${NAME}.pkg" > "${NAME}.pkg.sha256")
-      - name: Attach notarized macOS pkg
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          files: |
-            dist/*.pkg
-            dist/*.pkg.sha256
-          fail_on_unmatched_files: true
       - uses: actions/upload-artifact@v7
-        if: always()
         with:
           name: signed-macos-${{ matrix.target }}
           path: dist/*
-          if-no-files-found: ignore
+          if-no-files-found: error
