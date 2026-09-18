@@ -475,7 +475,7 @@ fn path_label(connection: &Connection) -> String {
 
 fn print_status(report: &ProbeReport) {
     if let Some(error) = &report.error {
-        println!("{:<18}sample {} failed: {error}", "error:", report.seq + 1);
+        eprintln!("{:<18}sample {} failed: {error}", "error:", report.seq + 1);
     }
     if let Some(endpoint_id) = &report.endpoint_id {
         println!("{:<18}{}", "endpoint:", endpoint_id);

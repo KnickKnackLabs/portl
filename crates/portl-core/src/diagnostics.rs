@@ -177,6 +177,11 @@ pub fn redact_env_value(name: &str, value: &str) -> String {
 
 fn looks_like_portl_ticket(value: &str) -> bool {
     let normalized = value.trim().to_ascii_uppercase();
+    // This exact, non-secret setting appears in actionable error messages.
+    // Do not let the conservative legacy-ticket heuristic hide that advice.
+    if normalized == "PORTL_DISCOVERY=NONE" {
+        return false;
+    }
     normalized.starts_with("PORTLINV-")
         || normalized.starts_with("PORTL-SHARE1-")
         || normalized.starts_with("PORTL-S-")
@@ -313,6 +318,19 @@ mod tests {
             redacted,
             "unknown peer or ticket name '<redacted:ticket>'.\nTry token=<redacted>"
         );
+    }
+
+    #[test]
+    fn preserves_discovery_advice_without_unmasking_ticket_values() {
+        assert_eq!(
+            redact_text("unset 'PORTL_DISCOVERY=none'; use PORTLTKT-secret"),
+            "unset 'PORTL_DISCOVERY=none'; use <redacted:ticket>"
+        );
+        assert_eq!(
+            redact_text("PORTL_DISCOVERY=PORTLTKT-secret"),
+            "<redacted:ticket>"
+        );
+        assert_eq!(redact_text("PORTL_TOKEN=secret"), "PORTL_TOKEN=<redacted>");
     }
 
     #[test]

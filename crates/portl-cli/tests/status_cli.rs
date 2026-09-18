@@ -22,7 +22,9 @@ async fn status_command_reports_cached_ticket_peer() -> Result<()> {
     let identity_path = home.path().join("identity.bin");
     store::save(&operator, &identity_path)?;
 
-    server.inner().online().await;
+    // This fixture has no relay. Waiting for relay connectivity would never
+    // finish; its explicit loopback address is sufficient for the ticket.
+    assert!(server.addr().ip_addrs().any(|addr| addr.ip().is_loopback()));
 
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let ticket = mint_root(
@@ -179,6 +181,39 @@ fn status_relay_probe_fails_closed_on_dns_timeout() -> Result<()> {
         "unexpected stderr: {stderr}"
     );
 
+    Ok(())
+}
+
+#[test]
+fn failed_status_samples_match_human_and_json_modes() -> Result<()> {
+    let home = tempdir()?;
+    store::save(&Identity::new(), &home.path().join("identity.bin"))?;
+    let peer = hex::encode(Identity::new().verifying_key());
+    for json in [false, true] {
+        let mut command = Command::new(assert_cmd::cargo::cargo_bin("portl"));
+        command
+            .env("PORTL_HOME", home.path())
+            .env("PORTL_DISCOVERY", "none")
+            .args(["status", "--relay", "--count", "3", peer.as_str()]);
+        if json {
+            command.arg("--json");
+        }
+        let output = command.output()?;
+        assert!(!output.status.success());
+        if json {
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            assert_eq!(report["probes"].as_array().expect("samples").len(), 3);
+            assert_eq!(report["summary"]["failures"], 3);
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            for sample in 1..=3 {
+                assert!(stderr.contains(&format!("sample {sample} failed:")));
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.contains("0/3 ok"));
+            assert!(!stdout.contains("error:"));
+        }
+    }
     Ok(())
 }
 
