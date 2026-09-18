@@ -5017,8 +5017,8 @@ async fn run_remote_attach_v1_once(
         control_send: _control_send,
         control_recv: _control_recv,
         stdin,
-        stdout: mut stdout_recv,
-        stderr: mut stderr_recv,
+        stdout: stdout_recv,
+        stderr: stderr_recv,
         mut exit,
         signal: _signal,
         resize,
@@ -5039,30 +5039,22 @@ async fn run_remote_attach_v1_once(
     if let Err(err) = display.clear_bar().await {
         return AttachEnd::Disconnected(err);
     }
-    let stdout_display = display.clone();
-    let stdout_tracker = Arc::clone(mode_tracker);
-    let mut stdout_task = tokio::spawn(async move {
-        copy_remote_output(
-            &mut stdout_recv,
-            &stdout_display,
-            AttachOutputStream::Stdout,
-            &stdout_tracker,
-        )
-        .await
-    });
-    let stderr_display = display.clone();
-    let stderr_tracker = Arc::clone(mode_tracker);
-    let mut stderr_task = tokio::spawn(async move {
-        copy_remote_output(
-            &mut stderr_recv,
-            &stderr_display,
-            AttachOutputStream::Stderr,
-            &stderr_tracker,
-        )
-        .await
-    });
+    let mut stdout_task = spawn_remote_attach_output(
+        stdout_recv,
+        display,
+        AttachOutputStream::Stdout,
+        mode_tracker,
+    );
+    let mut stderr_task = spawn_remote_attach_output(
+        stderr_recv,
+        display,
+        AttachOutputStream::Stderr,
+        mode_tracker,
+    );
     let mut exit_fut = Box::pin(read_exit(&mut exit));
-    let end = loop {
+    let mut stdout_joined = false;
+    let mut stderr_joined = false;
+    let mut end = loop {
         tokio::select! {
             code = &mut exit_fut => {
                 break match code {
@@ -5087,20 +5079,89 @@ async fn run_remote_attach_v1_once(
                 };
             }
             stdout = &mut stdout_task => {
+                stdout_joined = true;
                 let stdout = stdout.context("join stdout task").and_then(|result| result);
                 break output_task_end_to_attach_end(stdout, "stdout", &mut exit_fut).await;
             }
             stderr = &mut stderr_task => {
+                stderr_joined = true;
                 let stderr = stderr.context("join stderr task").and_then(|result| result);
                 break output_task_end_to_attach_end(stderr, "stderr", &mut exit_fut).await;
             }
             signal = signal_watcher.next() => break AttachEnd::Signal(signal),
         }
     };
+    let _ = coordinator.clear_sink().await;
+    if matches!(end, AttachEnd::Exited(_)) {
+        // Exit travels on a separate stream and can arrive before output EOF.
+        // Keep the connection alive until both output tasks have drained.
+        let drain = drain_remote_attach_output(
+            (!stdout_joined).then_some(&mut stdout_task),
+            (!stderr_joined).then_some(&mut stderr_task),
+        );
+        tokio::select! {
+            result = drain => end = result.map_or_else(AttachEnd::Disconnected, |()| end),
+            signal = signal_watcher.next() => end = AttachEnd::Signal(signal),
+        }
+    }
     stdout_task.abort();
     stderr_task.abort();
-    let _ = coordinator.clear_sink().await;
     end
+}
+
+fn spawn_remote_attach_output<R: AsyncRead + Unpin + Send + 'static>(
+    mut recv: R,
+    display: &AttachDisplay,
+    stream: AttachOutputStream,
+    tracker: &SharedTerminalModeTracker,
+) -> tokio::task::JoinHandle<Result<()>> {
+    let display = display.clone();
+    let tracker = Arc::clone(tracker);
+    tokio::spawn(async move { copy_remote_output(&mut recv, &display, stream, &tracker).await })
+}
+
+async fn drain_remote_attach_output(
+    stdout: Option<&mut tokio::task::JoinHandle<Result<()>>>,
+    stderr: Option<&mut tokio::task::JoinHandle<Result<()>>>,
+) -> Result<()> {
+    let join = async |task: Option<&mut tokio::task::JoinHandle<Result<()>>>, name| {
+        if let Some(task) = task {
+            task.await.with_context(|| format!("join {name} task"))??;
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+    tokio::try_join!(join(stdout, "stdout"), join(stderr, "stderr"))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod remote_attach_drain_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn exit_waits_for_delayed_output_eof() {
+        let mut stdout = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Ok(())
+        });
+        let mut stderr = tokio::spawn(async { Ok(()) });
+        let started = tokio::time::Instant::now();
+        drain_remote_attach_output(Some(&mut stdout), Some(&mut stderr))
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn output_failure_is_not_a_successful_exit() {
+        let mut stdout = tokio::spawn(std::future::pending::<Result<()>>());
+        let mut stderr = tokio::spawn(async { anyhow::bail!("output reset") });
+        let error = drain_remote_attach_output(Some(&mut stdout), Some(&mut stderr))
+            .await
+            .unwrap_err();
+        stdout.abort();
+        assert!(error.to_string().contains("output reset"));
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6004,15 +6065,13 @@ async fn output_task_end_to_attach_end(
     stream_name: &str,
     exit_fut: &mut std::pin::Pin<Box<impl Future<Output = Result<i32>> + '_>>,
 ) -> AttachEnd {
+    if let Err(error) = output {
+        return AttachEnd::Disconnected(error);
+    }
     match tokio::time::timeout(Duration::from_secs(2), exit_fut).await {
         Ok(Ok(code)) => AttachEnd::Exited(code),
         Ok(Err(err)) => AttachEnd::Disconnected(err),
-        Err(_) => match output {
-            Ok(()) => {
-                AttachEnd::Disconnected(anyhow!("{stream_name} stream ended before exit frame"))
-            }
-            Err(err) => AttachEnd::Disconnected(err),
-        },
+        Err(_) => AttachEnd::Disconnected(anyhow!("{stream_name} stream ended before exit frame")),
     }
 }
 
@@ -6893,10 +6952,16 @@ fn test_reconnect_scenario() -> Result<Option<TestReconnectScenario>> {
 
 #[cfg(feature = "test-reconnect-injection")]
 fn reconnect_policy_for_environment(mut policy: ReconnectPolicy) -> ReconnectPolicy {
-    if test_reconnect_scenario().ok().flatten().is_some() {
+    if let Some(scenario) = test_reconnect_scenario().ok().flatten() {
         policy.base_delay = Duration::from_millis(25);
         policy.max_delay = Duration::from_millis(25);
-        policy.max_elapsed = Duration::from_millis(90);
+        // The successful fixture must allow the real second-attempt delay
+        // (150–300 ms) and its application exchange within the hard budget.
+        policy.max_elapsed = if matches!(scenario, TestReconnectScenario::Transient) {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_millis(90)
+        };
         policy.delay_floor = Duration::from_millis(25);
         policy.transparent_grace = Duration::ZERO;
     }

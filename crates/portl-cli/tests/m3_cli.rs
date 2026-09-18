@@ -2,7 +2,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use assert_cmd::cargo::CommandCargoExt;
 use iroh_tickets::Ticket;
 use portl_agent::{AgentConfig, DiscoveryConfig, run_task};
@@ -133,6 +133,7 @@ async fn tcp_command_connects_and_forwards_bytes() -> Result<()> {
     let remote_task = tokio::spawn(async move {
         loop {
             let (mut socket, _) = remote_listener.accept().await?;
+            socket.write_all(b"ready").await?;
             let mut buf = [0_u8; 16];
             let read = socket.read(&mut buf).await?;
             if read == 0 {
@@ -162,9 +163,7 @@ async fn tcp_command_connects_and_forwards_bytes() -> Result<()> {
         .stderr(Stdio::piped())
         .spawn()?;
 
-    wait_for_forward(&mut child, local_port).await?;
-
-    let mut forwarded = TcpStream::connect(("127.0.0.1", local_port)).await?;
+    let mut forwarded = wait_for_forward(&mut child, local_port).await?;
     forwarded.write_all(b"z").await?;
     forwarded.shutdown().await?;
 
@@ -253,28 +252,33 @@ fn reserve_local_port() -> Result<u16> {
     Ok(port)
 }
 
-async fn wait_for_forward(child: &mut std::process::Child, local_port: u16) -> Result<()> {
+async fn wait_for_forward(child: &mut std::process::Child, local_port: u16) -> Result<TcpStream> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        match TcpStream::connect(("127.0.0.1", local_port)).await {
-            Ok(stream) => {
-                drop(stream);
-                return Ok(());
-            }
-            Err(_) if tokio::time::Instant::now() < deadline => {
-                if let Some(status) = child.try_wait().context("poll tcp command")? {
-                    let stderr = read_child_stderr(child)?;
-                    bail!("tcp command exited early with {status}: {stderr}");
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err(err) => {
-                let stderr = read_child_stderr(child)?;
-                return Err(anyhow!(
-                    "timed out waiting for tcp forward on {local_port}: {err}; stderr: {stderr}"
-                ));
-            }
+        // A retained listener can accept while its peer is offline. Read a
+        // remote greeting before sending the one-shot test payload.
+        let probe = async {
+            let mut stream = TcpStream::connect(("127.0.0.1", local_port)).await?;
+            let mut greeting = [0; 5];
+            stream.read_exact(&mut greeting).await?;
+            anyhow::ensure!(&greeting == b"ready", "unexpected remote greeting");
+            Ok::<_, anyhow::Error>(stream)
+        };
+        let attempt_deadline = deadline.min(tokio::time::Instant::now() + Duration::from_secs(1));
+        if let Ok(Ok(stream)) = tokio::time::timeout_at(attempt_deadline, probe).await {
+            return Ok(stream);
         }
+        if let Some(status) = child.try_wait().context("poll tcp command")? {
+            let stderr = read_child_stderr(child)?;
+            bail!("tcp command exited early with {status}: {stderr}");
+        }
+        if tokio::time::Instant::now() >= deadline {
+            child.kill().context("stop unready tcp command")?;
+            child.wait().context("wait for unready tcp command")?;
+            let stderr = read_child_stderr(child)?;
+            bail!("timed out waiting for remote tcp greeting on {local_port}; stderr: {stderr}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 

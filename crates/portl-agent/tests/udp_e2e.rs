@@ -190,8 +190,8 @@ async fn udp_burst_loopback_smoke() -> Result<()> {
 
     let mut seen = vec![false; BURST as usize];
     let mut buf = vec![0_u8; 256];
-    sender.await??;
-
+    // Drain replies while sending. Waiting for the whole burst first can
+    // overflow Linux's receive buffer before this test starts reading it.
     loop {
         match tokio::time::timeout(Duration::from_millis(500), app.recv(&mut buf)).await {
             Ok(Ok(read)) => {
@@ -206,6 +206,7 @@ async fn udp_burst_loopback_smoke() -> Result<()> {
             Err(_) => break,
         }
     }
+    sender.await??;
     let delivered = seen.iter().filter(|present| **present).count();
     assert!(
         delivered >= MIN_DELIVERED,

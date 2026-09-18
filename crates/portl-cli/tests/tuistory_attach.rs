@@ -721,8 +721,9 @@ fn symptom3_successful_reconnect_window_has_no_cleanup_leak() {
     .expect("post-reconnect fixture markers");
     assert!(
         contains_subslice(live_after_reconnect, b"OK"),
-        "post-reconnect prompt probe did not render cleanly:\n{}",
-        escaped(live_after_reconnect)
+        "post-reconnect prompt probe did not render cleanly:\n{}\nfull transcript:\n{}",
+        escaped(live_after_reconnect),
+        escaped(&transcript)
     );
     assert_cleanup_ends_before_marker(
         &transcript,
@@ -1031,8 +1032,7 @@ mod two_host_fixture {
             .to_owned();
         let before_reload = fixture.host_bound.len();
 
-        fixture.trigger_reload();
-        let reload_command_done = fixture.host_bound.len();
+        let reload_command_done = fixture.trigger_reload();
         let reload_command_paints =
             live_full_screen_paints(&fixture.host_bound[before_reload..reload_command_done]);
         assert!(
@@ -1040,7 +1040,9 @@ mod two_host_fixture {
             "LiveOutput frame painted during reload command window after pre-reload frame {pre_reload_frame}: {reload_command_paints:?}\n{}",
             escaped(&fixture.host_bound[before_reload..reload_command_done])
         );
-        fixture.wait_for_host_marker_with_answerback(b"LIVE_READY:010", Duration::from_secs(10));
+        // Intermediate frames can be covered by the post-reload viewport.
+        // Require the final live frame, beyond the bounded dedup window.
+        fixture.wait_for_host_marker_with_answerback(b"LIVE_READY:029", Duration::from_secs(10));
         drain_for(
             &fixture.child.rx,
             &mut fixture.host_bound,
@@ -1375,8 +1377,12 @@ exit 0
 
     impl SharedTwoHostClient {
         fn wait_for_host_marker_with_answerback(&mut self, marker: &[u8], timeout: Duration) {
+            if contains_subslice(&self.host_bound, marker) {
+                return;
+            }
             let deadline = Instant::now() + timeout;
             let mut answered = [false; 4];
+            let answer_start = self.host_bound.len();
             while Instant::now() < deadline {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 match self
@@ -1386,7 +1392,11 @@ exit 0
                 {
                     Ok(chunk) => {
                         self.host_bound.extend_from_slice(&chunk);
-                        answer_queries_once(&self.host_bound, &self.child.input, &mut answered);
+                        answer_queries_once(
+                            &self.host_bound[answer_start..],
+                            &self.child.input,
+                            &mut answered,
+                        );
                         if contains_subslice(&self.host_bound, marker) {
                             return;
                         }
@@ -1449,10 +1459,12 @@ exit 0
                 );
                 return;
             }
+            let control_start = self.host_bound.len();
             write(&self.child.input, DETACH_KEY).expect("enter attach control mode");
-            wait_for_bytes(
+            wait_for_new_bytes(
                 &self.child.rx,
                 &mut self.host_bound,
+                control_start,
                 b"detach",
                 Duration::from_secs(5),
             )
@@ -1772,8 +1784,12 @@ exit 0
         }
 
         fn wait_for_host_marker_with_answerback(&mut self, marker: &[u8], timeout: Duration) {
+            if contains_subslice(&self.host_bound, marker) {
+                return;
+            }
             let deadline = Instant::now() + timeout;
             let mut answered = [false; 4];
+            let answer_start = self.host_bound.len();
             while Instant::now() < deadline {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 match self
@@ -1783,7 +1799,11 @@ exit 0
                 {
                     Ok(chunk) => {
                         self.host_bound.extend_from_slice(&chunk);
-                        answer_queries_once(&self.host_bound, &self.child.input, &mut answered);
+                        answer_queries_once(
+                            &self.host_bound[answer_start..],
+                            &self.child.input,
+                            &mut answered,
+                        );
                         if contains_subslice(&self.host_bound, marker) {
                             return;
                         }
@@ -1807,6 +1827,7 @@ exit 0
         ) {
             let deadline = Instant::now() + timeout;
             let mut answered = [false; 4];
+            let answer_start = self.host_bound.len();
             while Instant::now() < deadline {
                 if count_subslice(&self.host_bound, marker) >= occurrences {
                     return;
@@ -1819,7 +1840,11 @@ exit 0
                 {
                     Ok(chunk) => {
                         self.host_bound.extend_from_slice(&chunk);
-                        answer_queries_once(&self.host_bound, &self.child.input, &mut answered);
+                        answer_queries_once(
+                            &self.host_bound[answer_start..],
+                            &self.child.input,
+                            &mut answered,
+                        );
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1832,11 +1857,19 @@ exit 0
             );
         }
 
-        fn trigger_reload(&mut self) {
+        fn trigger_reload(&mut self) -> usize {
             write(&self.child.input, DETACH_KEY).expect("enter attach control mode for reload");
             self.wait_for_host_marker_with_answerback(b"reload", Duration::from_secs(5));
+            let request_start = self.host_bound.len();
             write(&self.child.input, b"r").expect("request attach reload");
-            self.wait_for_host_marker_with_answerback(b"reload requested", Duration::from_secs(5));
+            let marker = b"reload requested";
+            self.wait_for_host_marker_with_answerback(marker, Duration::from_secs(5));
+            // One read can contain both the acknowledgement and later paints.
+            // The command boundary is the marker, not the end of that read.
+            request_start
+                + find_subslice(&self.host_bound[request_start..], marker)
+                    .expect("reload acknowledgement")
+                + marker.len()
         }
 
         fn inject_ghostty_answers(&self, answers: &[&[u8]]) {
@@ -1869,10 +1902,12 @@ exit 0
                 );
                 return;
             }
+            let control_start = self.host_bound.len();
             write(&self.child.input, DETACH_KEY).expect("enter attach control mode");
-            wait_for_bytes(
+            wait_for_new_bytes(
                 &self.child.rx,
                 &mut self.host_bound,
+                control_start,
                 b"detach",
                 Duration::from_secs(5),
             )
@@ -1994,16 +2029,21 @@ exit 0
         portl_core::QueryStripper::reset_max_buffered_watermark_for_test();
         let sizes = [1024_usize, 100 * 1024, 10 * 1024 * 1024];
         let mut samples = Vec::new();
-        let started = Instant::now();
         let mut fixture = spawn_provider_dos_fixture(provider, &sizes);
-        let mut previous = started;
         for size in sizes {
+            // Start each burst only after the reader is ready. Otherwise a
+            // later burst can already be buffered when its timer starts.
+            let start_marker = format!("E2E_DOS_START_{size}");
+            fixture.wait_for_host_marker_with_answerback(
+                start_marker.as_bytes(),
+                Duration::from_secs(30),
+            );
+            let started = Instant::now();
+            write(&fixture.child.input, b"G").expect("start timed query burst");
             let marker = dos_marker(size);
             fixture.wait_for_host_marker_with_answerback(&marker, Duration::from_secs(30));
-            let now = Instant::now();
+            samples.push((size, started.elapsed()));
             assert_no_query_bytes(&fixture.host_bound, provider.name());
-            samples.push((size, now.saturating_duration_since(previous)));
-            previous = now;
         }
         fixture.inject_safe_stdin_marker();
         let wire = fixture.wait_for_wire_bytes(SAFE_STDIN_MARKER, Duration::from_secs(10));
@@ -2113,15 +2153,28 @@ exit 0
                 .expect("write escaped prefix");
         }
         format!(
-            "python3 -c 'import sys;sizes=[{sizes}];q=b\"\\x1b[c\";sys.stdout.buffer.write(b\"{escaped_prefix}\");[(sys.stdout.buffer.write(q*((s+len(q)-1)//len(q))),sys.stdout.buffer.write(f\"E2E_DOS_READY_{{s}}\\r\\n\".encode()),sys.stdout.buffer.flush()) for s in sizes]'"
+            r#"stty -echo -icanon min 1 time 0 2>/dev/null || true
+python3 -c 'import sys
+sizes=[{sizes}]
+q=b"\x1b[c"
+sys.stdout.buffer.write(b"{escaped_prefix}")
+for s in sizes:
+    sys.stdout.buffer.write(f"E2E_DOS_START_{{s}}\r\n".encode())
+    sys.stdout.buffer.flush()
+    if sys.stdin.buffer.read(1) != b"G":
+        raise SystemExit("missing query burst start signal")
+    sys.stdout.buffer.write(q*((s+len(q)-1)//len(q)))
+    sys.stdout.buffer.write(f"E2E_DOS_READY_{{s}}\r\n".encode())
+    sys.stdout.buffer.flush()
+'"#
         )
     }
 
     fn dos_burst_shell_command(sizes: &[usize]) -> String {
-        format!(
-            "/bin/sh -c {:?}",
-            format!("{}; sleep 30", dos_burst_python(b"", sizes))
-        )
+        let script = format!("{}; sleep 30", dos_burst_python(b"", sizes));
+        // Rust debug escaping is not shell quoting: it turns newlines into
+        // literal backslash-n characters and corrupts the Python program.
+        format!("/bin/sh -c '{}'", script.replace('\'', "'\\''"))
     }
 
     fn full_box_drawing_block() -> Vec<char> {
@@ -2773,7 +2826,7 @@ case "$1" in
   list) printf 'dev\n' ;;
   attach)
     {}
-    stty -echo -icanon min 0 time 100 2>/dev/null || true
+    stty -echo -icanon min 1 time 0 2>/dev/null || true
     dd of=/dev/null bs=1024 count=1 2>/dev/null || true
     ;;
   kill) echo "killed:$2" ;;
@@ -2803,7 +2856,7 @@ case "$1" in
   kill-session) echo "killed:$3" ;;
   -CC)
     {python}
-    stty -echo -icanon min 0 time 100 2>/dev/null || true
+    stty -echo -icanon min 1 time 0 2>/dev/null || true
     dd of=/dev/null bs=1024 count=1 2>/dev/null || true
     ;;
   *) echo "not tmux e2e fixture" >&2; exit 64 ;;
@@ -3141,8 +3194,14 @@ exit 0
         "transient" => b"RECONNECT_SUCCESS".as_slice(),
         other => panic!("unknown reconnect fixture scenario {other}"),
     };
-    wait_for_bytes(&child.rx, &mut transcript, ready, Duration::from_secs(10))
-        .expect("reconnect fixture reached ready marker");
+    wait_for_bytes(&child.rx, &mut transcript, ready, Duration::from_secs(10)).unwrap_or_else(
+        |error| {
+            panic!(
+                "reconnect fixture did not reach ready marker: {error}; transcript:\n{}",
+                escaped(&transcript)
+            )
+        },
+    );
     if let Some(signal) = signal {
         let pid = attach_pid_from_transcript(&transcript);
         kill(pid, signal).expect("send reconnect fixture signal");
@@ -3238,12 +3297,26 @@ fn spawn_reader(master: OwnedFd) -> mpsc::Receiver<Vec<u8>> {
     rx
 }
 
+#[test]
+fn buffered_waiters_preserve_marker_scope() {
+    let (_sender, receiver) = mpsc::channel();
+    let mut transcript = b"OLD_READY new READY".to_vec();
+    assert!(wait_for_bytes(&receiver, &mut transcript, b"READY", Duration::ZERO).is_ok());
+    assert!(wait_for_new_bytes(&receiver, &mut transcript, 10, b"READY", Duration::ZERO).is_ok());
+    assert!(
+        wait_for_new_bytes(&receiver, &mut transcript, 10, b"OLD_READY", Duration::ZERO).is_err()
+    );
+}
+
 fn wait_for_bytes(
     rx: &mpsc::Receiver<Vec<u8>>,
     transcript: &mut Vec<u8>,
     needle: &[u8],
     timeout: Duration,
 ) -> io::Result<()> {
+    if contains_subslice(transcript, needle) {
+        return Ok(());
+    }
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -3271,6 +3344,9 @@ fn wait_for_new_bytes(
     needle: &[u8],
     timeout: Duration,
 ) -> io::Result<()> {
+    if contains_subslice(&transcript[start..], needle) {
+        return Ok(());
+    }
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());

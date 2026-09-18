@@ -197,7 +197,9 @@ jobs:
       # the feature-independent suite already covered by the primary test job.
       - run: cargo nextest run --locked --profile ci -p portl-agent --features ghostty-vt-static --lib --tests -E '(kind(lib) + binary(=session_e2e))'
       - run: cargo nextest run --locked --profile ci -p portl-cli --features ghostty-vt-static -E 'binary(=ghostty_smoke)'
-      - run: cargo clippy --locked -p portl-agent -p portl-cli --features ghostty-vt-static --all-targets -- -D warnings
+      - name: Check terminal attach and reconnect regressions
+        run: cargo nextest run --locked --profile ci -p portl-cli --all-features --test tuistory_attach --test-threads 1
+      - run: cargo clippy --locked -p portl-agent -p portl-cli --all-features --all-targets -- -D warnings
 
   ghostty-musl-smoke:
     name: ghostty musl smoke (${{ matrix.target }})

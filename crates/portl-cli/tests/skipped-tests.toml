@@ -33,14 +33,6 @@ justification = "mDNS localhost discovery is environment-dependent and flaky in 
 
 [[skipped_tests]]
 package = "portl-agent"
-binary = "agent_misc"
-kind = "test"
-name = "rlimits::fork_bomb_killed_by_nproc"
-platform = "linux"
-justification = "Linux-only resource-limit stress test is unsafe for shared CI hosts."
-
-[[skipped_tests]]
-package = "portl-agent"
 binary = "shell_e2e"
 kind = "test"
 name = "exec_user_switch_drops_supplementary_groups"
