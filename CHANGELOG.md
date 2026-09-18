@@ -9,6 +9,8 @@ All notable changes land here. This project follows
 
 ### Fixed
 
+- Updated Rustls to 0.23.45 to reject TLS 1.3 handshake messages received at
+  incorrect encryption levels (RUSTSEC-2026-0285).
 - TCP and Unix forwards retain their listeners and reconnect after terminal
   peer loss. Failed client streams are closed, never replayed against a new
   destination. New clients fail promptly while the peer is unavailable.

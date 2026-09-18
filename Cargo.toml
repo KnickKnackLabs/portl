@@ -31,7 +31,7 @@ iroh-mdns-address-lookup = "0.5.0"
 russh        = { version = "0.63.2", default-features = false, features = ["ring"] }
 # TLS for the embedded relay server. Feature set matches Portl's ring-only
 # provider policy; no aws-lc-rs.
-rustls          = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+rustls          = { version = "0.23.45", default-features = false, features = ["std", "ring", "tls12"] }
 tokio        = { version = "1", features = [
     "fs", "io-std", "io-util", "macros", "net", "process",
     "rt-multi-thread", "signal", "sync", "time",
