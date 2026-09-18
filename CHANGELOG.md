@@ -5,6 +5,29 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.14.2 — 2026-09-18
+
+### Fixed
+
+- TCP and Unix forwards retain their listeners and reconnect after terminal
+  peer loss. Failed client streams are closed, never replayed against a new
+  destination. New clients fail promptly while the peer is unavailable.
+- Preserve TCP and Unix half-closes so delayed responses can finish, and drain
+  shell and exec output instead of silently discarding it after 250 ms.
+- Supervise attach forward workers, roll back partial listener startup, and
+  route replies correctly when multiple UDP forwards share one connection.
+- Bound and cancel setup requests, use delayed retries for temporary failures,
+  and stop retrying permanent configuration or authorization failures.
+- Docker readiness now handles closed logs and stalled requests. Restart
+  monitoring reports lost event streams, retries read-only checks, and does
+  not repeat an injection with an unknown result.
+- Human and JSON status output collect the same requested samples and return
+  success when at least one sample succeeds.
+- End SSH stdio connections when the remote peer is lost, close session and
+  Slicer resources on failure, and bound pairing and session control requests.
+- Check local agent readiness after a restart request and report unexpected
+  watchdog failure. Local readiness does not claim remote network health.
+
 ## 0.14.1 — 2026-09-10
 
 ### Fixed
