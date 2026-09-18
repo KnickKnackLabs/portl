@@ -50,7 +50,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
 use tracing::{debug, trace};
 
-use crate::commands::forwarding::{ForwardPlan, ForwardingArgs};
+use crate::commands::forwarding::{ForwardPlan, ForwardingArgs, supervise_forwarding};
+use crate::commands::network_lifecycle;
 use crate::commands::peer_resolve::{
     bind_client_endpoint, close_client_endpoint, close_connected, close_connected_connection,
     connect_peer, connect_peer_quiet, connect_peer_with_endpoint, resolve_identity_path,
@@ -239,9 +240,13 @@ pub fn providers(target: Option<&str>, json: bool) -> Result<ExitCode> {
             local_session_providers()
         } else {
             let connected = connect_peer(&target, session_caps()).await?;
-            let report = open_session_providers(&connected.connection, &connected.session).await?;
+            let report = network_lifecycle::cancellable_setup(
+                "session providers request",
+                open_session_providers(&connected.connection, &connected.session),
+            )
+            .await;
             close_connected(connected, b"session complete").await;
-            report
+            report?
         };
         if json {
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -293,14 +298,17 @@ pub fn ls(
             local_session_list_detailed(provider.as_deref()).await?
         } else {
             let connected = connect_peer(&target, session_caps()).await?;
-            let groups = open_session_list_detailed(
-                &connected.connection,
-                &connected.session,
-                provider.clone(),
+            let groups = network_lifecycle::cancellable_setup(
+                "session list request",
+                open_session_list_detailed(
+                    &connected.connection,
+                    &connected.session,
+                    provider.clone(),
+                ),
             )
-            .await?;
+            .await;
             close_connected(connected, b"session complete").await;
-            groups
+            groups?
         };
         let listing = SessionListing::from_groups(&target, provider.as_deref(), groups);
         if json {
@@ -429,15 +437,18 @@ pub fn history(
             local_session_history(provider.as_deref(), &resolved.session).await?
         } else {
             let connected = connect_peer(&resolved.target, session_caps()).await?;
-            let output = open_session_history(
-                &connected.connection,
-                &connected.session,
-                provider.clone(),
-                resolved.session,
+            let output = network_lifecycle::cancellable_setup(
+                "session history request",
+                open_session_history(
+                    &connected.connection,
+                    &connected.session,
+                    provider.clone(),
+                    resolved.session,
+                ),
             )
-            .await?;
+            .await;
             close_connected(connected, b"session complete").await;
-            output
+            output?
         };
         print!("{output}");
         Ok(ExitCode::SUCCESS)
@@ -460,14 +471,18 @@ pub fn kill(
             local_session_kill(provider.as_deref(), &resolved.session).await?;
         } else {
             let connected = connect_peer(&resolved.target, session_caps()).await?;
-            open_session_kill(
-                &connected.connection,
-                &connected.session,
-                provider.clone(),
-                resolved.session,
+            let result = network_lifecycle::cancellable_setup(
+                "session kill request (completion may be unknown on transport failure)",
+                open_session_kill(
+                    &connected.connection,
+                    &connected.session,
+                    provider.clone(),
+                    resolved.session,
+                ),
             )
-            .await?;
+            .await;
             close_connected(connected, b"session complete").await;
+            result?;
         }
         Ok(ExitCode::SUCCESS)
     });
@@ -2650,6 +2665,38 @@ async fn open_remote_attach_session_checked(
     cwd: Option<String>,
     pty: portl_core::net::shell_client::PtyCfg,
 ) -> std::result::Result<RemoteAttachSession, SessionOpenError> {
+    tokio::time::timeout(
+        network_lifecycle::SETUP_TIMEOUT,
+        open_remote_attach_session_inner(
+            connection,
+            session,
+            provider,
+            session_name,
+            argv,
+            user,
+            cwd,
+            pty,
+        ),
+    )
+    .await
+    .map_err(|error| {
+        SessionOpenError::Transport(
+            anyhow!(error).context("session attach setup deadline exceeded"),
+        )
+    })?
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_remote_attach_session_inner(
+    connection: &Connection,
+    session: &portl_core::net::PeerSession,
+    provider: Option<String>,
+    session_name: String,
+    argv: Option<Vec<String>>,
+    user: Option<String>,
+    cwd: Option<String>,
+    pty: portl_core::net::shell_client::PtyCfg,
+) -> std::result::Result<RemoteAttachSession, SessionOpenError> {
     if provider.as_deref() == Some("herdr") {
         return open_session_attach_herdr_checked(
             connection,
@@ -2726,7 +2773,7 @@ async fn remote_session_attach_once_without_reconnect(
         request.provider.as_deref(),
         &request.session_name,
     );
-    let _forward_runtime = match start_attach_forwarding(&request, &connected, true).await {
+    let mut forward_runtime = match start_attach_forwarding(&request, &connected, true).await {
         Ok(runtime) => runtime,
         Err(err) => {
             close_connected(connected, b"forward startup failed").await;
@@ -2762,9 +2809,12 @@ async fn remote_session_attach_once_without_reconnect(
             );
             let canonical_ref =
                 canonical_session_ref(&request.target, &provider, &request.session_name);
-            bridge_attach(session, request.cols, request.rows, canonical_ref)
-                .await
-                .map(exit_code_from_i32)
+            supervise_forwarding(
+                &mut forward_runtime,
+                bridge_attach(session, request.cols, request.rows, canonical_ref),
+            )
+            .await
+            .map(exit_code_from_i32)
         }
         Err(err) => Err(err.into()),
     };
@@ -2857,7 +2907,12 @@ async fn remote_session_attach_herdr_with_reconnect_on_endpoint(
         let RemoteAttachSession::Herdr(herdr_session) = session else {
             anyhow::bail!("expected herdr attach session, got provider '{provider}'");
         };
-        match bridge_attach_herdr(herdr_session, canonical_ref.clone()).await {
+        match supervise_forwarding(
+            &mut forward_runtime,
+            bridge_attach_herdr(herdr_session, canonical_ref.clone()),
+        )
+        .await
+        {
             Ok(code) => {
                 drop(forward_runtime.take());
                 cleanup_attach_forwarding(&request);
@@ -2875,7 +2930,7 @@ async fn remote_session_attach_herdr_with_reconnect_on_endpoint(
                     reason,
                     error = %error,
                 );
-                if reason != "remote_stream_closed" {
+                if reason != "remote_stream_closed" || !network_lifecycle::retryable(&err) {
                     drop(forward_runtime.take());
                     cleanup_attach_forwarding(&request);
                     close_connected_connection(connected, b"herdr attach ended").await;
@@ -2885,13 +2940,19 @@ async fn remote_session_attach_herdr_with_reconnect_on_endpoint(
                 if attach_started.elapsed() >= Duration::from_secs(30) {
                     reconnect_state = ReconnectAttemptState::new();
                 }
-                let reattached = reconnect_remote_herdr_session(
-                    &request,
-                    &provider,
-                    identity,
-                    endpoint,
-                    &canonical_ref,
-                    &mut reconnect_state,
+                if let Some(runtime) = &mut forward_runtime {
+                    runtime.disconnected();
+                }
+                let reattached = supervise_forwarding(
+                    &mut forward_runtime,
+                    reconnect_remote_herdr_session(
+                        &request,
+                        &provider,
+                        identity,
+                        endpoint,
+                        &canonical_ref,
+                        &mut reconnect_state,
+                    ),
                 )
                 .await?;
                 connected = reattached.connected;
@@ -2911,6 +2972,27 @@ struct ReattachedHerdrSession {
 }
 
 async fn reconnect_remote_herdr_session(
+    request: &RemoteSessionAttachRequest,
+    provider: &str,
+    identity: &portl_core::id::Identity,
+    endpoint: &iroh::Endpoint,
+    canonical_ref: &str,
+    state: &mut ReconnectAttemptState,
+) -> Result<ReattachedHerdrSession> {
+    let policy = reconnect_policy_for_environment(ReconnectPolicy::default_interactive());
+    let remaining = policy.max_elapsed.saturating_sub(state.started.elapsed());
+    tokio::select! {
+        result = tokio::time::timeout(remaining,
+            Box::pin(reconnect_remote_herdr_session_inner(request, provider, identity, endpoint, canonical_ref, state)),
+        ) => result.context("herdr session reconnect deadline exceeded")?,
+        result = network_lifecycle::shutdown_signal() => {
+            result?;
+            anyhow::bail!("session reconnect interrupted");
+        }
+    }
+}
+
+async fn reconnect_remote_herdr_session_inner(
     request: &RemoteSessionAttachRequest,
     provider: &str,
     identity: &portl_core::id::Identity,
@@ -2945,6 +3027,9 @@ async fn reconnect_remote_herdr_session(
         {
             Ok(connected) => connected,
             Err(err) => {
+                if !network_lifecycle::retryable(&err) {
+                    return Err(err);
+                }
                 debug!(%err, attempt, "herdr reconnect connect failed");
                 continue;
             }
@@ -3057,24 +3142,32 @@ async fn remote_session_attach_with_reconnect_on_endpoint(
             }
             AttachEnd::Disconnected(anyhow!("test reconnect injection"))
         } else {
-            run_remote_attach_once(
+            supervise_forwarding(&mut forward_runtime, async {
+                Ok(run_remote_attach_once(
+                    session,
+                    &display,
+                    &mut coordinator,
+                    &mode_tracker,
+                    &mut signal_watcher,
+                )
+                .await)
+            })
+            .await
+            .unwrap_or_else(AttachEnd::Disconnected)
+        };
+        #[cfg(not(feature = "test-reconnect-injection"))]
+        let attach_end = supervise_forwarding(&mut forward_runtime, async {
+            Ok(run_remote_attach_once(
                 session,
                 &display,
                 &mut coordinator,
                 &mode_tracker,
                 &mut signal_watcher,
             )
-            .await
-        };
-        #[cfg(not(feature = "test-reconnect-injection"))]
-        let attach_end = run_remote_attach_once(
-            session,
-            &display,
-            &mut coordinator,
-            &mode_tracker,
-            &mut signal_watcher,
-        )
-        .await;
+            .await)
+        })
+        .await
+        .unwrap_or_else(AttachEnd::Disconnected);
 
         match attach_end {
             AttachEnd::Exited(code) => {
@@ -3112,6 +3205,12 @@ async fn remote_session_attach_with_reconnect_on_endpoint(
                 return Ok(ExitCode::from(1));
             }
             AttachEnd::Disconnected(err) => {
+                if !network_lifecycle::retryable(&err) {
+                    display.clear_bar().await?;
+                    coordinator.stop().await;
+                    raw_guard.finish(RawModeExitVariant::Normal);
+                    return Err(err);
+                }
                 debug!(%err, "remote session attach disconnected");
                 let disconnected_path = attach_path_snapshot(&connected.connection);
                 if attach_started.elapsed() >= Duration::from_secs(30) {
@@ -3122,18 +3221,21 @@ async fn remote_session_attach_with_reconnect_on_endpoint(
                     format!("attach stream disconnected: {err}"),
                     disconnected_path,
                 );
-                let reattached = reconnect_remote_session(
-                    &request,
-                    &provider,
-                    connected,
-                    identity,
-                    endpoint,
-                    &display,
-                    &canonical_ref,
-                    &mut coordinator,
-                    &mut reconnect_state,
-                    &mut flight_recorder,
-                    &mut signal_watcher,
+                let reattached = supervise_forwarding(
+                    &mut forward_runtime,
+                    reconnect_remote_session(
+                        &request,
+                        &provider,
+                        connected,
+                        identity,
+                        endpoint,
+                        &display,
+                        &canonical_ref,
+                        &mut coordinator,
+                        &mut reconnect_state,
+                        &mut flight_recorder,
+                        &mut signal_watcher,
+                    ),
                 )
                 .await?;
                 match reattached {
@@ -4378,6 +4480,54 @@ async fn reconnect_remote_session(
     flight_recorder: &mut AttachFlightRecorder,
     signal_watcher: &mut AttachSignalWatcher,
 ) -> Result<ReconnectOutcome> {
+    let policy = reconnect_policy_for_environment(ReconnectPolicy::default_interactive());
+    let remaining = policy.max_elapsed.saturating_sub(state.started.elapsed());
+    if let Ok(result) = tokio::time::timeout(
+        remaining,
+        Box::pin(reconnect_remote_session_inner(
+            request,
+            provider,
+            current_connected,
+            identity,
+            endpoint,
+            display,
+            canonical_ref,
+            coordinator,
+            state,
+            flight_recorder,
+            signal_watcher,
+        )),
+    )
+    .await
+    {
+        result
+    } else {
+        flight_recorder.record("reconnect application exchange exceeded remaining budget");
+        #[cfg(feature = "test-reconnect-injection")]
+        if matches!(
+            test_reconnect_scenario()?,
+            Some(TestReconnectScenario::Exhausted)
+        ) {
+            write_reconnect_test_marker(display, b"RECONNECT_BUDGET_EXHAUSTED\r\n").await?;
+        }
+        Ok(ReconnectOutcome::Expired)
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn reconnect_remote_session_inner(
+    request: &RemoteSessionAttachRequest,
+    provider: &str,
+    current_connected: crate::commands::peer_resolve::ConnectedPeer,
+    identity: &portl_core::id::Identity,
+    endpoint: &iroh::Endpoint,
+    display: &AttachDisplay,
+    canonical_ref: &str,
+    coordinator: &mut AttachInputCoordinator,
+    state: &mut ReconnectAttemptState,
+    flight_recorder: &mut AttachFlightRecorder,
+    signal_watcher: &mut AttachSignalWatcher,
+) -> Result<ReconnectOutcome> {
     let policy = reconnect_policy_for_environment(ReconnectPolicy::default_interactive())
         .with_observed_rtt(state.last_rtt);
     if !policy.retry_budget_remaining(state.started.elapsed()) {
@@ -4511,6 +4661,9 @@ async fn reconnect_remote_session(
         } {
             Ok(connected) => connected,
             Err(err) => {
+                if !network_lifecycle::retryable(&err) {
+                    return Err(err);
+                }
                 debug!(%err, attempt, "session reconnect connect failed");
                 log_reconnect_transport_event(
                     "transport.reconnect.connect_failed",
@@ -7030,9 +7183,18 @@ impl AttachInputCoordinator {
         }
     }
 
-    async fn stop(self) {
-        let _ = self.tx.send(AttachInputCommand::Stop).await;
-        let _ = self.handle.await;
+    async fn stop(mut self) {
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            let _ = self.tx.send(AttachInputCommand::Stop).await;
+            let _ = (&mut self.handle).await;
+        })
+        .await;
+    }
+}
+
+impl Drop for AttachInputCoordinator {
+    fn drop(&mut self) {
+        self.handle.abort();
     }
 }
 

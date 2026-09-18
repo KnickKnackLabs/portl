@@ -32,6 +32,8 @@ pub async fn endpoint() -> Result<Endpoint, iroh::endpoint::BindError> {
     Ok(Endpoint::from(
         iroh::Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Disabled)
+            .bind_addr(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+            .expect("valid loopback test address")
             .dns_resolver(test_dns_resolver())
             .bind()
             .await?,
@@ -54,6 +56,8 @@ pub async fn pair() -> Result<(Endpoint, Endpoint), iroh::endpoint::BindError> {
     let a = Endpoint::from(
         iroh::Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Disabled)
+            .bind_addr(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+            .expect("valid loopback test address")
             .dns_resolver(test_dns_resolver())
             .address_lookup(lookup.clone())
             .bind()
@@ -62,6 +66,8 @@ pub async fn pair() -> Result<(Endpoint, Endpoint), iroh::endpoint::BindError> {
     let b = Endpoint::from(
         iroh::Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Disabled)
+            .bind_addr(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+            .expect("valid loopback test address")
             .dns_resolver(test_dns_resolver())
             .address_lookup(lookup.clone())
             .bind()

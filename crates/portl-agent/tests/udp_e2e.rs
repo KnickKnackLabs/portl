@@ -18,6 +18,62 @@ use portl_proto::udp_v1::{UdpBind, UdpDatagram};
 use tokio::net::UdpSocket;
 
 #[tokio::test]
+async fn udp_forwards_share_one_connection_without_stealing_replies() -> Result<()> {
+    let echo = start_udp_echo_server().await?;
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator, None).await?;
+    let ticket = root_ticket(&operator, server.addr(), udp_caps(echo.port, echo.port));
+    let (connection, session) = open_ticket_v1(&client, &ticket, &[], &operator).await?;
+    let fanout = std::sync::Arc::new(portl_core::net::udp_client::UdpDatagramFanout::new(
+        connection.clone(),
+    ));
+    let mut tasks = Vec::new();
+    let mut ports = Vec::new();
+    for _ in 0..2 {
+        let port = reserve_udp_port()?;
+        let forward = portl_core::net::LocalUdpForwardHandle::bind(&format!("127.0.0.1:{port}"))?;
+        let control =
+            open_udp(&connection, &session, None, vec![udp_bind(port, echo.port)]).await?;
+        let connection = connection.clone();
+        let fanout = std::sync::Arc::clone(&fanout);
+        let target_port = echo.port;
+        tasks.push(tokio::spawn(async move {
+            forward
+                .run_with_control_via_fanout(connection, control, target_port, &fanout)
+                .await
+        }));
+        ports.push(port);
+    }
+    let app = UdpSocket::bind("127.0.0.1:0").await?;
+    for (index, port) in ports.iter().enumerate() {
+        for sequence in 0..16_u8 {
+            app.send_to(&[u8::try_from(index)?, sequence], ("127.0.0.1", *port))
+                .await?;
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut replies = std::collections::HashSet::new();
+        for _ in 0..32 {
+            let mut payload = [0; 2];
+            let (read, from) = app.recv_from(&mut payload).await?;
+            assert_eq!(read, 2);
+            assert_eq!(from.port(), ports[usize::from(payload[0])]);
+            assert!(replies.insert(payload), "duplicate UDP reply");
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    close_connection(&connection);
+    for task in tasks {
+        let _ = task.await?;
+    }
+    drop(fanout);
+    echo.task.abort();
+    shutdown(client, server, agent).await
+}
+
+#[tokio::test]
 async fn udp_ctl_roundtrip() -> Result<()> {
     let echo = start_udp_echo_server().await?;
     let (client, server) = pair().await?;

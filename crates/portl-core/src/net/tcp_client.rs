@@ -345,6 +345,7 @@ async fn run_local_forward_with_listener_logged(
                     &format_close_line(&local_addr, client_addr, started.elapsed(), stats),
                 ),
                 Err(err) => {
+                    let err = crate::diagnostics::redact_text(&format!("{err:#}"));
                     let close_line = format!(
                         "[tcp -L {local_addr}] closed client={client_addr} after {}, error={err}",
                         format_duration(started.elapsed())

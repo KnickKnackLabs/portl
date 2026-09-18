@@ -60,7 +60,11 @@ async fn run_async(invite: &InviteCode) -> Result<ExitCode> {
     let endpoint =
         crate::client_endpoint::bind_pairing_client_endpoint_with_config(&identity, &client_cfg)
             .await?;
-    let result = run_async_with_endpoint(invite, &our_eid_hex, caller_relay_hint, &endpoint).await;
+    let result = crate::commands::network_lifecycle::cancellable_setup(
+        "pairing exchange (completion may be unknown on transport failure)",
+        run_async_with_endpoint(invite, &our_eid_hex, caller_relay_hint, &endpoint),
+    )
+    .await;
     crate::commands::peer_resolve::close_client_endpoint(endpoint, "pair command").await;
     result
 }

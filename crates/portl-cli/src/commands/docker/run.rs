@@ -95,8 +95,19 @@ pub(super) async fn inject_container<D: DockerOps, H: HostOps>(
             exec_env,
         )
         .await?;
-    let logs = docker.start_exec_with_logs(&exec_id).await?;
-    wait_for_agent_start(docker, &exec_id, logs).await?;
+    let logs = docker
+        .start_exec_with_logs(&exec_id)
+        .await
+        .with_context(|| {
+            format!(
+                "start injected exec {exec_id}; completion may be unknown, inspect before retrying"
+            )
+        })?;
+    wait_for_agent_start(docker, &exec_id, logs)
+        .await
+        .with_context(|| {
+            format!("injected exec {exec_id} did not confirm readiness; inspect before retrying")
+        })?;
     Ok(InjectionOutcome {
         container,
         binary_path,
@@ -168,15 +179,19 @@ pub(super) async fn finalize_connectable_ticket(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let result = async {
         loop {
-            match resolve_peer(
-                &plan.endpoint_id_hex,
-                &ResolveOpts {
-                    caps: plan.caps.clone(),
-                    force_relay: false,
-                    identity: operator,
-                    endpoint: &endpoint,
-                    quiet: false,
-                },
+            match crate::commands::network_lifecycle::before_deadline(
+                deadline,
+                "Docker agent ticket resolution",
+                resolve_peer(
+                    &plan.endpoint_id_hex,
+                    &ResolveOpts {
+                        caps: plan.caps.clone(),
+                        force_relay: false,
+                        identity: operator,
+                        endpoint: &endpoint,
+                        quiet: false,
+                    },
+                ),
             )
             .await
             {
@@ -187,7 +202,10 @@ pub(super) async fn finalize_connectable_ticket(
                 }
                 Err(err) if tokio::time::Instant::now() < deadline => {
                     let _ = err;
-                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    tokio::time::sleep_until(
+                        (tokio::time::Instant::now() + Duration::from_millis(250)).min(deadline),
+                    )
+                    .await;
                 }
                 Err(err) => {
                     return Err(err)
@@ -459,37 +477,71 @@ pub(super) async fn wait_for_agent_start<D: DockerOps>(
     exec_id: &str,
     mut logs: BoxStream<'static, Result<String>>,
 ) -> Result<()> {
-    let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(false);
-    tokio::spawn(async move {
-        while let Some(line) = logs.next().await {
-            match line {
-                Ok(line) if line.contains(READY_LOG_TOKEN) => {
-                    let _ = ready_tx.send(true);
-                }
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
-    });
-
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        tokio::select! {
-            changed = ready_rx.changed() => {
-                if changed.is_ok() && *ready_rx.borrow() {
-                    return Ok(());
-                }
-            }
-            () = tokio::time::sleep(Duration::from_millis(200)) => {
-                let exec = docker.inspect_exec(exec_id).await?;
-                if let Some(code) = exec.exit_code {
-                    bail!("injected agent exited before becoming ready (exit code {code})");
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    bail!("injected agent did not report readiness within 5s");
-                }
+    let ready = async {
+        while let Some(line) = logs.next().await {
+            if line
+                .context("read injected agent readiness log")?
+                .contains(READY_LOG_TOKEN)
+            {
+                return Ok(());
             }
         }
+        let exec = docker.inspect_exec(exec_id).await?;
+        if let Some(code) = exec.exit_code {
+            bail!("injected agent exited before becoming ready (exit code {code})");
+        }
+        bail!("injected agent log stream closed before readiness");
+    };
+    let exited = async {
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let exec = docker.inspect_exec(exec_id).await?;
+            if let Some(code) = exec.exit_code {
+                bail!("injected agent exited before becoming ready (exit code {code})");
+            }
+        }
+    };
+    // Both readers are owned by this call. EOF is terminal, and neither a
+    // closed log stream nor a stalled inspect request can reset the deadline.
+    tokio::select! {
+        result = ready => result,
+        result = exited => result,
+        () = tokio::time::sleep_until(deadline) => bail!("injected agent did not report readiness within 5s"),
+    }
+}
+
+// Read-only reconciliation is safe to retry. Never infer that an agent is
+// absent from a failed request: only a stopped exec or a confirmed 404 permits
+// reinjection into a running container.
+pub(super) async fn stopped_agent_container<D: DockerOps>(
+    docker: &D,
+    container: &str,
+    exec_id: &str,
+) -> Result<Option<ContainerSnapshot>> {
+    let snapshot = docker.inspect_container(container).await?;
+    if !snapshot.running {
+        return Ok(None);
+    }
+    match docker.inspect_exec(exec_id).await {
+        Ok(exec) if exec.running => Ok(None),
+        Ok(_) => Ok(Some(snapshot)),
+        Err(error)
+            if error
+                .downcast_ref::<bollard::errors::Error>()
+                .is_some_and(|error| {
+                    matches!(
+                        error,
+                        bollard::errors::Error::DockerResponseServerError {
+                            status_code: 404,
+                            ..
+                        }
+                    )
+                }) =>
+        {
+            Ok(Some(snapshot))
+        }
+        Err(error) => Err(error).context("inspect owned agent exec before reinjection"),
     }
 }
 
@@ -497,37 +549,76 @@ pub(super) async fn watch_container_restarts<D: DockerOps, H: HostOps>(
     docker: &D,
     host: &H,
     container: &str,
+    initial_exec: &str,
     binary_source: &BinarySource,
     operator: &Identity,
     session_provider: Option<&str>,
 ) -> Result<()> {
+    use crate::commands::network_lifecycle::{Backoff, before_deadline, shutdown_signal};
+    use tokio::time::Instant;
+
     let mut events = docker.container_events(container);
-    let mut needs_reinject = false;
+    let mut exec_id = initial_exec.to_owned();
+    let mut next_check = Instant::now() + Duration::from_secs(5);
+    let mut backoff = Backoff::default();
+    let mut failures = 0;
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
     loop {
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                signal.context("wait for ctrl-c")?;
-                return Ok(());
-            }
+            signal = &mut shutdown => return signal,
             event = events.next() => match event {
-                Some(Ok(ContainerEvent { action })) => match action.as_str() {
-                    "die" => needs_reinject = true,
-                    "start" if needs_reinject => {
-                        match attach_existing(docker, host, container, binary_source, operator, session_provider).await {
-                            Ok(outcome) => {
-                                save_injected_alias(&outcome)?;
-                            println!("{}", outcome.plan.ticket.encode_string());
-                                needs_reinject = false;
-                            }
-                            Err(err) => {
-                                eprintln!("warning: failed to re-inject after container restart: {err:#}");
-                            }
+                Some(Ok(ContainerEvent { action })) if action == "start" => next_check = Instant::now(),
+                Some(Ok(_)) => {},
+                Some(Err(error)) => return Err(error).context("Docker restart monitoring lost"),
+                None => bail!("Docker restart event stream closed; monitoring is lost"),
+            },
+            () = tokio::time::sleep_until(next_check) => {
+                let checked = tokio::select! {
+                    signal = &mut shutdown => return signal,
+                    result = before_deadline(Instant::now() + Duration::from_secs(5),
+                        "Docker restart reconciliation", stopped_agent_container(docker, container, &exec_id)) => result,
+                };
+                let snapshot = match checked {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        failures += 1;
+                        if failures >= 5 {
+                            return Err(error).context("Docker restart reconciliation failed after 5 read-only attempts");
+                        }
+                        tracing::warn!(error = %portl_core::diagnostics::redact_text(&format!("{error:#}")), "Docker restart check failed; retrying read-only check");
+                        next_check = Instant::now() + backoff.next();
+                        continue;
+                    }
+                };
+                failures = 0;
+                backoff = Backoff::default();
+                if let Some(snapshot) = snapshot {
+                    let plan = prepare_injection_plan(operator, session_provider)?;
+                    // Provisioning gets a separate 5-minute budget. A failed
+                    // mutation may have completed remotely: stop, do not replay.
+                    let mut outcome = tokio::select! {
+                        signal = &mut shutdown => {
+                            signal?;
+                            bail!("Docker reinjection interrupted; completion may be unknown, inspect before retrying");
+                        },
+                        result = before_deadline(Instant::now() + Duration::from_secs(300),
+                            "Docker reinjection", Box::pin(inject_container(docker, host, snapshot, binary_source, operator, plan))) => {
+                            result.context("Docker reinjection failed; mutation was not replayed, inspect before retrying")?
+                        }
+                    };
+                    save_injected_alias(&outcome)?;
+                    tokio::select! {
+                        signal = &mut shutdown => return signal,
+                        result = finalize_connectable_ticket(operator, &mut outcome.plan) => {
+                            result.with_context(|| format!("agent exec {} started, but ticket discovery failed; do not reinject", outcome.exec_id))?;
                         }
                     }
-                    _ => {}
-                },
-                Some(Err(err)) => return Err(err),
-                None => return Ok(()),
+                    save_injected_alias(&outcome)?;
+                    println!("{}", outcome.plan.ticket.encode_string());
+                    exec_id = outcome.exec_id;
+                }
+                next_check = Instant::now() + Duration::from_secs(5);
             }
         }
     }

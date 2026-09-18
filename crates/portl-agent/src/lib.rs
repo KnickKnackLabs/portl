@@ -628,10 +628,11 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
             () = shutdown.cancelled() => {
                 break;
             }
-            refresh = watchdog_refresh_rx.recv(), if watchdog_enabled => {
-                let Some(network_watchdog::WatchdogCommand::RefreshEndpoint) = refresh else {
+            refresh = network_watchdog::receive_refresh(&mut watchdog_refresh_rx), if watchdog_enabled => {
+                if let Err(error) = refresh {
+                    fatal_watchdog_error = Some(error);
                     break;
-                };
+                }
                 info!("watchdog requested endpoint refresh");
                 if cfg.bind_addr.is_some_and(|addr| addr.port() != 0) {
                     state.network_watchdog.record_endpoint_refresh_failure(

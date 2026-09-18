@@ -260,6 +260,15 @@ pub enum WatchdogCommand {
     RefreshEndpoint,
 }
 
+pub(crate) async fn receive_refresh(
+    receiver: &mut mpsc::UnboundedReceiver<WatchdogCommand>,
+) -> Result<()> {
+    match receiver.recv().await {
+        Some(WatchdogCommand::RefreshEndpoint) => Ok(()),
+        None => bail!("network watchdog command channel closed unexpectedly"),
+    }
+}
+
 pub fn spawn_watchdog_task(
     config: WatchdogConfig,
     health: NetworkWatchdogHealth,
@@ -524,6 +533,20 @@ mod tests {
 
     fn ts(secs: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    #[tokio::test]
+    async fn closed_watchdog_channel_is_failure_not_normal_completion() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        sender
+            .send(WatchdogCommand::RefreshEndpoint)
+            .expect("refresh");
+        receive_refresh(&mut receiver).await.expect("valid refresh");
+        drop(sender);
+        let error = receive_refresh(&mut receiver)
+            .await
+            .expect_err("lost critical worker");
+        assert!(error.to_string().contains("closed unexpectedly"));
     }
 
     #[test]

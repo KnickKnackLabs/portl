@@ -108,7 +108,17 @@ pub fn run(
             &operator,
         )
         .await?;
-        finalize_connectable_ticket(&operator, &mut outcome.plan).await?;
+        // Record the owned exec before discovery: a discovery failure must not
+        // leave a started agent untracked or require another injection.
+        save_injected_alias(&outcome)?;
+        finalize_connectable_ticket(&operator, &mut outcome.plan)
+            .await
+            .with_context(|| {
+                format!(
+                    "agent exec {} started, but ticket discovery failed; do not reinject",
+                    outcome.exec_id
+                )
+            })?;
         save_injected_alias(&outcome)?;
         println!("{}", outcome.plan.ticket.encode_string());
         if watch {
@@ -116,6 +126,7 @@ pub fn run(
                 &docker,
                 &host,
                 &outcome.container.id,
+                &outcome.exec_id,
                 &binary_source,
                 &operator,
                 session_provider,
@@ -147,7 +158,17 @@ pub fn attach(
             session_provider,
         )
         .await?;
-        finalize_connectable_ticket(&operator, &mut outcome.plan).await?;
+        // Record the owned exec before discovery: a discovery failure must not
+        // leave a started agent untracked or require another injection.
+        save_injected_alias(&outcome)?;
+        finalize_connectable_ticket(&operator, &mut outcome.plan)
+            .await
+            .with_context(|| {
+                format!(
+                    "agent exec {} started, but ticket discovery failed; do not reinject",
+                    outcome.exec_id
+                )
+            })?;
         save_injected_alias(&outcome)?;
         println!("{}", outcome.plan.ticket.encode_string());
         Ok(ExitCode::SUCCESS)
@@ -378,6 +399,8 @@ mod tests {
         command_runs: Mutex<Vec<(String, Vec<String>)>>,
         start_logs: Mutex<Vec<String>>,
         events: Mutex<Vec<ContainerEvent>>,
+        keep_events_open: bool,
+        stall_inspect_exec: bool,
     }
 
     impl MockDockerOps {
@@ -405,6 +428,8 @@ mod tests {
                 command_runs: Mutex::new(Vec::new()),
                 start_logs: Mutex::new(vec![READY_LOG_TOKEN.to_owned()]),
                 events: Mutex::new(Vec::new()),
+                keep_events_open: false,
+                stall_inspect_exec: false,
             }
         }
 
@@ -529,6 +554,9 @@ mod tests {
         }
 
         async fn inspect_exec(&self, exec_id: &str) -> Result<ExecSnapshot> {
+            if self.stall_inspect_exec {
+                return std::future::pending().await;
+            }
             self.actions
                 .lock()
                 .expect("lock")
@@ -568,9 +596,13 @@ mod tests {
 
         fn container_events(&self, _container: &str) -> BoxStream<'static, Result<ContainerEvent>> {
             let events = self.events.lock().expect("lock").clone();
-            Box::pin(futures_util::stream::iter(
-                events.into_iter().map(Ok::<_, anyhow::Error>),
-            ))
+            let stream = futures_util::stream::iter(events.into_iter().map(Ok::<_, anyhow::Error>));
+            if self.keep_events_open {
+                use futures_util::StreamExt as _;
+                Box::pin(stream.chain(futures_util::stream::pending()))
+            } else {
+                Box::pin(stream)
+            }
         }
     }
 
@@ -589,6 +621,176 @@ mod tests {
 
     fn operator() -> Identity {
         Identity::new()
+    }
+
+    #[tokio::test]
+    async fn readiness_closed_log_stream_is_terminal() {
+        let docker = MockDockerOps::new(running_container());
+        let error =
+            wait_for_agent_start(&docker, "exec-1", Box::pin(futures_util::stream::empty()))
+                .await
+                .expect_err("closed logs");
+        assert!(error.to_string().contains("closed before readiness"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn readiness_pending_log_stream_has_absolute_deadline() {
+        let docker = MockDockerOps::new(running_container());
+        let started = tokio::time::Instant::now();
+        let error =
+            wait_for_agent_start(&docker, "exec-1", Box::pin(futures_util::stream::pending()))
+                .await
+                .expect_err("pending logs");
+        assert!(error.to_string().contains("within 5s"));
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_inspect_cannot_hide_readiness_or_its_deadline() {
+        let mut docker = MockDockerOps::new(running_container());
+        docker.stall_inspect_exec = true;
+        let logs = Box::pin(futures_util::stream::once(async {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            Ok(READY_LOG_TOKEN.to_owned())
+        }));
+        wait_for_agent_start(&docker, "exec-1", logs)
+            .await
+            .expect("ready while inspect stalls");
+        let started = tokio::time::Instant::now();
+        wait_for_agent_start(&docker, "exec-1", Box::pin(futures_util::stream::pending()))
+            .await
+            .expect_err("stalled inspect and log");
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn restart_read_failures_retry_without_another_event_and_then_stop() {
+        let mut docker = MockDockerOps::new(running_container());
+        docker.keep_events_open = true;
+        let host = MockHostOps::with_current_exe(std::env::current_exe().expect("current exe"));
+        let error = watch_container_restarts(
+            &docker,
+            &host,
+            "demo-id",
+            "unknown-exec",
+            &BinarySource::CurrentExecutable,
+            &operator(),
+            None,
+        )
+        .await
+        .expect_err("bounded read retries");
+        assert!(error.to_string().contains("5 read-only attempts"));
+        let actions = docker.actions.lock().expect("lock");
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| action.starts_with("inspect-exec:"))
+                .count(),
+            5
+        );
+        assert!(
+            actions.iter().all(|action| action.starts_with("inspect")),
+            "failed checks must not cause mutations"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn restart_injection_failure_is_not_replayed() {
+        let mut docker = MockDockerOps::new(running_container())
+            .with_copy_failures(INJECTION_PATHS.iter().map(|path| (*path, "copy failed")));
+        docker.keep_events_open = true;
+        docker
+            .execs
+            .lock()
+            .expect("lock")
+            .get_mut("exec-1")
+            .expect("exec")
+            .running = false;
+        let host = MockHostOps::with_current_exe(std::env::current_exe().expect("current exe"));
+        let error = watch_container_restarts(
+            &docker,
+            &host,
+            "demo-id",
+            "exec-1",
+            &BinarySource::CurrentExecutable,
+            &operator(),
+            None,
+        )
+        .await
+        .expect_err("uncertain mutation");
+        assert!(error.to_string().contains("mutation was not replayed"));
+        let actions = docker.actions.lock().expect("lock");
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| action.starts_with("copy:"))
+                .count(),
+            INJECTION_PATHS.len()
+        );
+        assert!(docker.recorded_exec_cmd.lock().expect("lock").is_none());
+    }
+
+    #[tokio::test]
+    async fn restart_reconciliation_requires_confirmed_stopped_exec() {
+        let docker = MockDockerOps::new(running_container());
+        assert!(
+            run::stopped_agent_container(&docker, "demo-id", "exec-1")
+                .await
+                .expect("live exec")
+                .is_none()
+        );
+        assert!(
+            run::stopped_agent_container(&docker, "demo-id", "unknown-exec")
+                .await
+                .is_err()
+        );
+        docker
+            .execs
+            .lock()
+            .expect("lock")
+            .get_mut("exec-1")
+            .expect("exec")
+            .running = false;
+        assert!(
+            run::stopped_agent_container(&docker, "demo-id", "exec-1")
+                .await
+                .expect("stopped exec")
+                .is_some()
+        );
+        assert!(
+            docker
+                .actions
+                .lock()
+                .expect("lock")
+                .iter()
+                .all(|action| action.starts_with("inspect"))
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_watch_eof_is_not_success() {
+        let docker = MockDockerOps::new(running_container());
+        let host = MockHostOps::with_current_exe(std::env::current_exe().expect("current exe"));
+        let error = watch_container_restarts(
+            &docker,
+            &host,
+            "demo-id",
+            "exec-1",
+            &BinarySource::CurrentExecutable,
+            &operator(),
+            None,
+        )
+        .await
+        .expect_err("lost watch");
+        assert!(error.to_string().contains("monitoring is lost"));
+        assert!(
+            docker
+                .actions
+                .lock()
+                .expect("lock")
+                .iter()
+                .all(|action| !action.starts_with("create"))
+        );
     }
 
     #[tokio::test]

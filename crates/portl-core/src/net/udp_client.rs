@@ -91,6 +91,44 @@ impl UdpForwardStats {
     }
 }
 
+/// One QUIC datagram reader shared by all UDP forwards on a connection.
+/// Subscribers filter their own session IDs. A slow subscriber drops packets
+/// from its bounded queue without blocking other forwards.
+#[derive(Debug)]
+pub struct UdpDatagramFanout {
+    sender: tokio::sync::broadcast::WeakSender<Bytes>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl UdpDatagramFanout {
+    #[must_use]
+    pub fn new(connection: Connection) -> Self {
+        let (sender, _) = tokio::sync::broadcast::channel(256);
+        let weak = sender.downgrade();
+        let task = tokio::spawn(async move {
+            while let Ok(bytes) = connection.read_datagram().await {
+                let _ = sender.send(bytes);
+            }
+            // Dropping the sole strong sender wakes all remaining receivers.
+        });
+        Self { sender: weak, task }
+    }
+
+    fn subscribe(&self) -> Result<tokio::sync::broadcast::Receiver<Bytes>> {
+        Ok(self
+            .sender
+            .upgrade()
+            .context("UDP datagram reader stopped")?
+            .subscribe())
+    }
+}
+
+impl Drop for UdpDatagramFanout {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 #[derive(Debug)]
 pub struct LocalUdpForwardHandle {
     local_socket: Arc<UdpSocket>,
@@ -161,6 +199,29 @@ impl LocalUdpForwardHandle {
         control: UdpControl,
         target_port: u16,
     ) -> Result<()> {
+        self.run_with_receiver(connection, control, target_port, None)
+            .await
+    }
+
+    pub async fn run_with_control_via_fanout(
+        &self,
+        connection: Connection,
+        control: UdpControl,
+        target_port: u16,
+        fanout: &UdpDatagramFanout,
+    ) -> Result<()> {
+        let receiver = fanout.subscribe()?;
+        self.run_with_receiver(connection, control, target_port, Some(receiver))
+            .await
+    }
+
+    async fn run_with_receiver(
+        &self,
+        connection: Connection,
+        control: UdpControl,
+        target_port: u16,
+        datagrams: Option<tokio::sync::broadcast::Receiver<Bytes>>,
+    ) -> Result<()> {
         let session_id = control.session_id;
         *self.session_id.lock().expect("session_id mutex poisoned") = Some(session_id);
 
@@ -178,6 +239,7 @@ impl LocalUdpForwardHandle {
             Arc::clone(&self.src_tags),
             Arc::clone(&self.stats),
             session_id,
+            datagrams,
         );
 
         tokio::select! {
@@ -224,6 +286,10 @@ fn bind_ingress_socket(local_addr: &str) -> Result<UdpSocket> {
     UdpSocket::from_std(std_sock).context("wrap std udp socket for tokio")
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("udp request rejected: {0}")]
+pub struct UdpRequestRejected(pub String);
+
 pub async fn open_udp(
     connection: &Connection,
     session: &PeerSession,
@@ -253,9 +319,8 @@ pub async fn open_udp(
     let ack: UdpCtlResp =
         postcard::from_bytes(&ack_bytes).context("decode udp control response")?;
     if !ack.ok {
-        bail!(
-            "udp request rejected: {}",
-            ack.error.unwrap_or_else(|| "unknown error".to_owned())
+        return Err(
+            UdpRequestRejected(ack.error.unwrap_or_else(|| "unknown error".to_owned())).into(),
         );
     }
 
@@ -392,12 +457,26 @@ async fn reverse_loop(
     src_tags: Arc<Mutex<SrcTagTable>>,
     stats: Arc<UdpForwardStats>,
     session_id: [u8; 8],
+    mut datagrams: Option<tokio::sync::broadcast::Receiver<Bytes>>,
 ) -> Result<()> {
     loop {
-        let bytes = connection
-            .read_datagram()
-            .await
-            .context("read udp datagram")?;
+        let bytes = if let Some(receiver) = &mut datagrams {
+            match receiver.recv().await {
+                Ok(bytes) => bytes,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(dropped)) => {
+                    tracing::warn!(dropped, "UDP forward receive queue overflow");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    bail!("UDP datagram reader stopped")
+                }
+            }
+        } else {
+            connection
+                .read_datagram()
+                .await
+                .context("read udp datagram")?
+        };
         let datagram: UdpDatagram = match postcard::from_bytes::<UdpDatagram>(&bytes) {
             Ok(datagram) if datagram.session_id == session_id => datagram,
             Ok(_) | Err(_) => continue,

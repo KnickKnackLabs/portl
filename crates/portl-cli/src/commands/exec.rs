@@ -11,6 +11,8 @@ use portl_core::wire::shell::EnvValue;
 use tokio::io::{AsyncWriteExt, copy};
 use tracing::debug;
 
+use crate::commands::stream_io::await_output_task;
+
 use crate::commands::peer_resolve::{
     ConnectedPeer, close_connected, connect_peer, connect_peer_quiet,
 };
@@ -133,22 +135,6 @@ fn exec_caps() -> Capabilities {
 fn exit_code_from_i32(code: i32) -> ExitCode {
     let code = u8::try_from(code).unwrap_or(1);
     ExitCode::from(code)
-}
-
-async fn await_output_task(
-    mut task: tokio::task::JoinHandle<Result<()>>,
-    stream_name: &str,
-) -> Result<()> {
-    if let Ok(joined) = tokio::time::timeout(Duration::from_millis(250), &mut task).await {
-        joined.with_context(|| format!("join {stream_name} task"))??;
-    } else {
-        debug!(
-            stream = stream_name,
-            "timed out waiting for output drain; aborting task"
-        );
-        task.abort();
-    }
-    Ok(())
 }
 
 fn maybe_spawn_stdin_task(mut send: SendStream) -> Result<Option<tokio::task::JoinHandle<()>>> {

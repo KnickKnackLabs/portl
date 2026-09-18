@@ -107,77 +107,81 @@ pub fn vm_add(
             .collect::<Result<Vec<_>>>()?;
         let session_provider = validate_session_provider(session_provider)?;
         let client = client_for(base_url, &operator).await?;
-        let bootstrapper = SlicerBootstrapper::new(client.client.clone());
-        let provision = ProvisionSpec {
-            name: format!("{group}-requested"),
-            adapter_params: serde_json::to_value(SlicerProvisionParams {
-                base_url: client.original_base_url.clone(),
-                group: group.to_owned(),
-                cpus,
-                ram_gb,
-                tags: label_pairs.clone(),
-                relay_list: Vec::new(),
-                operator_pubkey: hex::encode(operator.verifying_key()),
-                portl_release_url: "github.com/KnickKnackLabs/portl/releases/download/latest"
-                    .to_owned(),
-                session_provider: session_provider.clone(),
-                auth_token: None,
-            })?,
-            labels: Vec::new(),
-        };
-        let handle = bootstrapper.provision(&provision).await?;
-        let inner = SlicerHandle::from_handle(&handle)?;
-        let now = u64::try_from(now_unix_secs()?)?;
-        let caps = parse_caps(DEFAULT_AGENT_CAPS)?;
-        let ttl_secs = parse_ttl(DEFAULT_TICKET_TTL)?;
-        let ticket =
-            mint_slicer_vm_ticket(&operator, &inner.endpoint_id, caps.clone(), now, ttl_secs)?;
-        let ticket_path = ticket_out.map_or_else(
-            || {
-                slicer_home()
-                    .join("tickets")
-                    .join(format!("{}.ticket", inner.name))
-            },
-            Path::to_path_buf,
-        );
-        write_ticket(&ticket_path, &ticket)?;
-        AliasStore::default().save(
-            &AliasRecord {
-                name: inner.name.clone(),
-                adapter: ADAPTER_NAME.to_owned(),
-                container_id: inner.name.clone(),
-                endpoint_id: inner.endpoint_id.clone(),
-                image: group.to_owned(),
-                network: client.original_base_url.clone(),
-                created_at: now_unix_secs()?,
-            },
-            &StoredSpec {
-                caps,
-                ttl_secs,
-                to: Some(operator.verifying_key()),
-                labels: label_pairs,
-                root_ticket_id: Some(ticket_id(&ticket.sig)),
-                ticket_file_path: Some(ticket_path.clone()),
-                group_name: Some(group.to_owned()),
-                base_url: Some(client.original_base_url.clone()),
-                session_provider: session_provider.clone(),
-                session_provider_install: session_provider.as_ref().map(|provider| {
-                    crate::alias_store::SessionProviderInstall {
-                        provider: provider.clone(),
-                        version: None,
-                        path: None,
-                        installed_by_portl: false,
-                    }
-                }),
-                docker_exec_id: None,
-                docker_injected_binary_path: None,
-                docker_injected_binary_preexisted: false,
-            },
-        )?;
+        let result = async {
+            let bootstrapper = SlicerBootstrapper::new(client.client.clone());
+            let provision = ProvisionSpec {
+                name: format!("{group}-requested"),
+                adapter_params: serde_json::to_value(SlicerProvisionParams {
+                    base_url: client.original_base_url.clone(),
+                    group: group.to_owned(),
+                    cpus,
+                    ram_gb,
+                    tags: label_pairs.clone(),
+                    relay_list: Vec::new(),
+                    operator_pubkey: hex::encode(operator.verifying_key()),
+                    portl_release_url: "github.com/KnickKnackLabs/portl/releases/download/latest"
+                        .to_owned(),
+                    session_provider: session_provider.clone(),
+                    auth_token: None,
+                })?,
+                labels: Vec::new(),
+            };
+            let handle = bootstrapper.provision(&provision).await?;
+            let inner = SlicerHandle::from_handle(&handle)?;
+            let now = u64::try_from(now_unix_secs()?)?;
+            let caps = parse_caps(DEFAULT_AGENT_CAPS)?;
+            let ttl_secs = parse_ttl(DEFAULT_TICKET_TTL)?;
+            let ticket =
+                mint_slicer_vm_ticket(&operator, &inner.endpoint_id, caps.clone(), now, ttl_secs)?;
+            let ticket_path = ticket_out.map_or_else(
+                || {
+                    slicer_home()
+                        .join("tickets")
+                        .join(format!("{}.ticket", inner.name))
+                },
+                Path::to_path_buf,
+            );
+            write_ticket(&ticket_path, &ticket)?;
+            AliasStore::default().save(
+                &AliasRecord {
+                    name: inner.name.clone(),
+                    adapter: ADAPTER_NAME.to_owned(),
+                    container_id: inner.name.clone(),
+                    endpoint_id: inner.endpoint_id,
+                    image: group.to_owned(),
+                    network: client.original_base_url.clone(),
+                    created_at: now_unix_secs()?,
+                },
+                &StoredSpec {
+                    caps,
+                    ttl_secs,
+                    to: Some(operator.verifying_key()),
+                    labels: label_pairs,
+                    root_ticket_id: Some(ticket_id(&ticket.sig)),
+                    ticket_file_path: Some(ticket_path),
+                    group_name: Some(group.to_owned()),
+                    base_url: Some(client.original_base_url.clone()),
+                    session_provider: session_provider.clone(),
+                    session_provider_install: session_provider.as_ref().map(|provider| {
+                        crate::alias_store::SessionProviderInstall {
+                            provider: provider.clone(),
+                            version: None,
+                            path: None,
+                            installed_by_portl: false,
+                        }
+                    }),
+                    docker_exec_id: None,
+                    docker_injected_binary_path: None,
+                    docker_injected_binary_preexisted: false,
+                },
+            )?;
 
-        println!("{}", ticket.encode_string());
+            println!("{}", ticket.encode_string());
+            Ok(ExitCode::SUCCESS)
+        }
+        .await;
         client.shutdown().await;
-        Ok(ExitCode::SUCCESS)
+        result
     })
 }
 
@@ -186,43 +190,47 @@ pub fn vm_list(base_url: Option<&str>, json_output: bool) -> Result<ExitCode> {
     runtime.block_on(async move {
         let operator = store::load(&store::default_path()).context("load operator identity")?;
         let client = client_for(base_url, &operator).await?;
-        let listed = client.client.list_vms().await?;
-        let aliases = AliasStore::default()
-            .list()?
-            .into_iter()
-            .filter(|alias| alias.adapter == ADAPTER_NAME)
-            .collect::<Vec<_>>();
-        let rows = listed
-            .into_iter()
-            .map(|vm| {
-                let alias = aliases.iter().find(|alias| alias.name == vm.name);
-                serde_json::json!({
-                    "name": vm.name,
-                    "group": vm.group,
-                    "status": vm.status,
-                    "endpoint_id": alias.map_or("", |alias| alias.endpoint_id.as_str()),
-                    "ip": vm.ip,
+        let result = async {
+            let listed = client.client.list_vms().await?;
+            let aliases = AliasStore::default()
+                .list()?
+                .into_iter()
+                .filter(|alias| alias.adapter == ADAPTER_NAME)
+                .collect::<Vec<_>>();
+            let rows = listed
+                .into_iter()
+                .map(|vm| {
+                    let alias = aliases.iter().find(|alias| alias.name == vm.name);
+                    serde_json::json!({
+                        "name": vm.name,
+                        "group": vm.group,
+                        "status": vm.status,
+                        "endpoint_id": alias.map_or("", |alias| alias.endpoint_id.as_str()),
+                        "ip": vm.ip,
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
-        if json_output {
-            println!("{}", serde_json::to_string_pretty(&rows)?);
-        } else if rows.is_empty() {
-            println!("No slicer VMs found.");
-        } else {
-            println!("NAME\tGROUP\tSTATUS\tENDPOINT");
-            for row in &rows {
-                println!(
-                    "{}\t{}\t{}\t{}",
-                    row["name"].as_str().unwrap_or_default(),
-                    row["group"].as_str().unwrap_or_default(),
-                    row["status"].as_str().unwrap_or_default(),
-                    row["endpoint_id"].as_str().unwrap_or_default(),
-                );
+                .collect::<Vec<_>>();
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else if rows.is_empty() {
+                println!("No slicer VMs found.");
+            } else {
+                println!("NAME\tGROUP\tSTATUS\tENDPOINT");
+                for row in &rows {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        row["name"].as_str().unwrap_or_default(),
+                        row["group"].as_str().unwrap_or_default(),
+                        row["status"].as_str().unwrap_or_default(),
+                        row["endpoint_id"].as_str().unwrap_or_default(),
+                    );
+                }
             }
+            Ok(ExitCode::SUCCESS)
         }
+        .await;
         client.shutdown().await;
-        Ok(ExitCode::SUCCESS)
+        result
     })
 }
 
@@ -242,25 +250,29 @@ pub fn vm_delete(name: &str, base_url: Option<&str>) -> Result<ExitCode> {
             .ok_or_else(|| anyhow!("missing slicer group for {name}"))?;
         let operator = store::load(&store::default_path()).context("load operator identity")?;
         let client = client_for(base_url.or(spec.base_url.as_deref()), &operator).await?;
-        client.client.delete_vm(&group, &alias.container_id).await?;
+        let result = async {
+            client.client.delete_vm(&group, &alias.container_id).await?;
 
-        if let Some(root_ticket_id) = spec.root_ticket_id {
-            append_revocation(
-                root_ticket_id,
-                ticket_not_after(alias.created_at, spec.ttl_secs),
-                &local_revocations_path(),
-            )?;
+            if let Some(root_ticket_id) = spec.root_ticket_id {
+                append_revocation(
+                    root_ticket_id,
+                    ticket_not_after(alias.created_at, spec.ttl_secs),
+                    &local_revocations_path(),
+                )?;
+            }
+            if let Some(ticket_path) = spec.ticket_file_path
+                && let Err(err) = fs::remove_file(&ticket_path)
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(err)
+                    .with_context(|| format!("remove stored ticket {}", ticket_path.display()));
+            }
+            store.remove(name)?;
+            Ok(ExitCode::SUCCESS)
         }
-        if let Some(ticket_path) = spec.ticket_file_path
-            && let Err(err) = fs::remove_file(&ticket_path)
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(err)
-                .with_context(|| format!("remove stored ticket {}", ticket_path.display()));
-        }
-        store.remove(name)?;
+        .await;
         client.shutdown().await;
-        Ok(ExitCode::SUCCESS)
+        result
     })
 }
 
@@ -280,13 +292,17 @@ pub fn vm_logs(name: &str, base_url: Option<&str>, tail: usize) -> Result<ExitCo
             .ok_or_else(|| anyhow!("missing slicer group for {name}"))?;
         let operator = store::load(&store::default_path()).context("load operator identity")?;
         let client = client_for(base_url.or(spec.base_url.as_deref()), &operator).await?;
-        let logs = client
-            .client
-            .vm_logs(&group, &alias.container_id, tail)
-            .await?;
-        print!("{logs}");
+        let result = async {
+            let logs = client
+                .client
+                .vm_logs(&group, &alias.container_id, tail)
+                .await?;
+            print!("{logs}");
+            Ok(ExitCode::SUCCESS)
+        }
+        .await;
         client.shutdown().await;
-        Ok(ExitCode::SUCCESS)
+        result
     })
 }
 
@@ -318,8 +334,15 @@ async fn client_for(base_url: Option<&str>, identity: &Identity) -> Result<Clien
     let original_base_url = resolve_base_url(base_url);
     if let Some(login) = load_login_record()? {
         let tunnel = GatewayTunnel::open(&login, identity).await?;
+        let client = match SlicerClient::new(&tunnel.local_base_url, None) {
+            Ok(client) => client,
+            Err(error) => {
+                tunnel.shutdown().await;
+                return Err(error);
+            }
+        };
         return Ok(ClientContext {
-            client: SlicerClient::new(&tunnel.local_base_url, None)?,
+            client,
             original_base_url,
             tunnel: Some(tunnel),
         });
@@ -353,27 +376,73 @@ impl GatewayTunnel {
         .await
         .context("bind local gateway client endpoint")?;
         let endpoint_wrapper = Endpoint::from(endpoint.clone());
-        let (connection, session) = open_ticket_v1(&endpoint_wrapper, &ticket, &[], identity)
-            .await
-            .context("connect slicer gateway")?;
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .context("bind local slicer HTTP tunnel")?;
-        let local_addr = listener.local_addr().context("local slicer tunnel addr")?;
+        let peer = crate::commands::network_lifecycle::setup(
+            "slicer gateway setup",
+            open_ticket_v1(&endpoint_wrapper, &ticket, &[], identity),
+        )
+        .await
+        .context("connect slicer gateway");
+        let (connection, session) = match peer {
+            Ok(peer) => peer,
+            Err(error) => {
+                crate::commands::peer_resolve::close_client_endpoint(
+                    endpoint,
+                    "slicer gateway setup failed",
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        let bound = async {
+            let listener = TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .context("bind local slicer HTTP tunnel")?;
+            let address = listener.local_addr().context("local slicer tunnel addr")?;
+            Ok::<_, anyhow::Error>((listener, address))
+        }
+        .await;
+        let (listener, local_addr) = match bound {
+            Ok(bound) => bound,
+            Err(error) => {
+                connection.close(0u32.into(), b"slicer local bind failed");
+                crate::commands::peer_resolve::close_client_endpoint(
+                    endpoint,
+                    "slicer local bind failed",
+                )
+                .await;
+                return Err(error);
+            }
+        };
         let connection_for_task = connection.clone();
         let session_for_task = session.clone();
         let remote_host_for_task = remote_host.clone();
         let task = tokio::spawn(async move {
+            let mut clients = tokio::task::JoinSet::new();
             loop {
-                let Ok((local, _)) = listener.accept().await else {
-                    break;
+                let accepted = tokio::select! {
+                    accepted = listener.accept() => accepted,
+                    _ = connection_for_task.closed() => break,
+                    result = clients.join_next(), if !clients.is_empty() => {
+                        if let Some(Err(error)) = result {
+                            tracing::warn!(%error, "slicer tunnel client task failed");
+                        }
+                        continue;
+                    }
+                };
+                let (local, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        tracing::warn!(%error, "slicer tunnel listener failed");
+                        break;
+                    }
                 };
                 let connection = connection_for_task.clone();
                 let session = session_for_task.clone();
                 let remote_host = remote_host_for_task.clone();
-                tokio::spawn(async move {
-                    let _ =
-                        forward_one(local, connection, session, &remote_host, remote_port).await;
+                clients.spawn(async move {
+                    if let Err(error) = forward_one(local, connection, session, &remote_host, remote_port).await {
+                        tracing::warn!(error = %portl_core::diagnostics::redact_text(&format!("{error:#}")), "slicer tunnel stream failed");
+                    }
                 });
             }
         });
@@ -386,10 +455,23 @@ impl GatewayTunnel {
         })
     }
 
-    async fn shutdown(self) {
+    async fn shutdown(mut self) {
         self.connection.close(0u32.into(), b"done");
         self.task.abort();
-        crate::commands::peer_resolve::close_client_endpoint(self.endpoint, "slicer gateway").await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut self.task).await;
+        crate::commands::peer_resolve::close_client_endpoint(
+            self.endpoint.clone(),
+            "slicer gateway",
+        )
+        .await;
+    }
+}
+
+impl Drop for GatewayTunnel {
+    fn drop(&mut self) {
+        self.connection
+            .close(0u32.into(), b"slicer tunnel owner dropped");
+        self.task.abort();
     }
 }
 
@@ -400,7 +482,11 @@ async fn forward_one(
     remote_host: &str,
     remote_port: u16,
 ) -> Result<()> {
-    let (mut send, mut recv) = open_tcp(&connection, &session, remote_host, remote_port).await?;
+    let (mut send, mut recv) = crate::commands::network_lifecycle::setup(
+        "slicer stream setup",
+        open_tcp(&connection, &session, remote_host, remote_port),
+    )
+    .await?;
     let (mut local_read, mut local_write) = local.into_split();
     let upstream = async {
         copy(&mut local_read, &mut send)
@@ -563,6 +649,30 @@ fn append_revocation(
             not_after_of_ticket,
         ),
     )
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    #[tokio::test]
+    async fn tunnel_drop_closes_peer_and_aborts_worker() {
+        let (client, _server, connection, _remote) =
+            crate::commands::network_lifecycle::test_connection_pair().await;
+        let task = tokio::spawn(std::future::pending());
+        let worker = task.abort_handle();
+        let tunnel = super::GatewayTunnel {
+            endpoint: client.inner().clone(),
+            connection: connection.clone(),
+            task,
+            local_base_url: "http://127.0.0.1:1".to_owned(),
+        };
+        drop(tunnel);
+        assert!(connection.close_reason().is_some());
+        tokio::task::yield_now().await;
+        assert!(
+            worker.is_finished(),
+            "owner drop must not detach tunnel worker"
+        );
+    }
 }
 
 #[cfg(test)]

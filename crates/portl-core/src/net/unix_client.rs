@@ -226,6 +226,7 @@ async fn run_local_unix_forward_with_listener_logged(
                     &format_close_line("-L", &local_path, started.elapsed(), stats),
                 ),
                 Err(err) => {
+                    let err = crate::diagnostics::redact_text(&format!("{err:#}"));
                     let close_line = format!(
                         "[unix -L {local_path}] closed after {}, error={err}",
                         format_duration(started.elapsed())
@@ -298,6 +299,7 @@ async fn run_unix_reverse_forwards_logged(
                     &format_close_line("-R", &remote_path, started.elapsed(), stats),
                 ),
                 Err(err) => {
+                    let err = crate::diagnostics::redact_text(&format!("{err:#}"));
                     let close_line = format!(
                         "[unix -R {remote_path}] closed after {}, error={err}",
                         format_duration(started.elapsed())

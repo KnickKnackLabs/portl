@@ -1,51 +1,31 @@
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use portl_core::net::{bind_local_forward_listener, run_local_forward_with_listener};
 use portl_core::ticket::schema::{Capabilities, PortRule};
 
-use crate::commands::peer_resolve::connect_peer;
+use crate::commands::forwarding::ForwardPlan;
+use crate::commands::persistent_forward;
 
 pub fn run(peer: &str, specs: &[String]) -> Result<ExitCode> {
+    if specs.is_empty() {
+        bail!("at least one -L spec is required")
+    }
+    let parsed_specs = specs
+        .iter()
+        .map(|spec| parse_local_spec(spec))
+        .collect::<Result<Vec<_>>>()?;
+    eprint!("{}", render_startup_summary(peer, &parsed_specs));
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async move {
-        if specs.is_empty() {
-            bail!("at least one -L spec is required")
-        }
-        let parsed_specs = specs
-            .iter()
-            .map(|spec| parse_local_spec(spec))
-            .collect::<Result<Vec<_>>>()?;
-        let connected = connect_peer(peer, tcp_caps()).await?;
-        eprint!("{}", render_startup_summary(peer, &parsed_specs));
-
-        let mut tasks = Vec::new();
-        for parsed in parsed_specs {
-            let local_addr = parsed.local_addr();
-            let listener = bind_local_forward_listener(&local_addr).await?;
-            let connection = connected.connection.clone();
-            let session = connected.session.clone();
-            tasks.push(tokio::spawn(async move {
-                run_local_forward_with_listener(
-                    listener,
-                    connection,
-                    session,
-                    local_addr,
-                    parsed.remote_host,
-                    parsed.remote_port,
-                )
-                .await
-            }));
-        }
-
-        tokio::signal::ctrl_c().await.context("wait for ctrl-c")?;
-        connected.connection.close(0u32.into(), b"tcp complete");
-        connected.endpoint.close().await;
-        for task in tasks {
-            task.abort();
-        }
-        Ok(ExitCode::SUCCESS)
-    })
+    let result = runtime.block_on(persistent_forward::run(
+        peer,
+        ForwardPlan {
+            tcp: parsed_specs,
+            ..ForwardPlan::default()
+        },
+        tcp_caps(),
+    ));
+    runtime.shutdown_background();
+    result
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

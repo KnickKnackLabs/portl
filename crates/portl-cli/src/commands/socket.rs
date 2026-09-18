@@ -5,11 +5,12 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use portl_core::id::store;
-use portl_core::net::{open_unix_listen, run_local_unix_forward, run_unix_reverse_forwards};
 use portl_core::ticket::schema::{Capabilities, UnixCaps, UnixPathRule, validate_unix_path_rule};
 use sha2::{Digest, Sha256};
 
-use crate::commands::peer_resolve::{close_connected, connect_peer, resolve_identity_path};
+use crate::commands::forwarding::ForwardPlan;
+use crate::commands::peer_resolve::resolve_identity_path;
+use crate::commands::persistent_forward;
 
 pub fn run(
     peer: &str,
@@ -31,86 +32,19 @@ pub fn run(
         remote_forwards,
         cleanup,
     )?;
+    eprint!("{}", render_startup_summary(peer, &source_label, &modes));
+    let caps = socket_caps_for_modes(&modes);
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async move {
-        let connected = connect_peer(peer, socket_caps_for_modes(&modes)).await?;
-        eprint!("{}", render_startup_summary(peer, &source_label, &modes));
-        let mut tasks = Vec::new();
-        let mut listen_controls = Vec::new();
-        let mut reverse_forwards = Vec::new();
-
-        for mode in &modes {
-            match mode {
-                SocketMode::Connect {
-                    local,
-                    remote,
-                    cleanup,
-                    generated,
-                } => {
-                    if *generated {
-                        ensure_generated_socket_parent(local, "portl-to-")?;
-                    }
-                    tasks.push(tokio::spawn(run_local_unix_forward(
-                        connected.connection.clone(),
-                        connected.session.clone(),
-                        local.clone(),
-                        remote.clone(),
-                        *cleanup,
-                    )));
-                }
-                SocketMode::Listen {
-                    remote,
-                    local,
-                    cleanup,
-                    ..
-                } => {
-                    let control = open_unix_listen(
-                        &connected.connection,
-                        &connected.session,
-                        remote,
-                        *cleanup,
-                    )
-                    .await?;
-                    listen_controls.push(control);
-                    reverse_forwards.push((remote.clone(), local.clone()));
-                }
-            }
-        }
-
-        if !reverse_forwards.is_empty() {
-            tasks.push(tokio::spawn(run_unix_reverse_forwards(
-                connected.connection.clone(),
-                connected.session.clone(),
-                reverse_forwards,
-            )));
-        }
-
-        tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                signal.context("wait for ctrl-c")?;
-            }
-            result = wait_for_forward_task(&mut tasks) => {
-                result?;
-            }
-        }
-
-        for control in listen_controls {
-            control.close()?;
-        }
-        for task in tasks {
-            task.abort();
-        }
-        close_connected(connected, b"socket complete").await;
-        Ok(ExitCode::SUCCESS)
-    })
-}
-
-async fn wait_for_forward_task(tasks: &mut [tokio::task::JoinHandle<Result<()>>]) -> Result<()> {
-    if tasks.is_empty() {
-        return Ok(());
-    }
-    let (result, _index, _remaining) = futures_util::future::select_all(tasks.iter_mut()).await;
-    result.context("join unix forward task")?
+    let result = runtime.block_on(persistent_forward::run(
+        peer,
+        ForwardPlan {
+            unix: modes,
+            ..ForwardPlan::default()
+        },
+        caps,
+    ));
+    runtime.shutdown_background();
+    result
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

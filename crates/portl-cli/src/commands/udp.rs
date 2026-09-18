@@ -1,153 +1,32 @@
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use portl_core::id::store;
-use portl_core::net::{LocalUdpForwardHandle, open_udp};
 use portl_core::ticket::schema::{Capabilities, PortRule};
-use portl_proto::udp_v1::UdpBind;
-use tokio::sync::watch;
 
-use crate::commands::peer_resolve::{
-    bind_client_endpoint, close_client_endpoint, connect_peer_with_endpoint, resolve_identity_path,
-};
+use crate::commands::forwarding::ForwardPlan;
+use crate::commands::persistent_forward;
 
-#[allow(clippy::too_many_lines)]
 pub fn run(peer: &str, specs: &[String]) -> Result<ExitCode> {
-    let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async move {
-        if specs.is_empty() {
-            bail!("at least one -L spec is required")
-        }
-
-        let parsed_specs = specs
-            .iter()
-            .map(|spec| parse_local_spec(spec))
-            .collect::<Result<Vec<_>>>()?;
-        let identity_path = resolve_identity_path(None);
-        let identity = store::load(&identity_path).context("load local identity")?;
-        eprint!("{}", render_startup_summary(peer, &parsed_specs));
-        let (shutdown_tx, _) = watch::channel(false);
-        let mut tasks = Vec::new();
-
-        for parsed in parsed_specs {
-            let peer = peer.to_owned();
-            let identity = identity.clone();
-            let endpoint = bind_client_endpoint(&identity).await?;
-            let mut shutdown_rx = shutdown_tx.subscribe();
-            let forward = LocalUdpForwardHandle::bind(&parsed.local_addr())?;
-            tasks.push(tokio::spawn(async move {
-                let mut backoff = Duration::from_millis(100);
-                loop {
-                    if *shutdown_rx.borrow() {
-                        close_client_endpoint(endpoint, "udp command").await;
-                        return Ok::<_, anyhow::Error>(());
-                    }
-
-                    let quiet = false;
-                    let connected = match connect_peer_with_endpoint(
-                        &peer,
-                        udp_caps(),
-                        &identity,
-                        &endpoint,
-                        quiet,
-                    )
-                    .await {
-                        Ok(connected) => connected,
-                        Err(err) => {
-                            tracing::debug!(%err, spec = %parsed.local_addr(), "udp reconnect failed during ticket handshake");
-                            wait_backoff(&mut shutdown_rx, backoff).await;
-                            backoff = next_backoff(backoff);
-                            continue;
-                        }
-                    };
-
-                    let requested_session_id = forward.session_id();
-                    let control = match open_udp(
-                        &connected.connection,
-                        &connected.session,
-                        requested_session_id,
-                        vec![UdpBind {
-                            local_port_range: (parsed.local_port, parsed.local_port),
-                            target_host: parsed.remote_host.clone(),
-                            target_port_range: (parsed.remote_port, parsed.remote_port),
-                        }],
-                    )
-                    .await
-                    {
-                        Ok(control) => control,
-                        Err(err) => {
-                            tracing::debug!(%err, spec = %parsed.local_addr(), "udp reconnect failed while opening control stream");
-                            connected.connection.close(0u32.into(), b"udp reconnect retry");
-                            wait_backoff(&mut shutdown_rx, backoff).await;
-                            backoff = next_backoff(backoff);
-                            continue;
-                        }
-                    };
-
-                    backoff = Duration::from_millis(100);
-                    let opened_at = Instant::now();
-                    let start_stats = forward.stats_snapshot();
-                    eprintln!("{}", format_open_line(&parsed));
-                    let mut shutdown_during_run = false;
-                    let result = tokio::select! {
-                        result = forward.run_with_control(
-                            connected.connection.clone(),
-                            control,
-                            parsed.remote_port,
-                        ) => result,
-                        changed = shutdown_rx.changed() => {
-                            let _ = changed;
-                            shutdown_during_run = true;
-                            Ok(())
-                        }
-                    };
-
-                    connected.connection.close(0u32.into(), b"udp reconnect retry");
-                    let stats = forward.stats_snapshot().delta_since(start_stats);
-                    match &result {
-                        Ok(()) => eprintln!("{}", format_close_line(&parsed, opened_at.elapsed(), stats)),
-                        Err(err) => eprintln!(
-                            "[udp -L {}] closed after {}, error={err}",
-                            parsed.local_addr(),
-                            format_duration(opened_at.elapsed())
-                        ),
-                    }
-
-                    if shutdown_during_run || *shutdown_rx.borrow() {
-                        close_client_endpoint(endpoint, "udp command").await;
-                        return Ok(());
-                    }
-
-                    if let Err(err) = result {
-                        tracing::debug!(%err, spec = %parsed.local_addr(), "udp forward loop stopped; reconnecting");
-                    }
-                    wait_backoff(&mut shutdown_rx, backoff).await;
-                    backoff = next_backoff(backoff);
-                }
-            }));
-        }
-
-        tokio::signal::ctrl_c().await.context("wait for ctrl-c")?;
-        let _ = shutdown_tx.send(true);
-        for task in tasks {
-            let _ = task.await;
-        }
-        Ok(ExitCode::SUCCESS)
-    })
-}
-
-async fn wait_backoff(shutdown_rx: &mut watch::Receiver<bool>, backoff: Duration) {
-    tokio::select! {
-        () = tokio::time::sleep(backoff) => {}
-        changed = shutdown_rx.changed() => {
-            let _ = changed;
-        }
+    if specs.is_empty() {
+        bail!("at least one -L spec is required")
     }
-}
-
-fn next_backoff(current: Duration) -> Duration {
-    (current * 2).min(Duration::from_secs(5))
+    let parsed_specs = specs
+        .iter()
+        .map(|spec| parse_local_spec(spec))
+        .collect::<Result<Vec<_>>>()?;
+    eprint!("{}", render_startup_summary(peer, &parsed_specs));
+    let runtime = tokio::runtime::Runtime::new()?;
+    let result = runtime.block_on(persistent_forward::run(
+        peer,
+        ForwardPlan {
+            udp: parsed_specs,
+            ..ForwardPlan::default()
+        },
+        udp_caps(),
+    ));
+    runtime.shutdown_background();
+    result
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,9 +187,7 @@ fn udp_caps() -> Capabilities {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        LocalForwardSpec, format_close_line, next_backoff, parse_local_spec, render_startup_summary,
-    };
+    use super::{LocalForwardSpec, format_close_line, parse_local_spec, render_startup_summary};
     use std::time::Duration;
 
     #[test]
@@ -415,12 +292,10 @@ mod tests {
     }
 
     #[test]
-    fn udp_reconnect_backoff_caps_at_five_seconds() {
-        assert_eq!(
-            next_backoff(Duration::from_millis(100)),
-            Duration::from_millis(200)
-        );
-        assert_eq!(next_backoff(Duration::from_secs(4)), Duration::from_secs(5));
-        assert_eq!(next_backoff(Duration::from_secs(5)), Duration::from_secs(5));
+    fn udp_control_rejection_is_not_retried_forever() {
+        let error = portl_core::net::udp_client::UdpRequestRejected("capability denied".to_owned());
+        assert!(!crate::commands::network_lifecycle::retryable(
+            &error.into()
+        ));
     }
 }

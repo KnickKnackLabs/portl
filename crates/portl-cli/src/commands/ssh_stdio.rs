@@ -120,11 +120,42 @@ async fn run_stdio_on_connected(
         initial_agent,
         map_ssh_user,
     );
-    let running = server::run_stream(config, StdioStream::new(), handler)
-        .await
-        .context("start stdio SSH server")?;
-    running.await.context("run stdio SSH server")?;
-    Ok(ExitCode::SUCCESS)
+    let running = with_backend_lifetime(&connected.connection, async {
+        server::run_stream(config, StdioStream::new(), handler)
+            .await
+            .context("start stdio SSH server")
+    })
+    .await?;
+    let handle = running.handle();
+    let result = with_backend_lifetime(&connected.connection, async {
+        running.await.context("run stdio SSH server")
+    })
+    .await;
+    if result.is_err() {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(1),
+            handle.disconnect(
+                russh::Disconnect::ByApplication,
+                "Portl backend closed".to_owned(),
+                "en".to_owned(),
+            ),
+        )
+        .await;
+    }
+    result.map(|()| ExitCode::SUCCESS)
+}
+
+async fn with_backend_lifetime<T>(
+    connection: &Connection,
+    operation: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::select! {
+        result = operation => result,
+        error = connection.closed() => {
+            anyhow::bail!("SSH backend connection closed: {}",
+                portl_core::diagnostics::redact_text(&error.to_string()));
+        }
+    }
 }
 
 fn ssh_stdio_connect_caps(remote_agent_path: &str) -> Capabilities {
@@ -1380,6 +1411,30 @@ fn signal_number(signal: &Sig) -> Option<u8> {
         Sig::TERM => 15,
         Sig::Custom(_) => return None,
     })
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    #[tokio::test]
+    async fn idle_operation_ends_on_terminal_backend_loss() {
+        let (_client, _server, local, remote) =
+            crate::commands::network_lifecycle::test_connection_pair().await;
+        assert_eq!(
+            super::with_backend_lifetime(&local, async { Ok(42) })
+                .await
+                .expect("live backend"),
+            42
+        );
+        remote.close(0u32.into(), b"test backend loss");
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            super::with_backend_lifetime::<()>(&local, std::future::pending()),
+        )
+        .await
+        .expect("bounded backend loss")
+        .expect_err("must not remain alive");
+        assert!(error.to_string().contains("SSH backend connection closed"));
+    }
 }
 
 #[cfg(test)]

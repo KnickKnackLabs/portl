@@ -300,9 +300,9 @@ impl RelayHandle {
             task.abort();
         }
         if let Some(server) = self.server.take() {
-            server
-                .shutdown()
+            tokio::time::timeout(std::time::Duration::from_secs(5), server.shutdown())
                 .await
+                .context("in-process relay shutdown deadline exceeded")?
                 .context("shutdown in-process iroh-relay server")?;
         }
         Ok(())

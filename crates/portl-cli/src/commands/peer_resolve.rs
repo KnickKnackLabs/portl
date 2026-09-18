@@ -44,6 +44,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::alias_store::AliasStore;
+use crate::commands::network_lifecycle::{self, RetryClass};
 
 const CLI_ENDPOINT_CLOSE_GRACE: Duration = Duration::from_millis(100);
 const CLI_TRANSPORT_OBSERVER_CLOSE_GRACE: Duration = Duration::from_millis(200);
@@ -122,6 +123,15 @@ pub(crate) struct ConnectedPeer {
     pub(crate) transport_observer: Option<tokio::task::JoinHandle<()>>,
 }
 
+impl Drop for ConnectedPeer {
+    fn drop(&mut self) {
+        self.connection.close(0u32.into(), b"peer owner dropped");
+        if let Some(observer) = self.transport_observer.take() {
+            observer.abort();
+        }
+    }
+}
+
 pub(crate) fn resolve_identity_path(explicit: Option<&Path>) -> PathBuf {
     explicit
         .map(Path::to_path_buf)
@@ -160,20 +170,14 @@ pub(crate) async fn close_connected(connected: ConnectedPeer, reason: &'static [
 }
 
 pub(crate) async fn close_connected_connection(
-    connected: ConnectedPeer,
+    mut connected: ConnectedPeer,
     reason: &'static [u8],
 ) -> iroh::Endpoint {
-    let ConnectedPeer {
-        endpoint,
-        connection,
-        session: _,
-        transport_observer,
-    } = connected;
-    connection.close(0u32.into(), reason);
-    if let Some(observer) = transport_observer {
+    connected.connection.close(0u32.into(), reason);
+    if let Some(observer) = connected.transport_observer.take() {
         await_transport_observer_close(observer).await;
     }
-    endpoint
+    connected.endpoint.clone()
 }
 
 async fn await_transport_observer_close(mut observer: tokio::task::JoinHandle<()>) {
@@ -228,6 +232,22 @@ pub(crate) async fn connect_peer_with_endpoint(
     endpoint: &iroh::Endpoint,
     quiet: bool,
 ) -> Result<ConnectedPeer> {
+    network_lifecycle::setup(
+        "peer setup",
+        Box::pin(connect_peer_with_endpoint_inner(
+            peer, caps, identity, endpoint, quiet,
+        )),
+    )
+    .await
+}
+
+async fn connect_peer_with_endpoint_inner(
+    peer: &str,
+    caps: Capabilities,
+    identity: &Identity,
+    endpoint: &iroh::Endpoint,
+    quiet: bool,
+) -> Result<ConnectedPeer> {
     let endpoint_wrapper = Endpoint::from(endpoint.clone());
     let peer_log = portl_core::diagnostics::redact_arg(peer);
     tracing::info!(
@@ -245,7 +265,14 @@ pub(crate) async fn connect_peer_with_endpoint(
             quiet,
         },
     )
-    .await?;
+    .await
+    .map_err(|error| {
+        if error.downcast_ref::<RetryClass>() == Some(&RetryClass::Transient) {
+            error
+        } else {
+            error.context(RetryClass::Permanent)
+        }
+    })?;
     tracing::info!(
         event = "cli.target.resolve.complete",
         peer = %peer_log,
@@ -253,34 +280,40 @@ pub(crate) async fn connect_peer_with_endpoint(
         discovery = %resolved.discovery,
         force_relay = false,
     );
-    let (connection, mut session) =
-        open_ticket_v1(&endpoint_wrapper, &resolved.ticket, &[], identity)
-            .await
-            .context("run ticket handshake")?;
-    if session
+    let (connection, session) = open_ticket_v1(&endpoint_wrapper, &resolved.ticket, &[], identity)
+        .await
+        .context("run ticket handshake")?;
+    let mut connected = ConnectedPeer {
+        endpoint: endpoint.clone(),
+        connection,
+        session,
+        transport_observer: None,
+    };
+    if connected
+        .session
         .effective_caps
         .meta
         .as_ref()
         .is_some_and(|meta| meta.info)
     {
-        match supported_alpns(&connection, &session).await {
-            Ok(supported_alpns) => session.supported_alpns = supported_alpns,
-            Err(err) => {
-                debug!(%err, "failed to query peer supported ALPNs");
-            }
+        match supported_alpns(&connected.connection, &connected.session).await {
+            Ok(supported_alpns) => connected.session.supported_alpns = supported_alpns,
+            Err(err) => debug!(%err, "failed to query peer supported ALPNs"),
         }
     }
-    let transport_observer = Some(portl_core::transport_telemetry::spawn_connection_observer(
-        connection.clone(),
-        cli_transport_context(peer_log, endpoint, &connection, &resolved.ticket, &session),
-        ObserverConfig::from_env(),
-    ));
-    Ok(ConnectedPeer {
-        endpoint: endpoint.clone(),
-        connection,
-        session,
-        transport_observer,
-    })
+    connected.transport_observer =
+        Some(portl_core::transport_telemetry::spawn_connection_observer(
+            connected.connection.clone(),
+            cli_transport_context(
+                peer_log,
+                endpoint,
+                &connected.connection,
+                &resolved.ticket,
+                &connected.session,
+            ),
+            ObserverConfig::from_env(),
+        ));
+    Ok(connected)
 }
 
 async fn supported_alpns(connection: &Connection, session: &PeerSession) -> Result<Vec<String>> {
@@ -707,16 +740,18 @@ pub(crate) async fn resolve_endpoint_addr(
                     .map(|err| err.to_string())
                     .collect::<Vec<_>>()
                     .join("; ");
-                bail!("discovery failed: {detail}")
+                return Err(anyhow!("discovery failed: {detail}").context(RetryClass::Transient));
             }
-            Err(err) => return Err(anyhow!(err)),
+            Err(err) => return Err(anyhow!(err).context(RetryClass::Transient)),
         }
     }
 
     if saw_empty_addr {
-        bail!("discovery returned no usable addresses")
+        return Err(
+            anyhow!("discovery returned no usable addresses").context(RetryClass::Transient)
+        );
     }
-    bail!("discovery returned no addresses")
+    Err(anyhow!("discovery returned no addresses").context(RetryClass::Transient))
 }
 
 fn relay_fallback_addr(

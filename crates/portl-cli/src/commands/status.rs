@@ -26,7 +26,7 @@ pub fn run(
     timeout: Duration,
 ) -> Result<ExitCode> {
     if let Some(target) = target {
-        run_target_count(target, relay, json, count.max(1), timeout)
+        Ok(run_target_count(target, relay, json, count.max(1), timeout))
     } else {
         run_dashboard(json, watch)
     }
@@ -224,39 +224,57 @@ fn run_target_count(
     json: bool,
     count: u32,
     timeout: Duration,
-) -> Result<ExitCode> {
-    let mut any_success = false;
-    let mut reports = Vec::new();
-    for seq in 0..count {
-        let result = run_probe_with_identity_path_mode_timeout(peer, None, relay, timeout);
-        match result {
-            Ok(mut report) => {
-                report.seq = seq;
-                any_success = true;
-                if !json {
-                    print_status(&report);
-                }
-                reports.push(report);
+) -> ExitCode {
+    let reports = collect_probe_reports(
+        peer,
+        count,
+        || run_probe_with_identity_path_mode_timeout(peer, None, relay, timeout),
+        |report| {
+            if !json {
+                print_status(report);
             }
-            Err(err) if json => {
-                reports.push(ProbeReport::failure(seq, peer, format!("{err:#}")));
-            }
-            Err(err) => return Err(err),
-        }
-        if seq + 1 < count {
-            std::thread::sleep(Duration::from_secs(1));
-        }
-    }
+        },
+        || std::thread::sleep(Duration::from_secs(1)),
+    );
+    // Preserve the existing JSON policy: success means at least one sample
+    // succeeded. Formatting must not change sampling or the exit status.
+    let any_success = reports.iter().any(|report| report.ok);
     if json {
         println!("{}", render_probe_json_envelope(reports, count));
     } else if count > 1 {
         print_probe_summary(&ProbeSummary::from_reports(&reports));
     }
-    Ok(if any_success {
+    if any_success {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
-    })
+    }
+}
+
+fn collect_probe_reports(
+    peer: &str,
+    count: u32,
+    mut probe: impl FnMut() -> Result<ProbeReport>,
+    mut emit: impl FnMut(&ProbeReport),
+    mut wait: impl FnMut(),
+) -> Vec<ProbeReport> {
+    let mut reports = Vec::new();
+    for seq in 0..count {
+        let mut report = probe().unwrap_or_else(|error| {
+            ProbeReport::failure(
+                seq,
+                peer,
+                portl_core::diagnostics::redact_text(&format!("{error:#}")),
+            )
+        });
+        report.seq = seq;
+        emit(&report);
+        reports.push(report);
+        if seq + 1 < count {
+            wait();
+        }
+    }
+    reports
 }
 
 fn run_with_identity_path_mode(
@@ -456,6 +474,9 @@ fn path_label(connection: &Connection) -> String {
 }
 
 fn print_status(report: &ProbeReport) {
+    if let Some(error) = &report.error {
+        println!("{:<18}sample {} failed: {error}", "error:", report.seq + 1);
+    }
     if let Some(endpoint_id) = &report.endpoint_id {
         println!("{:<18}{}", "endpoint:", endpoint_id);
     }
@@ -771,6 +792,44 @@ mod tests {
         AgentInfo, DefaultUserInfo, DiscoveryInfo, NetworkHealthInfo, NetworkInfo,
         SessionProviderInfo, SessionProviderSearchPath, SessionProvidersInfo, StatusResponse,
     };
+
+    #[test]
+    fn mixed_samples_have_identical_counts_and_results_for_both_formats() {
+        for json in [false, true] {
+            let mut attempts = 0;
+            let mut waits = 0;
+            let mut emitted = 0;
+            let reports = super::collect_probe_reports(
+                "test-peer",
+                3,
+                || {
+                    attempts += 1;
+                    if attempts == 2 {
+                        let mut report = super::ProbeReport::failure(0, "test-peer", String::new());
+                        report.ok = true;
+                        report.error = None;
+                        Ok(report)
+                    } else {
+                        anyhow::bail!("probe failed")
+                    }
+                },
+                |report| {
+                    emitted += 1;
+                    if json {
+                        assert!(!super::render_probe_json(report).is_empty());
+                    }
+                },
+                || waits += 1,
+            );
+            assert_eq!((attempts, emitted, waits), (3, 3, 2));
+            let summary = super::ProbeSummary::from_reports(&reports);
+            assert_eq!((summary.successes, summary.failures), (1, 2));
+            assert_eq!(
+                reports.iter().map(|report| report.seq).collect::<Vec<_>>(),
+                vec![0, 1, 2]
+            );
+        }
+    }
 
     #[test]
     fn target_status_json_emits_single_json_object_without_human_prefix() {

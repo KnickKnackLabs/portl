@@ -152,23 +152,58 @@ fn restart(json: bool) -> Result<ExitCode> {
         return print_action(json, &report);
     }
     let result = restart_service(&before.service);
-    let ok = result.is_ok();
+    let changed = result.is_ok();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut report = collect_report();
+    while changed && !restart_ready(before.ipc.pid, &report.ipc) {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        report.ipc = fetch_ipc_info_with_timeout(
+            report.ipc.socket.clone(),
+            remaining.min(Duration::from_secs(1)),
+        );
+        if !restart_ready(before.ipc.pid, &report.ipc) {
+            std::thread::sleep(
+                deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .min(Duration::from_millis(200)),
+            );
+        }
+    }
+    report.process = ProcessInfo {
+        running: report.ipc.pid.is_some(),
+        pid: report.ipc.pid,
+    };
+    let ok = changed && restart_ready(before.ipc.pid, &report.ipc);
     let message = match result {
-        Ok(()) => "agent service restarted".to_owned(),
+        Ok(()) if ok => {
+            "restart requested; agent local IPC is ready (remote health not checked)".to_owned()
+        }
+        Ok(()) if report.ipc.ok => {
+            "restart requested; still waiting for a new agent process".to_owned()
+        }
+        Ok(()) => {
+            "restart requested; agent IPC is unavailable after the readiness deadline".to_owned()
+        }
         Err(err) => format!("failed to restart agent service: {err:#}"),
     };
-    let report = collect_report();
     print_action(
         json,
         &AgentActionReport {
             schema: "portl.agent.action.v1",
             action: "restart".to_owned(),
             ok,
-            changed: ok,
+            changed,
             message,
             status: report,
         },
     )
+}
+
+fn restart_ready(previous_pid: Option<u32>, ipc: &IpcInfo) -> bool {
+    ipc.ok && ipc.pid.is_some() && ipc.pid != previous_pid
 }
 
 fn up_action_outcome(
@@ -253,6 +288,10 @@ fn collect_report() -> AgentServiceReport {
 }
 
 fn fetch_ipc_info(socket: String) -> IpcInfo {
+    fetch_ipc_info_with_timeout(socket, Duration::from_secs(5))
+}
+
+fn fetch_ipc_info_with_timeout(socket: String, timeout: Duration) -> IpcInfo {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(err) => {
@@ -266,8 +305,14 @@ fn fetch_ipc_info(socket: String) -> IpcInfo {
             };
         }
     };
-    match runtime.block_on(async { crate::agent_ipc::fetch_status(&PathBuf::from(&socket)).await })
-    {
+    match runtime.block_on(async {
+        tokio::time::timeout(
+            timeout,
+            crate::agent_ipc::fetch_status(&PathBuf::from(&socket)),
+        )
+        .await
+        .context("agent IPC readiness deadline exceeded")?
+    }) {
         Ok(status) => {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -546,6 +591,29 @@ fn run_checked(program: &str, args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restart_readiness_requires_new_process_and_responsive_ipc() {
+        let mut ipc = IpcInfo {
+            ok: true,
+            socket: String::new(),
+            pid: Some(10),
+            version: None,
+            uptime_secs: None,
+            error: None,
+        };
+        assert!(
+            !restart_ready(Some(10), &ipc),
+            "old agent is not proof of restart"
+        );
+        ipc.pid = Some(11);
+        assert!(restart_ready(Some(10), &ipc));
+        ipc.ok = false;
+        assert!(
+            !restart_ready(Some(10), &ipc),
+            "new PID without IPC is not ready"
+        );
+    }
 
     #[test]
     fn container_service_info_is_manual_and_unmanaged() {
