@@ -17,6 +17,8 @@ All notable changes land here. This project follows
 - Preserve TCP and Unix half-closes so delayed responses can finish, and drain
   shell and exec output instead of silently discarding it after 250 ms.
   Session attach also drains output when the exit status arrives before EOF.
+- Recover the terminal viewport when a snapshot arrives before the reload
+  completion or cancellation message on a separate stream.
 - Supervise attach forward workers, roll back partial listener startup, and
   route replies correctly when multiple UDP forwards share one connection.
 - Bound and cancel setup requests, use delayed retries for temporary failures,

@@ -1858,12 +1858,27 @@ exit 0
         }
 
         fn trigger_reload(&mut self) -> usize {
+            let control_start = self.host_bound.len();
             write(&self.child.input, DETACH_KEY).expect("enter attach control mode for reload");
-            self.wait_for_host_marker_with_answerback(b"reload", Duration::from_secs(5));
+            wait_for_new_bytes(
+                &self.child.rx,
+                &mut self.host_bound,
+                control_start,
+                b"reload",
+                Duration::from_secs(5),
+            )
+            .expect("new reload control menu");
             let request_start = self.host_bound.len();
             write(&self.child.input, b"r").expect("request attach reload");
             let marker = b"reload requested";
-            self.wait_for_host_marker_with_answerback(marker, Duration::from_secs(5));
+            wait_for_new_bytes(
+                &self.child.rx,
+                &mut self.host_bound,
+                request_start,
+                marker,
+                Duration::from_secs(5),
+            )
+            .expect("new reload acknowledgement");
             // One read can contain both the acknowledgement and later paints.
             // The command boundary is the marker, not the end of that read.
             request_start

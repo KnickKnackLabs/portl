@@ -5138,6 +5138,25 @@ async fn drain_remote_attach_output(
 mod remote_attach_drain_tests {
     use super::*;
 
+    #[test]
+    fn reordered_reload_viewport_is_requested_after_terminal_frame() {
+        let mut deferred = true;
+        assert!(!take_deferred_viewport_request(
+            &mut deferred,
+            AttachV2ReloadState::Loading { reload_id: 7 },
+        ));
+        assert!(deferred);
+        assert!(take_deferred_viewport_request(
+            &mut deferred,
+            AttachV2ReloadState::AwaitingViewport { reload_id: 7 },
+        ));
+        assert!(!deferred);
+        assert!(!take_deferred_viewport_request(
+            &mut deferred,
+            AttachV2ReloadState::AwaitingViewport { reload_id: 7 },
+        ));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn exit_waits_for_delayed_output_eof() {
         let mut stdout = tokio::spawn(async {
@@ -5219,6 +5238,7 @@ async fn run_remote_attach_v2_once(
     let mut data_streams = AttachV2DataStreamStatus::default();
     let mut resync_pending = false;
     let mut post_reload_dedup_until: Option<Instant> = None;
+    let mut viewport_deferred = false;
     let end = loop {
         tokio::select! {
             frame = read_attach_v2_frame(&mut control_recv) => {
@@ -5231,7 +5251,16 @@ async fn run_remote_attach_v2_once(
                         mode_tracker,
                     ).await {
                         Ok(Some(end)) => break end,
-                        Ok(None) => {}
+                        Ok(None) => {
+                            let state = reload_state.lock().map_or(
+                                AttachV2ReloadState::Idle, |state| state.state(),
+                            );
+                            if take_deferred_viewport_request(&mut viewport_deferred, state)
+                                && let Err(error) = coordinator.request_viewport("deferred_reload_viewport").await
+                            {
+                                break AttachEnd::Disconnected(error);
+                            }
+                        }
                         Err(err) => break AttachEnd::Disconnected(err),
                     },
                     Ok(Some(_)) => {}
@@ -5254,6 +5283,7 @@ async fn run_remote_attach_v2_once(
                             AttachV2ViewportDecision::Render => {
                                 match payload.decode(ATTACH_V2_MAX_DECODED_PAYLOAD) {
                                     Ok(bytes) => {
+                                        viewport_deferred = false;
                                         last_viewport_generation = generation;
                                         covered_live_seq = covered_live_seq.max(covers_live_seq);
                                         resync_pending = false;
@@ -5343,6 +5373,7 @@ async fn run_remote_attach_v2_once(
                                 }
                             }
                             AttachV2ViewportDecision::DeferForReload => {
+                                viewport_deferred = true;
                                 debug!(
                                     generation,
                                     resize_id,
@@ -5907,6 +5938,17 @@ enum AttachV2ViewportDecision {
     Render,
     DeferForReload,
     Stale,
+}
+
+// Control and viewport use independent streams. If a snapshot overtakes the
+// terminal reload frame, request a new one after that frame changes state.
+fn take_deferred_viewport_request(deferred: &mut bool, state: AttachV2ReloadState) -> bool {
+    if *deferred && state.allows_viewport_render() {
+        *deferred = false;
+        true
+    } else {
+        false
+    }
 }
 
 fn attach_v2_viewport_decision(
