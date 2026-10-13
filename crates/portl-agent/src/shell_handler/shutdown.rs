@@ -371,7 +371,7 @@ pub(super) mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let (exit_tx, exit_rx) = watch::channel(None);
-        let wait_task = tokio::task::spawn_blocking(move || {
+        let waiter = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
             child.wait().expect("wait zombie child");
             let _ = exit_tx.send(Some(0));
@@ -380,7 +380,7 @@ pub(super) mod tests {
         let reaped = SessionReaper::new_for_test(pid, exit_rx, Duration::from_secs(2))
             .reap()
             .await;
-        wait_task.await.expect("wait task join");
+        waiter.join().expect("waiter thread join");
 
         assert!(reaped, "an exiting session must be reported as reaped");
     }
