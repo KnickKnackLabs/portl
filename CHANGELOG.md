@@ -24,6 +24,12 @@ All notable changes land here. This project follows
 - Upgraded iroh, iroh-base and iroh-relay to 1.3.0 and
   iroh-mdns-address-lookup to 0.6.0; added netwatch 0.19.3.
 
+### Fixed
+
+- On macOS, agent shutdown no longer reports a shell session as unreaped when
+  its process group was already exiting; the reaper keeps waiting for the
+  observed exit instead of giving up on the `EPERM` from `killpg`.
+
 ## 0.14.2 — 2026-09-18
 
 ### Fixed

@@ -77,31 +77,26 @@ impl SessionReaper {
         for signal in [
             nix::sys::signal::Signal::SIGHUP,
             nix::sys::signal::Signal::SIGTERM,
+            nix::sys::signal::Signal::SIGKILL,
         ] {
             match nix::sys::signal::killpg(pgid, signal) {
                 Ok(()) => {}
                 Err(nix::errno::Errno::ESRCH) => return true,
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        pgid = pgid.as_raw(),
-                        ?signal,
-                        "session reaper failed to signal process group"
-                    );
-                    return false;
-                }
+                // Darwin reports EPERM for a group whose members are already
+                // exiting (zombies). The exit watch is authoritative, so keep
+                // waiting instead of declaring the session unreaped.
+                Err(err) => warn!(
+                    ?err,
+                    pgid = pgid.as_raw(),
+                    ?signal,
+                    "session reaper failed to signal process group"
+                ),
+            }
+            if signal == nix::sys::signal::Signal::SIGKILL {
+                break;
             }
             if self.wait_for_reap().await {
                 return true;
-            }
-        }
-
-        match nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL) {
-            Ok(()) => {}
-            Err(nix::errno::Errno::ESRCH) => return true,
-            Err(err) => {
-                warn!(?err, pgid = pgid.as_raw(), signal = ?nix::sys::signal::Signal::SIGKILL, "session reaper failed to signal process group");
-                return false;
             }
         }
 
@@ -357,6 +352,37 @@ pub(super) mod tests {
             nix::sys::signal::Signal::SIGKILL,
         );
         let _ = std::fs::remove_file(pid_file);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reaper_observes_exit_when_group_is_already_exiting() {
+        use std::os::unix::process::CommandExt;
+
+        // An exited-but-unwaited child leaves a zombie-only process group.
+        // Darwin rejects killpg on such a group with EPERM; the reaper must
+        // still trust the exit watch instead of reporting the session live.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .process_group(0)
+            .spawn()
+            .expect("spawn exiting child");
+        let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id()).expect("pid fits in i32"));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (exit_tx, exit_rx) = watch::channel(None);
+        let wait_task = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            child.wait().expect("wait zombie child");
+            let _ = exit_tx.send(Some(0));
+        });
+
+        let reaped = SessionReaper::new_for_test(pid, exit_rx, Duration::from_secs(2))
+            .reap()
+            .await;
+        wait_task.await.expect("wait task join");
+
+        assert!(reaped, "an exiting session must be reported as reaped");
     }
 
     #[cfg(unix)]
