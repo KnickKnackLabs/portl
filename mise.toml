@@ -1,9 +1,15 @@
 [tools]
 rust = "1.93.0"
 uv = "0.11.30"
-zig = "0.15.2"
+# Upstream Zig 0.15.2 cannot link against macOS SDKs >= 26.4 (libSystem.tbd
+# lists only arm64e-macos). On macOS use Homebrew's patched keg-only
+# `zig@0.15` (`brew install zig@0.15`), prepended to PATH below.
+zig = { version = "0.15.2", os = ["linux"] }
 "github:nextest-rs/nextest" = "cargo-nextest-0.9.140"
 # sccache: compiler-output caching wrapper. Activated workspace-wide via
 # RUSTC_WRAPPER in .cargo/config.toml; biggest wins are on fresh target
 # dirs, branch switches, and CI runners.
 "github:mozilla/sccache" = "0.16.0"
+
+[env]
+_.path = ["{% if os() == 'macos' %}/opt/homebrew/opt/zig@0.15/bin{% endif %}"]
