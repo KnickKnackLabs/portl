@@ -5,21 +5,30 @@ use portl_core::ticket::schema::{Capabilities, PortRule};
 
 use crate::commands::forwarding::ForwardPlan;
 use crate::commands::persistent_forward;
+use crate::commands::socks::{DynamicForwardSpec, parse_dynamic_spec};
 
-pub fn run(peer: &str, specs: &[String]) -> Result<ExitCode> {
-    if specs.is_empty() {
-        bail!("at least one -L spec is required")
+pub fn run(peer: &str, specs: &[String], dynamic_specs: &[String]) -> Result<ExitCode> {
+    if specs.is_empty() && dynamic_specs.is_empty() {
+        bail!("at least one -L or -D spec is required")
     }
     let parsed_specs = specs
         .iter()
         .map(|spec| parse_local_spec(spec))
         .collect::<Result<Vec<_>>>()?;
-    eprint!("{}", render_startup_summary(peer, &parsed_specs));
+    let parsed_dynamic = dynamic_specs
+        .iter()
+        .map(|spec| parse_dynamic_spec(spec))
+        .collect::<Result<Vec<_>>>()?;
+    eprint!(
+        "{}",
+        render_startup_summary(peer, &parsed_specs, &parsed_dynamic)
+    );
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(persistent_forward::run(
         peer,
         ForwardPlan {
             tcp: parsed_specs,
+            dynamic: parsed_dynamic,
             ..ForwardPlan::default()
         },
         tcp_caps(),
@@ -47,19 +56,35 @@ impl LocalForwardSpec {
 }
 
 #[allow(clippy::format_push_string)]
-fn render_startup_summary(peer: &str, specs: &[LocalForwardSpec]) -> String {
+fn render_startup_summary(
+    peer: &str,
+    specs: &[LocalForwardSpec],
+    dynamic_specs: &[DynamicForwardSpec],
+) -> String {
     let local_width = specs
         .iter()
         .map(|spec| spec.local_addr().len())
         .max()
         .unwrap_or(0);
-    let mut summary = format!("Forwarding through {peer}\n\nTCP ports:\n");
+    let mut summary = format!("Forwarding through {peer}\n");
+    if !specs.is_empty() {
+        summary.push_str("\nTCP ports:\n");
+    }
     for spec in specs {
         summary.push_str(&format!(
             "  -L  {local:<local_width$} -> {peer}:{}\n",
             spec.remote_addr(),
             local = spec.local_addr(),
         ));
+    }
+    if !dynamic_specs.is_empty() {
+        summary.push_str("\nSOCKS5 proxies (no auth, CONNECT only):\n");
+        for spec in dynamic_specs {
+            summary.push_str(&format!(
+                "  -D  {} -> {peer}:requested destination (remote DNS)\n",
+                spec.local_addr(),
+            ));
+        }
     }
     summary.push_str("\nWaiting for connections. Press Ctrl-C to stop.\n");
     summary
@@ -139,9 +164,23 @@ mod tests {
             parse_local_spec("15432:db.internal:5432").unwrap(),
         ];
         assert_eq!(
-            render_startup_summary("remote-dev", &specs),
+            render_startup_summary("remote-dev", &specs, &[]),
             "Forwarding through remote-dev\n\nTCP ports:\n  -L  127.0.0.1:8080  -> remote-dev:localhost:3000\n  -L  127.0.0.1:15432 -> remote-dev:db.internal:5432\n\nWaiting for connections. Press Ctrl-C to stop.\n"
         );
+    }
+
+    #[test]
+    fn renders_dynamic_only_and_mixed_startup_summaries() {
+        let dynamic = [crate::commands::socks::parse_dynamic_spec("1080").unwrap()];
+        assert_eq!(
+            render_startup_summary("vn3", &[], &dynamic),
+            "Forwarding through vn3\n\nSOCKS5 proxies (no auth, CONNECT only):\n  -D  127.0.0.1:1080 -> vn3:requested destination (remote DNS)\n\nWaiting for connections. Press Ctrl-C to stop.\n"
+        );
+        let summary =
+            render_startup_summary("vn3", &[parse_local_spec("8080:3000").unwrap()], &dynamic);
+        assert_eq!(summary.matches("Forwarding through vn3").count(), 1);
+        assert!(summary.contains("-L"));
+        assert!(summary.contains("-D"));
     }
 
     #[test]

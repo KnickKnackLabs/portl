@@ -12,6 +12,23 @@ use iroh::EndpointId;
 use iroh::endpoint::presets;
 use iroh_base::EndpointAddr;
 
+/// QUIC idle timeout advertised by every portl endpoint.
+///
+/// The effective timeout is the minimum of both peers' values (RFC 9000
+/// §10.1), so clients and agents must advertise the same value. Five
+/// minutes lets established streams ride out Wi-Fi blips and network
+/// switches; iroh's 5 s keepalive keeps healthy connections active.
+pub const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Transport config shared by portl agents and clients.
+pub fn transport_config() -> iroh::endpoint::QuicTransportConfig {
+    let idle = iroh::endpoint::IdleTimeout::try_from(IDLE_TIMEOUT)
+        .expect("IDLE_TIMEOUT fits in a QUIC varint");
+    iroh::endpoint::QuicTransportConfig::builder()
+        .max_idle_timeout(Some(idle))
+        .build()
+}
+
 /// A portl endpoint. Thin newtype over [`iroh::Endpoint`].
 #[derive(Debug, Clone)]
 pub struct Endpoint(iroh::Endpoint);

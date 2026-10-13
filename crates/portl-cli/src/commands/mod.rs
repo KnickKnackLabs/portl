@@ -21,6 +21,7 @@ pub mod session_share;
 pub mod shell;
 pub mod slicer;
 pub mod socket;
+pub(crate) mod socks;
 pub mod ssh;
 pub mod ssh_config;
 pub mod ssh_proxy;
