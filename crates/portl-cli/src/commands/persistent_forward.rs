@@ -8,11 +8,13 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use futures_util::Stream;
+use iroh::endpoint::ConnectionError;
 use portl_core::id::store;
 use portl_core::ticket::schema::Capabilities;
 
 use super::forwarding::{ForwardPlan, ForwardRuntime};
-use super::network_lifecycle::{self, Backoff};
+use super::network_lifecycle::{self, Backoff, NetworkChanges};
 use super::peer_resolve::{
     bind_client_endpoint, close_client_endpoint, close_connected_connection,
     connect_peer_with_endpoint, resolve_identity_path,
@@ -23,26 +25,40 @@ pub(crate) async fn run(peer: &str, plan: ForwardPlan, caps: Capabilities) -> Re
     let mut forwards = plan.start_persistent().await?;
     let shutdown = network_lifecycle::shutdown_signal();
     tokio::pin!(shutdown);
-    let endpoint = tokio::select! {
+    let (endpoint, monitor) = tokio::select! {
         result = &mut shutdown => {
             forwards.shutdown().await;
             result?;
             return Ok(ExitCode::SUCCESS);
         }
-        result = network_lifecycle::setup("client endpoint setup", bind_client_endpoint(&identity)) => match result {
-            Ok(endpoint) => endpoint,
+        result = network_lifecycle::setup("client endpoint setup", async {
+            let monitor = netwatch::netmon::Monitor::new()
+                .await
+                .context("watch local network changes")?;
+            let endpoint = bind_client_endpoint(&identity).await?;
+            Ok((endpoint, monitor))
+        }) => match result {
+            Ok(ready) => ready,
             Err(error) => {
                 forwards.shutdown().await;
                 return Err(error);
             }
         }
     };
+    let mut changes = network_lifecycle::network_changes(&monitor);
     let mut quiet = false;
-    let result = supervise(&mut forwards, &mut shutdown, || {
-        let attempt = connect_peer_with_endpoint(peer, caps.clone(), &identity, &endpoint, quiet);
-        quiet = true;
-        attempt
-    })
+    let result = supervise(
+        &mut forwards,
+        &mut shutdown,
+        &endpoint,
+        &mut changes,
+        || {
+            let attempt =
+                connect_peer_with_endpoint(peer, caps.clone(), &identity, &endpoint, quiet);
+            quiet = true;
+            attempt
+        },
+    )
     .await;
     forwards.shutdown().await;
     close_client_endpoint(endpoint, "persistent forward stopped").await;
@@ -50,27 +66,41 @@ pub(crate) async fn run(peer: &str, plan: ForwardPlan, caps: Capabilities) -> Re
 }
 
 enum PeerEnd {
-    Closed,
+    Closed(ConnectionError),
     Signal(Result<()>),
     Worker(anyhow::Error),
 }
 
-pub(super) async fn supervise<F, Fut>(
+pub(super) async fn supervise<F, Fut, S>(
     forwards: &mut ForwardRuntime,
     shutdown: &mut (impl Future<Output = Result<()>> + Unpin),
+    endpoint: &iroh::Endpoint,
+    changes: &mut NetworkChanges<S>,
     mut connect: F,
 ) -> Result<ExitCode>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<super::peer_resolve::ConnectedPeer>>,
+    S: Stream<Item = Result<()>> + Unpin,
 {
     let mut backoff = Backoff::default();
     loop {
         tracing::info!(state = "connecting", "persistent forward peer state");
         let connected = tokio::select! {
+            biased;
             result = &mut *shutdown => { result?; return Ok(ExitCode::SUCCESS); },
             error = forwards.failed() => return Err(error),
-            result = connect() => result,
+            change = changes.changed() => { change?; None },
+            result = connect() => Some(result),
+        };
+        let Some(connected) = connected else {
+            tracing::info!(
+                state = "reconnecting",
+                "local network changed; restarting peer setup"
+            );
+            backoff.reset();
+            network_lifecycle::refresh_network(endpoint).await?;
+            continue;
         };
         match connected {
             Err(error) if !network_lifecycle::retryable(&error) => return Err(error),
@@ -86,7 +116,7 @@ where
                     error = forwards.failed() => PeerEnd::Worker(error),
                     error = connected.connection.closed() => {
                         tracing::warn!(%error, state = "reconnecting", "forward peer closed");
-                        PeerEnd::Closed
+                        PeerEnd::Closed(error)
                     },
                 };
                 forwards.disconnected();
@@ -98,17 +128,42 @@ where
                         return Ok(ExitCode::SUCCESS);
                     }
                     PeerEnd::Worker(error) => return Err(error),
-                    PeerEnd::Closed => {}
+                    // Transport loss after a working session: redial now. A peer that
+                    // closes right after setup keeps the backoff so it cannot spin.
+                    PeerEnd::Closed(error)
+                        if started.elapsed() >= Duration::from_secs(5)
+                            && matches!(
+                                error,
+                                ConnectionError::TransportError(_)
+                                    | ConnectionError::ConnectionClosed(_)
+                                    | ConnectionError::Reset
+                                    | ConnectionError::TimedOut
+                            ) =>
+                    {
+                        backoff.reset();
+                        continue;
+                    }
+                    PeerEnd::Closed(_) => {}
                 }
                 if started.elapsed() >= Duration::from_secs(30) {
                     backoff.reset();
                 }
             }
         }
-        tokio::select! {
+        let network_changed = tokio::select! {
+            biased;
             result = &mut *shutdown => { result?; return Ok(ExitCode::SUCCESS); },
             error = forwards.failed() => return Err(error),
-            () = tokio::time::sleep(backoff.next()) => {},
+            change = changes.changed() => { change?; true },
+            () = tokio::time::sleep(backoff.next()) => false,
+        };
+        if network_changed {
+            tracing::info!(
+                state = "reconnecting",
+                "local network changed; retrying now"
+            );
+            backoff.reset();
+            network_lifecycle::refresh_network(endpoint).await?;
         }
     }
 }

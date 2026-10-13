@@ -20,7 +20,7 @@ use tokio::sync::watch;
 use crate::commands::network_lifecycle::{self, Backoff};
 use crate::commands::peer_resolve::ConnectedPeer;
 use crate::commands::stream_io::forward_stream;
-use crate::commands::{socket, tcp, udp};
+use crate::commands::{socket, socks, tcp, udp};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ForwardingArgs {
@@ -65,24 +65,33 @@ impl ForwardingArgs {
             socket::parse_new_socket_modes(peer, source_label, &unix_l, &unix_r, false)?
         };
 
-        Ok(ForwardPlan { tcp, udp, unix })
+        Ok(ForwardPlan {
+            tcp,
+            udp,
+            unix,
+            ..ForwardPlan::default()
+        })
     }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ForwardPlan {
     pub(crate) tcp: Vec<tcp::LocalForwardSpec>,
+    pub(crate) dynamic: Vec<socks::DynamicForwardSpec>,
     pub(crate) udp: Vec<udp::LocalForwardSpec>,
     pub(crate) unix: Vec<socket::SocketMode>,
 }
 
 impl ForwardPlan {
     pub(crate) fn is_empty(&self) -> bool {
-        self.tcp.is_empty() && self.udp.is_empty() && self.unix.is_empty()
+        self.tcp.is_empty()
+            && self.dynamic.is_empty()
+            && self.udp.is_empty()
+            && self.unix.is_empty()
     }
 
     pub(crate) fn augment_caps(&self, caps: &mut Capabilities) {
-        if !self.tcp.is_empty() {
+        if !self.tcp.is_empty() || !self.dynamic.is_empty() {
             caps.presence |= 0b0000_0010;
             let rules = caps.tcp.get_or_insert_with(Vec::new);
             rules.push(PortRule {
@@ -142,6 +151,15 @@ impl ForwardPlan {
                     spec.remote_host,
                     spec.remote_port,
                     local = spec.local_addr(),
+                ));
+            }
+        }
+        if !self.dynamic.is_empty() {
+            out.push_str("\nSOCKS5 proxies (no auth, CONNECT only):\n");
+            for spec in &self.dynamic {
+                out.push_str(&format!(
+                    "  -D  {} -> {peer}:requested destination (remote DNS)\n",
+                    spec.local_addr(),
                 ));
             }
         }
@@ -247,6 +265,7 @@ impl ForwardPlan {
             cleanup_unix_paths: Vec::new(),
         };
         let mut tcp_listeners = Vec::new();
+        let mut dynamic_listeners = Vec::new();
         let mut udp_forwards = Vec::new();
         let mut unix_listeners = Vec::new();
         let mut unix_reverse = Vec::new();
@@ -256,6 +275,10 @@ impl ForwardPlan {
         for spec in &self.tcp {
             let listener = bind_local_forward_listener(&spec.local_addr()).await?;
             tcp_listeners.push((spec.clone(), listener));
+        }
+        for spec in &self.dynamic {
+            let listener = bind_local_forward_listener(&spec.local_addr()).await?;
+            dynamic_listeners.push((spec.clone(), listener));
         }
         for spec in &self.udp {
             udp_forwards.push((
@@ -306,6 +329,15 @@ impl ForwardPlan {
                     spec.remote_port,
                 )));
         }
+        for (spec, listener) in dynamic_listeners {
+            runtime
+                .tasks
+                .push(tokio::spawn(run_resilient_socks_listener(
+                    listener,
+                    peer_rx.clone(),
+                    spec.local_addr(),
+                )));
+        }
         for (spec, forward) in udp_forwards {
             runtime.tasks.push(tokio::spawn(run_resilient_udp_forward(
                 forward,
@@ -341,6 +373,7 @@ impl ForwardPlan {
         options: ForwardStartOptions,
     ) -> Result<ForwardRuntime> {
         let mut tcp_forwards = Vec::new();
+        let mut dynamic_listeners = Vec::new();
         let mut udp_forwards = Vec::new();
         let mut unix_connects = Vec::new();
         let mut unix_listens = Vec::new();
@@ -354,6 +387,12 @@ impl ForwardPlan {
                 spec.remote_host.clone(),
                 spec.remote_port,
             ));
+        }
+
+        for spec in &self.dynamic {
+            let local_addr = spec.local_addr();
+            let listener = bind_local_forward_listener(&local_addr).await?;
+            dynamic_listeners.push((listener, local_addr));
         }
 
         for spec in &self.udp {
@@ -431,6 +470,17 @@ impl ForwardPlan {
                 )
                 .await
             }));
+        }
+
+        if !dynamic_listeners.is_empty() {
+            let (_, peer_rx) = watch::channel(Some(ForwardPeer::new(connected, 0)));
+            for (listener, local_addr) in dynamic_listeners {
+                tasks.push(tokio::spawn(run_resilient_socks_listener(
+                    listener,
+                    peer_rx.clone(),
+                    local_addr,
+                )));
+            }
         }
 
         for (spec, forward, control) in udp_ready {
@@ -600,6 +650,50 @@ async fn forward_resilient_tcp_client(
         upstream_bytes,
         downstream_bytes,
     })
+}
+
+async fn run_resilient_socks_listener(
+    listener: TcpListener,
+    peer_rx: watch::Receiver<Option<ForwardPeer>>,
+    local_addr: String,
+) -> Result<()> {
+    let mut clients = tokio::task::JoinSet::new();
+    loop {
+        let (local, client_addr) = tokio::select! {
+            accepted = listener.accept() => accepted.context("accept local SOCKS5 connection")?,
+            result = clients.join_next(), if !clients.is_empty() => {
+                if let Some(Err(error)) = result {
+                    tracing::warn!(%error, "SOCKS5 client task failed");
+                }
+                continue;
+            }
+        };
+        let peer = peer_rx.borrow().clone();
+        let local_addr = local_addr.clone();
+        clients.spawn(async move {
+            let started = Instant::now();
+            let peer = peer.as_ref().map(|peer| (&peer.connection, &peer.session));
+            match socks::forward_client(local, peer).await {
+                Ok(stats) => tracing::info!(
+                    message = %format!(
+                        "[tcp -D {local_addr}] closed client={client_addr} after {}, up={} down={}",
+                        udp::format_duration(started.elapsed()),
+                        stats.upstream_bytes,
+                        stats.downstream_bytes,
+                    ),
+                    "tcp forwarding event"
+                ),
+                Err(error) => tracing::info!(
+                    message = %format!(
+                        "[tcp -D {local_addr}] closed client={client_addr} after {}, error={}",
+                        udp::format_duration(started.elapsed()),
+                        portl_core::diagnostics::redact_text(&format!("{error:#}")),
+                    ),
+                    "tcp forwarding event"
+                ),
+            }
+        });
+    }
 }
 
 async fn run_resilient_unix_forward_listener(
@@ -1086,6 +1180,209 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn socks_success_waits_for_agent_ack_and_preserves_remote_domain() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (requested_tx, requested_rx) = tokio::sync::oneshot::channel();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let (connected, server) = connected_test_peer_with_handler(move |connection| async move {
+            let (mut send, recv) = connection.accept_bi().await.unwrap();
+            let mut recv = portl_core::io::BufferedRecv::new(recv, Vec::new());
+            let request = recv
+                .read_frame::<portl_proto::tcp_v1::TcpReq>(4096)
+                .await
+                .unwrap()
+                .unwrap();
+            requested_tx.send((request.host, request.port)).unwrap();
+            ack_rx.await.unwrap();
+            send.write_all(
+                &postcard::to_stdvec(&portl_proto::tcp_v1::TcpAck {
+                    ok: true,
+                    error: None,
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            send.write_all(b"ready").await.unwrap();
+            let mut bytes = Vec::new();
+            recv.read_to_end(&mut bytes).await.unwrap();
+            send.write_all(&bytes).await.unwrap();
+            send.finish().unwrap();
+            connection.closed().await;
+        })
+        .await;
+        let port = unused_tcp_port().await;
+        let address = format!("127.0.0.1:{port}");
+        let plan = super::ForwardPlan {
+            dynamic: vec![crate::commands::socks::parse_dynamic_spec(&port.to_string()).unwrap()],
+            ..super::ForwardPlan::default()
+        };
+        let mut runtime = plan.start_persistent().await.unwrap();
+        runtime.reconnect(&connected);
+        let mut client = socks_test_client(&address).await;
+        let requested = tokio::time::timeout(std::time::Duration::from_secs(5), requested_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(requested, ("rancher.tcbs.com.vn".to_owned(), 443));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), client.read(&mut [0]))
+                .await
+                .is_err()
+        );
+        ack_tx.send(()).unwrap();
+        let mut reply = [0; 10];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_exact(&mut reply),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(reply, [5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+        let mut ready = [0; 5];
+        client.read_exact(&mut ready).await.unwrap();
+        assert_eq!(&ready, b"ready");
+        client.write_all(b"request").await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_end(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response, b"request");
+        runtime.shutdown().await;
+        finish_connected_test_peer(connected, server).await;
+    }
+
+    #[tokio::test]
+    async fn socks_agent_rejections_return_failure_without_success() {
+        use tokio::io::AsyncReadExt;
+
+        for (error, reply_code) in [
+            ("Connection refused (os error 111)", 5),
+            ("No route to host (os error 113)", 4),
+            ("destination not permitted by ticket", 1),
+        ] {
+            let (connected, server) =
+                connected_test_peer_with_handler(move |connection| async move {
+                    let (mut send, recv) = connection.accept_bi().await.unwrap();
+                    let mut recv = portl_core::io::BufferedRecv::new(recv, Vec::new());
+                    recv.read_frame::<portl_proto::tcp_v1::TcpReq>(4096)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    send.write_all(
+                        &postcard::to_stdvec(&portl_proto::tcp_v1::TcpAck {
+                            ok: false,
+                            error: Some(error.to_owned()),
+                        })
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                    send.finish().unwrap();
+                    connection.closed().await;
+                })
+                .await;
+            let port = unused_tcp_port().await;
+            let address = format!("127.0.0.1:{port}");
+            let plan = super::ForwardPlan {
+                dynamic: vec![
+                    crate::commands::socks::parse_dynamic_spec(&port.to_string()).unwrap(),
+                ],
+                ..super::ForwardPlan::default()
+            };
+            let mut runtime = plan.start(&connected).await.unwrap();
+            let mut client = socks_test_client(&address).await;
+            let mut reply = [0; 10];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.read_exact(&mut reply),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(reply, [5, reply_code, 0, 1, 0, 0, 0, 0, 0, 0]);
+            assert_eq!(client.read(&mut [0]).await.unwrap(), 0);
+            runtime.shutdown().await;
+            finish_connected_test_peer(connected, server).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_socks_listener_fails_fast_offline_and_keeps_port_across_generations() {
+        use tokio::io::AsyncReadExt;
+
+        let port = unused_tcp_port().await;
+        let address = format!("127.0.0.1:{port}");
+        let plan = super::ForwardPlan {
+            dynamic: vec![crate::commands::socks::parse_dynamic_spec(&port.to_string()).unwrap()],
+            ..super::ForwardPlan::default()
+        };
+        assert!(!plan.is_empty());
+        assert!(plan.render_summary("vn3", "local").contains("-D"));
+        let mut runtime = plan.start_persistent().await.unwrap();
+        for generation in 0..2 {
+            let mut offline = tokio::net::TcpStream::connect(&address).await.unwrap();
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), offline.read(&mut [0]))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+            assert!(tokio::net::TcpListener::bind(&address).await.is_err());
+            let (connected, server) = echo_test_peer().await;
+            runtime.reconnect(&connected);
+            let payload = format!("generation {generation}");
+            socks_test_exchange(&address, payload.as_bytes()).await;
+            runtime.disconnected();
+            finish_connected_test_peer(connected, server).await;
+        }
+        runtime.shutdown().await;
+        let _released = tokio::net::TcpListener::bind(&address).await.unwrap();
+    }
+
+    async fn socks_test_client(address: &str) -> tokio::net::TcpStream {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+            client
+                .write_all(b"\x05\x01\x00\x05\x01\x00\x03\x13rancher.tcbs.com.vn\x01\xbb")
+                .await
+                .unwrap();
+            let mut method = [0; 2];
+            client.read_exact(&mut method).await.unwrap();
+            assert_eq!(method, [5, 0]);
+            client
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn socks_test_exchange(address: &str, payload: &[u8]) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut client = socks_test_client(address).await;
+            let mut reply = [0; 10];
+            client.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, [5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+            client.write_all(payload).await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            assert_eq!(response, payload);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn persistent_listener_starts_offline_and_recovers_on_the_same_port() {
         use std::time::Duration;
         use tokio::io::AsyncReadExt;
@@ -1124,17 +1421,26 @@ mod tests {
             Ok(second),
         ]);
         let (stop, stopped) = tokio::sync::oneshot::channel();
+        let endpoint = first_endpoint.clone();
         let owner = tokio::spawn(async move {
             let mut shutdown = Box::pin(async { stopped.await.map_err(anyhow::Error::from) });
-            let result =
-                crate::commands::persistent_forward::supervise(&mut runtime, &mut shutdown, || {
+            let mut changes = crate::commands::network_lifecycle::NetworkChanges::new(
+                futures_util::stream::pending(),
+            );
+            let result = crate::commands::persistent_forward::supervise(
+                &mut runtime,
+                &mut shutdown,
+                &endpoint,
+                &mut changes,
+                || {
                     std::future::ready(
                         attempts
                             .pop_front()
                             .expect("unexpected extra connection attempt"),
                     )
-                })
-                .await;
+                },
+            )
+            .await;
             runtime.shutdown().await;
             assert!(attempts.is_empty());
             result
@@ -1412,6 +1718,34 @@ mod tests {
             .await
             .expect("accept task timeout")
             .expect("accept task panic");
+    }
+
+    #[test]
+    fn dynamic_forwarding_plan_requests_tcp_connect_caps() {
+        let plan = super::ForwardPlan {
+            dynamic: vec![crate::commands::socks::parse_dynamic_spec("1080").unwrap()],
+            ..super::ForwardPlan::default()
+        };
+        let mut caps = Capabilities {
+            presence: 0,
+            shell: None,
+            tcp: None,
+            udp: None,
+            fs: None,
+            vpn: None,
+            meta: None,
+            unix: None,
+        };
+        plan.augment_caps(&mut caps);
+        assert_eq!(caps.presence, 0b0000_0010);
+        assert_eq!(
+            caps.tcp.unwrap(),
+            vec![portl_core::ticket::schema::PortRule {
+                host_glob: "*".to_owned(),
+                port_min: 1,
+                port_max: 65535,
+            }]
+        );
     }
 
     #[test]

@@ -39,7 +39,9 @@ pub(crate) async fn bind_client_endpoint_with_config(
         relays = cfg.discovery.relays.len(),
         "binding CLI client endpoint"
     );
-    let mut builder = iroh::Endpoint::builder(presets::Minimal).secret_key(SecretKey::generate());
+    let mut builder = iroh::Endpoint::builder(presets::Minimal)
+        .secret_key(SecretKey::generate())
+        .transport_config(portl_core::endpoint::transport_config());
 
     builder = if cfg.discovery.relays.is_empty() {
         builder.relay_mode(RelayMode::Disabled)

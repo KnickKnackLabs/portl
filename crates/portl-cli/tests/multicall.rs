@@ -229,6 +229,7 @@ fn shell_exec_tcp_and_udp_subcommands_parse() {
         Command::Tcp {
             peer: "peer-ticket".to_owned(),
             local: vec!["127.0.0.1:9000:127.0.0.1:22".to_owned()],
+            dynamic: Vec::new(),
         }
     );
 
@@ -247,6 +248,45 @@ fn shell_exec_tcp_and_udp_subcommands_parse() {
             local: vec!["127.0.0.1:9001:127.0.0.1:53".to_owned()],
         }
     );
+}
+
+#[test]
+fn tcp_accepts_dynamic_forwards_alone_or_with_local_forwards() {
+    assert_eq!(
+        parse(argv(&[
+            "portl",
+            "tcp",
+            "-D",
+            "1080",
+            "-D",
+            "[::1]:1081",
+            "vn3"
+        ]))
+        .unwrap(),
+        Command::Tcp {
+            peer: "vn3".to_owned(),
+            local: Vec::new(),
+            dynamic: vec!["1080".to_owned(), "[::1]:1081".to_owned()],
+        }
+    );
+    assert_eq!(
+        parse(argv(&[
+            "portl",
+            "tcp",
+            "-L",
+            "8080:3000",
+            "-D",
+            "127.0.0.1:1080",
+            "vn3"
+        ]))
+        .unwrap(),
+        Command::Tcp {
+            peer: "vn3".to_owned(),
+            local: vec!["8080:3000".to_owned()],
+            dynamic: vec!["127.0.0.1:1080".to_owned()],
+        }
+    );
+    assert!(parse(argv(&["portl", "tcp", "vn3"])).is_err());
 }
 
 #[test]

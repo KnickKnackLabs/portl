@@ -5,6 +5,25 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Added
+
+- `portl tcp -D [BIND_ADDR:]PORT` runs a local no-auth SOCKS5 CONNECT proxy.
+  The SOCKS handshake ends locally and the destination (domains unresolved,
+  socks5h semantics) travels in the existing TCP stream request, so the agent
+  connects directly. Arbitrary destinations need a `tcp:*:1-65535` grant.
+
+### Changed
+
+- Agents and clients advertise a 300 s QUIC idle timeout (was iroh's 30 s), so
+  open streams survive Wi-Fi blips and network switches. Both sides must run
+  this version: QUIC uses the smaller of the two advertised values.
+- Persistent forwards watch local interfaces (netwatch). A network change
+  cancels a stalled peer setup or backoff, resets the endpoint's DNS resolver,
+  notifies iroh, and redials at once (at most one redial per second). A lost
+  connection that had been up for at least 5 s redials without backoff.
+- Upgraded iroh, iroh-base and iroh-relay to 1.3.0 and
+  iroh-mdns-address-lookup to 0.6.0; added netwatch 0.19.3.
+
 ## 0.14.2 — 2026-09-18
 
 ### Fixed

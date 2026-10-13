@@ -19,6 +19,7 @@ fn local_only_dns_resolver() -> DnsResolver {
 pub async fn bind(cfg: &AgentConfig, identity: &Identity) -> Result<iroh::Endpoint> {
     let mut builder = iroh::Endpoint::builder(presets::Minimal)
         .secret_key(SecretKey::from_bytes(&identity.signing_key().to_bytes()))
+        .transport_config(portl_core::endpoint::transport_config())
         .alpns(vec![
             portl_proto::ticket_v1::ALPN_TICKET_V1.to_vec(),
             portl_proto::pair_v1::ALPN_PAIR_V1.to_vec(),

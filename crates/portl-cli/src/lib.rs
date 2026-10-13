@@ -194,6 +194,7 @@ pub enum Command {
     Tcp {
         peer: String,
         local: Vec<String>,
+        dynamic: Vec<String>,
     },
     Udp {
         peer: String,
@@ -1180,7 +1181,11 @@ fn dispatch(cmd: Command) -> anyhow::Result<ExitCode> {
             &portl_bin,
             ssh_user.as_deref(),
         ),
-        Command::Tcp { peer, local } => commands::tcp::run(&peer, &local),
+        Command::Tcp {
+            peer,
+            local,
+            dynamic,
+        } => commands::tcp::run(&peer, &local, &dynamic),
         Command::Udp { peer, local } => commands::udp::run(&peer, &local),
         Command::Socket {
             peer,
@@ -1547,7 +1552,7 @@ Session environment overrides:
 
 See `docs/ENV.md` for the full list including relay and internal variables.";
 
-const TCP_AFTER_HELP: &str = "TCP forwarding examples:\n  portl tcp -L 9090 remote-dev\n      Forwards port 9090 on the current machine to port 9090 on remote-dev.\n\n  portl tcp -L 8080:3000 remote-dev\n      Forwards port 8080 on the current machine to port 3000 on remote-dev.\n\n  portl tcp -L 15432:db.internal:5432 remote-dev\n      Forwards local port 15432 to db.internal:5432 as seen from remote-dev.\n";
+const TCP_AFTER_HELP: &str = "TCP forwarding examples:\n  portl tcp -L 9090 remote-dev\n      Forwards port 9090 on the current machine to port 9090 on remote-dev.\n\n  portl tcp -L 8080:3000 remote-dev\n      Forwards port 8080 on the current machine to port 3000 on remote-dev.\n\n  portl tcp -L 15432:db.internal:5432 remote-dev\n      Forwards local port 15432 to db.internal:5432 as seen from remote-dev.\n\n  portl tcp -D 1080 remote-dev\n      Serves a no-auth SOCKS5 CONNECT proxy on 127.0.0.1:1080; destination DNS resolves on remote-dev.\n\n  portl tcp -D 127.0.0.1:1080 -L 8080:3000 remote-dev\n      Keeps both listeners open across peer reconnects; new connections fail fast while offline.\n\nUse socks5h://127.0.0.1:1080 to send domains to the peer. Binding outside loopback exposes an unauthenticated proxy.\nDestinations still require the peer ticket's TCP host/port permissions; unrestricted forwarding needs tcp:*:1-65535.\n";
 
 const UDP_AFTER_HELP: &str = "UDP forwarding examples:\n  portl udp -L 5353/udp remote-dev\n      Forwards UDP port 5353 on the current machine to UDP port 5353 on remote-dev.\n\n  portl udp -L 1053:dns.internal:53/udp remote-dev\n      Forwards local UDP port 1053 to dns.internal:53 as seen from remote-dev.\n";
 
@@ -2006,12 +2011,15 @@ enum ConnectTopLevel {
         #[arg(long = "user", value_name = "USER")]
         ssh_user: Option<String>,
     },
-    /// Set up one or more local TCP forwards.
+    /// Set up local TCP forwards and/or SOCKS5 CONNECT proxies.
     #[command(display_order = 180, after_long_help = TCP_AFTER_HELP)]
     Tcp {
         /// Local forward spec: `LOCAL_PORT`, `LOCAL_PORT:REMOTE_PORT`, or `[LOCAL_HOST:]LOCAL_PORT:REMOTE_HOST:REMOTE_PORT[/tcp]`.
-        #[arg(short = 'L', required = true)]
+        #[arg(short = 'L', required_unless_present = "dynamic")]
         local: Vec<String>,
+        /// Local no-auth SOCKS5 CONNECT proxy: `[BIND_ADDR:]PORT`. Domains resolve on the peer; bracket IPv6 bind addresses.
+        #[arg(short = 'D', value_name = "[BIND_ADDR:]PORT")]
+        dynamic: Vec<String>,
         #[arg(help = TARGET_HELP, value_name = "TARGET")]
         peer: String,
     },
@@ -2985,7 +2993,15 @@ fn connect_into_command(action: ConnectTopLevel, log_verbose: u8) -> Command {
             portl_bin,
             ssh_user,
         },
-        ConnectTopLevel::Tcp { local, peer } => Command::Tcp { peer, local },
+        ConnectTopLevel::Tcp {
+            local,
+            dynamic,
+            peer,
+        } => Command::Tcp {
+            peer,
+            local,
+            dynamic,
+        },
         ConnectTopLevel::Udp { local, peer } => Command::Udp { peer, local },
         ConnectTopLevel::Socket {
             peer,

@@ -49,7 +49,7 @@ fn connect_commands_use_target_metavars() {
         ),
         (
             &["tcp", "--help"][..],
-            "Usage: portl tcp [OPTIONS] -L <LOCAL> <TARGET>",
+            "Usage: portl tcp [OPTIONS] <TARGET>",
         ),
         (
             &["udp", "--help"][..],

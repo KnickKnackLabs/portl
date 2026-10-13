@@ -3,6 +3,8 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use futures_util::{FutureExt, Stream, StreamExt};
+use iroh::Watcher;
 use portl_core::net::client::TicketHandshakeError;
 use portl_core::wire::AckReason;
 use tokio::time::Instant;
@@ -97,6 +99,65 @@ impl Backoff {
     pub(crate) fn reset(&mut self) {
         *self = Self::default();
     }
+}
+
+const NETWORK_REDIAL_INTERVAL: Duration = Duration::from_secs(1);
+
+pub(crate) struct NetworkChanges<S> {
+    source: S,
+    next_redial: Instant,
+    pending: bool,
+}
+
+impl<S: Stream<Item = Result<()>> + Unpin> NetworkChanges<S> {
+    pub(crate) fn new(source: S) -> Self {
+        Self {
+            source,
+            next_redial: Instant::now(),
+            pending: false,
+        }
+    }
+
+    // Keep a change observed during the cooldown even if another select branch wins.
+    pub(crate) async fn changed(&mut self) -> Result<()> {
+        if !self.pending {
+            self.source
+                .next()
+                .await
+                .context("local network monitor stopped")??;
+            self.pending = true;
+        }
+        if Instant::now() < self.next_redial {
+            tokio::time::sleep_until(self.next_redial).await;
+        }
+        // Coalesce the rest of the burst before allowing the next setup attempt.
+        while let Some(Some(change)) = self.source.next().now_or_never() {
+            change?;
+        }
+        self.pending = false;
+        self.next_redial = Instant::now() + NETWORK_REDIAL_INTERVAL;
+        Ok(())
+    }
+}
+
+pub(crate) fn network_changes(
+    monitor: &netwatch::netmon::Monitor,
+) -> NetworkChanges<impl Stream<Item = Result<()>> + Unpin + use<>> {
+    let mut watcher = monitor.interface_state();
+    NetworkChanges::new(futures_util::stream::poll_fn(move |cx| {
+        watcher
+            .poll_updated(cx)
+            .map(|result| Some(result.context("watch local network changes")))
+    }))
+}
+
+pub(crate) async fn refresh_network(endpoint: &iroh::Endpoint) -> Result<()> {
+    endpoint.network_change().await;
+    endpoint
+        .dns_resolver()
+        .context("access endpoint DNS resolver after network change")?
+        .reset();
+    Ok(())
 }
 
 pub(crate) async fn shutdown_signal() -> Result<()> {
@@ -231,5 +292,35 @@ mod tests {
                 .downcast_ref::<tokio::time::error::Elapsed>()
                 .is_some()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn network_change_bursts_are_coalesced_and_cancelled_waits_are_retained() {
+        let (signal, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let mut changes = NetworkChanges::new(futures_util::stream::poll_fn(move |cx| {
+            received.poll_recv(cx)
+        }));
+        let started = Instant::now();
+        signal.send(Ok(())).unwrap();
+        changes.changed().await.unwrap();
+        assert_eq!(started.elapsed(), Duration::ZERO);
+
+        signal.send(Ok(())).unwrap();
+        {
+            let pending = changes.changed();
+            tokio::pin!(pending);
+            assert!(futures_util::poll!(&mut pending).is_pending());
+        }
+        tokio::time::advance(Duration::from_millis(999)).await;
+        signal.send(Ok(())).unwrap();
+        {
+            let pending = changes.changed();
+            tokio::pin!(pending);
+            assert!(futures_util::poll!(&mut pending).is_pending());
+        }
+        tokio::time::advance(Duration::from_millis(1)).await;
+        changes.changed().await.unwrap();
+        assert_eq!(started.elapsed(), NETWORK_REDIAL_INTERVAL);
+        assert!(changes.changed().now_or_never().is_none());
     }
 }
