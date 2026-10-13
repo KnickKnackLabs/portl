@@ -5,6 +5,8 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.15.0 — 2026-10-13
+
 ### Added
 
 - `portl tcp -D [BIND_ADDR:]PORT` runs a local no-auth SOCKS5 CONNECT proxy.

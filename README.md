@@ -15,13 +15,12 @@ used for NAT traversal when direct paths are unavailable.
 
 ## Status
 
-**v0.14.2** — Repairs persistent forwarding after peer loss without replaying
-failed client streams. Preserves half-closes and complete output, bounds setup
-and cleanup, and improves Docker, SSH, status, and agent failure reporting.
-Includes stable Iroh, SSH and dependency fixes, Herdr protocol 19 routing, and
-required macOS signing and notarization checks. Upgrade clients, agents, and
-self-hosted relays together when moving off the old Iroh release candidate;
-see the [release notes](CHANGELOG.md) for compatibility and relay guidance.
+**v0.15.0** — Adds `portl tcp -D` local SOCKS5 dynamic forwards and keeps
+persistent forwards alive across Wi-Fi blips and network switches: a 300 s QUIC
+idle timeout and immediate redial when local interfaces change. Upgrade
+clients and agents together; QUIC uses the smaller advertised idle timeout.
+Builds on v0.14.2's forwarding recovery, output draining, and Rustls security
+update; see the [release notes](CHANGELOG.md) for details.
 
 Tagged releases include a
 `PortlFFI-<tag>-apple.xcframework.zip` asset for iOS device, iOS Simulator,
@@ -78,7 +77,7 @@ curl -fsSL \
 
 The installer is idempotent. Re-run it to upgrade; by default it preserves
 whether this machine was already configured as a client or agent. Set
-`PORTL_VERSION=0.14.2` to pin a release. Use `--agent=off` to disable the
+`PORTL_VERSION=0.15.0` to pin a release. Use `--agent=off` to disable the
 service, or `--uninstall` to remove binaries and service while keeping
 `$PORTL_HOME`. By default, Portl stores local state under `~/.portl` on
 all operating systems (`config/`, `data/`, `state/`, and `run/` subdirs).
@@ -101,7 +100,7 @@ portl-agent down            # stop/disable service, keeping state
 
 ```bash
 # mise
-mise use -g github:KnickKnackLabs/portl@0.14.2
+mise use -g github:KnickKnackLabs/portl@0.15.0
 # mise only shims `portl`; run install.sh with PORTL_AGENT=1 if this machine should be shared.
 
 # cargo
