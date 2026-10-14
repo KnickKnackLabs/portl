@@ -5,6 +5,8 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.15.1 — 2026-10-14
+
 ### Fixed
 
 - The agent completes incoming QUIC handshakes concurrently, each with a 15 s
