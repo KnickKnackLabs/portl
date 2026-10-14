@@ -12,6 +12,7 @@ use super::stream_io::forward_stream;
 
 const SUCCESS: u8 = 0x00;
 const GENERAL_FAILURE: u8 = 0x01;
+const NETWORK_UNREACHABLE: u8 = 0x03;
 const HOST_UNREACHABLE: u8 = 0x04;
 const CONNECTION_REFUSED: u8 = 0x05;
 const COMMAND_UNSUPPORTED: u8 = 0x07;
@@ -70,7 +71,6 @@ pub(crate) async fn forward_client(
 ) -> Result<TcpForwardStats> {
     // Snapshot the peer at accept time. Offline clients never wait for a future
     // generation, and an established byte stream is never replayed on reconnect.
-    let (connection, session) = peer.context("forward unavailable while peer reconnects")?;
     let request = network_lifecycle::setup("SOCKS5 handshake", async {
         negotiate_no_auth(&mut local).await?;
         match read_connect_request(&mut local).await {
@@ -82,6 +82,14 @@ pub(crate) async fn forward_client(
         }
     })
     .await?;
+    // While the peer reconnects, answer with a SOCKS failure at once so the
+    // client fails fast instead of seeing a bare close or waiting on setup.
+    let Some((connection, session)) =
+        peer.filter(|(connection, _)| connection.close_reason().is_none())
+    else {
+        write_reply(&mut local, NETWORK_UNREACHABLE).await?;
+        bail!("forward unavailable while peer reconnects");
+    };
     let (send, recv) = match network_lifecycle::setup(
         "SOCKS5 TCP forward setup",
         open_tcp(connection, session, &request.host, request.port),

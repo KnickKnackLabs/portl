@@ -5,6 +5,16 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Fixed
+
+- The agent completes incoming QUIC handshakes concurrently, each with a 15 s
+  deadline. Previously one half-open handshake (for example a client that
+  switched networks mid-connect) blocked every later connection until the
+  300 s idle timeout expired, repeatedly.
+- `portl tcp -D` answers SOCKS clients with a "network unreachable" reply
+  while the peer is reconnecting, instead of closing the connection without
+  a SOCKS response.
+
 ## 0.15.0 — 2026-10-13
 
 ### Added

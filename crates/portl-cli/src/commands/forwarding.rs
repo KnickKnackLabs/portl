@@ -1328,14 +1328,17 @@ mod tests {
         assert!(plan.render_summary("vn3", "local").contains("-D"));
         let mut runtime = plan.start_persistent().await.unwrap();
         for generation in 0..2 {
-            let mut offline = tokio::net::TcpStream::connect(&address).await.unwrap();
-            assert_eq!(
-                tokio::time::timeout(std::time::Duration::from_secs(2), offline.read(&mut [0]))
-                    .await
-                    .unwrap()
-                    .unwrap(),
-                0
-            );
+            // Offline clients get a SOCKS5 "network unreachable" reply at once.
+            let mut offline = socks_test_client(&address).await;
+            let mut reply = [0; 10];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                offline.read_exact(&mut reply),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(reply, [5, 3, 0, 1, 0, 0, 0, 0, 0, 0]);
             assert!(tokio::net::TcpListener::bind(&address).await.is_err());
             let (connected, server) = echo_test_peer().await;
             runtime.reconnect(&connected);
