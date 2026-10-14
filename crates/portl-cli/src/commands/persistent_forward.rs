@@ -8,7 +8,8 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use futures_util::Stream;
+use futures_util::stream::FuturesUnordered;
+use futures_util::{Stream, StreamExt};
 use iroh::endpoint::ConnectionError;
 use portl_core::id::store;
 use portl_core::ticket::schema::Capabilities;
@@ -91,7 +92,7 @@ where
             result = &mut *shutdown => { result?; return Ok(ExitCode::SUCCESS); },
             error = forwards.failed() => return Err(error),
             change = changes.changed() => { change?; None },
-            result = connect() => Some(result),
+            result = hedged_connect(&mut connect) => Some(result),
         };
         let Some(connected) = connected else {
             tracing::info!(
@@ -164,6 +165,36 @@ where
             );
             backoff.reset();
             network_lifecycle::refresh_network(endpoint).await?;
+        }
+    }
+}
+
+/// Delay before a pending peer setup gets a fresh sibling attempt.
+const CONNECT_HEDGE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// A dial started while the peer was unreachable can stay stuck after the
+/// peer returns, while a fresh dial on the same endpoint connects at once.
+/// Add a fresh attempt every interval, keep each attempt's own deadline, and
+/// take the first result; dropping the others cancels them.
+async fn hedged_connect<F, Fut, T>(connect: &mut F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let mut attempts = FuturesUnordered::new();
+    attempts.push(connect());
+    let mut hedge = tokio::time::interval_at(
+        tokio::time::Instant::now() + CONNECT_HEDGE_INTERVAL,
+        CONNECT_HEDGE_INTERVAL,
+    );
+    hedge.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            Some(result) = attempts.next() => return result,
+            _ = hedge.tick() => {
+                tracing::info!(state = "connecting", "peer setup still pending; starting a fresh attempt");
+                attempts.push(connect());
+            }
         }
     }
 }

@@ -1,4 +1,5 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use iroh::endpoint::Connection;
@@ -68,6 +69,7 @@ struct RejectedRequest {
 pub(crate) async fn forward_client(
     mut local: TcpStream,
     peer: Option<(&Connection, &PeerSession)>,
+    setup_timeout: Duration,
 ) -> Result<TcpForwardStats> {
     // Snapshot the peer at accept time. Offline clients never wait for a future
     // generation, and an established byte stream is never replayed on reconnect.
@@ -90,16 +92,25 @@ pub(crate) async fn forward_client(
         write_reply(&mut local, NETWORK_UNREACHABLE).await?;
         bail!("forward unavailable while peer reconnects");
     };
-    let (send, recv) = match network_lifecycle::setup(
-        "SOCKS5 TCP forward setup",
+    let opened = tokio::time::timeout(
+        setup_timeout,
         open_tcp(connection, session, &request.host, request.port),
     )
-    .await
-    {
-        Ok(stream) => stream,
-        Err(error) => {
+    .await;
+    let (send, recv) = match opened {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) => {
             write_reply(&mut local, reply_for_error(&error)).await?;
             return Err(error);
+        }
+        // The peer connection outlives a local outage (300 s QUIC idle timeout)
+        // but cannot carry the request; that is the tunnel, not the destination.
+        Err(_) => {
+            write_reply(&mut local, NETWORK_UNREACHABLE).await?;
+            bail!(
+                "SOCKS5 TCP forward setup deadline exceeded: peer did not answer within {}s",
+                setup_timeout.as_secs()
+            );
         }
     };
     // open_tcp returns only after the agent has accepted and connected the
@@ -436,10 +447,6 @@ mod tests {
                 GENERAL_FAILURE,
             ),
             ("open tcp stream: connection lost", GENERAL_FAILURE),
-            (
-                "SOCKS5 TCP forward setup deadline exceeded",
-                GENERAL_FAILURE,
-            ),
         ] {
             assert_eq!(
                 reply_for_error(&anyhow::anyhow!(message).context("forward setup")),

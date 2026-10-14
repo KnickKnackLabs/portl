@@ -5,6 +5,17 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Fixed
+
+- `portl tcp -D` replies SOCKS5 "network unreachable" (0x03) when the peer
+  does not answer a CONNECT within 10 s. Previously a request sent during a
+  local outage waited up to 30 s, because the 300 s QUIC idle timeout keeps
+  the connection open. Persistent `-L` TCP and Unix forwards now close a
+  stalled stream setup after 10 s as well (was 30 s).
+- Persistent forwards start a fresh peer setup every 5 s while one is
+  pending. Previously a handshake that began while the peer was down could
+  wait the full 30 s setup deadline after the peer came back.
+
 ## 0.15.1 — 2026-10-14
 
 ### Fixed

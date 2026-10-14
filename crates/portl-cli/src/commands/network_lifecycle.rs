@@ -10,6 +10,10 @@ use portl_core::wire::AckReason;
 use tokio::time::Instant;
 
 pub(crate) const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Opening one forwarded stream on an established peer connection. QUIC keeps
+/// a connection open through a 300 s idle timeout, so during a local outage
+/// a stream open just waits; local clients need an answer well before that.
+pub(crate) const STREAM_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RetryClass {
@@ -62,6 +66,13 @@ pub(crate) async fn setup<T>(
     operation: impl Future<Output = Result<T>>,
 ) -> Result<T> {
     before_deadline(Instant::now() + SETUP_TIMEOUT, stage, operation).await
+}
+
+pub(crate) async fn stream_setup<T>(
+    stage: &'static str,
+    operation: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    before_deadline(Instant::now() + STREAM_SETUP_TIMEOUT, stage, operation).await
 }
 
 pub(crate) async fn cancellable_setup<T>(

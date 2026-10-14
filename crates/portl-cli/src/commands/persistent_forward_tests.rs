@@ -172,3 +172,52 @@ async fn network_change_interrupts_backoff_and_resets_the_next_delay() {
     client.inner().close().await;
     server.inner().close().await;
 }
+
+#[tokio::test]
+async fn stalled_peer_setup_gets_a_fresh_attempt_before_its_deadline() {
+    let (client, server) = portl_core::test_util::pair().await.unwrap();
+    let mut forwards = ForwardPlan::default().start_persistent().await.unwrap();
+    let mut shutdown = std::future::pending::<Result<()>>();
+    let mut changes = NetworkChanges::new(futures_util::stream::pending());
+    let (owner, mut dropped) = tokio::sync::oneshot::channel::<()>();
+    let mut owner = Some(owner);
+    let mut attempts = Vec::new();
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let error = supervise(
+        &mut forwards,
+        &mut shutdown,
+        client.inner(),
+        &mut changes,
+        || {
+            attempts.push(started.elapsed());
+            let owner = owner.take();
+            async move {
+                if let Some(owner) = owner {
+                    // A dial begun while the peer was down: it never notices the
+                    // peer is back and would hold the 30-second setup deadline.
+                    let _owner = owner;
+                    network_lifecycle::setup("stalled peer setup", std::future::pending()).await
+                } else {
+                    Err(anyhow::anyhow!("fresh attempt")
+                        .context(network_lifecycle::RetryClass::Permanent))
+                }
+            }
+        },
+    )
+    .await
+    .unwrap_err();
+    tokio::time::resume();
+    assert!(format!("{error:#}").contains("fresh attempt"));
+    assert_eq!(attempts.len(), 2);
+    assert!(attempts[1] >= CONNECT_HEDGE_INTERVAL);
+    // Tokio rounds timer deadlines to milliseconds.
+    assert!(attempts[1] <= CONNECT_HEDGE_INTERVAL + Duration::from_millis(1));
+    assert!(matches!(
+        dropped.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+    ));
+    forwards.shutdown().await;
+    client.inner().close().await;
+    server.inner().close().await;
+}

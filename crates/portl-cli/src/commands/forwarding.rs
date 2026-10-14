@@ -640,7 +640,7 @@ async fn forward_resilient_tcp_client(
         .borrow()
         .clone()
         .context("forward unavailable while peer reconnects")?;
-    let (send, recv) = network_lifecycle::setup(
+    let (send, recv) = network_lifecycle::stream_setup(
         "TCP forward setup",
         open_tcp(&peer.connection, &peer.session, remote_host, remote_port),
     )
@@ -673,7 +673,8 @@ async fn run_resilient_socks_listener(
         clients.spawn(async move {
             let started = Instant::now();
             let peer = peer.as_ref().map(|peer| (&peer.connection, &peer.session));
-            match socks::forward_client(local, peer).await {
+            match socks::forward_client(local, peer, network_lifecycle::STREAM_SETUP_TIMEOUT).await
+            {
                 Ok(stats) => tracing::info!(
                     message = %format!(
                         "[tcp -D {local_addr}] closed client={client_addr} after {}, up={} down={}",
@@ -749,7 +750,7 @@ async fn forward_resilient_unix_client(
         .borrow()
         .clone()
         .context("forward unavailable while peer reconnects")?;
-    let (send, recv) = network_lifecycle::setup(
+    let (send, recv) = network_lifecycle::stream_setup(
         "Unix forward setup",
         open_unix(&peer.connection, &peer.session, remote_path),
     )
@@ -1312,6 +1313,58 @@ mod tests {
             runtime.shutdown().await;
             finish_connected_test_peer(connected, server).await;
         }
+    }
+
+    #[tokio::test]
+    async fn socks_stalled_tunnel_replies_network_unreachable_at_stream_deadline() {
+        use tokio::io::AsyncReadExt;
+
+        // A live peer connection whose stream never answers, as during a local
+        // Wi-Fi outage: QUIC keeps the connection open but nothing gets through.
+        let (requested_tx, requested_rx) = tokio::sync::oneshot::channel();
+        let (connected, server) = connected_test_peer_with_handler(move |connection| async move {
+            let (_send, recv) = connection.accept_bi().await.unwrap();
+            let mut recv = portl_core::io::BufferedRecv::new(recv, Vec::new());
+            recv.read_frame::<portl_proto::tcp_v1::TcpReq>(4096)
+                .await
+                .unwrap()
+                .unwrap();
+            requested_tx.send(()).unwrap();
+            connection.closed().await;
+        })
+        .await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let setup_timeout = std::time::Duration::from_millis(300);
+        let forward = async {
+            let (local, _) = listener.accept().await.unwrap();
+            let started = tokio::time::Instant::now();
+            let result = crate::commands::socks::forward_client(
+                local,
+                Some((&connected.connection, &connected.session)),
+                setup_timeout,
+            )
+            .await;
+            (result, started.elapsed())
+        };
+        let client = async {
+            let mut client = socks_test_client(&address).await;
+            let mut reply = [0; 10];
+            client.read_exact(&mut reply).await.unwrap();
+            assert_eq!(client.read(&mut [0]).await.unwrap(), 0);
+            reply
+        };
+        let ((result, elapsed), reply) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            futures_util::future::join(forward, client),
+        )
+        .await
+        .expect("stalled tunnel must not hold the SOCKS client");
+        requested_rx.await.unwrap();
+        assert_eq!(reply, [5, 3, 0, 1, 0, 0, 0, 0, 0, 0]);
+        assert!(elapsed >= setup_timeout);
+        assert!(format!("{:#}", result.unwrap_err()).contains("deadline exceeded"));
+        finish_connected_test_peer(connected, server).await;
     }
 
     #[tokio::test]
