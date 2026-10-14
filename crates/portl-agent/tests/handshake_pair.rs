@@ -144,6 +144,79 @@ async fn handshake_pair_rejects_bad_signature() -> Result<()> {
     Ok(())
 }
 
+/// A peer that sends its QUIC Initial and then goes silent (a roaming client
+/// that switched networks mid-handshake) must not block later connections.
+#[tokio::test]
+async fn stalled_incoming_handshake_does_not_block_later_connections() -> Result<()> {
+    let (client, server) = pair().await?;
+    let operator = Identity::new();
+    let agent = start_agent(server.clone(), &operator).await?;
+
+    // Black-hole proxy: forwards client datagrams to the agent from a separate
+    // socket and never relays replies, so the agent's handshake stays half-open.
+    let server_addr = server
+        .inner()
+        .bound_sockets()
+        .into_iter()
+        .find(std::net::SocketAddr::is_ipv4)
+        .expect("agent bound an IPv4 socket");
+    let front = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    let back = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    let proxy_addr = front.local_addr()?;
+    let (forwarded_tx, mut forwarded_rx) = tokio::sync::watch::channel(0_usize);
+    let proxy = tokio::spawn(async move {
+        let mut buf = vec![0_u8; 65_536];
+        let mut forwarded = 0;
+        while let Ok((len, _)) = front.recv_from(&mut buf).await {
+            if back.send_to(&buf[..len], server_addr).await.is_ok() {
+                forwarded += 1;
+                let _ = forwarded_tx.send(forwarded);
+            }
+        }
+    });
+
+    let stalled_client = portl_core::test_util::endpoint().await?;
+    let stalled_addr = iroh_base::EndpointAddr::new(server.id()).with_ip_addr(proxy_addr);
+    let stalled_connect = tokio::spawn(async move {
+        let _ = stalled_client
+            .inner()
+            .connect(stalled_addr, portl_proto::ticket_v1::ALPN_TICKET_V1)
+            .await;
+    });
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        forwarded_rx.wait_for(|count| *count > 0),
+    )
+    .await
+    .expect("stalled client Initial reached the agent")?;
+    // Let the agent's accept loop take the half-open handshake first.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let ticket = root_ticket(
+        &operator,
+        server.addr(),
+        meta_caps(),
+        unix_now_secs(),
+        unix_now_secs() + 300,
+    );
+    let (connection, _session) = tokio::time::timeout(
+        Duration::from_secs(5),
+        open_ticket_v1(&client, &ticket, &[], &operator),
+    )
+    .await
+    .expect("second connection accepted while another handshake is stalled")?;
+
+    connection.close(0u32.into(), b"done");
+    stalled_connect.abort();
+    proxy.abort();
+    client.inner().close().await;
+    server.inner().close().await;
+    tokio::time::timeout(Duration::from_secs(5), agent)
+        .await
+        .expect("agent join timeout")??;
+    Ok(())
+}
+
 async fn start_agent(
     server: portl_core::endpoint::Endpoint,
     operator: &Identity,

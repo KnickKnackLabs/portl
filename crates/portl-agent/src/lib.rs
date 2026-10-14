@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 #[cfg(feature = "ghostty-vt")]
 use anyhow::Context as _;
@@ -665,33 +665,28 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
                 let Some(incoming) = incoming else {
                     break;
                 };
-                let connection = match incoming.await {
-                    Ok(connection) => connection,
-                    Err(err) => {
-                        warn!(?err, "failed to accept incoming connection");
-                        continue;
-                    }
-                };
-
-                if connection.alpn() == portl_proto::ticket_v1::ALPN_TICKET_V1 {
-                    let state = Arc::clone(&state);
-                    tokio::spawn(async move {
-                        if let Err(err) = ticket_handler::serve_connection(connection, state).await
-                        {
-                            warn!(?err, "ticket connection failed");
+                // Complete each handshake in its own task. A peer that stalls
+                // mid-handshake (for example a roaming client that switched
+                // networks) must not block later connections, and gets a
+                // short deadline independent of the QUIC idle timeout.
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    let connection = match tokio::time::timeout(INCOMING_HANDSHAKE_TIMEOUT, incoming).await {
+                        Ok(Ok(connection)) => connection,
+                        Ok(Err(err)) => {
+                            warn!(?err, "failed to accept incoming connection");
+                            return;
                         }
-                    });
-                } else if connection.alpn() == portl_proto::pair_v1::ALPN_PAIR_V1 {
-                    let state = Arc::clone(&state);
-                    tokio::spawn(async move {
-                        if let Err(err) = pair_handler::serve_connection(connection, state).await
-                        {
-                            warn!(?err, "pair connection failed");
+                        Err(_) => {
+                            warn!(
+                                timeout_ms = INCOMING_HANDSHAKE_TIMEOUT.as_millis(),
+                                "incoming connection handshake timed out"
+                            );
+                            return;
                         }
-                    });
-                } else {
-                    connection.close(0x1003u32.into(), b"unsupported ALPN");
-                }
+                    };
+                    serve_accepted_connection(connection, state).await;
+                });
             }
         }
     }
@@ -755,7 +750,7 @@ pub async fn run_task(cfg: AgentConfig) -> Result<JoinHandle<Result<()>>> {
 
 fn spawn_udp_gc_task(state: Arc<AgentState>, shutdown: CancellationToken) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -775,7 +770,7 @@ fn spawn_udp_gc_task(state: Arc<AgentState>, shutdown: CancellationToken) -> Joi
 /// agent restart.
 fn spawn_revocation_gc_task(state: Arc<AgentState>, shutdown: CancellationToken) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_hours(1));
+        let mut interval = tokio::time::interval(Duration::from_hours(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Skip the immediate first tick; GC already ran at load time.
         interval.tick().await;
@@ -815,7 +810,7 @@ fn spawn_revocation_reload_task(
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        let mut interval = tokio::time::interval(Duration::from_millis(500));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         interval.tick().await;
         loop {
@@ -909,7 +904,7 @@ fn spawn_peer_store_reload_task(
             // No peer store configured (test harness). Nothing to do.
             return;
         };
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        let mut interval = tokio::time::interval(Duration::from_millis(500));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         interval.tick().await;
         loop {
@@ -954,13 +949,30 @@ fn spawn_peer_store_reload_task(
     })
 }
 
+/// Deadline for an incoming QUIC handshake. Kept far below the 300 s idle
+/// timeout so a peer that vanishes mid-handshake is dropped quickly; relayed
+/// handshakes normally finish within a few seconds.
+const INCOMING_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+async fn serve_accepted_connection(connection: iroh::endpoint::Connection, state: Arc<AgentState>) {
+    if connection.alpn() == portl_proto::ticket_v1::ALPN_TICKET_V1 {
+        if let Err(err) = ticket_handler::serve_connection(connection, state).await {
+            warn!(?err, "ticket connection failed");
+        }
+    } else if connection.alpn() == portl_proto::pair_v1::ALPN_PAIR_V1 {
+        if let Err(err) = pair_handler::serve_connection(connection, state).await {
+            warn!(?err, "pair connection failed");
+        }
+    } else {
+        connection.close(0x1003u32.into(), b"unsupported ALPN");
+    }
+}
+
 async fn graceful_close_endpoint(endpoint: &iroh::Endpoint) {
     let context = endpoint_close_context("shutdown");
     tracing::info!(event = "agent.endpoint.close.start", context);
     let started = Instant::now();
-    if let Err(err) =
-        tokio::time::timeout(std::time::Duration::from_secs(10), endpoint.close()).await
-    {
+    if let Err(err) = tokio::time::timeout(Duration::from_secs(10), endpoint.close()).await {
         tracing::warn!(
             event = "agent.endpoint.close.timeout",
             context,
@@ -1004,7 +1016,7 @@ async fn graceful_shutdown_shell_processes(
         });
     }
 
-    (tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    (tokio::time::timeout(Duration::from_secs(30), async {
         let mut all_reaped = true;
         while let Some(result) = joins.join_next().await {
             match result {
