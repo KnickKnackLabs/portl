@@ -5,6 +5,8 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.15.2 — 2026-10-20
+
 ### Added
 
 - Proxy configuration for every outbound HTTP path: the iroh relay
