@@ -30,7 +30,7 @@ netwatch     = "0.19.3"
 # Keep russh default-features off: upstream defaults enable aws-lc-rs;
 # Portl standardises on rustls/ring to avoid mixed-provider link/runtime
 # surprises on macOS and static Linux builds.
-russh        = { version = "0.63.2", default-features = false, features = ["ring"] }
+russh        = { version = "0.64.1", default-features = false, features = ["ring"] }
 # TLS for the embedded relay server. Feature set matches Portl's ring-only
 # provider policy; no aws-lc-rs.
 rustls          = { version = "0.23.45", default-features = false, features = ["std", "ring", "tls12"] }
