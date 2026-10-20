@@ -14,14 +14,20 @@ pub struct SlicerClient {
 impl SlicerClient {
     pub fn new(base_url: &str, auth_token: Option<String>) -> Result<Self> {
         portl_core::tls::install_default_crypto_provider();
+        let base_url = reqwest::Url::parse(base_url)
+            .with_context(|| format!("parse slicer base url {base_url}"))?;
+        // portl's resolved proxy decision is authoritative; never let
+        // reqwest pick up proxy env vars on its own.
+        let mut http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(5))
+            .no_proxy();
+        if let Some(proxy) = portl_core::proxy::current().proxy_for(&base_url) {
+            http = http.proxy(reqwest::Proxy::all(proxy.url().clone()).context("configure proxy")?);
+        }
         Ok(Self {
-            base_url: reqwest::Url::parse(base_url)
-                .with_context(|| format!("parse slicer base url {base_url}"))?,
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .connect_timeout(Duration::from_secs(5))
-                .build()
-                .context("build reqwest client")?,
+            base_url,
+            http: http.build().context("build reqwest client")?,
             auth_token,
         })
     }

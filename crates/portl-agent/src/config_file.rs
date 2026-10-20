@@ -66,6 +66,10 @@ pub struct PortlConfig {
     #[serde(default)]
     pub agent: AgentSection,
 
+    /// Outbound network settings shared by the agent and the CLI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkSection>,
+
     /// Reserved for future CLI-side config; present so the parser
     /// doesn't reject a hand-written `[cli]` table.
     #[serde(default)]
@@ -130,6 +134,23 @@ pub struct UdpSection {
     pub session_linger_secs: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkSection {
+    /// HTTP proxy for relay, pkarr, net-report, and mailbox traffic:
+    /// an `http://[user:pass@]host:port` URL, or `"direct"` / `"none"` to
+    /// ignore `HTTPS_PROXY` and friends. Overridden by `PORTL_PROXY` and
+    /// `--proxy` / `--no-proxy`.
+    pub proxy: Option<String>,
+}
+
+impl PortlConfig {
+    /// `[network] proxy`, if set.
+    #[must_use]
+    pub fn proxy(&self) -> Option<&str> {
+        self.network.as_ref()?.proxy.as_deref()
+    }
+}
+
 /// Reserved CLI-side config section. Empty today.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CliSection {}
@@ -158,6 +179,11 @@ impl PortlConfig {
     /// tests can exercise the parser without touching disk.
     pub fn parse_toml(text: &str) -> Result<Self> {
         let cfg: Self = toml::from_str(text).context("parse portl.toml")?;
+        if let Some(proxy) = cfg.proxy() {
+            proxy
+                .parse::<portl_core::proxy::ProxySetting>()
+                .context("invalid [network] proxy")?;
+        }
         if cfg.schema != CURRENT_SCHEMA {
             // Forward-compat: log but don't fail on unknown schema.
             // Downgrade semantics: a v0.3.x agent reading a v0.4.x
@@ -237,6 +263,31 @@ session_linger_secs = 120
         assert_eq!(rl.burst, Some(20));
         let udp = cfg.agent.udp.expect("udp");
         assert_eq!(udp.session_linger_secs, Some(120));
+    }
+
+    #[test]
+    fn network_proxy_is_optional_validated_and_schema_compatible() {
+        let cfg = PortlConfig::parse_toml(
+            "schema = 1\n[network]\nproxy = \"http://user:pw@proxy:3128\"\n",
+        )
+        .expect("parse");
+        assert_eq!(cfg.proxy(), Some("http://user:pw@proxy:3128"));
+        let cfg = PortlConfig::parse_toml("[network]\nproxy = \"direct\"\n").expect("parse");
+        assert_eq!(cfg.proxy(), Some("direct"));
+        assert_eq!(
+            PortlConfig::parse_toml("schema = 1\n")
+                .expect("parse")
+                .proxy(),
+            None
+        );
+
+        let err = PortlConfig::parse_toml("[network]\nproxy = \"socks5://p:1080\"\n")
+            .expect_err("socks is rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("[network] proxy") && msg.contains("SOCKS"),
+            "{msg}"
+        );
     }
 
     #[test]

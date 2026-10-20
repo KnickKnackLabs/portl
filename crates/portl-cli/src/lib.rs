@@ -433,6 +433,8 @@ pub fn parse(argv: Vec<OsString>) -> Result<Command, ParseError> {
 
 /// Library entry point wrapping parsing + dispatch.
 const EX_USAGE: u8 = 2;
+/// `docs/EXIT_CODES.md`: local config or identity problem.
+const EX_LOCAL_CONFIG: u8 = 10;
 
 fn clap_exit_code(err: &clap::Error) -> ExitCode {
     match err.kind() {
@@ -862,6 +864,31 @@ fn ensure_layout_migrated_or_exit() -> Result<(), ExitCode> {
     }
 }
 
+/// Resolve the process-wide outbound proxy (flag > `PORTL_PROXY` >
+/// portl.toml > standard env) before any endpoint or HTTP client exists.
+fn init_proxy(command: &Command, args: &ProxyArgs) -> Result<Vec<String>, ExitCode> {
+    let flag = match args.setting() {
+        Ok(flag) => flag,
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            return Err(ExitCode::from(EX_USAGE));
+        }
+    };
+    // `portl config` must stay usable for inspecting and fixing a bad value.
+    if matches!(command, Command::Config { .. }) {
+        return Ok(Vec::new());
+    }
+    // An unreadable portl.toml is reported by the commands that load it.
+    let file = portl_agent::config_file::PortlConfig::load(&portl_core::paths::config_path()).ok();
+    match portl_core::proxy::init_process(flag, file.as_ref().and_then(|cfg| cfg.proxy())) {
+        Ok(cfg) => Ok(cfg.warnings().to_vec()),
+        Err(err) => {
+            eprintln!("portl: {err:#}");
+            Err(ExitCode::from(EX_LOCAL_CONFIG))
+        }
+    }
+}
+
 fn dispatch_parse_result(parsed: Result<Command, clap::Error>) -> ExitCode {
     match parsed {
         Ok(command) => dispatch_command(command),
@@ -895,9 +922,15 @@ pub fn run(argv: Vec<OsString>) -> ExitCode {
         }
         Ok(false) => match is_portl_agent_invocation(&argv) {
             Ok(true) => {
-                return dispatch_parse_result(
-                    AgentCli::try_parse_from(argv).map(|cli| agent_cli_to_command(&cli)),
-                );
+                let cli = match AgentCli::try_parse_from(argv) {
+                    Ok(cli) => cli,
+                    Err(err) => return dispatch_parse_result(Err(err)),
+                };
+                let command = agent_cli_to_command(&cli);
+                if let Err(code) = init_proxy(&command, &cli.proxy) {
+                    return code;
+                }
+                return dispatch_command(command);
             }
             Ok(false) => {}
             Err(ParseError::EmptyArgv) => {
@@ -947,7 +980,7 @@ pub fn run(argv: Vec<OsString>) -> ExitCode {
     }
 
     let log_context = command_log_context(&argv);
-    let cli = match Cli::try_parse_from(argv) {
+    let mut cli = match Cli::try_parse_from(argv) {
         Ok(cli) => cli,
         Err(err) => {
             let code = clap_exit_code(&err);
@@ -956,8 +989,18 @@ pub fn run(argv: Vec<OsString>) -> ExitCode {
         }
     };
 
-    logging::init(cli.log_verbose, cli.log.as_deref());
+    let (log_verbose, log_filter) = (cli.log_verbose, cli.log.clone());
+    let proxy_args = std::mem::take(&mut cli.proxy);
     let command = cli.into_command();
+    // Before logging starts its writer thread: this may rewrite proxy env vars.
+    let proxy_warnings = match init_proxy(&command, &proxy_args) {
+        Ok(warnings) => warnings,
+        Err(code) => return code,
+    };
+    logging::init(log_verbose, log_filter.as_deref());
+    for warning in proxy_warnings {
+        tracing::debug!("{warning}");
+    }
     let should_migrate = match prepare_layout_for_command(&command) {
         Ok(should_migrate) => should_migrate,
         Err(code) => return code,
@@ -1464,7 +1507,7 @@ pub const SESSION_SHARE_TARGET_HELP: &str = "Target identifier. Supported forms:
 
 const SESSION_ENV_HELP: &str = "Session environment overrides:\n  PORTL_SESSION_PROVIDER       Preferred persistent-session provider (default, ghostty, herdr, zmx, tmux).\n                              `default` resolves to ghostty.\n  PORTL_SESSION_PROVIDER_PATH  Absolute path to a zmx, tmux, or herdr provider binary.\n  PORTL_HERDR_PATH             Absolute path to the local or target-side herdr binary.\n";
 
-const PORTL_AFTER_HELP: &str = "Everyday sessions:\n  $ portl attach dotfiles\n  $ portl run dotfiles -- git status\n  $ PORTL_TARGET=other-machine portl attach dotfiles\n  $ portl session share dotfiles\n\nPair two machines:\n  $ portl init\n  $ portl invite                       # on the other machine\n  $ portl accept PORTLINV-…            # on this machine\n\nRun `portl <COMMAND> --help` for details on any subcommand.\n\nEnvironment variables:\n  PORTL_HOME       Portl home root override (default: ~/.portl).\n  PORTL_CONFIG     Alt portl.toml path.\n  PORTL_TARGET     Default target for session commands.\n  PORTL_JSON       Force --json where supported (0/1).\n  PORTL_QUIET      Force --quiet where supported (0/1).\n  NO_COLOR         Disable color output.\n\nSession environment overrides:\n  PORTL_SESSION_PROVIDER       Preferred persistent-session provider (default, ghostty, zmx, tmux).\n                              `default` resolves to ghostty.\n  PORTL_SESSION_PROVIDER_PATH  Absolute path to a zmx or tmux provider binary.\n\nSee `docs/ENV.md` for the full list including relay and internal variables.";
+const PORTL_AFTER_HELP: &str = "Everyday sessions:\n  $ portl attach dotfiles\n  $ portl run dotfiles -- git status\n  $ PORTL_TARGET=other-machine portl attach dotfiles\n  $ portl session share dotfiles\n\nPair two machines:\n  $ portl init\n  $ portl invite                       # on the other machine\n  $ portl accept PORTLINV-…            # on this machine\n\nRun `portl <COMMAND> --help` for details on any subcommand.\n\nEnvironment variables:\n  PORTL_HOME       Portl home root override (default: ~/.portl).\n  PORTL_CONFIG     Alt portl.toml path.\n  PORTL_PROXY      HTTP proxy URL, or `direct` (overrides portl.toml and HTTPS_PROXY).\n  PORTL_TARGET     Default target for session commands.\n  PORTL_JSON       Force --json where supported (0/1).\n  PORTL_QUIET      Force --quiet where supported (0/1).\n  NO_COLOR         Disable color output.\n\nSession environment overrides:\n  PORTL_SESSION_PROVIDER       Preferred persistent-session provider (default, ghostty, zmx, tmux).\n                              `default` resolves to ghostty.\n  PORTL_SESSION_PROVIDER_PATH  Absolute path to a zmx or tmux provider binary.\n\nSee `docs/ENV.md` for the full list including relay and internal variables.";
 
 const TOP_LEVEL_HELP: &str = "portl — peer-to-peer remote access and port forwarding.
 
@@ -1539,6 +1582,7 @@ Run `portl <COMMAND> --help` for details on any subcommand.
 Environment variables:
   PORTL_HOME       Portl home root override (default: ~/.portl).
   PORTL_CONFIG     Alt portl.toml path.
+  PORTL_PROXY      HTTP proxy URL, or `direct` (overrides portl.toml and HTTPS_PROXY).
   PORTL_TARGET     Default target for session commands.
   PORTL_JSON       Force --json where supported (0/1).
   PORTL_QUIET      Force --quiet where supported (0/1).
@@ -1573,8 +1617,37 @@ struct Cli {
     /// RUST_LOG-style tracing filter. Overrides -v and `PORTL_LOG`.
     #[arg(long = "log", global = true, value_name = "FILTER")]
     log: Option<String>,
+    #[command(flatten)]
+    proxy: ProxyArgs,
     #[command(subcommand)]
     command: TopLevel,
+}
+
+/// Outbound proxy flags shared by `portl` and `portl-agent`.
+#[derive(clap::Args, Debug, Default)]
+struct ProxyArgs {
+    /// HTTP proxy for relay and HTTP traffic (overrides `PORTL_PROXY`)
+    #[arg(long, global = true, value_name = "URL")]
+    proxy: Option<String>,
+    /// Connect directly, ignoring `PORTL_PROXY`, portl.toml, and `HTTPS_PROXY`
+    #[arg(long = "no-proxy", global = true, conflicts_with = "proxy")]
+    no_proxy: bool,
+}
+
+impl ProxyArgs {
+    fn setting(&self) -> anyhow::Result<Option<portl_core::proxy::ProxySetting>> {
+        if self.no_proxy {
+            return Ok(Some(portl_core::proxy::ProxySetting::Direct));
+        }
+        self.proxy
+            .as_deref()
+            .map(|value| {
+                value
+                    .parse()
+                    .map_err(|err| anyhow::anyhow!("invalid --proxy: {err:#}"))
+            })
+            .transpose()
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -1583,6 +1656,8 @@ struct AgentCli {
     /// Emit structured JSON where supported.
     #[arg(long, global = true)]
     json: bool,
+    #[command(flatten)]
+    proxy: ProxyArgs,
     #[command(subcommand)]
     action: Option<AgentAction>,
 }

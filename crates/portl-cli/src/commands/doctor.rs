@@ -58,6 +58,7 @@ pub fn run(opts: &RunOpts) -> ExitCode {
         check_identity(),
         check_listener_bind(),
         check_discovery_config(),
+        check_proxy(),
         check_peer_store(),
         check_ticket_store(),
         check_stored_ticket_expiry(),
@@ -333,6 +334,91 @@ fn check_discovery_config() -> CheckResult {
             status: Status::Fail,
             detail: format!("cannot load agent env config: {err}"),
         },
+    }
+}
+
+/// Report the CLI's and the running agent's effective proxy, and flag an
+/// agent that has relays and a proxy in play but no relay connection.
+fn check_proxy() -> CheckResult {
+    let socket = portl_core::paths::metrics_socket_path();
+    check_proxy_with(
+        &portl_core::proxy::current(),
+        fetch_agent_status_sync(&socket).ok().as_ref(),
+    )
+}
+
+/// An agent younger than this may still be dialing its relay.
+const RELAY_CONNECT_GRACE_SECS: u64 = 15;
+
+fn check_proxy_with(
+    cli: &portl_core::proxy::ProxyConfig,
+    agent: Option<&portl_agent::status_schema::StatusResponse>,
+) -> CheckResult {
+    use std::fmt::Write as _;
+
+    let mut status = if cli.warnings().is_empty() {
+        Status::Ok
+    } else {
+        Status::Warn
+    };
+    let mut detail = format!("cli: {}", cli.describe());
+    for warning in cli.warnings() {
+        let _ = write!(detail, "; {warning}");
+    }
+    if let Some(agent) = agent {
+        let network = &agent.network;
+        let agent_proxy = network.proxy.as_ref();
+        if let Some(proxy) = agent_proxy {
+            let _ = write!(
+                detail,
+                "; agent: {} ({})",
+                proxy.url.as_deref().unwrap_or("direct"),
+                proxy.source
+            );
+            for warning in &proxy.warnings {
+                status = Status::Warn;
+                let _ = write!(detail, "; agent: {warning}");
+            }
+        }
+        let uptime = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+            .saturating_sub(agent.agent.started_at_unix);
+        let relay_down = network
+            .home_relays
+            .as_ref()
+            .is_some_and(|relays| !relays.iter().any(|relay| relay.connected));
+        let agent_uses_proxy = agent_proxy.is_some_and(|proxy| proxy.url.is_some());
+        if !network.relays.is_empty()
+            && relay_down
+            && uptime >= RELAY_CONNECT_GRACE_SECS
+            && (cli.has_proxy() || agent_uses_proxy)
+        {
+            status = Status::Warn;
+            let _ = write!(
+                detail,
+                "; proxy env present but the agent's relay connection is not established"
+            );
+            if let Some(error) = network
+                .home_relays
+                .iter()
+                .flatten()
+                .find_map(|relay| relay.last_error.as_deref())
+            {
+                let _ = write!(detail, " (last error: {error})");
+            }
+            if !agent_uses_proxy {
+                let _ = write!(
+                    detail,
+                    "; the agent connects directly: set PORTL_PROXY in its service environment (e.g. /etc/portl/agent.env) or [network] proxy in portl.toml, then restart it"
+                );
+            }
+        }
+    }
+    CheckResult {
+        name: "proxy",
+        status,
+        detail,
     }
 }
 
@@ -1352,6 +1438,8 @@ mod tests {
                     pkarr: false,
                     local: true,
                 },
+                proxy: None,
+                home_relays: None,
             },
             portl_agent::status_schema::NetworkHealthInfo::disabled(),
             portl_agent::status_schema::SessionProvidersInfo::default(),
@@ -1368,6 +1456,82 @@ mod tests {
         assert_eq!(result.status, Status::Warn);
         assert!(result.detail.contains("state=degraded"));
         assert!(result.detail.contains("endpoint generation 7"));
+    }
+
+    #[test]
+    fn proxy_check_flags_agent_without_relay_while_proxy_env_is_present() {
+        let agent_status = |agent_proxy: Option<&str>, connected: bool| {
+            portl_agent::status_schema::StatusResponse::new(
+                portl_agent::status_schema::AgentInfo {
+                    pid: 42,
+                    version: "0.15.2".to_owned(),
+                    started_at_unix: 100,
+                    home: "/tmp/portl".to_owned(),
+                    metrics_socket: "/tmp/portl/run/metrics.sock".to_owned(),
+                },
+                Vec::new(),
+                portl_agent::status_schema::NetworkInfo {
+                    relays: vec!["https://relay.example/".to_owned()],
+                    discovery: portl_agent::status_schema::DiscoveryInfo {
+                        dns: true,
+                        pkarr: true,
+                        local: false,
+                    },
+                    proxy: Some(portl_agent::status_schema::ProxyInfo {
+                        url: agent_proxy.map(ToOwned::to_owned),
+                        source: if agent_proxy.is_some() {
+                            "PORTL_PROXY"
+                        } else {
+                            "default"
+                        }
+                        .to_owned(),
+                        warnings: Vec::new(),
+                    }),
+                    home_relays: Some(vec![portl_agent::status_schema::HomeRelayInfo {
+                        url: "https://relay.example/".to_owned(),
+                        connected,
+                        last_error: (!connected).then(|| "connect timed out".to_owned()),
+                    }]),
+                },
+                portl_agent::status_schema::NetworkHealthInfo::disabled(),
+                portl_agent::status_schema::SessionProvidersInfo::default(),
+                portl_agent::relay::RelayStatus::disabled(),
+            )
+        };
+        let cli_env = portl_core::proxy::ProxyConfig::resolve(None, None, |name| {
+            (name == "HTTPS_PROXY").then(|| "http://u:secret@proxy:3128".to_owned())
+        })
+        .expect("resolve");
+
+        // The reported sandbox: proxy in the environment, agent dialing directly.
+        let result = check_proxy_with(&cli_env, Some(&agent_status(None, false)));
+        assert_eq!(result.status, Status::Warn);
+        assert!(
+            result
+                .detail
+                .contains("relay connection is not established")
+                && result.detail.contains("connect timed out")
+                && result.detail.contains("set PORTL_PROXY"),
+            "{}",
+            result.detail
+        );
+        assert!(!result.detail.contains("secret"), "{}", result.detail);
+
+        let healthy = check_proxy_with(
+            &cli_env,
+            Some(&agent_status(Some("http://***@proxy:3128/"), true)),
+        );
+        assert_eq!(healthy.status, Status::Ok, "{}", healthy.detail);
+        assert!(
+            healthy
+                .detail
+                .contains("agent: http://***@proxy:3128/ (PORTL_PROXY)")
+        );
+
+        // No proxy anywhere: a relay outage is not a proxy problem.
+        let direct = portl_core::proxy::ProxyConfig::direct();
+        let result = check_proxy_with(&direct, Some(&agent_status(None, false)));
+        assert_eq!(result.status, Status::Ok, "{}", result.detail);
     }
 
     #[allow(unsafe_code)]
@@ -1405,6 +1569,8 @@ mod tests {
                         pkarr: false,
                         local: true,
                     },
+                    proxy: None,
+                    home_relays: None,
                 },
                 health,
                 portl_agent::status_schema::SessionProvidersInfo::default(),
@@ -1437,6 +1603,8 @@ mod tests {
                         pkarr: false,
                         local: true,
                     },
+                    proxy: None,
+                    home_relays: None,
                 },
                 portl_agent::status_schema::NetworkHealthInfo::disabled(),
                 portl_agent::status_schema::SessionProvidersInfo::default(),
@@ -1471,6 +1639,8 @@ mod tests {
                         pkarr: false,
                         local: true,
                     },
+                    proxy: None,
+                    home_relays: None,
                 },
                 health,
                 portl_agent::status_schema::SessionProvidersInfo::default(),
@@ -1502,6 +1672,8 @@ mod tests {
                     pkarr: false,
                     local: true,
                 },
+                proxy: None,
+                home_relays: None,
             },
             portl_agent::status_schema::NetworkHealthInfo::disabled(),
             portl_agent::status_schema::SessionProvidersInfo::default(),
@@ -1539,6 +1711,8 @@ mod tests {
                     pkarr: false,
                     local: true,
                 },
+                proxy: None,
+                home_relays: None,
             },
             portl_agent::status_schema::NetworkHealthInfo::disabled(),
             portl_agent::status_schema::SessionProvidersInfo::default(),
@@ -1576,6 +1750,8 @@ mod tests {
                     pkarr: false,
                     local: true,
                 },
+                proxy: None,
+                home_relays: None,
             },
             portl_agent::status_schema::NetworkHealthInfo::disabled(),
             portl_agent::status_schema::SessionProvidersInfo::default(),

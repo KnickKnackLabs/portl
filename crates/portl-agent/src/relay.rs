@@ -412,6 +412,7 @@ mod tests {
             watchdog_probe_endpoint_id: None,
             network_watchdog: NetworkWatchdogHealth::new(SystemTime::now()),
             relay_status: RwLock::new(RelayStatus::disabled()),
+            current_endpoint: std::sync::OnceLock::new(),
         })
     }
 

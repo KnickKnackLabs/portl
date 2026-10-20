@@ -80,7 +80,10 @@ pub enum ConfigAction {
 
 fn run_show(json: bool) -> Result<()> {
     let path = effective_path();
-    let cfg = PortlConfig::load(&path).with_context(|| format!("load {}", path.display()))?;
+    let mut cfg = PortlConfig::load(&path).with_context(|| format!("load {}", path.display()))?;
+    if let Some(proxy) = cfg.network.as_mut().and_then(|n| n.proxy.as_mut()) {
+        *proxy = portl_core::diagnostics::redact_url_userinfo(proxy);
+    }
     if json {
         println!(
             "{}",
@@ -105,7 +108,7 @@ fn run_validate(path: Option<PathBuf>, stdin: bool, human_ok: bool) -> Result<()
         std::io::stdin()
             .read_to_string(&mut input)
             .context("read config from stdin")?;
-        let _cfg: PortlConfig = toml::from_str(&input).context("parse stdin")?;
+        let _cfg = PortlConfig::parse_toml(&input).context("parse stdin")?;
         if human_ok {
             println!("ok: stdin parses cleanly");
         }
@@ -149,6 +152,15 @@ mod tests {
         let path = dir.path().join("portl.toml");
         std::fs::write(&path, PortlConfig::default_template()).expect("write");
         run_validate(Some(path), false, true).expect("template must validate");
+    }
+
+    #[test]
+    fn validate_rejects_unsupported_proxy() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("portl.toml");
+        std::fs::write(&path, "[network]\nproxy = \"https://proxy:443\"\n").expect("write");
+        let err = run_validate(Some(path), false, true).expect_err("must reject");
+        assert!(format!("{err:#}").contains("https:// proxies are not supported"));
     }
 
     #[test]

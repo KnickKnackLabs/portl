@@ -44,6 +44,10 @@ socket2      = "0.6"
 futures-util = "0.3"
 http         = "1"
 dashmap      = "6"
+# NO_PROXY matching: reuse the exact matcher reqwest applies to iroh's
+# internal HTTP clients so portl's relay proxy choice agrees with them.
+hyper-util   = { version = "0.1.20", default-features = false, features = ["client-proxy"] }
+percent-encoding = "2"
 
 # crypto
 ed25519-dalek = { version = "2", features = ["rand_core"] }
@@ -86,7 +90,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender  = "0.2"
 tracing-journald  = "0.3"
 governor          = "0.8"
-zip               = { version = "2", default-features = false, features = ["deflate"] }
+zip               = { version = "9", default-features = false, features = ["deflate"] }
 
 # testing
 prometheus-client = "0.23"

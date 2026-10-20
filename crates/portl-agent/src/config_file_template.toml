@@ -55,5 +55,20 @@ relays = ["default"]
 # Idle seconds before a UDP forwarder session is reaped.
 # session_linger_secs = 60
 
+[network]
+# HTTP proxy for every outbound HTTP(S) path portl uses: the iroh relay
+# connection, pkarr publish/resolve, net-report probes, and short-code
+# rendezvous. Only http:// proxies (HTTP CONNECT) are supported;
+# user:pass@ credentials are sent as Proxy-Authorization.
+#
+# Unset (default): honor HTTPS_PROXY / ALL_PROXY / HTTP_PROXY / NO_PROXY.
+# Overridden by PORTL_PROXY and by the --proxy / --no-proxy flags.
+#
+# Proxy-only sandbox (direct TCP egress is blocked):
+# proxy = "http://user:pass@egress-proxy:3128"
+#
+# Force direct connections even when HTTPS_PROXY etc. are set:
+# proxy = "direct"
+
 # [cli] section reserved for future use.
 # [cli]

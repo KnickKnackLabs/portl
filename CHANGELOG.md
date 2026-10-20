@@ -5,8 +5,32 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Added
+
+- Proxy configuration for every outbound HTTP path: the iroh relay
+  connection, pkarr publish/resolve, net-report probes, short-code
+  rendezvous, and release downloads. Set it with `--proxy <URL>` /
+  `--no-proxy` (any `portl` or `portl-agent` command), `PORTL_PROXY`
+  (a URL, or `direct` / `none`), or `[network] proxy` in `portl.toml`.
+  Without these, portl uses `HTTPS_PROXY` / `ALL_PROXY` / `HTTP_PROXY`
+  with `NO_PROXY`. An explicit `direct` also stops iroh's HTTP clients from
+  using those variables. Only `http://` proxies are supported, with optional
+  `user:pass@` credentials; credentials are redacted in logs, `status`,
+  `doctor`, and `config show`.
+- `portl status` shows the agent's proxy and home-relay connection state,
+  and `portl status <TARGET>` prints the proxy used for the probe.
+  `portl doctor` has a `proxy` check that warns when a proxy is in play but
+  the agent has no relay connection.
+
 ### Fixed
 
+- On hosts whose only egress is an HTTP proxy, the agent's relay
+  connection now goes through the proxy. Previously only short-lived probes
+  used `HTTPS_PROXY`; the relay connection dialed directly, failed, and left
+  the agent unreachable while it still advertised the relay.
+- Update rustls to 0.23.46 and zip to 9 for RustSec advisories
+  (RUSTSEC-2026-0346..0349, 0367..0369). Portl only writes zip files
+  (doctor bundles), so the zip extraction advisories did not apply to it.
 - `portl tcp -D` replies SOCKS5 "network unreachable" (0x03) when the peer
   does not answer a CONNECT within 10 s. Previously a request sent during a
   local outage waited up to 30 s, because the 300 s QUIC idle timeout keeps

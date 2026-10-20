@@ -473,6 +473,7 @@ async fn bind_probe_endpoint(
     } else {
         builder.relay_mode(RelayMode::custom(discovery.relays.iter().cloned()))
     };
+    builder = portl_core::proxy::configure_endpoint(builder, &discovery.relays);
     builder.bind().await.map_err(Into::into)
 }
 

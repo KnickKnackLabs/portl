@@ -333,6 +333,39 @@ and the v0.5.0 control-provider work in
 - **tmux** — compatibility persistent-session provider via PTY-backed
   `tmux -CC`.
 
+## HTTP proxies
+
+Portl sends its relay connection, pkarr publish/resolve, iroh net-report
+probes, and short-code rendezvous through an HTTP CONNECT proxy when one
+is configured. Highest precedence first:
+
+1. `--proxy <URL>` or `--no-proxy` on any `portl` / `portl-agent` command
+2. `PORTL_PROXY` — a URL, or `direct` / `none`
+3. `[network] proxy` in `portl.toml`
+4. `HTTPS_PROXY` / `ALL_PROXY` / `HTTP_PROXY` (and lowercase), with `NO_PROXY`
+5. direct
+
+Only `http://[user:pass@]host:port` proxies are supported; `https://` and
+SOCKS proxy URLs are rejected. Credentials are redacted in logs, `status`,
+`doctor`, and `config show`. Peer-to-peer QUIC (UDP) and plain DNS lookups
+are not proxied. The relay covers peers that cannot reach each other over UDP.
+
+```toml
+# Proxy-only sandbox: direct TCP egress is blocked.
+[network]
+proxy = "http://user:pass@egress-proxy:3128"
+
+# Or force direct connections even when HTTPS_PROXY is set:
+# proxy = "direct"
+```
+
+The agent reads this at startup; restart it after changing the setting.
+Service managers do not pass your shell's `HTTPS_PROXY` to the agent, so
+put `PORTL_PROXY=…` in `/etc/portl/agent.env` (system systemd units) or
+`~/.config/portl/agent.env` (user units), or use `portl.toml` (launchd,
+OpenRC). `portl status` and `portl doctor` show the effective proxy and
+where it came from.
+
 ## Diagnostics
 
 ```bash

@@ -26,9 +26,15 @@ pub fn download_release_binary(tag: &str, target_os: &str, target_arch: &str) ->
     let archive_name = format!("portl-{tag}-{triple}.tar.zst");
     let archive_url = format!("{RELEASE_BASE_URL}/{tag}/{archive_name}");
     let sha_url = format!("{archive_url}.sha256");
-    let client = Client::builder()
-        .build()
-        .context("build release downloader")?;
+    // Never let reqwest read proxy env on its own: portl's resolved
+    // decision (which may be an explicit `direct`) is authoritative.
+    let mut builder = Client::builder().no_proxy();
+    let release_url = reqwest::Url::parse(&archive_url).context("parse release URL")?;
+    if let Some(proxy) = portl_core::proxy::current().proxy_for(&release_url) {
+        builder =
+            builder.proxy(reqwest::Proxy::all(proxy.url().clone()).context("configure proxy")?);
+    }
+    let client = builder.build().context("build release downloader")?;
     let archive = download_bytes(&client, &archive_url)?;
     let sha = download_text(&client, &sha_url)?;
     verify_sha256(&archive, &sha, &archive_name)?;

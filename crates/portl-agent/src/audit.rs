@@ -27,7 +27,11 @@ pub(crate) fn init() {
         // Without this, tracing_subscriber defaults to TRACE which
         // is unusable in production.
         let default_filter = default_filter_directive();
-        let filter = filter_directive(default_filter);
+        let filter = format!(
+            "{},{}",
+            filter_directive(default_filter),
+            portl_core::proxy::CREDENTIAL_SAFE_LOG_DIRECTIVE
+        );
         let env_filter =
             EnvFilter::try_new(&filter).unwrap_or_else(|_| EnvFilter::new(default_filter));
 

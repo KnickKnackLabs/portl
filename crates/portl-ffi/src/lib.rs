@@ -789,11 +789,13 @@ async fn accept_peer_invite(
     local_label: Option<String>,
     peer_store_path: PathBuf,
 ) -> Result<String> {
-    let endpoint = iroh::Endpoint::builder(presets::N0)
-        .secret_key(SecretKey::from_bytes(&identity.signing_key().to_bytes()))
-        .bind()
-        .await
-        .context("bind Portl pairing endpoint")?;
+    let builder = iroh::Endpoint::builder(presets::N0)
+        .secret_key(SecretKey::from_bytes(&identity.signing_key().to_bytes()));
+    let endpoint =
+        portl_core::proxy::configure_endpoint(builder, &portl_core::endpoint::default_relays())
+            .bind()
+            .await
+            .context("bind Portl pairing endpoint")?;
 
     let result =
         accept_peer_invite_with_endpoint(&endpoint, &invite, local_label, &peer_store_path).await;

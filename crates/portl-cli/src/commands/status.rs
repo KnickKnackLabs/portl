@@ -126,6 +126,27 @@ fn render_dashboard_human(snap: &portl_agent::status_schema::StatusResponse) -> 
             snap.network.relays.join(", ")
         );
     }
+    if let Some(proxy) = &snap.network.proxy {
+        let _ = writeln!(
+            s,
+            "                proxy:     {} ({})",
+            proxy.url.as_deref().unwrap_or("direct"),
+            proxy.source
+        );
+    }
+    if let Some(home_relays) = &snap.network.home_relays {
+        if home_relays.is_empty() && !snap.network.relays.is_empty() {
+            let _ = writeln!(s, "                home relay: not connected");
+        }
+        for relay in home_relays {
+            let state = match (relay.connected, &relay.last_error) {
+                (true, _) => "connected".to_owned(),
+                (false, Some(error)) => format!("not connected: {error}"),
+                (false, None) => "not connected".to_owned(),
+            };
+            let _ = writeln!(s, "                home relay: {} {state}", relay.url);
+        }
+    }
     let _ = writeln!(s);
     render_provider_summary(&mut s, &snap.session_providers);
     let _ = writeln!(s);
@@ -225,6 +246,13 @@ fn run_target_count(
     count: u32,
     timeout: Duration,
 ) -> ExitCode {
+    if !json {
+        println!(
+            "{:<18}{}",
+            "proxy:",
+            portl_core::proxy::current().describe()
+        );
+    }
     let reports = collect_probe_reports(
         peer,
         count,
@@ -980,6 +1008,8 @@ mod tests {
                     pkarr: true,
                     local: true,
                 },
+                proxy: None,
+                home_relays: None,
             },
             NetworkHealthInfo::disabled(),
             SessionProvidersInfo::default(),
@@ -1021,6 +1051,8 @@ mod tests {
                     pkarr: true,
                     local: true,
                 },
+                proxy: None,
+                home_relays: None,
             },
             NetworkHealthInfo::disabled(),
             SessionProvidersInfo::default(),
@@ -1050,6 +1082,8 @@ mod tests {
                     pkarr: true,
                     local: true,
                 },
+                proxy: None,
+                home_relays: None,
             },
             NetworkHealthInfo::disabled(),
             SessionProvidersInfo {

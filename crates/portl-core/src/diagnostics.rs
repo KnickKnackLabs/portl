@@ -122,7 +122,7 @@ pub fn redact_arg(arg: &str) -> String {
     {
         return format!("{key}=<redacted>");
     }
-    arg.to_owned()
+    redact_url_userinfo(arg)
 }
 
 #[must_use]
@@ -158,7 +158,7 @@ fn redact_text_token(token: &str) -> String {
 
     let trimmed = token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-');
     if trimmed.is_empty() || !looks_like_portl_ticket(trimmed) {
-        return token.to_owned();
+        return redact_url_userinfo(token);
     }
 
     let start = token.find(trimmed).unwrap_or(0);
@@ -171,8 +171,32 @@ pub fn redact_env_value(name: &str, value: &str) -> String {
     if is_sensitive_key(name) || looks_like_portl_ticket(value) {
         "<redacted>".to_owned()
     } else {
-        value.to_owned()
+        redact_url_userinfo(value)
     }
+}
+
+/// Replace the userinfo of every `scheme://user:pass@host` in `text` with
+/// `***`, e.g. proxy credentials in URLs, argv, env values, and errors.
+#[must_use]
+pub fn redact_url_userinfo(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(idx) = rest.find("://") {
+        let (head, tail) = rest.split_at(idx + 3);
+        out.push_str(head);
+        let authority_end = tail
+            .find(|ch: char| matches!(ch, '/' | '?' | '#') || ch.is_whitespace())
+            .unwrap_or(tail.len());
+        match tail[..authority_end].rfind('@') {
+            Some(at) => {
+                out.push_str("***");
+                rest = &tail[at..];
+            }
+            None => rest = tail,
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn looks_like_portl_ticket(value: &str) -> bool {
@@ -281,6 +305,39 @@ mod tests {
         assert_eq!(redacted[4], "<redacted:ticket>");
         assert_eq!(redacted[5], "--token=<redacted>");
         assert_eq!(redacted[7], "/tmp/work");
+    }
+
+    #[test]
+    fn redacts_url_credentials_in_argv_env_and_text() {
+        let args = vec![
+            "portl".to_owned(),
+            "--proxy".to_owned(),
+            "http://user:hunter2@proxy:3128".to_owned(),
+            "--proxy=http://u:p@h:1/x".to_owned(),
+            "https://relay.example/".to_owned(),
+        ];
+        assert_eq!(
+            redact_argv(&args),
+            [
+                "portl",
+                "--proxy",
+                "http://***@proxy:3128",
+                "--proxy=http://***@h:1/x",
+                "https://relay.example/",
+            ]
+        );
+        assert_eq!(
+            redact_env_value("PORTL_PROXY", "http://a:b@p:1"),
+            "http://***@p:1"
+        );
+        assert_eq!(
+            redact_text("dial http://a:b@p:1 then ws://c@q/path?x=@y failed"),
+            "dial http://***@p:1 then ws://***@q/path?x=@y failed"
+        );
+        assert_eq!(
+            redact_url_userinfo("no urls here: a@b"),
+            "no urls here: a@b"
+        );
     }
 
     #[test]

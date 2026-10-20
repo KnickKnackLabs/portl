@@ -24,7 +24,9 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tokio_websockets::{ClientBuilder, Limits, MaybeTlsStream, Message, WebSocketStream};
+use tokio_websockets::{
+    ClientBuilder, Connector, Limits, MaybeTlsStream, Message, WebSocketStream,
+};
 
 use super::backend::{
     AcceptOutcome, ExchangeOffer, OfferHandle, RecipientHelloV1, RendezvousBackend,
@@ -110,11 +112,33 @@ impl WsMailboxTransport {
         let mailbox_uri = http::Uri::from_str(url)
             .map_err(|e| RendezvousError::Backend(format!("invalid mailbox uri: {e}")))?;
         let limits = Limits::default().max_payload_len(Some(MAX_WS_PAYLOAD_LEN));
-        let (stream, _resp) = ClientBuilder::from_uri(mailbox_uri)
-            .limits(limits)
-            .connect()
-            .await
-            .map_err(|e| RendezvousError::Backend(format!("websocket connect failed: {e}")))?;
+        let builder = ClientBuilder::from_uri(mailbox_uri).limits(limits);
+        let connect_failed = |e: tokio_websockets::Error| {
+            RendezvousError::Backend(format!("websocket connect failed: {e}"))
+        };
+        let target = url::Url::parse(url)
+            .map_err(|e| RendezvousError::Backend(format!("invalid mailbox url: {e}")))?;
+        let proxy_cfg = crate::proxy::current();
+        let (stream, _resp) = if let Some(proxy) = proxy_cfg.proxy_for(&target) {
+            let host = target.host_str().unwrap_or_default();
+            let port = target.port_or_known_default().unwrap_or(80);
+            let tcp = crate::proxy::connect_tunnel(proxy, host, port)
+                .await
+                .map_err(|e| RendezvousError::Backend(format!("websocket connect failed: {e}")))?;
+            let connector = if target.scheme() == "wss" {
+                Connector::new().map_err(connect_failed)?
+            } else {
+                Connector::Plain
+            };
+            let tls_host = host.trim_start_matches('[').trim_end_matches(']');
+            let stream = connector
+                .wrap(tls_host, tcp)
+                .await
+                .map_err(connect_failed)?;
+            builder.connect_on(stream).await.map_err(connect_failed)?
+        } else {
+            builder.connect().await.map_err(connect_failed)?
+        };
         Ok(Self {
             inner: stream,
             next_id: 0,

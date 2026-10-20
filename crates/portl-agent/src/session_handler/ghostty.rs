@@ -1246,7 +1246,7 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
         .split_first()
         .map(|(program, args)| (program.clone(), args.to_vec()))
         .expect("checked non-empty argv");
-    let env = config.env.unwrap_or_else(|| std::env::vars().collect());
+    let env = config.env.unwrap_or_else(portl_core::proxy::child_env_vars);
     let (master, mut child) = crate::shell_handler::spawn::spawn_pty_blocking(
         &program,
         &args,

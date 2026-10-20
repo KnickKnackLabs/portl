@@ -29,6 +29,12 @@ pub fn transport_config() -> iroh::endpoint::QuicTransportConfig {
         .build()
 }
 
+/// Relay URLs of iroh's default (n0) relay map, in preference order.
+#[must_use]
+pub fn default_relays() -> Vec<iroh_base::RelayUrl> {
+    iroh::endpoint::default_relay_mode().relay_map().urls()
+}
+
 /// A portl endpoint. Thin newtype over [`iroh::Endpoint`].
 #[derive(Debug, Clone)]
 pub struct Endpoint(iroh::Endpoint);
@@ -48,7 +54,12 @@ impl Endpoint {
     /// discovery; callers are expected to use this method rather
     /// than building iroh endpoints directly.
     pub async fn bind() -> Result<Self, iroh::endpoint::BindError> {
-        let inner = iroh::Endpoint::bind(presets::N0).await?;
+        let inner = crate::proxy::configure_endpoint(
+            iroh::Endpoint::builder(presets::N0),
+            &default_relays(),
+        )
+        .bind()
+        .await?;
         Ok(Self(inner))
     }
 

@@ -30,6 +30,7 @@ pub async fn bind(cfg: &AgentConfig, identity: &Identity) -> Result<iroh::Endpoi
     } else {
         builder.relay_mode(RelayMode::custom(cfg.discovery.relays.iter().cloned()))
     };
+    builder = portl_core::proxy::configure_endpoint(builder, &cfg.discovery.relays);
 
     if cfg.discovery.relays.is_empty() && !cfg.discovery.dns && !cfg.discovery.pkarr {
         builder = builder.dns_resolver(local_only_dns_resolver());

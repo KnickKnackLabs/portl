@@ -411,6 +411,7 @@ mod tests {
             network_watchdog: crate::network_watchdog::NetworkWatchdogHealth::new(SystemTime::now()),
             started_at_unix: 0,
             relay_status: RwLock::new(crate::relay::RelayStatus::disabled()),
+            current_endpoint: std::sync::OnceLock::new(),
         }
     }
 

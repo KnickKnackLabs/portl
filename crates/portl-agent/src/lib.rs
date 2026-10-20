@@ -86,7 +86,12 @@ pub async fn ghostty_session_run(
     argv: &[String],
 ) -> Result<portl_proto::session_v1::SessionRunResult> {
     session_handler::ghostty::GhosttyProvider::new()
-        .run(session, cwd, argv, Some(std::env::vars().collect()))
+        .run(
+            session,
+            cwd,
+            argv,
+            Some(portl_core::proxy::child_env_vars()),
+        )
         .await
 }
 
@@ -124,7 +129,7 @@ pub async fn ghostty_session_attach(
             cwd,
             Some(&pty),
             argv,
-            Some(std::env::vars().collect()),
+            Some(portl_core::proxy::child_env_vars()),
         )
         .await?;
     process.set_started_at(Instant::now());
@@ -378,6 +383,9 @@ pub(crate) struct AgentState {
     /// config on startup when enabled. `RwLock` keeps it
     /// trivially cheap to read from the metrics server.
     pub relay_status: std::sync::RwLock<relay::RelayStatus>,
+    /// The live endpoint (replaced on watchdog refresh), for reporting
+    /// home-relay connection state via `/status`. Unset in unit tests.
+    pub current_endpoint: std::sync::OnceLock<watch::Receiver<iroh::Endpoint>>,
 }
 
 impl metrics::StatusSource for AgentState {
@@ -396,6 +404,7 @@ impl metrics::StatusSource for AgentState {
     }
 
     fn network_info(&self) -> status_schema::NetworkInfo {
+        let proxy = portl_core::proxy::current();
         status_schema::NetworkInfo {
             relays: self
                 .discovery
@@ -408,6 +417,29 @@ impl metrics::StatusSource for AgentState {
                 pkarr: self.discovery.pkarr,
                 local: self.discovery.local,
             },
+            proxy: Some(status_schema::ProxyInfo {
+                url: proxy
+                    .relay_proxy(&self.discovery.relays)
+                    .map(ToString::to_string),
+                source: proxy.source().as_str().to_owned(),
+                warnings: proxy.warnings().to_vec(),
+            }),
+            home_relays: self.current_endpoint.get().map(|endpoint| {
+                use iroh::Watcher as _;
+                endpoint
+                    .borrow()
+                    .home_relay_status()
+                    .get()
+                    .into_iter()
+                    .map(|relay| status_schema::HomeRelayInfo {
+                        url: relay.url().to_string(),
+                        connected: relay.is_connected(),
+                        last_error: relay.last_error().map(|err| {
+                            portl_core::diagnostics::redact_url_userinfo(&format!("{err:#}"))
+                        }),
+                    })
+                    .collect()
+            }),
         }
     }
 
@@ -593,9 +625,20 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs()),
         relay_status: std::sync::RwLock::new(relay::RelayStatus::disabled()),
+        current_endpoint: std::sync::OnceLock::new(),
     });
 
-    tracing::info!("portl-agent listening");
+    let proxy = portl_core::proxy::current();
+    for warning in proxy.warnings() {
+        warn!("{warning}");
+    }
+    tracing::info!(
+        proxy = %proxy.describe(),
+        relay_proxy = proxy
+            .relay_proxy(&cfg.discovery.relays)
+            .map_or_else(|| "direct".to_owned(), ToString::to_string),
+        "portl-agent listening"
+    );
 
     let signal_shutdown = Arc::new(AtomicBool::new(false));
     let signal_tasks = install_signal_tasks(&shutdown, &signal_shutdown)?;
@@ -607,6 +650,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
     let relay_handle = spawn_relay_if_enabled(&state, shutdown.clone(), &cfg).await?;
     let mut fatal_watchdog_error: Option<anyhow::Error> = None;
     let (endpoint_tx, endpoint_rx) = watch::channel(endpoint.clone());
+    let _ = state.current_endpoint.set(endpoint_rx.clone());
     let (watchdog_refresh_tx, mut watchdog_refresh_rx) = mpsc::unbounded_channel();
     let watchdog_task = watchdog_enabled.then(|| {
         network_watchdog::spawn_watchdog_task(

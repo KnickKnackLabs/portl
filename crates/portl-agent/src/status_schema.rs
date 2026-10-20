@@ -143,6 +143,34 @@ pub struct NetworkInfo {
     /// Empty = relay disabled locally.
     pub relays: Vec<String>,
     pub discovery: DiscoveryInfo,
+    /// Outbound proxy used for relay connections. Absent from agents
+    /// older than v0.15.2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<ProxyInfo>,
+    /// Live connection state of the endpoint's home relay(s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_relays: Option<Vec<HomeRelayInfo>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxyInfo {
+    /// Redacted proxy URL for relay connections; `None` = direct.
+    pub url: Option<String>,
+    /// `flag`, `PORTL_PROXY`, `portl.toml`, a standard variable name such
+    /// as `HTTPS_PROXY`, or `default`.
+    pub source: String,
+    /// Ignored proxy env values and credential caveats.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HomeRelayInfo {
+    pub url: String,
+    pub connected: bool,
+    /// Most recent connection error (credentials redacted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -355,6 +383,8 @@ mod tests {
                     pkarr: true,
                     local: false,
                 },
+                proxy: None,
+                home_relays: None,
             },
             NetworkHealthInfo::disabled(),
             SessionProvidersInfo {
@@ -406,6 +436,8 @@ mod tests {
                     pkarr: false,
                     local: true,
                 },
+                proxy: None,
+                home_relays: None,
             },
             NetworkHealthInfo {
                 enabled: true,

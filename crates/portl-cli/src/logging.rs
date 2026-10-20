@@ -7,7 +7,11 @@ static LOGGING_INIT: OnceLock<()> = OnceLock::new();
 
 pub(crate) fn init(verbose: u8, explicit_filter: Option<&str>) {
     let () = *LOGGING_INIT.get_or_init(|| {
-        let filter = filter_directive(verbose, explicit_filter);
+        let filter = format!(
+            "{},{}",
+            filter_directive(verbose, explicit_filter),
+            portl_core::proxy::CREDENTIAL_SAFE_LOG_DIRECTIVE
+        );
         let env_filter = match EnvFilter::try_new(&filter) {
             Ok(filter) => filter,
             Err(err) => {

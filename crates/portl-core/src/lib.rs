@@ -20,6 +20,7 @@ pub mod pair_code;
 pub mod pair_store;
 pub mod paths;
 pub mod peer_store;
+pub mod proxy;
 pub mod query_response_filter;
 pub mod query_stripper;
 pub mod rendezvous;

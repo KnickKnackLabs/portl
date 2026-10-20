@@ -10,6 +10,8 @@ surface.
 | --- | --- |
 | `PORTL_HOME` | Portl home root override. Defaults to `~/.portl` on every OS. Portl stores config under `config/`, durable data under `data/`, operational state under `state/`, and runtime sockets under `run/`. |
 | `PORTL_CONFIG` | Alternate `portl.toml` path. |
+| `PORTL_PROXY` | Portl's outbound HTTP proxy: `http://[user:pass@]host:port`, or `direct` / `none` to connect directly. Covers the iroh relay connection, pkarr publish/resolve, net-report probes, short-code rendezvous, and release downloads. Overrides `[network] proxy` in `portl.toml` and the standard variables below; `--proxy` / `--no-proxy` override it. Only `http://` proxies are accepted. |
+| `HTTPS_PROXY`, `ALL_PROXY`, `HTTP_PROXY`, `NO_PROXY` (and lowercase) | Used only when neither a flag, `PORTL_PROXY`, nor `portl.toml` sets a proxy. `HTTPS_PROXY` (then `ALL_PROXY`) applies to `https://` relays, `HTTP_PROXY` (then `ALL_PROXY`) to `http://` ones; `NO_PROXY` takes hostnames, domain suffixes, IPs, CIDRs, or `*`. iroh takes one proxy for all relays, chosen for the first relay in the list. |
 | `PORTL_TARGET` | Default target for session commands. Accepts peer labels, saved ticket labels, endpoint IDs, aliases, and unique hostname shorthands such as `max` for `max-b265`. Explicit `--target` or `host/session` refs take precedence. |
 | `PORTL_JSON` | Force `--json` on commands that support structured output. Truthy values are `1`, `true`, `yes`, and `on`; falsey values are `0`, `false`, `no`, and `off`. |
 | `PORTL_QUIET` | Force quiet output on commands that support it, including `init` and `doctor`. Uses the same boolean values as `PORTL_JSON`. |
@@ -18,6 +20,18 @@ surface.
 
 Precedence for behavior variables is: explicit CLI flag, then the
 environment variable, then the built-in default.
+
+When a flag, `PORTL_PROXY`, or `portl.toml` sets the proxy, portl rewrites
+the standard proxy variables (and `PORTL_PROXY`) in its own process to match,
+so iroh's internal HTTP clients and child `portl` processes (for example an
+ssh `ProxyCommand`) follow the same decision. Shells and sessions that
+portl starts for users never inherit the rewritten values.
+
+The agent reads proxy settings at startup. Service managers do not pass
+your shell's proxy variables to it: set `PORTL_PROXY` in
+`/etc/portl/agent.env` (system systemd units) or
+`~/.config/portl/agent.env` (user units), or use `[network] proxy` in
+`portl.toml` (launchd, OpenRC), then restart the agent.
 
 ## Local logs and doctor bundles
 
