@@ -37,10 +37,11 @@ mod discovery_local {
     #[ignore = "mDNS on localhost can be flaky in CI"]
     async fn local_discovery_resolves_endpoint_id_over_mdns() -> Result<()> {
         let discovery = DiscoveryConfig {
-            dns: false,
-            pkarr: false,
+            dns: Vec::new(),
+            pkarr: Vec::new(),
             local: true,
             relays: Vec::new(),
+            ..DiscoveryConfig::in_process()
         };
         let cfg = AgentConfig {
             bind_addr: Some("127.0.0.1:0".parse().expect("bind addr")),

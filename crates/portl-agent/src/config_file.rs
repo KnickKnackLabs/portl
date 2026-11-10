@@ -103,12 +103,12 @@ pub struct AgentSection {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiscoverySection {
-    /// Publish + resolve endpoint IDs via n0's DNS service.
-    pub dns: Option<bool>,
-    /// Publish + resolve endpoint IDs via pkarr.
-    pub pkarr: Option<bool>,
+    /// DNS lookup origins, optionally suffixed with `@nameserver:port`.
+    pub dns: Option<DiscoverySelection>,
+    /// HTTP(S) pkarr publish/resolve endpoints.
+    pub pkarr: Option<DiscoverySelection>,
     /// Advertise + discover via mDNS on the local network.
-    pub local: Option<bool>,
+    pub local: Option<crate::mdns::LocalDiscovery>,
     /// Ordered list of relay entries. Each entry is either:
     ///
     /// - `"default"` — iroh's built-in n0 relay(s)
@@ -118,6 +118,16 @@ pub struct DiscoverySection {
     ///
     /// Example: `["default", "https://relay.mynet.com./"]`
     pub relays: Option<Vec<String>>,
+}
+
+/// Backward-compatible backend selection: `true`/`"default"` enables
+/// built-in endpoints, `false`/`[]` disables, strings/lists select endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum DiscoverySelection {
+    Enabled(bool),
+    Endpoint(String),
+    Endpoints(Vec<String>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -179,6 +189,9 @@ impl PortlConfig {
     /// tests can exercise the parser without touching disk.
     pub fn parse_toml(text: &str) -> Result<Self> {
         let cfg: Self = toml::from_str(text).context("parse portl.toml")?;
+        if let Some(discovery) = &cfg.agent.discovery {
+            crate::config::build_discovery_from_file(discovery)?;
+        }
         if let Some(proxy) = cfg.proxy() {
             proxy
                 .parse::<portl_core::proxy::ProxySetting>()
@@ -198,7 +211,7 @@ impl PortlConfig {
     }
 
     /// Emit a commented template suitable for piping into
-    /// `portl.toml` via `portl config default`.
+    /// `portl.toml` via `portl config template`.
     #[must_use]
     pub fn default_template() -> &'static str {
         include_str!("config_file_template.toml")
@@ -208,6 +221,20 @@ impl PortlConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_selection_roundtrips_all_supported_shapes() {
+        for fields in [
+            "dns = true\npkarr = false\nlocal = true",
+            "dns = 'default'\npkarr = 'https://custom.example/pkarr'",
+            "dns = ['default', 'custom.example@127.0.0.1:5353']\npkarr = ['default', 'https://custom.example/pkarr']",
+            "dns = []\npkarr = []\nlocal = { enabled = false, deny = [{ interface = 'eth0' }] }",
+        ] {
+            let cfg = PortlConfig::parse_toml(&format!("[agent.discovery]\n{fields}")).unwrap();
+            let encoded = toml::to_string(&cfg).unwrap();
+            assert_eq!(PortlConfig::parse_toml(&encoded).unwrap(), cfg);
+        }
+    }
 
     #[test]
     fn empty_file_parses_to_defaults() {

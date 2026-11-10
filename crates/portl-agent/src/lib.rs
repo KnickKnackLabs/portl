@@ -21,6 +21,7 @@ pub mod config_file;
 pub mod conn_registry;
 pub mod endpoint;
 pub mod gateway;
+pub mod mdns;
 pub mod meta_handler;
 pub mod metrics;
 pub mod network_watchdog;
@@ -43,7 +44,7 @@ pub mod udp_handler;
 pub mod udp_registry;
 pub mod unix_handler;
 
-pub use config::{AgentConfig, AgentMode, DiscoveryConfig, RateLimitConfig};
+pub use config::{AgentConfig, AgentMode, DiscoveryConfig, DnsOrigin, RateLimitConfig};
 
 #[cfg(feature = "ghostty-vt")]
 pub enum GhosttyAttachInput {
@@ -363,6 +364,7 @@ pub(crate) struct AgentState {
     /// `/status/network` IPC route. Discovery reconfig requires a
     /// restart in v0.3.2; that's fine for the dashboard use-case.
     pub discovery: DiscoveryConfig,
+    pub mdns_status: mdns::MdnsStatus,
     /// Absolute path of `$PORTL_HOME`; surfaced via `/status`.
     pub home: PathBuf,
     /// Absolute path of `metrics.sock`; surfaced via `/status`.
@@ -413,9 +415,17 @@ impl metrics::StatusSource for AgentState {
                 .map(ToString::to_string)
                 .collect(),
             discovery: status_schema::DiscoveryInfo {
-                dns: self.discovery.dns,
-                pkarr: self.discovery.pkarr,
+                dns: !self.discovery.dns.is_empty(),
+                pkarr: !self.discovery.pkarr.is_empty(),
                 local: self.discovery.local,
+                dns_endpoints: self.discovery.dns.iter().map(ToString::to_string).collect(),
+                pkarr_endpoints: self
+                    .discovery
+                    .pkarr
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                mdns: self.discovery.local.then(|| self.mdns_status.snapshot()),
             },
             proxy: Some(status_schema::ProxyInfo {
                 url: proxy
@@ -604,6 +614,7 @@ pub async fn run_with_shutdown(cfg: AgentConfig, shutdown: CancellationToken) ->
         connections: conn_registry::ConnectionRegistry::new(),
         peers_path: cfg.peers_path.clone(),
         discovery: cfg.discovery.clone(),
+        mdns_status: cfg.mdns_status.clone(),
         home: cfg
             .peers_path
             .as_ref()

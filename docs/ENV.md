@@ -68,7 +68,7 @@ Portl writes exactly that file and fails if it already exists.
 | `PORTL_REVOCATIONS_MAX_BYTES` | Size cap for the revocations log. |
 | `PORTL_UDP_SESSION_LINGER_SECS` | UDP session linger tuning. |
 | `PORTL_LISTEN_ADDR` | Agent listen address override. |
-| `PORTL_DISCOVERY` | Discovery backend selection. |
+| `PORTL_DISCOVERY` | Replaces the entire discovery configuration. Comma-separated `dns`, `pkarr`, `local`, `relay`, or `none` alone. Custom entries: `pkarr:https://host/pkarr`, `dns:origin.example@192.0.2.53:5353`, `relay:https://host/`; `=` aliases `:`. Bare tokens add n0 defaults (or unrestricted mDNS for `local`). Repeat custom entries for multiple endpoints. |
 | `PORTL_RATE_LIMIT` | Per-peer rate limit. |
 | `PORTL_METRICS` | Metrics endpoint toggle. |
 | `PORTL_MODE` | Agent run mode. |
@@ -78,6 +78,10 @@ Portl writes exactly that file and fails if it already exists.
 | `PORTL_AGENT_WATCHDOG_FAILURES` | Consecutive self-probe failures before refreshing the agent endpoint. Defaults to `3`; minimum `1`. |
 | `PORTL_SESSION_PROVIDER` | Preferred target-side persistent-session provider. v0.4.0 supports `zmx`. Used by managed targets and `portl.toml`; manual hosts must install providers explicitly. |
 | `PORTL_SESSION_PROVIDER_PATH` | Target-side persistent-session provider CLI path. The v0.4.0 slice treats this as a `zmx` path; otherwise the agent discovers `zmx` with `command -v zmx`. |
+
+Use `[agent.discovery]` in `$PORTL_HOME/config/portl.toml` for ordered pkarr HTTP(S) URLs, DNS origins with optional nameserver overrides, and `[agent.discovery.local]` network rules. Existing `pkarr = true|false`, `dns = true|false` and `local = true|false` retain their meanings. Endpoint lists replace defaults unless `"default"` is included; `[]` disables. Lookups run concurrently, not in sequential fallback order.
+
+mDNS rules match SSID, interface name and local address CIDR. Deny wins over allow; unreadable SSIDs use `unknown`, defaulting to deny when rules exist. `PORTL_DISCOVERY=local` replaces those rules with unrestricted mDNS, so leave the variable unset to use a TOML policy. macOS Location Services can redact SSIDs, including in a LaunchAgent; interface/CIDR rules work without SSID access. See [discovery endpoints and network scope](DISCOVERY.md) for examples, precedence, platform detection limits and transition timing. `portl status` shows the running agent's endpoints and current mDNS decision; `portl doctor` shows the effective configuration.
 
 ## Internal and test-only variables
 

@@ -56,8 +56,8 @@ async fn agent_run_loads_env_config_and_accepts_configured_root() -> Result<()> 
     );
     assert_eq!(cfg.trust_roots, vec![operator.verifying_key()]);
     assert!(cfg.discovery.local);
-    assert!(!cfg.discovery.dns);
-    assert!(!cfg.discovery.pkarr);
+    assert!(cfg.discovery.dns.is_empty());
+    assert!(cfg.discovery.pkarr.is_empty());
     cfg.endpoint = Some(server.clone());
 
     let agent = run_task(cfg).await?;

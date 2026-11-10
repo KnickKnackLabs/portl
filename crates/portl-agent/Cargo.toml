@@ -40,6 +40,10 @@ iroh        = { workspace = true }
 iroh-base   = { workspace = true }
 iroh-relay  = { workspace = true }
 iroh-mdns-address-lookup = { workspace = true }
+netwatch    = { workspace = true }
+n0-future   = { workspace = true }
+futures-util = { workspace = true }
+ipnet       = { version = "2", features = ["serde"] }
 rustls           = { workspace = true }
 tokio       = { workspace = true }
 tokio-util  = { workspace = true }
@@ -60,13 +64,13 @@ libghostty-vt = { version = "0.1.1", git = "https://github.com/Uzaaft/libghostty
 tracing-journald = { workspace = true }
 
 [dev-dependencies]
+wiremock = { workspace = true }
 portl-core = { version = "0.15.2", path = "../portl-core", features = ["test-util"] }
 http       = { workspace = true }
 tempfile   = { workspace = true }
 iroh-base = { workspace = true }
 tokio      = { workspace = true }
 tokio-util = { workspace = true }
-n0-future  = { workspace = true }
 # Pre-main hook used by `tests/common/mod.rs` to install a per-test-binary
 # watchdog that aborts the process after `PORTL_TEST_WATCHDOG_SECS` (default
 # 30s). Prevents a single hung integration test (e.g. iroh relay stalls)

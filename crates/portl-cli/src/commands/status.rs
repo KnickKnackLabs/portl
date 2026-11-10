@@ -112,11 +112,7 @@ fn render_dashboard_human(snap: &portl_agent::status_schema::StatusResponse) -> 
     let _ = writeln!(s, "                home: {}", snap.agent.home);
     let _ = writeln!(s, "                metrics: {}", snap.agent.metrics_socket);
     let _ = writeln!(s);
-    let _ = writeln!(
-        s,
-        "network:        discovery: dns={} pkarr={} local={}",
-        snap.network.discovery.dns, snap.network.discovery.pkarr, snap.network.discovery.local
-    );
+    render_discovery_summary(&mut s, &snap.network.discovery);
     if snap.network.relays.is_empty() {
         let _ = writeln!(s, "                relays:    (disabled)");
     } else {
@@ -183,6 +179,52 @@ fn render_dashboard_human(snap: &portl_agent::status_schema::StatusResponse) -> 
         );
     }
     s
+}
+
+fn render_discovery_summary(
+    out: &mut String,
+    discovery: &portl_agent::status_schema::DiscoveryInfo,
+) {
+    use std::fmt::Write;
+    let _ = writeln!(
+        out,
+        "network:        discovery: dns={} pkarr={} local={}",
+        discovery.dns, discovery.pkarr, discovery.local
+    );
+    for (backend, endpoints) in [
+        ("dns", &discovery.dns_endpoints),
+        ("pkarr", &discovery.pkarr_endpoints),
+    ] {
+        if !endpoints.is_empty() {
+            let _ = writeln!(
+                out,
+                "                {backend} endpoints: {}",
+                endpoints.join(", ")
+            );
+        }
+    }
+    if let Some(mdns) = &discovery.mdns {
+        let _ = writeln!(
+            out,
+            "                mDNS: active={} ({})",
+            mdns.active, mdns.reason
+        );
+        for link in &mdns.network.links {
+            let addresses = link
+                .addresses
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                out,
+                "                network: {} ssid={} addresses=[{}]",
+                link.interface,
+                link.ssid.as_deref().unwrap_or("unknown"),
+                addresses
+            );
+        }
+    }
 }
 
 fn connection_auth_label(c: &portl_agent::conn_registry::ConnectionSnapshot) -> String {
@@ -1007,6 +1049,19 @@ mod tests {
                     dns: true,
                     pkarr: true,
                     local: true,
+                    dns_endpoints: vec!["discovery.example@127.0.0.1:5353".to_owned()],
+                    pkarr_endpoints: vec!["https://discovery.example/pkarr".to_owned()],
+                    mdns: Some(portl_agent::mdns::MdnsSnapshot {
+                        active: false,
+                        reason: "deny rule identity unavailable".to_owned(),
+                        network: portl_agent::mdns::NetworkIdentity {
+                            links: vec![portl_agent::mdns::NetworkLink {
+                                interface: "en0".to_owned(),
+                                ssid: None,
+                                addresses: vec!["10.61.176.2".parse().unwrap()],
+                            }],
+                        },
+                    }),
                 },
                 proxy: None,
                 home_relays: None,
@@ -1019,6 +1074,10 @@ mod tests {
         let rendered = super::render_dashboard_human(&snap);
 
         assert!(rendered.contains("11111111…1111 auth=22222222…2222"));
+        assert!(rendered.contains("dns endpoints: discovery.example@127.0.0.1:5353"));
+        assert!(rendered.contains("pkarr endpoints: https://discovery.example/pkarr"));
+        assert!(rendered.contains("mDNS: active=false (deny rule identity unavailable)"));
+        assert!(rendered.contains("network: en0 ssid=unknown addresses=[10.61.176.2]"));
     }
 
     #[test]
@@ -1050,6 +1109,7 @@ mod tests {
                     dns: true,
                     pkarr: true,
                     local: true,
+                    ..DiscoveryInfo::default()
                 },
                 proxy: None,
                 home_relays: None,
@@ -1081,6 +1141,7 @@ mod tests {
                     dns: true,
                     pkarr: true,
                     local: true,
+                    ..DiscoveryInfo::default()
                 },
                 proxy: None,
                 home_relays: None,

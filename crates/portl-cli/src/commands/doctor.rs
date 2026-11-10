@@ -297,8 +297,8 @@ fn check_listener_bind() -> CheckResult {
     }
 }
 
-/// Report the agent's effective discovery config as derived from the
-/// fixed env-var schema. Doesn't actually probe DNS here; that's the
+/// Report the effective TOML/environment discovery configuration.
+/// Doesn't actually probe DNS here; that's the
 /// relay check's job.
 fn check_discovery_config() -> CheckResult {
     match portl_agent::AgentConfig::from_env_without_layout_migration() {
@@ -315,14 +315,30 @@ fn check_discovery_config() -> CheckResult {
                     .join(",")
             };
             let detail = format!(
-                "dns={} pkarr={} local={} relay={}",
-                discovery.dns, discovery.pkarr, discovery.local, relay
+                "dns={} pkarr={} local={} relay={} dns_endpoints=[{}] pkarr_endpoints=[{}]",
+                !discovery.dns.is_empty(),
+                !discovery.pkarr.is_empty(),
+                discovery.local,
+                relay,
+                discovery
+                    .dns
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                discovery
+                    .pkarr
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
             );
-            let status = if discovery.dns || discovery.pkarr || discovery.local {
-                Status::Ok
-            } else {
-                Status::Warn
-            };
+            let status =
+                if !discovery.dns.is_empty() || !discovery.pkarr.is_empty() || discovery.local {
+                    Status::Ok
+                } else {
+                    Status::Warn
+                };
             CheckResult {
                 name: "discovery",
                 status,
@@ -1354,6 +1370,54 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(unsafe_code)]
+    fn discovery_check_reports_custom_effective_endpoints_and_safe_errors() {
+        let old = std::env::var_os("PORTL_DISCOVERY");
+        unsafe {
+            std::env::set_var(
+                "PORTL_DISCOVERY",
+                "dns:first.example@127.0.0.1:5353,dns:second.example,pkarr:https://custom.example/pkarr",
+            );
+        }
+        let result = check_discovery_config();
+        assert_eq!(result.status, Status::Ok);
+        assert!(
+            result
+                .detail
+                .contains("dns=true pkarr=true local=false relay=none")
+        );
+        assert!(
+            result
+                .detail
+                .contains("dns_endpoints=[first.example@127.0.0.1:5353,second.example]")
+        );
+        assert!(
+            result
+                .detail
+                .contains("pkarr_endpoints=[https://custom.example/pkarr]")
+        );
+        unsafe {
+            std::env::set_var(
+                "PORTL_DISCOVERY",
+                "pkarr:https://user:secret-value@host/pkarr",
+            );
+        }
+        let result = check_discovery_config();
+        assert_eq!(result.status, Status::Fail);
+        assert!(!result.detail.contains("secret-value"));
+        unsafe {
+            std::env::set_var("PORTL_DISCOVERY", "none");
+        }
+        assert_eq!(check_discovery_config().status, Status::Warn);
+        unsafe {
+            match old {
+                Some(value) => std::env::set_var("PORTL_DISCOVERY", value),
+                None => std::env::remove_var("PORTL_DISCOVERY"),
+            }
+        }
+    }
+
+    #[test]
     fn json_value_includes_schema_and_fail_status() {
         let value = json_value(&[CheckResult {
             name: "example",
@@ -1437,6 +1501,7 @@ mod tests {
                     dns: false,
                     pkarr: false,
                     local: true,
+                    ..Default::default()
                 },
                 proxy: None,
                 home_relays: None,
@@ -1476,6 +1541,7 @@ mod tests {
                         dns: true,
                         pkarr: true,
                         local: false,
+                        ..Default::default()
                     },
                     proxy: Some(portl_agent::status_schema::ProxyInfo {
                         url: agent_proxy.map(ToOwned::to_owned),
@@ -1568,6 +1634,7 @@ mod tests {
                         dns: false,
                         pkarr: false,
                         local: true,
+                        ..Default::default()
                     },
                     proxy: None,
                     home_relays: None,
@@ -1602,6 +1669,7 @@ mod tests {
                         dns: false,
                         pkarr: false,
                         local: true,
+                        ..Default::default()
                     },
                     proxy: None,
                     home_relays: None,
@@ -1638,6 +1706,7 @@ mod tests {
                         dns: false,
                         pkarr: false,
                         local: true,
+                        ..Default::default()
                     },
                     proxy: None,
                     home_relays: None,
@@ -1671,6 +1740,7 @@ mod tests {
                     dns: false,
                     pkarr: false,
                     local: true,
+                    ..Default::default()
                 },
                 proxy: None,
                 home_relays: None,
@@ -1710,6 +1780,7 @@ mod tests {
                     dns: false,
                     pkarr: false,
                     local: true,
+                    ..Default::default()
                 },
                 proxy: None,
                 home_relays: None,
@@ -1749,6 +1820,7 @@ mod tests {
                     dns: false,
                     pkarr: false,
                     local: true,
+                    ..Default::default()
                 },
                 proxy: None,
                 home_relays: None,
