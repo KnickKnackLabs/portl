@@ -173,11 +173,19 @@ pub struct HomeRelayInfo {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DiscoveryInfo {
     pub dns: bool,
     pub pkarr: bool,
     pub local: bool,
+    /// Effective DNS origins, including any per-origin nameserver selection.
+    #[serde(default)]
+    pub dns_endpoints: Vec<String>,
+    /// Effective HTTP(S) pkarr relay endpoints (not the Mainline DHT).
+    #[serde(default)]
+    pub pkarr_endpoints: Vec<String>,
+    #[serde(default)]
+    pub mdns: Option<crate::mdns::MdnsSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -351,6 +359,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn discovery_endpoints_are_additive_and_legacy_json_still_loads() {
+        let old: DiscoveryInfo =
+            serde_json::from_str(r#"{"dns":true,"pkarr":true,"local":false}"#).unwrap();
+        assert!(old.dns);
+        assert!(old.pkarr);
+        assert!(old.dns_endpoints.is_empty());
+        assert!(old.pkarr_endpoints.is_empty());
+        assert!(old.mdns.is_none());
+        let info = DiscoveryInfo {
+            dns_endpoints: vec!["origin.example@127.0.0.1:5353".into()],
+            pkarr_endpoints: vec!["https://origin.example/pkarr".into()],
+            ..old
+        };
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(value["dns"], true);
+        assert_eq!(value["pkarr"], true);
+        assert_eq!(value["dns_endpoints"][0], "origin.example@127.0.0.1:5353");
+        assert_eq!(value["pkarr_endpoints"][0], "https://origin.example/pkarr");
+        let decoded: DiscoveryInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.dns_endpoints, info.dns_endpoints);
+        assert_eq!(decoded.pkarr_endpoints, info.pkarr_endpoints);
+    }
+
+    #[test]
     fn unix_epoch_decomposes_correctly() {
         assert_eq!(unix_to_ymdhms(0), (1970, 1, 1, 0, 0, 0));
     }
@@ -382,6 +414,7 @@ mod tests {
                     dns: true,
                     pkarr: true,
                     local: false,
+                    ..DiscoveryInfo::default()
                 },
                 proxy: None,
                 home_relays: None,
@@ -435,6 +468,7 @@ mod tests {
                     dns: false,
                     pkarr: false,
                     local: true,
+                    ..DiscoveryInfo::default()
                 },
                 proxy: None,
                 home_relays: None,

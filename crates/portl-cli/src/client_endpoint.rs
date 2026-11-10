@@ -5,7 +5,6 @@ use iroh::address_lookup::{DnsAddressLookup, PkarrResolver};
 use iroh::dns::DnsResolver;
 use iroh::endpoint::{RelayMode, presets};
 use iroh_base::SecretKey;
-use iroh_mdns_address_lookup::MdnsAddressLookup;
 use portl_core::id::Identity;
 
 pub(crate) fn load_client_config() -> Result<portl_agent::AgentConfig> {
@@ -33,8 +32,8 @@ pub(crate) async fn bind_client_endpoint_with_config(
     cfg: &portl_agent::AgentConfig,
 ) -> Result<iroh::Endpoint> {
     tracing::debug!(
-        dns = cfg.discovery.dns,
-        pkarr = cfg.discovery.pkarr,
+        dns = ?cfg.discovery.dns,
+        pkarr = ?cfg.discovery.pkarr,
         local = cfg.discovery.local,
         relays = cfg.discovery.relays.len(),
         "binding CLI client endpoint"
@@ -50,18 +49,29 @@ pub(crate) async fn bind_client_endpoint_with_config(
     };
     builder = portl_core::proxy::configure_endpoint(builder, &cfg.discovery.relays);
 
-    if cfg.discovery.relays.is_empty() && !cfg.discovery.dns && !cfg.discovery.pkarr {
+    if cfg.discovery.relays.is_empty()
+        && cfg.discovery.dns.is_empty()
+        && cfg.discovery.pkarr.is_empty()
+    {
         builder = builder.dns_resolver(local_only_dns_resolver());
     }
 
-    if cfg.discovery.pkarr {
-        builder = builder.address_lookup(PkarrResolver::n0_dns());
+    for url in &cfg.discovery.pkarr {
+        builder = builder.address_lookup(PkarrResolver::builder(url.clone()));
     }
-    if cfg.discovery.dns {
-        builder = builder.address_lookup(DnsAddressLookup::n0_dns());
+    for origin in &cfg.discovery.dns {
+        let mut lookup = DnsAddressLookup::builder(origin.origin.clone());
+        if let Some(nameserver) = origin.nameserver {
+            lookup = lookup.dns_resolver(DnsResolver::with_nameserver(nameserver));
+        }
+        builder = builder.address_lookup(lookup);
     }
     if cfg.discovery.local {
-        builder = builder.address_lookup(MdnsAddressLookup::builder().advertise(false));
+        builder = builder.address_lookup(portl_agent::mdns::ScopedMdns {
+            policy: cfg.discovery.local_policy.clone(),
+            advertise: false,
+            status: cfg.mdns_status.clone(),
+        });
     }
     if let Some(bind_addr) = cfg.bind_addr {
         builder = builder.bind_addr(bind_addr)?;
@@ -75,8 +85,8 @@ pub(crate) async fn bind_pairing_client_endpoint_with_config(
     cfg: &portl_agent::AgentConfig,
 ) -> Result<iroh::Endpoint> {
     tracing::debug!(
-        dns = cfg.discovery.dns,
-        pkarr = cfg.discovery.pkarr,
+        dns = ?cfg.discovery.dns,
+        pkarr = ?cfg.discovery.pkarr,
         local = cfg.discovery.local,
         relays = cfg.discovery.relays.len(),
         "binding CLI pairing endpoint"
@@ -101,6 +111,81 @@ mod tests {
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+    #[tokio::test]
+    async fn dial_client_resolves_signed_records_from_all_custom_urls_without_publishing() {
+        use iroh::address_lookup::EndpointInfo;
+        use n0_future::StreamExt as _;
+        use std::time::Duration;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let peer_key = iroh_base::SecretKey::generate();
+        let mut expected = Vec::new();
+        for prefix in ["first", "second"] {
+            let info = EndpointInfo::from(
+                iroh_base::EndpointAddr::new(peer_key.public())
+                    .with_relay_url(format!("https://{prefix}.example/").parse().unwrap()),
+            );
+            let packet = info.to_pkarr_signed_packet(&peer_key, 30).unwrap();
+            Mock::given(method("GET"))
+                .and(path(format!("/{prefix}/{}", peer_key.public().to_z32())))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(packet.to_relay_payload()))
+                .expect(1)
+                .mount(&server)
+                .await;
+            expected.push(info);
+        }
+        let identity = portl_core::id::Identity::new();
+        let cfg = portl_agent::AgentConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            discovery: portl_agent::DiscoveryConfig {
+                pkarr: ["first", "second"]
+                    .iter()
+                    .map(|prefix| format!("{}/{prefix}", server.uri()).parse().unwrap())
+                    .collect(),
+                ..portl_agent::DiscoveryConfig::in_process()
+            },
+            ..portl_agent::AgentConfig::default()
+        };
+        let endpoint = super::bind_client_endpoint_with_config(&identity, &cfg)
+            .await
+            .unwrap();
+        assert_ne!(endpoint.id().as_bytes(), &identity.verifying_key());
+        let lookups = endpoint.address_lookup().unwrap();
+        let stream = lookups.resolve(peer_key.public());
+        tokio::pin!(stream);
+        for _ in 0..2 {
+            let item = tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let index = expected
+                .iter()
+                .position(|info| info == item.endpoint_info())
+                .expect("verified record returned by one configured service");
+            expected.remove(index);
+        }
+        assert!(expected.is_empty());
+        endpoint.close().await;
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method == "GET")
+        );
+        server.verify().await;
+    }
+
     #[test]
     fn load_client_config_honors_portl_discovery_env() {
         let _guard = ENV_LOCK.lock().expect("env lock");
@@ -109,8 +194,8 @@ mod tests {
 
         let cfg = super::load_client_config().expect("load client config");
 
-        assert!(!cfg.discovery.dns);
-        assert!(!cfg.discovery.pkarr);
+        assert!(cfg.discovery.dns.is_empty());
+        assert!(cfg.discovery.pkarr.is_empty());
         assert!(!cfg.discovery.local);
         assert!(cfg.discovery.relays.is_empty());
         restore_env("PORTL_DISCOVERY", old);

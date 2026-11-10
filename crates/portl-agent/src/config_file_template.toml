@@ -33,10 +33,28 @@ schema = 1
 
 [agent.discovery]
 # How peers find us (publish) and how we find them (resolve).
-# Setting all four to false is valid for in-process / loopback tests.
-dns   = true     # publish + resolve via n0's DNS service
-pkarr = true     # publish + resolve via pkarr (mainline DHT)
+# Disable with dns = false, pkarr = false, local = false, relays = [].
+dns   = true     # resolve TXT records via n0's DNS origin
+pkarr = true     # publish + resolve signed records over HTTP(S), not Mainline DHT
 local = true     # mDNS on the local network
+
+# DNS/pkarr accept true (built-in default), false (disabled), "default",
+# one endpoint string, or an ordered list. [] disables; duplicates are removed.
+# Custom lists replace defaults unless "default" is explicitly included.
+# All lookup services run concurrently: order is NOT fallback priority.
+# DNS entries are origins, optionally @IP or @IP:port (default port 53).
+# IPv6 nameservers: origin@::1 or origin@[::1]:5353.
+# The override affects that DNS lookup only, not relay/pkarr hostname resolution.
+# dns = ["default", "discovery.example@192.0.2.53:5353"]
+# pkarr = ["default", "https://discovery.example/pkarr"]
+# Pkarr URLs must use http(s) with a host and no credentials/query/fragment.
+# Existing relay URL parsing is unchanged. Ordinary dial clients resolve only;
+# pairing preserves stable agent-style publication and mDNS advertising.
+# Agents publish to every configured pkarr endpoint.
+# PORTL_DISCOVERY replaces the entire section, e.g.:
+#   dns,pkarr:https://discovery.example/pkarr,dns:discovery.example@192.0.2.53,local,relay
+# Each custom prefix accepts ':' or '='. Bare dns/pkarr/relay use built-ins.
+# See docs/DISCOVERY.md for local-network policy configuration.
 
 # Ordered list of relays. Each entry is one of:
 #   "default"               — iroh's built-in n0 relay(s)
@@ -44,6 +62,20 @@ local = true     # mDNS on the local network
 #                             other reachable iroh-relay endpoint)
 # Empty list = relay disabled (peers must hole-punch or be on LAN).
 relays = ["default"]
+
+# To scope mDNS, REMOVE local = true above and uncomment this table:
+# [agent.discovery.local]
+# enabled = true
+# deny = [{ ssid = "TCB-BYOD" }, { subnet = "10.61.176.0/20" }]
+# allow = [] # if nonempty, every active interface must match an allow
+# unknown = "deny" # default with any rule; no rules default to allow
+# Matchers: ssid, interface (exact name), subnet (IPv4/IPv6 address CIDR).
+# Fields within one rule are ANDed; separate rules ORed. Deny wins.
+# A redacted SSID is unknown, NOT a known nonmatch. On macOS 14+ a
+# standalone LaunchAgent may not have Location Services authorization.
+# For home access without SSIDs, use interface/subnet rules instead.
+# Policy changes automatically on OS network events, with a 10-second
+# identity recheck for SSID-only roams. It gates all mDNS interfaces.
 
 [agent.rate_limit]
 # Token-bucket on inbound ticket-accept attempts. Defaults are quite

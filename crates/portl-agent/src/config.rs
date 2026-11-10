@@ -7,6 +7,7 @@ use iroh_base::RelayUrl;
 use portl_core::endpoint::Endpoint;
 use portl_core::peer_store::PeerStore;
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::config_file::PortlConfig;
 use crate::relay::{RelayPolicy, RelayServerConfig, RelayTlsConfig};
@@ -51,6 +52,8 @@ pub struct AgentConfig {
     pub identity_secret: Option<[u8; 32]>,
     pub bind_addr: Option<SocketAddr>,
     pub discovery: DiscoveryConfig,
+    #[doc(hidden)]
+    pub mdns_status: crate::mdns::MdnsStatus,
     /// Populated at startup from `peers.json`. v0.3.0 removed the
     /// `PORTL_TRUST_ROOTS` env var — the peer store is the only
     /// source of truth. Leave as empty `Vec` in tests that don't
@@ -244,6 +247,7 @@ impl AgentConfig {
             identity_secret,
             bind_addr: Some(bind_addr),
             discovery,
+            mdns_status: crate::mdns::MdnsStatus::default(),
             trust_roots,
             peers_path: Some(peers_path),
             revocations_path: Some(revocations_path),
@@ -275,9 +279,13 @@ pub enum AgentMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveryConfig {
-    pub dns: bool,
-    pub pkarr: bool,
+    /// Ordered, deduplicated DNS origins. Empty means disabled.
+    /// Iroh queries all lookups concurrently; order is not fallback priority.
+    pub dns: Vec<DnsOrigin>,
+    /// Ordered, deduplicated HTTP(S) pkarr endpoints. Empty means disabled.
+    pub pkarr: Vec<Url>,
     pub local: bool,
+    pub local_policy: crate::mdns::LocalPolicy,
     /// Ordered list of relay URLs. Empty vec = relay disabled.
     /// First entry is the preferred relay (iroh's `RelayMode::Custom`
     /// accepts any iterable; preference inside the list is determined
@@ -295,13 +303,32 @@ pub struct DiscoveryConfig {
     pub relays: Vec<RelayUrl>,
 }
 
+/// A DNS discovery origin and optional dedicated nameserver. The override
+/// applies only to this lookup, not to relay/pkarr hostname resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsOrigin {
+    pub origin: String,
+    pub nameserver: Option<SocketAddr>,
+}
+
+impl std::fmt::Display for DnsOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.origin)?;
+        if let Some(nameserver) = self.nameserver {
+            write!(f, "@{nameserver}")?;
+        }
+        Ok(())
+    }
+}
+
 impl DiscoveryConfig {
     #[must_use]
     pub fn in_process() -> Self {
         Self {
-            dns: false,
-            pkarr: false,
+            dns: Vec::new(),
+            pkarr: Vec::new(),
             local: false,
+            local_policy: crate::mdns::LocalPolicy::default(),
             relays: Vec::new(),
         }
     }
@@ -309,15 +336,34 @@ impl DiscoveryConfig {
 
 impl Default for DiscoveryConfig {
     fn default() -> Self {
+        use iroh::address_lookup::{dns, pkarr};
+        let staging = iroh::endpoint::force_staging_infra();
         let relays = iroh::endpoint::default_relay_mode()
             .relay_map()
             .urls::<Vec<_>>()
             .into_iter()
             .collect();
         Self {
-            dns: true,
-            pkarr: true,
+            dns: vec![DnsOrigin {
+                origin: if staging {
+                    dns::N0_DNS_ENDPOINT_ORIGIN_STAGING
+                } else {
+                    dns::N0_DNS_ENDPOINT_ORIGIN_PROD
+                }
+                .to_owned(),
+                nameserver: None,
+            }],
+            pkarr: vec![
+                if staging {
+                    pkarr::N0_DNS_PKARR_RELAY_STAGING
+                } else {
+                    pkarr::N0_DNS_PKARR_RELAY_PROD
+                }
+                .parse()
+                .expect("built-in pkarr URL"),
+            ],
             local: true,
+            local_policy: crate::mdns::LocalPolicy::default(),
             relays,
         }
     }
@@ -336,8 +382,7 @@ impl Default for RateLimitConfig {
 }
 
 pub fn parse_gateway_mode(url: &str) -> Result<AgentMode> {
-    let parsed =
-        url::Url::parse(url).with_context(|| format!("parse gateway upstream URL {url}"))?;
+    let parsed = Url::parse(url).with_context(|| format!("parse gateway upstream URL {url}"))?;
     let host = parsed
         .host_str()
         .map(ToOwned::to_owned)
@@ -384,7 +429,7 @@ fn parse_discovery(value: &str) -> Result<DiscoveryConfig> {
     }
 
     let mut discovery = DiscoveryConfig::in_process();
-    let default_relays = DiscoveryConfig::default().relays;
+    let defaults = DiscoveryConfig::default();
     let mut saw_entry = false;
     for item in value
         .split(',')
@@ -393,15 +438,27 @@ fn parse_discovery(value: &str) -> Result<DiscoveryConfig> {
     {
         saw_entry = true;
         match item {
-            "dns" => discovery.dns = true,
-            "pkarr" => discovery.pkarr = true,
+            "dns" => append_unique(&mut discovery.dns, defaults.dns.clone()),
+            "pkarr" => append_unique(&mut discovery.pkarr, defaults.pkarr.clone()),
             "local" => discovery.local = true,
+            other if other.starts_with("dns:") || other.starts_with("dns=") => {
+                let origin = parse_dns_origin(&other[4..], &defaults.dns)?;
+                append_unique(&mut discovery.dns, [origin]);
+            }
+            other if other.starts_with("pkarr:") || other.starts_with("pkarr=") => {
+                let value = &other[6..];
+                if value == "default" {
+                    append_unique(&mut discovery.pkarr, defaults.pkarr.clone());
+                } else {
+                    append_unique(&mut discovery.pkarr, [parse_http_url(value, "pkarr")?]);
+                }
+            }
             "relay" => {
                 // Bare `relay` token appends iroh's default relay(s).
                 // Dedup against what's already collected so
                 // `relay,relay` or `relay:<same>,relay` don't
                 // double-insert.
-                for url in &default_relays {
+                for url in &defaults.relays {
                     if !discovery.relays.contains(url) {
                         discovery.relays.push(url.clone());
                     }
@@ -414,14 +471,14 @@ fn parse_discovery(value: &str) -> Result<DiscoveryConfig> {
                 // surface a clear error rather than silently
                 // falling back to the default.
                 let url_str = &other["relay:".len()..];
-                let url = url_str.parse::<RelayUrl>().with_context(|| {
-                    format!("parse relay URL from PORTL_DISCOVERY entry `{other}`")
-                })?;
+                let url = url_str
+                    .parse::<RelayUrl>()
+                    .map_err(|_| anyhow!("parse relay URL: invalid URL"))?;
                 if !discovery.relays.contains(&url) {
                     discovery.relays.push(url);
                 }
             }
-            other => bail!("unsupported PORTL_DISCOVERY backend: {other}"),
+            _ => bail!("unsupported PORTL_DISCOVERY backend; use dns, pkarr, local, relay or none"),
         }
     }
 
@@ -430,6 +487,94 @@ fn parse_discovery(value: &str) -> Result<DiscoveryConfig> {
     }
 
     Ok(discovery)
+}
+
+fn append_unique<T: PartialEq>(target: &mut Vec<T>, entries: impl IntoIterator<Item = T>) {
+    for entry in entries {
+        if !target.contains(&entry) {
+            target.push(entry);
+        }
+    }
+}
+
+// Never include the supplied URL in an error: it may contain credentials.
+fn parse_http_url(value: &str, backend: &str) -> Result<Url> {
+    let url = Url::parse(value).map_err(|_| anyhow!("parse {backend} URL: invalid URL"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        bail!("parse {backend} URL: expected http(s) URL with a host");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("parse {backend} URL: credentials are not allowed");
+    }
+    // Query/fragment parameters are not part of an iroh discovery endpoint
+    // and may contain credentials that would otherwise reach diagnostics.
+    if url.query().is_some() || url.fragment().is_some() {
+        bail!("parse {backend} URL: query strings and fragments are not allowed");
+    }
+    Ok(url)
+}
+
+fn parse_dns_origin(value: &str, defaults: &[DnsOrigin]) -> Result<DnsOrigin> {
+    let (origin, nameserver) = value
+        .split_once('@')
+        .map_or((value, None), |(origin, ns)| (origin, Some(ns)));
+    let origin = if origin == "default" {
+        defaults[0].origin.clone()
+    } else {
+        let origin = origin
+            .strip_suffix('.')
+            .unwrap_or(origin)
+            .to_ascii_lowercase();
+        if origin.is_empty()
+            || origin.len() > 253
+            || !origin.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+        {
+            bail!("invalid DNS discovery origin: expected a DNS hostname, not a URL");
+        }
+        if origin == defaults[0].origin.trim_end_matches('.') {
+            defaults[0].origin.clone()
+        } else {
+            origin
+        }
+    };
+    let nameserver = nameserver
+        .map(|value| {
+            value
+                .parse::<SocketAddr>()
+                .or_else(|_| {
+                    value
+                        .parse::<std::net::IpAddr>()
+                        .map(|ip| SocketAddr::new(ip, 53))
+                })
+                .map_err(|_| {
+                    anyhow!("invalid DNS nameserver: expected IP or IP:port (IPv6: [IP]:port)")
+                })
+        })
+        .transpose()?;
+    if nameserver.is_some_and(|addr| addr.port() == 0) {
+        bail!("invalid DNS nameserver: port must not be zero");
+    }
+    Ok(DnsOrigin { origin, nameserver })
+}
+
+fn selection_entries(selection: Option<&crate::config_file::DiscoverySelection>) -> Vec<&str> {
+    use crate::config_file::DiscoverySelection;
+    match selection {
+        None | Some(DiscoverySelection::Enabled(true)) => vec!["default"],
+        Some(DiscoverySelection::Enabled(false)) => Vec::new(),
+        Some(DiscoverySelection::Endpoint(entry)) => vec![entry.as_str()],
+        Some(DiscoverySelection::Endpoints(entries)) => {
+            entries.iter().map(String::as_str).collect()
+        }
+    }
 }
 
 /// Build a [`DiscoveryConfig`] from a `[agent.discovery]` TOML
@@ -441,16 +586,39 @@ fn parse_discovery(value: &str) -> Result<DiscoveryConfig> {
 /// - `"default"` — append iroh's built-in n0 relays
 /// - `"disabled"` (alone) — empty list, relay disabled
 /// - any other string — parsed as a `RelayUrl`
-fn build_discovery_from_file(
+pub(crate) fn build_discovery_from_file(
     section: &crate::config_file::DiscoverySection,
 ) -> Result<DiscoveryConfig> {
     let defaults = DiscoveryConfig::default();
+    let local_policy = match &section.local {
+        None => defaults.local_policy,
+        Some(crate::mdns::LocalDiscovery::Enabled(enabled)) => crate::mdns::LocalPolicy {
+            enabled: *enabled,
+            ..Default::default()
+        },
+        Some(crate::mdns::LocalDiscovery::Policy(policy)) => policy.clone(),
+    };
+    local_policy.validate()?;
     let mut cfg = DiscoveryConfig {
-        dns: section.dns.unwrap_or(defaults.dns),
-        pkarr: section.pkarr.unwrap_or(defaults.pkarr),
-        local: section.local.unwrap_or(defaults.local),
+        dns: Vec::new(),
+        pkarr: Vec::new(),
+        local: local_policy.enabled,
+        local_policy,
         relays: Vec::new(),
     };
+    for entry in selection_entries(section.dns.as_ref()) {
+        append_unique(
+            &mut cfg.dns,
+            [parse_dns_origin(entry.trim(), &defaults.dns)?],
+        );
+    }
+    for entry in selection_entries(section.pkarr.as_ref()) {
+        if entry.trim() == "default" {
+            append_unique(&mut cfg.pkarr, defaults.pkarr.clone());
+        } else {
+            append_unique(&mut cfg.pkarr, [parse_http_url(entry.trim(), "pkarr")?]);
+        }
+    }
 
     let entries = if let Some(list) = section.relays.as_ref() {
         list.clone()
@@ -478,9 +646,9 @@ fn build_discovery_from_file(
                 "ignoring `disabled` in [agent.discovery].relays mixed with other entries"
             );
         } else {
-            let url = trimmed.parse::<RelayUrl>().with_context(|| {
-                format!("parse relay URL `{trimmed}` from [agent.discovery].relays")
-            })?;
+            let url = trimmed
+                .parse::<RelayUrl>()
+                .map_err(|_| anyhow!("parse relay URL: invalid URL"))?;
             if !cfg.relays.contains(&url) {
                 cfg.relays.push(url);
             }
@@ -714,6 +882,173 @@ mod tests {
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+    fn discovery_from_toml(fields: &str) -> DiscoveryConfig {
+        let file =
+            crate::config_file::PortlConfig::parse_toml(&format!("[agent.discovery]\n{fields}"))
+                .expect("parse discovery TOML");
+        super::build_discovery_from_file(file.agent.discovery.as_ref().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn discovery_toml_supports_legacy_bools_default_strings_and_empty_lists() {
+        let defaults = DiscoveryConfig::default();
+        for fields in [
+            "",
+            "dns = true\npkarr = true",
+            "dns = 'default'\npkarr = 'default'",
+            "dns = ['default']\npkarr = ['default']",
+        ] {
+            assert_eq!(discovery_from_toml(fields), defaults);
+        }
+        for fields in ["dns = false\npkarr = false", "dns = []\npkarr = []"] {
+            let cfg = discovery_from_toml(fields);
+            assert!(cfg.dns.is_empty());
+            assert!(cfg.pkarr.is_empty());
+            assert!(cfg.local);
+            assert_eq!(cfg.relays, defaults.relays);
+        }
+    }
+
+    #[test]
+    fn discovery_endpoints_preserve_order_deduplicate_and_override_defaults() {
+        let cfg = discovery_from_toml(
+            "dns = ['Example.NET.', 'second.example@127.0.0.1:5353', 'example.net']\n\
+             pkarr = ['http://127.0.0.1:8080/pkarr', 'https://second.example/pkarr', 'http://127.0.0.1:8080/pkarr']",
+        );
+        assert_eq!(
+            cfg.dns.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["example.net", "second.example@127.0.0.1:5353"]
+        );
+        assert_eq!(
+            cfg.pkarr
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            [
+                "http://127.0.0.1:8080/pkarr",
+                "https://second.example/pkarr"
+            ]
+        );
+        let cfg = discovery_from_toml("dns = 'only.example'\npkarr = 'https://only.example/pkarr'");
+        assert_eq!(cfg.dns.len(), 1);
+        assert_eq!(cfg.pkarr.len(), 1);
+        let default_origin = DiscoveryConfig::default().dns[0].origin.to_uppercase();
+        let cfg = discovery_from_toml(&format!("dns = ['default', '{default_origin}']"));
+        assert_eq!(cfg.dns, DiscoveryConfig::default().dns);
+    }
+
+    #[test]
+    fn discovery_env_custom_forms_match_toml_and_mix_with_bare_defaults() {
+        let cfg = super::parse_discovery(
+            "pkarr:https://custom.example/pkarr,pkarr,pkarr=https://custom.example/pkarr,\
+             dns=custom.example@1.1.1.1,dns,dns:custom.example@1.1.1.1:53,local,relay",
+        )
+        .unwrap();
+        let expected = discovery_from_toml(
+            "pkarr = ['https://custom.example/pkarr', 'default']\n\
+             dns = ['custom.example@1.1.1.1:53', 'default']",
+        );
+        assert_eq!(cfg, expected);
+        assert_eq!(
+            super::parse_discovery("none").unwrap(),
+            DiscoveryConfig::in_process()
+        );
+        assert_eq!(
+            super::parse_discovery("dns,pkarr,local,relay").unwrap(),
+            DiscoveryConfig::default()
+        );
+    }
+
+    #[test]
+    fn discovery_nameserver_supports_ipv4_ipv6_and_nonstandard_ports() {
+        let cfg = discovery_from_toml(
+            "dns = ['one.example@1.1.1.1', 'two.example@::1', 'three.example@[::1]:5353', 'default@127.0.0.1:5354']",
+        );
+        let servers: Vec<_> = cfg
+            .dns
+            .iter()
+            .map(|origin| origin.nameserver.unwrap().to_string())
+            .collect();
+        assert_eq!(
+            servers,
+            ["1.1.1.1:53", "[::1]:53", "[::1]:5353", "127.0.0.1:5354"]
+        );
+        assert_eq!(cfg.dns[3].origin, DiscoveryConfig::default().dns[0].origin);
+    }
+
+    #[test]
+    fn discovery_rejects_invalid_or_secret_endpoints_without_echoing_input() {
+        for value in [
+            "ftp://secret-value.example/pkarr",
+            "https://user:secret-value@host/pkarr",
+            "https://host/pkarr?token=secret-value",
+            "https://host/pkarr#secret-value",
+            "https://",
+            "not a URL secret-value",
+            "",
+        ] {
+            let err = super::parse_discovery(&format!("pkarr:{value}")).unwrap_err();
+            assert!(!format!("{err:#}").contains("secret-value"));
+            let text = format!("[agent.discovery]\npkarr = ['{value}']");
+            let err = crate::config_file::PortlConfig::parse_toml(&text).unwrap_err();
+            assert!(!format!("{err:#}").contains("secret-value"));
+        }
+        for value in [
+            "https://secret-value.example",
+            "-bad.example",
+            "bad..example",
+            "",
+            "origin@secret-value",
+            "origin@127.0.0.1:0",
+        ] {
+            let err = super::parse_discovery(&format!("dns:{value}")).unwrap_err();
+            assert!(!format!("{err:#}").contains("secret-value"));
+        }
+        assert!(super::parse_discovery("").is_err());
+        assert!(super::parse_discovery("none,dns").is_err());
+    }
+
+    #[test]
+    fn discovery_env_replaces_file_instead_of_merging_backend_lists() {
+        let file = crate::config_file::PortlConfig::parse_toml(
+            "[agent.discovery]\ndns = 'custom.example'\npkarr = 'https://custom.example/pkarr'\nlocal = false\nrelays = []",
+        ).unwrap();
+        with_env(
+            &[("PORTL_DISCOVERY", Some(OsString::from("local")))],
+            || {
+                let cfg = AgentConfig::build(Some(&file)).unwrap();
+                assert!(cfg.discovery.dns.is_empty());
+                assert!(cfg.discovery.pkarr.is_empty());
+                assert!(cfg.discovery.relays.is_empty());
+                assert!(cfg.discovery.local);
+                assert_eq!(
+                    cfg.discovery.local_policy,
+                    crate::mdns::LocalPolicy::default()
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn discovery_local_bool_and_policy_table_remain_compatible() {
+        let disabled = discovery_from_toml("local = false");
+        assert!(!disabled.local);
+        assert!(!disabled.local_policy.enabled);
+        let scoped =
+            discovery_from_toml("local = { enabled = true, allow = [{ interface = 'wg0' }] }");
+        assert!(scoped.local);
+        assert_eq!(
+            scoped.local_policy.allow[0].interface.as_deref(),
+            Some("wg0")
+        );
+        assert!(
+            crate::config_file::PortlConfig::parse_toml(
+                "[agent.discovery]\nlocal = { allow = [{}] }",
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn from_env_parses_defaults_in_empty_env() {
         let tmp = tempdir().expect("tempdir");
@@ -927,8 +1262,8 @@ mod tests {
             &[("PORTL_DISCOVERY", Some(OsString::from("local,relay")))],
             || {
                 let config = AgentConfig::from_env().expect("parse discovery env");
-                assert!(!config.discovery.dns);
-                assert!(!config.discovery.pkarr);
+                assert!(config.discovery.dns.is_empty());
+                assert!(config.discovery.pkarr.is_empty());
                 assert!(config.discovery.local);
                 assert!(!config.discovery.relays.is_empty());
             },
@@ -972,7 +1307,7 @@ mod tests {
                 let relays = &config.discovery.relays;
                 assert_eq!(relays.len(), 1);
                 assert_eq!(relays[0].as_str(), "https://relay.mynet.com./");
-                assert!(config.discovery.dns);
+                assert!(!config.discovery.dns.is_empty());
             },
         );
     }

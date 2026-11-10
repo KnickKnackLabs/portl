@@ -404,6 +404,7 @@ mod tests {
             connections: ConnectionRegistry::new(),
             peers_path: None,
             discovery: DiscoveryConfig::in_process(),
+            mdns_status: crate::mdns::MdnsStatus::default(),
             home: std::env::temp_dir(),
             metrics_socket: std::env::temp_dir().join("portl-relay-test-metrics.sock"),
             session_provider_path: None,

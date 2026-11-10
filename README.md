@@ -10,7 +10,7 @@ named workspace on a target, detach, and let another device or
 collaborator attach to the same workspace later.
 
 Portl is built on [iroh](https://iroh.computer). Discovery uses iroh's
-DNS, Pkarr, mDNS, and optional Mainline DHT support; relay fallback is
+DNS, HTTP(S) pkarr, and mDNS services; relay fallback is
 used for NAT traversal when direct paths are unavailable.
 
 ## Status
@@ -332,6 +332,41 @@ and the v0.5.0 control-provider work in
   where needed.
 - **tmux** — compatibility persistent-session provider via PTY-backed
   `tmux -CC`.
+
+## Discovery endpoints
+
+The agent and CLI share `[agent.discovery]` in `$PORTL_HOME/config/portl.toml`.
+`dns` and `pkarr` accept `true` (built-in n0 endpoint), `false` (disabled),
+`"default"`, a custom string, or an ordered list of strings:
+
+```toml
+[agent.discovery]
+dns = ["default", "discovery.example@192.0.2.53:5353"]
+pkarr = ["default", "https://discovery.example/pkarr"]
+local = true
+relays = ["default"]
+```
+
+DNS entries select TXT-record origins, optionally `@IP` (port 53) or
+`@IP:port`; use `@[IPv6]:port` for an explicit IPv6 port. Nameserver overrides
+apply to that lookup only, not the endpoint's relay/pkarr hostname resolver.
+Pkarr entries select HTTP(S) signed-record services, **not Mainline DHT**.
+Agents publish to and resolve from each pkarr endpoint. Ordinary dial clients
+resolve only; pairing preserves stable agent-style publication and mDNS advertising.
+Custom strings/lists replace defaults unless `"default"` is included; `[]`
+disables the backend. Duplicates are removed, preserving the first position.
+Iroh queries lookup services **concurrently**, so list order is not failover
+priority. Pkarr URLs must use HTTP(S) with a host, without credentials, query,
+or fragment; existing relay URL parsing is unchanged.
+
+`PORTL_DISCOVERY` overrides the entire discovery section. Existing `dns`,
+`pkarr`, `local`, `relay`, and `none` tokens still work; custom tokens accept
+`:` or `=`: `pkarr:https://discovery.example/pkarr`,
+`dns:discovery.example@192.0.2.53:5353`, `relay:https://relay.example/`.
+Join tokens with commas. `none` must be used alone. `portl status` reports
+the running agent's effective endpoints; `portl doctor` reports the current
+configuration. See [discovery and network scope](docs/DISCOVERY.md) for mDNS
+policy and `portl config template` for the full template.
 
 ## HTTP proxies
 

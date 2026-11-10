@@ -402,6 +402,7 @@ mod tests {
             connections: ConnectionRegistry::new(),
             peers_path: Some(peers_path.to_path_buf()),
             discovery: DiscoveryConfig::default(),
+            mdns_status: crate::mdns::MdnsStatus::default(),
             home: crate::home_from_peers_path(peers_path)
                 .unwrap_or_else(|| peers_path.to_path_buf()),
             metrics_socket: std::env::temp_dir().join("portl-pair-test.sock"),

@@ -22,7 +22,12 @@ pub(super) async fn pty_master_task(
     drain_timeout: Duration,
 ) -> Result<()> {
     set_nonblocking(&master)?;
-    let master = AsyncFd::new(master).context("register pty master fd")?;
+    // SAFETY: OwnedFd keeps the descriptor open and stable; it is never replaced
+    // or closed through a raw descriptor while registered with AsyncFd.
+    #[allow(unsafe_code)]
+    let master = unsafe { AsyncFd::register(master) }
+        .map_err(std::io::Error::from)
+        .context("register pty master fd")?;
     let mut stdin_open = true;
     let mut drain_deadline = None;
     let mut read_buf = vec![0_u8; IO_CHUNK];
