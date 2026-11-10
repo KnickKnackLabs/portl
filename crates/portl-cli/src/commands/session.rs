@@ -7652,7 +7652,12 @@ async fn pump_local_tmux_control_pty(
     mode_tracker: &SharedTerminalModeTracker,
 ) -> Result<()> {
     set_fd_nonblocking(&master)?;
-    let master = tokio::io::unix::AsyncFd::new(master).context("register tmux -CC pty")?;
+    // SAFETY: OwnedFd keeps the descriptor open and stable; it is never replaced
+    // or closed through a raw descriptor while registered with AsyncFd.
+    #[allow(unsafe_code)]
+    let master = unsafe { tokio::io::unix::AsyncFd::register(master) }
+        .map_err(std::io::Error::from)
+        .context("register tmux -CC pty")?;
     let mut decoder = tmux_cc::Decoder::default();
     let mut read_buf = vec![0_u8; 16 * 1024];
     let mut line_buf = Vec::new();

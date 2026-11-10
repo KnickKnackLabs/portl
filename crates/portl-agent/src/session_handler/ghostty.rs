@@ -1289,7 +1289,12 @@ pub(crate) async fn run_helper(config: GhosttyHelperConfig) -> Result<()> {
     });
 
     crate::shell_handler::pty_master::set_nonblocking(&master)?;
-    let master = tokio::io::unix::AsyncFd::new(master).context("register ghostty pty")?;
+    // SAFETY: OwnedFd keeps the descriptor open and stable; it is never replaced
+    // or closed through a raw descriptor while registered with AsyncFd.
+    #[allow(unsafe_code)]
+    let master = unsafe { tokio::io::unix::AsyncFd::register(master) }
+        .map_err(std::io::Error::from)
+        .context("register ghostty pty")?;
     let mut terminal = GhosttyTerminalIo::new(TerminalOptions {
         cols: config.cols,
         rows: config.rows,
