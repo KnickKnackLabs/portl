@@ -5,6 +5,39 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.16.0 — 2026-11-13
+
+### Added
+
+- Configure multiple pkarr HTTP endpoints and DNS origins/nameservers for
+  discovery. Agents publish to every configured pkarr endpoint; ordinary CLI
+  clients resolve without publishing. Explicit lists do not append n0 defaults,
+  and existing boolean TOML settings and `PORTL_DISCOVERY` tokens still work.
+- Scope local mDNS discovery by Wi-Fi SSID, interface name, or IPv4/IPv6 subnet.
+  Deny rules take precedence, and unavailable network identity fails closed
+  when needed by a rule. `portl status` reports the effective discovery
+  endpoints and current mDNS policy state; `portl doctor` shows the remote
+  endpoint configuration. See [discovery configuration](docs/DISCOVERY.md)
+  for examples and the limits of best-effort network detection.
+
+### Changed
+
+- Upgrade the iroh transport stack to 1.4.1 and mDNS discovery to 0.6.1 for
+  prompt relay-free address updates and refreshed peer-address caching.
+  Pkarr requests now inherit an endpoint's proxy when one is configured;
+  that proxy applies to all its pkarr URLs without per-URL `NO_PROXY`
+  evaluation. The existing SSID recheck and mDNS policy gate remain in place.
+
+### Fixed
+
+- Relay proxy authentication now handles percent-encoded credentials and
+  standard-base64 characters correctly, removing the previous credential
+  restriction warning.
+- Update russh to 0.65.1, Pageant to 0.2.5, and refresh cryptography, TLS,
+  Tokio, and compression dependencies for upstream security fixes, including
+  bounds on SSH-agent request buffering. Adapt SSH authentication to the new
+  russh API without changing Portl ticket authorization or username mapping.
+
 ## 0.15.2 — 2026-10-20
 
 ### Added
