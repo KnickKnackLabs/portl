@@ -52,7 +52,9 @@ local = false
 relays = ["default"]
 ```
 
-Lists retain configuration order and deduplicate equivalent entries. iroh 1.3.0 queries lookup services concurrently and publishes to every publisher; order is **not** a sequential fallback or strict priority guarantee. `dns` is lookup-only, not a publisher. Pkarr here is HTTP publishing/resolving, not Mainline DHT discovery.
+Lists retain configuration order and deduplicate equivalent entries. iroh 1.4.1 queries lookup services concurrently and publishes to every publisher; order is **not** a sequential fallback or strict priority guarantee. `dns` is lookup-only, not a publisher. Pkarr here is HTTP publishing/resolving, not Mainline DHT discovery.
+
+Since iroh 1.4, pkarr publishing and resolving inherit the endpoint's proxy URL, selected by Portl for the first configured relay. When present, that proxy applies to every pkarr URL too, without per-pkarr `NO_PROXY` evaluation. Without an endpoint proxy, pkarr still uses standard HTTP proxy environment settings. Relay-free endpoints now update advertised local addresses on interface changes without waiting for relay probes.
 
 Environment equivalents keep the old `dns,pkarr,local,relay` and `none` meanings. Add custom entries with `pkarr:<URL>`, `dns:<origin>[@nameserver]` and `relay:<URL>`; `=` is an alias for `:`. Repeat tokens to select multiple endpoints. Bare `pkarr`, `dns` and `relay` add their defaults. For example, `PORTL_DISCOVERY=pkarr:https://fabade-1.thinh.dev/pkarr,relay:https://fabade-1.thinh.dev/,relay:https://mifoka-1.thinh.dev/` enables only those remote services and disables mDNS. Use TOML for network-scoped mDNS; the environment's bare `local` means unrestricted mDNS, as before.
 
@@ -75,6 +77,8 @@ Each rule supports exact, case-sensitive `ssid`, exact `interface` name, and an 
 The upstream mDNS implementation uses process-wide multicast sockets, not per-interface policy controls. Portl therefore gates the entire service: any denied interface turns advertising **and** resolution off everywhere. Policy examines all up interfaces with non-loopback, non-unspecified assigned addresses, including bridges, tunnels and link-local addresses, not just the default route. Allowlist users may need to account for additional active interfaces; this conservative choice avoids leaking on a denied Wi-Fi while Ethernet/VPN is allowed.
 
 On deny, Portl drops the mDNS actor and sockets and cancels in-flight lookup streams. On allow it creates a fresh instance and republishes retained endpoint data; no denied-network mDNS cache survives. Previously discovered addresses already held by iroh/connections are not revoked: this is a discovery control, not a packet firewall or connection access policy.
+
+The mDNS 0.6.1 upgrade refreshes cached peer addresses when advertisements change and suppresses unchanged refresh notifications. It adds an optional discovery cadence API; Portl retains the 700 ms default and 10-second unsuccessful lookup deadline. This does not change service ownership, policy gating, or the separate SSID recheck below.
 
 Portl uses the same `netwatch` OS interface/route notifications as iroh, via a separate monitor because iroh does not expose its internal monitor. It quiesces mDNS on a notification before collecting the new identity. Netwatch 0.19.3 suppresses events when the interface/IP snapshot is unchanged; SSID-only roaming can therefore be invisible. A 10-second identity recheck covers that case and retries transient detection/socket failures. Each helper command has a two-second timeout. Detection is best-effort and not instantaneous: debounce, helper latency and unreported SSID-only roams leave a transition window. For a strict guarantee on untrusted networks, disable mDNS entirely or enforce multicast restrictions in the OS firewall.
 

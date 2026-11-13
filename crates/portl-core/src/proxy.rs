@@ -10,11 +10,11 @@
 //! 4. `HTTPS_PROXY` / `ALL_PROXY` / `HTTP_PROXY` (and lowercase), with `NO_PROXY`
 //! 5. direct
 //!
-//! iroh only tunnels its relay connection when the endpoint builder is
-//! given an explicit proxy URL ([`configure_endpoint`]), while iroh's
-//! internal reqwest clients (pkarr, net-report) only read the standard
-//! proxy env vars. For an explicit choice (1–3), [`init_process`] rewrites
-//! those env vars to match it, so no client in the process can disagree.
+//! iroh tunnels relay connections and net-report probes through the endpoint
+//! proxy URL ([`configure_endpoint`]). Since iroh 1.4, pkarr also inherits that
+//! URL; without one it still reads standard proxy env vars. For an explicit
+//! choice (1–3), [`init_process`] rewrites those vars for HTTP clients and
+//! child portl processes too.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -109,24 +109,6 @@ impl ProxyUrl {
             decode(self.0.username()),
             decode(self.0.password().unwrap_or_default()),
         ))
-    }
-
-    /// iroh 1.3's relay client sends the userinfo still percent-encoded and
-    /// base64url-encodes it, so some credentials reach the proxy mangled.
-    fn relay_auth_caveat(&self) -> Option<String> {
-        let raw = format!(
-            "{}:{}",
-            self.0.username(),
-            self.0.password().unwrap_or_default()
-        );
-        let mangled = raw.contains('%')
-            || base64::engine::general_purpose::STANDARD.encode(&raw)
-                != base64::engine::general_purpose::URL_SAFE.encode(&raw);
-        (self.credentials().is_some() && mangled).then(|| {
-            format!(
-                "proxy {self}: credentials contain characters that iroh's relay client encodes incorrectly; the proxy may reject relay connections (407). Prefer credentials made of letters and digits"
-            )
-        })
     }
 }
 
@@ -267,21 +249,11 @@ impl ProxyConfig {
                 }
             }
         };
-        let mut cfg = Self {
+        Ok(Self {
             source,
             route,
             warnings,
-        };
-        let caveats = cfg
-            .proxies()
-            .filter_map(ProxyUrl::relay_auth_caveat)
-            .collect::<Vec<_>>();
-        for caveat in caveats {
-            if !cfg.warnings.contains(&caveat) {
-                cfg.warnings.push(caveat);
-            }
-        }
-        Ok(cfg)
+        })
     }
 
     #[must_use]
@@ -289,7 +261,7 @@ impl ProxyConfig {
         self.source
     }
 
-    /// Ignored env values and credential caveats, for logging and doctor.
+    /// Ignored env values, for logging and doctor.
     #[must_use]
     pub fn warnings(&self) -> &[String] {
         &self.warnings
@@ -500,8 +472,8 @@ pub fn child_env_vars() -> Vec<(String, String)> {
         .collect()
 }
 
-/// Route an iroh endpoint's relay connections (and with them iroh's
-/// HTTPS net-report probes) through the process proxy, if one applies.
+/// Route an iroh endpoint's relay connections, net-report probes and pkarr
+/// requests through the process proxy, if one applies.
 #[must_use]
 pub fn configure_endpoint(
     builder: iroh::endpoint::Builder,
@@ -812,13 +784,13 @@ mod tests {
             Some("hunter2")
         );
 
-        let mangled = ProxyConfig::resolve(
+        let encoded = ProxyConfig::resolve(
             Some("http://u:p%40ss@proxy:1".parse().unwrap()),
             None,
             env(&[]),
         )
         .unwrap();
-        assert!(mangled.warnings()[0].contains("encodes incorrectly"));
+        assert!(encoded.warnings().is_empty());
     }
 
     async fn fake_proxy(reply: &'static str) -> (u16, tokio::task::JoinHandle<String>) {
