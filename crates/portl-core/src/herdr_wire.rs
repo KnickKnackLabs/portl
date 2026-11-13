@@ -520,11 +520,24 @@ impl RawHerdrFrame {
     }
 
     pub fn is_client_hello(&self) -> Result<bool, HerdrFrameError> {
-        self.client_variant_tag().map(|tag| tag == 0)
+        self.client_variant_tag()
+            .map(|tag| tag == 0 || (tag == 20 && self.is_endpoint_control("endpoint.hello.v1")))
     }
 
     pub fn is_server_welcome(&self) -> Result<bool, HerdrFrameError> {
-        self.server_variant_tag().map(|tag| tag == 0)
+        self.server_variant_tag()
+            .map(|tag| tag == 0 || (tag == 20 && self.is_endpoint_control("endpoint.welcome.v1")))
+    }
+
+    fn is_endpoint_control(&self, expected_kind: &str) -> bool {
+        // Herdr's stable endpoint generation 1 uses tag 20 with two strings.
+        // Inspect only the envelope; forward the negotiated JSON unchanged.
+        let payload = &self.storage.framed[LENGTH_PREFIX_BYTES..];
+        bincode::serde::borrow_decode_from_slice::<(u32, &str, &str), _>(
+            payload,
+            bincode::config::standard(),
+        )
+        .is_ok_and(|((_, kind, _), consumed)| kind == expected_kind && consumed == payload.len())
     }
 
     pub fn client_lane(&self) -> Result<ClientLane, HerdrFrameError> {
@@ -1124,6 +1137,35 @@ mod tests {
             server.server_lane().expect("server lane"),
             ServerLane::Control
         );
+    }
+
+    #[test]
+    fn stable_endpoint_handshakes_require_the_direction_specific_kind() {
+        // Frozen endpoint generation 1 envelope (also observed on protocol 22):
+        // variant 20, then length-prefixed kind and opaque JSON strings.
+        for (body, hello, welcome) in [
+            (&b"\x11endpoint.hello.v1\x02{}"[..], true, false),
+            (&b"\x13endpoint.welcome.v1\x02{}"[..], false, true),
+            (&b"\x11endpoint.input.v1\x02{}"[..], false, false),
+            (&b"\x11endpoint.hello.v1\x02{"[..], false, false),
+            (&b"\x11endpoint.hello.v1\x02{}extra"[..], false, false),
+        ] {
+            let bytes = raw_frame_with_variant(20, body);
+            let client = RawHerdrFrame::decode_client_from_bytes(&bytes).expect("client frame");
+            let server = RawHerdrFrame::decode_server_from_bytes(&bytes).expect("server frame");
+            assert_eq!(client.is_client_hello().expect("hello"), hello);
+            assert_eq!(server.is_server_welcome().expect("welcome"), welcome);
+            assert_eq!(
+                client.client_lane().expect("client lane"),
+                ClientLane::Control
+            );
+            assert_eq!(
+                server.server_lane().expect("server lane"),
+                ServerLane::Control
+            );
+            assert_eq!(client.framed_bytes(), bytes);
+            assert_eq!(server.framed_bytes(), bytes);
+        }
     }
 
     #[test]

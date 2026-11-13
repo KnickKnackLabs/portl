@@ -1124,6 +1124,45 @@ mod two_host_fixture {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn killed_ghostty_helper_is_reaped_without_stopping_agent() {
+        let mut fixture =
+            TwoHostFixture::spawn_ghostty_script("/bin/sh -c \"printf REAP_READY; sleep 30\"");
+        fixture.wait_for_host_marker_with_answerback(b"REAP_READY", Duration::from_secs(10));
+        let root = std::env::var("PORTL_GHOSTTY_RUNTIME_DIR").expect("isolated ghostty root");
+        let children = Command::new("ps")
+            .args([
+                "--ppid",
+                &std::process::id().to_string(),
+                "-o",
+                "pid=,args=",
+            ])
+            .output()
+            .expect("list agent children");
+        let children = String::from_utf8(children.stdout).expect("process list utf8");
+        let helper = children
+            .lines()
+            .find(|line| line.contains("__ghostty-session") && line.contains(&root))
+            .expect("running session helper child")
+            .split_whitespace()
+            .next()
+            .expect("helper pid");
+        let proc_path = std::path::PathBuf::from(format!("/proc/{helper}"));
+
+        // The wrapper kills the remote session after detach; retain the agent
+        // fixture until after the OS confirms the helper was actually reaped.
+        fixture.detach();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while proc_path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "killed helper {helper} was not reaped"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
     fn cross_area_realistic_ghostty_62_52_answerback_never_leaks_to_wire() {
         let mut fixture =
             TwoHostFixture::spawn_provider(E2eProvider::Ghostty, DROID_STARTUP_QUERIES);

@@ -30,6 +30,11 @@ All notable changes land here. This project follows
 
 ### Fixed
 
+- Accept Herdr's stable endpoint hello/welcome handshake alongside legacy
+  terminal handshakes, allowing current Herdr clients to attach without a
+  reconnect loop.
+- Reap exited Ghostty session helpers while the agent stays running, avoiding
+  zombie processes after session termination while preserving detached sessions.
 - Relay proxy authentication now handles percent-encoded credentials and
   standard-base64 characters correctly, removing the previous credential
   restriction warning.

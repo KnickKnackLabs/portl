@@ -553,7 +553,7 @@ impl GhosttyProvider {
             tokio::fs::create_dir_all(parent).await?;
         }
         let helper_argv = helper_initial_argv(argv, env.as_ref());
-        let mut command = std::process::Command::new(&self.helper_exe);
+        let mut command = tokio::process::Command::new(&self.helper_exe);
         command
             .arg("__ghostty-session")
             .arg("--name")
@@ -582,7 +582,6 @@ impl GhosttyProvider {
         }
         #[cfg(unix)]
         {
-            use std::os::unix::process::CommandExt;
             // SAFETY(unsafe_code): setsid is async-signal-safe and runs in the child
             // after fork and before exec so helpers outlive the launching agent/CLI.
             #[allow(unsafe_code)]
@@ -595,7 +594,14 @@ impl GhosttyProvider {
                 });
             }
         }
-        command.spawn().context("spawn ghostty helper")?;
+        let mut child = command.spawn().context("spawn ghostty helper")?;
+        // Reap exited helpers while the agent lives, without killing persistent
+        // sessions when the launcher's runtime shuts down (kill_on_drop is false).
+        tokio::spawn(async move {
+            if let Err(err) = child.wait().await {
+                tracing::warn!(%err, "wait for ghostty helper failed");
+            }
+        });
         wait_for_socket(&paths.socket_path, Duration::from_secs(5)).await
     }
 }
