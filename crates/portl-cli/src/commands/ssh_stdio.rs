@@ -525,7 +525,7 @@ impl server::Handler for PortlSshServer {
     async fn auth_publickey_offered(
         &mut self,
         user: &str,
-        _public_key: &ssh_key::PublicKey,
+        _public_key: server::PublicKeyOffer<'_>,
     ) -> Result<Auth, Self::Error> {
         self.auth_user = Some(user.to_owned());
         Ok(Auth::Accept)
@@ -534,7 +534,7 @@ impl server::Handler for PortlSshServer {
     async fn auth_publickey(
         &mut self,
         user: &str,
-        _public_key: &ssh_key::PublicKey,
+        _public_key: server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
         self.auth_user = Some(user.to_owned());
         Ok(Auth::Accept)
