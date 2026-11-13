@@ -187,14 +187,16 @@ async fn relay_connections_go_through_configured_proxy() -> Result<()> {
     let _serial = SERIAL.lock().await;
     let (_relay, relay_url, relay_addr) = spawn_relay().await?;
     let proxy = RecordingProxy::spawn(true).await?;
-    let proxy_url = format!("http://user:pass@{}", proxy.addr);
+    // Exercise both percent-decoding and the standard (not URL-safe) base64
+    // alphabet fixed in iroh-relay 1.4.
+    let proxy_url = format!("http://user:s3cret%3E%3E@{}", proxy.addr);
 
     let cfg = portl_core::proxy::init_process(
         Some(ProxySetting::Proxy(ProxyUrl::parse(&proxy_url)?)),
         None,
     )?;
     assert_eq!(cfg.source(), ProxySource::Flag);
-    // iroh's own reqwest clients (pkarr, net-report) read these.
+    // HTTP clients and child portl processes still inherit this choice.
     assert_eq!(std::env::var("HTTPS_PROXY")?, format!("{proxy_url}/"));
 
     let server = agent_endpoint(&relay_url).await?;
@@ -211,13 +213,13 @@ async fn relay_connections_go_through_configured_proxy() -> Result<()> {
         "both endpoints must reach the relay through the proxy; proxy saw {:?}",
         proxy.requests()
     );
-    // base64("user:pass"); header names are case-insensitive.
+    // base64("user:s3cret>>"); header names are case-insensitive.
     assert!(
         connects.iter().all(|head| head
             .lines()
             .any(|line| line.split_once(':').is_some_and(|(name, value)| name
                 .eq_ignore_ascii_case("proxy-authorization")
-                && value.trim() == "Basic dXNlcjpwYXNz"))),
+                && value.trim() == "Basic dXNlcjpzM2NyZXQ+Pg=="))),
         "{connects:?}"
     );
     close([client, server]).await;
