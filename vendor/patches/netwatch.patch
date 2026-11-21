@@ -1,0 +1,70 @@
+diff -r a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,4 +1,7 @@
+ //! Networking related utilities
++// portl vendor: path dependencies skip Cargo's `--cap-lints allow`, so CI's
++// `-D warnings` would fail on upstream warnings. Match registry builds.
++#![allow(warnings)]
+ 
+ pub mod interfaces;
+ pub mod ip;
+diff -r a/src/netmon/bsd.rs b/src/netmon/bsd.rs
+--- a/src/netmon/bsd.rs
++++ b/src/netmon/bsd.rs
+@@ -172,11 +172,19 @@
+             true
+         }
+         WireMessage::Route(msg) => {
+-            // RTM_MISS is not a route change and can be emitted often on
+-            // dual-stack hosts with no IPv6 connectivity.
+-            if msg.r#type as libc::c_int == libc::RTM_MISS {
++            // RTM_GET (and Darwin's RTM_GET2) is a route lookup, not a change.
++            // Lookup replies are broadcast to every AF_ROUTE listener, so route
++            // queries from other processes must not trigger full interface
++            // rescans. RTM_MISS can also be emitted often on dual-stack hosts
++            // with no IPv6 connectivity.
++            let ty = msg.r#type as libc::c_int;
++            if matches!(ty, libc::RTM_GET | libc::RTM_MISS) {
+                 return false;
+             }
++            #[cfg(any(target_os = "macos", target_os = "ios"))]
++            if ty == libc::RTM_GET2 {
++                return false;
++            }
+ 
+             // Ignore local unicast
+             if let Some(addr) = msg.addrs.get(RTAX_DST as usize)
+@@ -196,6 +204,32 @@
+ mod tests {
+     use super::*;
+ 
++    #[cfg(any(target_os = "macos", target_os = "ios"))]
++    #[test]
++    fn route_queries_do_not_trigger_changes() {
++        let mut message = vec![0u8; std::mem::size_of::<libc::rt_msghdr>()];
++        let length = message.len() as u16;
++        message[..2].copy_from_slice(&length.to_ne_bytes());
++        message[2] = libc::RTM_VERSION as u8;
++
++        for (message_type, expected) in [
++            (libc::RTM_GET, false),
++            (libc::RTM_MISS, false),
++            (libc::RTM_ADD, true),
++            (libc::RTM_DELETE, true),
++            (libc::RTM_CHANGE, true),
++        ] {
++            message[3] = message_type as u8;
++            let messages = parse_rib(libc::NET_RT_IFLIST, &message).expect("route message");
++            assert_eq!(messages.len(), 1);
++            assert_eq!(
++                contains_interesting_message(&messages),
++                expected,
++                "message type {message_type}"
++            );
++        }
++    }
++
+     /// A message [`parse_rib`] skips (wrong `rtm_version`), so it is read but
+     /// yields no `Change`.
+     fn skipped_message() -> Vec<u8> {

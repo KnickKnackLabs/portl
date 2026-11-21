@@ -414,6 +414,12 @@ impl ScopedMdns {
 }
 
 async fn identify(state: &netwatch::netmon::State) -> NetworkIdentity {
+    #[cfg(target_os = "macos")]
+    let wifi = tokio::task::spawn_blocking(wifi_interfaces)
+        .await
+        .ok()
+        .flatten();
+
     let mut links = Vec::new();
     for interface in state.interfaces.values().filter(|i| i.is_up()) {
         let mut addresses: Vec<_> = interface
@@ -425,9 +431,18 @@ async fn identify(state: &netwatch::netmon::State) -> NetworkIdentity {
             continue;
         }
         addresses.sort_unstable();
+        #[cfg(target_os = "macos")]
+        let probe = should_probe_ssid(interface.name(), wifi.as_deref());
+        #[cfg(not(target_os = "macos"))]
+        let probe = true;
+        let ssid = if probe {
+            ssid(interface.name()).await
+        } else {
+            None
+        };
         links.push(NetworkLink {
             interface: interface.name().into(),
-            ssid: ssid(interface.name()).await,
+            ssid,
             addresses,
         });
     }
@@ -460,6 +475,39 @@ fn ssid_field<'a>(output: &'a str, prefix: &str) -> Option<&'a str> {
     output
         .lines()
         .find_map(|line| line.trim_start().strip_prefix(prefix))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn should_probe_ssid(interface: &str, wifi_interfaces: Option<&[String]>) -> bool {
+    // Discovery failure is not evidence that an interface cannot have an SSID.
+    wifi_interfaces.is_none_or(|names| names.iter().any(|name| name == interface))
+}
+
+/// BSD names of Wi-Fi adapters, enumerated afresh per identity check (hot-plug safe).
+/// `None` when `SystemConfiguration` reports no interfaces at all: callers then probe every link.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn wifi_interfaces() -> Option<Vec<String>> {
+    use objc2_system_configuration::{SCNetworkInterface, kSCNetworkInterfaceTypeIEEE80211};
+
+    let all = SCNetworkInterface::all();
+    // SAFETY: SCNetworkInterfaceCopyAll returns a CFArray of SCNetworkInterfaceRef.
+    let all = unsafe { all.cast_unchecked::<SCNetworkInterface>() };
+    if all.is_empty() {
+        return None;
+    }
+    // SAFETY: immutable framework constant, valid for the process lifetime.
+    let wifi = unsafe { kSCNetworkInterfaceTypeIEEE80211 };
+    Some(
+        all.iter()
+            .filter(|interface| {
+                interface
+                    .interface_type()
+                    .is_some_and(|kind| &*kind == wifi)
+            })
+            .filter_map(|interface| interface.bsd_name().map(|name| name.to_string()))
+            .collect(),
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -517,6 +565,17 @@ async fn ssid(_interface: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssid_probes_only_wifi_unless_interface_discovery_failed() {
+        let wifi = vec!["en7".to_owned()];
+        assert!(should_probe_ssid("en7", Some(&wifi)));
+        assert!(!should_probe_ssid("en0", Some(&wifi)));
+        assert!(!should_probe_ssid("utun4", Some(&wifi)));
+        assert!(!should_probe_ssid("en7", Some(&[])));
+        assert!(should_probe_ssid("en7", None));
+        assert!(should_probe_ssid("utun4", None));
+    }
 
     fn network(ssid: Option<&str>, address: &str) -> NetworkIdentity {
         NetworkIdentity {

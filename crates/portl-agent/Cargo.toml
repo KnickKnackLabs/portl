@@ -60,6 +60,10 @@ uuid        = { workspace = true }
 # Keep default-features off: upstream defaults enable Kitty graphics support,
 # which is not needed for the native session provider MVP or static smoke.
 libghostty-vt = { version = "0.1.1", git = "https://github.com/Uzaaft/libghostty-rs", rev = "5ac47e9eb166add2c00c432bc65c279133629712", package = "libghostty-vt", default-features = false, optional = true }
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFString"] }
+objc2-system-configuration = { version = "0.3.2", default-features = false, features = ["SCNetworkConfiguration"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 tracing-journald = { workspace = true }
 

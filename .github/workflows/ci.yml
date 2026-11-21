@@ -132,6 +132,8 @@ jobs:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Vendored crate patches cover every resolved copy
+        run: python3 scripts/check-vendored-crates.py
       - name: Check non-Ghostty optional features
         run: |
           set -euo pipefail

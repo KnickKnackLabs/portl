@@ -5,6 +5,21 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+### Changed
+
+- Cut idle CPU on macOS by about 70–90% for both the agent and long-running
+  clients. Portl now carries local forks of `netdev` and `netwatch` (see
+  `[patch.crates-io]` in `Cargo.toml`) until the fixes land upstream:
+  interface enumeration reads the AF_LINK index directly instead of calling
+  `if_nametoindex` (a full `getifaddrs`) for each address, and route
+  monitoring ignores `RTM_GET`/`RTM_GET2` lookups, so another process's
+  `route get` no longer triggers a rescan.
+- mDNS network-identity checks run the SSID helpers (`ipconfig`,
+  `networksetup`) only on Wi-Fi adapters, so `utun`, `awdl` and bridge links
+  no longer spawn subprocesses every 10 seconds. Policy semantics, the
+  10-second recheck and fail-closed handling are unchanged.
+- Update `swarm-discovery` (mDNS) from 0.6.3 to 0.6.6.
+
 ## 0.16.0 — 2026-11-13
 
 ### Added

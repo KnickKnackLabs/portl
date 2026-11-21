@@ -9,6 +9,7 @@ members = [
     "adapters/docker-portl",
     "adapters/slicer-portl",
 ]
+exclude = ["vendor"]
 
 [workspace.package]
 version      = "0.16.0"
@@ -194,3 +195,10 @@ lto           = "thin"
 codegen-units = 1
 strip         = "symbols"
 panic         = "abort"
+
+# Local forks carrying idle-CPU fixes until released upstream.
+[patch.crates-io]
+# AF_LINK index on Darwin instead of one if_nametoindex (= getifaddrs) per address.
+netdev = { path = "vendor/netdev" }
+# Ignore RTM_GET/RTM_GET2 route lookups: other processes' `route get` forced full rescans.
+netwatch = { path = "vendor/netwatch" }

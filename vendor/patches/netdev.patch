@@ -1,0 +1,106 @@
+diff -r a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -8,6 +8,9 @@
+ //! - [`Interface`] represents one interface and its collected metadata.
+ //! - [`get_default_interface`] and [`get_default_gateway`] are available with the `gateway` feature (default).
+ //!
++// portl vendor: path dependencies skip Cargo's `--cap-lints allow`, so CI's
++// `-D warnings` would fail on upstream warnings. Match registry builds.
++#![allow(warnings)]
+ pub mod interface;
+ pub mod net;
+ mod os;
+diff -r a/src/os/unix/interface.rs b/src/os/unix/interface.rs
+--- a/src/os/unix/interface.rs
++++ b/src/os/unix/interface.rs
+@@ -43,7 +43,12 @@
+         let if_type = get_interface_type(addr_ref);
+         let c_str = addr_ref.ifa_name as *const c_char;
+         let name = interface_name_from_ptr(c_str);
+-        let if_index = if_nametoindex_or_zero(&name);
++        // Reuse the index for each address belonging to the same interface.
++        let iface_position = ifaces.iter().position(|iface| iface.name == name);
++        let if_index = iface_position
++            .map(|position| ifaces[position].index)
++            .filter(|&index| index != 0)
++            .unwrap_or_else(|| interface_index(addr_ref, &name));
+         let cap: libc::socklen_t = super::sockaddr::sockaddr_storage_cap();
+         let addr_len_opt = unsafe { compute_sockaddr_len(addr_ref.ifa_addr, None, Some(cap)) };
+         let (mac, ip, mut ipv6_scope_id) = match addr_len_opt {
+@@ -112,7 +117,9 @@
+         // Check if there is already an interface with this name (since getifaddrs returns one
+         // entry per address, so if the interface has multiple addresses, it returns multiple entries).
+         // If so, add the IP addresses from the current entry into the existing interface. Otherwise, add a new interface.
+-        if let Some(iface) = ifaces.iter_mut().find(|iface| iface.name == name) {
++        if let Some(position) = iface_position {
++            let iface = &mut ifaces[position];
++            iface.index = if_index;
+             if let Some(mac) = mac {
+                 iface.mac_addr = Some(mac);
+             }
+@@ -235,6 +242,29 @@
+     true
+ }
+ 
++fn interface_index(_addr: &libc::ifaddrs, name: &str) -> u32 {
++    #[cfg(target_vendor = "apple")]
++    {
++        let sa = _addr.ifa_addr;
++        // Darwin's AF_LINK entry already contains the index in this snapshot.
++        // Read only the index field; sockaddr_dl records may be variable-sized.
++        if !sa.is_null()
++            && unsafe { (*sa).sa_family as libc::c_int } == libc::AF_LINK
++            && unsafe { (*sa).sa_len as usize }
++                >= std::mem::offset_of!(libc::sockaddr_dl, sdl_index)
++                    + std::mem::size_of::<u16>()
++        {
++            let sdl = sa.cast::<libc::sockaddr_dl>();
++            let index = unsafe { std::ptr::addr_of!((*sdl).sdl_index).read_unaligned() };
++            if index != 0 {
++                return u32::from(index);
++            }
++        }
++    }
++    // Preserve support for entries without link-layer data and other Unix OSes.
++    if_nametoindex_or_zero(name)
++}
++
+ fn if_nametoindex_or_zero(name: &str) -> u32 {
+     match CString::new(name.as_bytes()) {
+         Ok(name) => unsafe { libc::if_nametoindex(name.as_ptr()) },
+@@ -255,7 +285,34 @@
+     use super::resolve_ipv6_scope_id;
+     use std::net::Ipv6Addr;
+ 
++    #[cfg(target_vendor = "apple")]
+     #[test]
++    fn reads_darwin_interface_index_from_link_record() {
++        let mut link: libc::sockaddr_dl = unsafe { std::mem::zeroed() };
++        link.sdl_len = std::mem::size_of::<libc::sockaddr_dl>() as u8;
++        link.sdl_family = libc::AF_LINK as libc::sa_family_t;
++        link.sdl_index = 42;
++        let mut addr: libc::ifaddrs = unsafe { std::mem::zeroed() };
++        addr.ifa_addr = std::ptr::addr_of_mut!(link).cast();
++
++        assert_eq!(super::interface_index(&addr, ""), 42);
++
++        link.sdl_index = 0;
++        assert_eq!(super::interface_index(&addr, ""), 0);
++        link.sdl_index = 42;
++
++        // A short or non-link record must not be interpreted as sockaddr_dl.
++        link.sdl_len = 3;
++        assert_eq!(super::interface_index(&addr, ""), 0);
++        link.sdl_len = std::mem::size_of::<libc::sockaddr_dl>() as u8;
++        link.sdl_family = libc::AF_INET as libc::sa_family_t;
++        assert_eq!(super::interface_index(&addr, ""), 0);
++
++        addr.ifa_addr = std::ptr::null_mut();
++        assert_eq!(super::interface_index(&addr, ""), 0);
++    }
++
++    #[test]
+     fn preserves_non_zero_ipv6_scope_id() {
+         let addr = "fe80::1".parse::<Ipv6Addr>().unwrap();
+         assert_eq!(resolve_ipv6_scope_id(&addr, Some(9), 3), 9);
