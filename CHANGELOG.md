@@ -5,6 +5,8 @@ All notable changes land here. This project follows
 
 ## Unreleased
 
+## 0.16.1 — 2026-11-21
+
 ### Changed
 
 - Cut idle CPU on macOS by about 70–90% for both the agent and long-running
