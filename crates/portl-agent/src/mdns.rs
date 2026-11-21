@@ -415,10 +415,13 @@ impl ScopedMdns {
 
 async fn identify(state: &netwatch::netmon::State) -> NetworkIdentity {
     #[cfg(target_os = "macos")]
-    let wifi = tokio::task::spawn_blocking(wifi_interfaces)
-        .await
-        .ok()
-        .flatten();
+    let wifi = portl_core::runtime::slow_task(
+        "mdns_wifi_interfaces",
+        tokio::task::spawn_blocking(wifi_interfaces),
+    )
+    .await
+    .ok()
+    .flatten();
 
     let mut links = Vec::new();
     for interface in state.interfaces.values().filter(|i| i.is_up()) {

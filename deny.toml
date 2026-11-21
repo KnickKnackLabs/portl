@@ -24,11 +24,17 @@ yanked  = "warn"
 # upgrade. Revisit when age/i18n-embed migrates away from it.
 # `basic-toml` is unmaintained with no safe upgrade; same path,
 # `age -> i18n-embed-fl -> i18n-config`, build-time only (proc macro).
+# `chrono` (RUSTSEC-2026-0543) and `humantime` (RUSTSEC-2026-0542, which wraps
+# chrono) are unmaintained with no safe upgrade. chrono arrives through
+# `iroh-relay -> tokio-rustls-acme`; humantime is a direct duration-parsing
+# dependency. Revisit when iroh drops chrono or humantime is replaced (jiff).
 ignore  = [
     "RUSTSEC-2024-0436",
     "RUSTSEC-2025-0141",
     "RUSTSEC-2026-0173",
     "RUSTSEC-2026-0374",
+    "RUSTSEC-2026-0542",
+    "RUSTSEC-2026-0543",
 ]
 
 [licenses]
